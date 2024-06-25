@@ -3,12 +3,9 @@
 from PyQt5.QtCore import pyqtSignal, Qt,QRect, QEvent,QSize
 from PyQt5.QtWidgets import QWidget, QAction,QGridLayout, QSplitter, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton,QTreeWidget,QTreeWidgetItem,QComboBox
 from pyvistaqt import QtInteractor, MainWindow
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent,QPixmap,QCursor,QColor,QBrush,QFont
-import pyvista as pv
-import os
-# from ui.ui_knitpaint import KnitPaintSplitter
-from ui.ui_tiffany import KnitPaintSplitter
-from ui.ui_meshlab import MeshLabSplitter
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent, QPixmap, QCursor, QColor, QBrush, QFont
+from phd.ui.ui_meshlab import MeshLabSplitter
+
 
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
@@ -27,6 +24,7 @@ class PlotterWidget(QWidget):
         for url in event.mimeData().urls():
             file_paths.append(str(url.toLocalFile()))
         self.filesDropped.emit(file_paths)  # 发射带有文件路径列表参数的信号
+
 
 class TreeWidgetItem(QTreeWidgetItem):
     def __init__(self,parent,name:str,level:int,type:int):
@@ -50,8 +48,10 @@ class TreeWidgetItem(QTreeWidgetItem):
                 childNEdges = TreeWidgetItem(self,"N_Edges",1,4)
                 childNFaces = TreeWidgetItem(self,"N_Faces",1,5)
 
+
 class TreeWidget(QTreeWidget):
     icon_clicked = pyqtSignal(TreeWidgetItem)
+
     def __init__(self) -> None:
         super().__init__()
         self.setAlternatingRowColors(True)
@@ -119,10 +119,11 @@ class TreeWidget(QTreeWidget):
                         item.setIcon(0, item.iconUnvisible)
         return super().viewportEvent(event)
 
+
 class MyMainWindow(MainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SingaLab")
+        self.setWindowTitle("PingLab")
         self.setMinimumSize(192*5, 108*5)
         self.resize(192*8, 108*8)
         self.setWindowIcon(QIcon('./resource/logo0.png'))
@@ -135,7 +136,7 @@ class MyMainWindow(MainWindow):
 
         self.connectFunction()
         
-        style_file = './stylesheets/ui_style.qss'
+        style_file = '/home/ping2/ros2_ws/src/phd/phd/stylesheets/ui_style.qss'
         with open(style_file, 'r',  encoding='UTF-8') as file:
             self.style_sheet = file.read()
         self.setObjectName("windowMain")
@@ -151,25 +152,19 @@ class MyMainWindow(MainWindow):
         # 添加Mode菜单
         modeMenu = mainMenu.addMenu('Mode')
         modeMenu.setObjectName("menuMode")
+
         self.modeMeshLab = QAction('MeshLab', self)
         self.modeMeshLab.setIcon(QIcon("./resource/logo1.png"))
         modeMenu.addAction(self.modeMeshLab)
-        
-        self.modeKnitPaint = QAction('KnitPaint', self)
-        self.modeKnitPaint.setIcon(QIcon("./resource/logo2.png"))
-        modeMenu.addAction(self.modeKnitPaint)
         
         self.modeROS = QAction('ROS', self)
         self.modeROS.setIcon(QIcon("./resource/logo3.png"))
         modeMenu.addAction(self.modeROS)
 
-        self.modeTiffany = QAction('Tiffany', self)
-        self.modeTiffany.setIcon(QIcon("./resource/logo6.png"))
-        modeMenu.addAction(self.modeTiffany)
-
         # 添加Mesh菜单
         fileMenu = mainMenu.addMenu('Help')
         fileMenu.setObjectName("menuFile")
+
         self.about = QAction('About', self)
         self.about.setIcon(QIcon("./resource/logo4.png"))
         fileMenu.addAction(self.about)
@@ -195,8 +190,8 @@ class MyMainWindow(MainWindow):
         self.widget_info.setFixedHeight(20)
 
         layout = QHBoxLayout(self.widget_info)
-        self.info_process = QLabel("Hello, Singa!")
-        self.info_FPS = QLabel("Hello, Singa!")
+        self.info_process = QLabel("Hello, Ping!")
+        self.info_FPS = QLabel("Hello, Ping!")
         self.info_FPS.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.info_process.resize(100,20)
         self.info_FPS.resize(100,20)
@@ -219,37 +214,31 @@ class MyMainWindow(MainWindow):
     def connectFunction(self):
         self.exit.triggered.connect(self.close)
         self.modeMeshLab.triggered.connect(self.runMeshLab)
-        self.modeKnitPaint.triggered.connect(self.runKnitPaint)
-        self.modeROS.triggered.connect(lambda: print("Run ROS Mode"))
-        self.modeTiffany.triggered.connect(self.runTiffany)
-        # self.about.triggered.connect(lambda: functions.message_about())
-    
+        self.modeROS.triggered.connect(self.runROSMode)
+
     def runMeshLab(self):
-        self.modeROS.setDisabled(True)
-        self.modeKnitPaint.setDisabled(True)
-        self.modeTiffany.setDisabled(True)
-        self.modeMeshLab.disconnect()
+        self.modeMeshLab.setDisabled(True)
+        self.modeROS.setEnabled(True)
         self.UIMeshLab = MeshLabSplitter(Qt.Horizontal)
         self.splitter_0.replaceWidget(0,self.UIMeshLab)
         self.UIMeshLab.reLayout()
 
-    def runKnitPaint(self):
-        self.modeROS.setDisabled(True)
-        self.modeMeshLab.setDisabled(True)
-        self.modeTiffany.setDisabled(True)
-        self.modeKnitPaint.disconnect()
-        self.UIKnitPaint = KnitPaintSplitter(Qt.Horizontal)
-        self.splitter_0.replaceWidget(0,self.UIKnitPaint)
-        self.UIKnitPaint.reLayout()
+    def runROSMode(self):
+        # Enable MeshLab mode button and disable ROS mode button
+        self.modeMeshLab.setEnabled(True)  # MeshLab mode can be activated again
+        self.modeROS.setDisabled(True)  # Current mode, disable button to prevent reactivation
 
-    def runTiffany(self):
-        self.modeROS.setDisabled(True)
-        self.modeMeshLab.setDisabled(True)
-        self.modeKnitPaint.setDisabled(True)
-        self.modeTiffany.disconnect()
-        self.UITiffany = KnitPaintSplitter(Qt.Horizontal)
-        self.splitter_0.replaceWidget(0,self.UITiffany)
-        self.UITiffany.reLayout()
+        # Update the label to show the ROS mode message
+        self.info_process.setText("Hello, ROS Mode!")
+        self.info_FPS.setText("FPS Display for ROS")
+
+        # Optionally, you can reset the layout to show something specific for ROS mode
+        # This is just a placeholder for any specific GUI elements you want to add for ROS mode
+        # Example of resetting the layout for ROS mode
+        ui_ros = QWidget()  # Create a new widget for ROS mode
+        layout_ros = QHBoxLayout(ui_ros)
+        layout_ros.addWidget(QLabel("ROS Mode Active"))
+        self.splitter_0.replaceWidget(0, ui_ros)  # Replace the current widget in splitter with ROS mode widget
 
 
 

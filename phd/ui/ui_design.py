@@ -1,11 +1,10 @@
 # ui_design.py
 
-from PyQt5.QtCore import pyqtSignal, Qt,QRect, QEvent,QSize
-from PyQt5.QtWidgets import QWidget, QAction,QGridLayout, QSplitter, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton,QTreeWidget,QTreeWidgetItem,QComboBox
+from PyQt5.QtCore import pyqtSignal, Qt, QRect, QEvent, QSize
+from PyQt5.QtWidgets import QWidget, QAction, QGridLayout, QSplitter, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton, QTreeWidget, QTreeWidgetItem, QComboBox
 from pyvistaqt import QtInteractor, MainWindow
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent,QPixmap,QCursor,QColor,QBrush,QFont
-import pyvista as pv
-import os
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent, QPixmap, QCursor,QColor, QBrush, QFont
+
 
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
@@ -24,6 +23,7 @@ class PlotterWidget(QWidget):
         for url in event.mimeData().urls():
             file_paths.append(str(url.toLocalFile()))
         self.filesDropped.emit(file_paths)  # 发射带有文件路径列表参数的信号
+
 
 class TreeWidgetItem(QTreeWidgetItem):
     def __init__(self,parent,name:str,level:int,type:int):
@@ -151,10 +151,6 @@ class MyMainWindow(MainWindow):
         self.modeMeshLab = QAction('MeshLab', self)
         self.modeMeshLab.setIcon(QIcon("./resource/logo1.png"))
         modeMenu.addAction(self.modeMeshLab)
-        
-        self.modeKnitPaint = QAction('KnitPaint', self)
-        self.modeKnitPaint.setIcon(QIcon("./resource/logo2.png"))
-        modeMenu.addAction(self.modeKnitPaint)
 
         self.modeROS = QAction('ROS', self)
         self.modeROS.setIcon(QIcon("./resource/logo3.png"))

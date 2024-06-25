@@ -20,6 +20,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'phd_ui = phd.phd_ui:main',
         ],
     },
 )
