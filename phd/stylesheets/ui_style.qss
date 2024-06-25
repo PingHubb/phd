@@ -1,0 +1,123 @@
+QMenuBar {
+    background-color: #1d1d1d;
+}
+QMenuBar::item {
+    background-color: transparent;
+    color: #CFCFCF;
+}
+QMenuBar::item:selected {
+    background-color: #303030;
+    color: #E7E7E7;
+}
+QMenuBar::item:pressed {
+    background-color: #606060;
+    color: #000000;
+}
+QMenu {
+    background-color: #303030;
+    color: #CFCFCF;
+    padding: 0px;
+    icon-size: 22px;
+}
+QMenu::item:selected {
+    background-color: #606060;
+    color: #000000;
+}
+
+QSplitter::handle {
+    background-color: transparent;
+}
+QSplitter#knitting::handle {
+    background-color: transparent;
+}
+
+QLabel#mapKnitting{
+    background-color: #000000;
+}
+
+QScrollBar {
+                width: 10px;
+                height: 10px;
+            }
+QScrollArea#widgetKnitting {
+    background-color: #303030;
+    border-radius: 3px;
+    padding: 0px;
+}
+
+
+
+QWidget#widgetMain {
+    background-color: #161616;
+    border-radius: 0px;
+    padding: 1px;
+}
+
+/* QWidget#widgetKnitting {
+    background-color: #303030;
+    border-radius: 3px;
+    padding: 0px;
+} */
+
+QWidget#widgetPlotter {
+    background-color: #303030;
+    border-radius: 3px;
+    padding: 0px;
+}
+QTreeWidget#widgetTree {
+    background-color: #303030;
+    alternate-background-color: #404040;
+    border-radius: 3px;
+    border: 0px;
+}
+QTreeWidget#widgetTree::Item {
+    color: #ffffff;
+    border-bottom: 0px;
+    padding: 0px;
+}
+QTreeWidget#widgetTree::Item:hover {
+    background-color: #505050;
+    color: #000000;
+}
+QTreeWidget#widgetTree::Item:selected {
+    background-color: #505050;
+    color: #FA812C;
+}
+QWidget#widgetFunc {
+    background-color: #303030;
+    border-radius: 3px;
+    padding: 1px;
+}
+QWidget#widgetInfo {
+    background-color: #303030;
+    border-radius: 3px;
+    padding: 1px;
+}
+QWidget#widgetFunc QPushButton{
+    background-color: #555555;
+        color: white;
+        border-radius: 3px;
+        padding: 6px 12px;
+}
+QWidget#widgetFunc QPushButton:hover {
+    background-color: #404040;
+    color: #000000;
+}
+QWidget#widgetFunc QPushButton:pressed {
+    background-color: #505050;
+    color: #FFFFFF;
+}
+QWidget#widgetFunc QCheckBox {
+    background-color: #555555;
+    color: white;
+    border-radius: 3px;
+    padding: 6px 12px;
+}
+QWidget#widgetFunc QCheckBox:hover {
+    background-color: #404040;
+    color: #000000;
+}
+QWidget#widgetFunc QCheckBox:pressed {
+    background-color: #505050;
+    color: #FFFFFF;
+}
