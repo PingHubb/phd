@@ -1,8 +1,6 @@
-# phd_ui.py
 import sys
 from PyQt5 import QtWidgets, QtGui
 from phd.ui.ui_initial import MyMainWindow
-import rclpy
 
 
 def main():

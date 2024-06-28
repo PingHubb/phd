@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import QSplitter,QWidget,QGridLayout,QTreeWidgetItem,QTreeW
 from pyvistaqt import QtInteractor
 from phd.dependence.func_meshLab import MyMeshLab
 
+
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
     def __init__(self):
@@ -23,6 +24,7 @@ class PlotterWidget(QWidget):
         for url in event.mimeData().urls():
             file_paths.append(str(url.toLocalFile()))
         self.filesDropped.emit(file_paths)  # 发射带有文件路径列表参数的信号
+
 
 class TreeWidgetItem(QTreeWidgetItem):
     def __init__(self,parent,name:str,level:int,type:int):
@@ -45,6 +47,7 @@ class TreeWidgetItem(QTreeWidgetItem):
                 childNVertex = TreeWidgetItem(self,"N_Vertex",1,3)
                 childNEdges = TreeWidgetItem(self,"N_Edges",1,4)
                 childNFaces = TreeWidgetItem(self,"N_Faces",1,5)
+
 
 class TreeWidget(QTreeWidget):
     icon_clicked = pyqtSignal(TreeWidgetItem)
