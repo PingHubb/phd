@@ -3,6 +3,7 @@ from PyQt5.QtWidgets import QWidget, QAction,QGridLayout, QSplitter, QVBoxLayout
 from pyvistaqt import QtInteractor, MainWindow
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent, QPixmap, QCursor, QColor, QBrush, QFont
 from phd.ui.ui_meshlab import MeshLabSplitter
+from phd.ui.ui_sensor import SensorSplitter
 from phd.ui.ui_ping import RosSplitter
 
 
@@ -12,7 +13,7 @@ class MyMainWindow(MainWindow):
         self.setWindowTitle("PingLab")
         self.setMinimumSize(192*5, 108*5)
         self.resize(192*8, 108*8)
-        self.setWindowIcon(QIcon('/home/ping2/ros2_ws/src/phd/phd/resource/logo0.png'))
+        self.setWindowIcon(QIcon('/home/ping2/ros2_ws/src/phd/phd/resource/icon/logo0.png'))
 
         # 创建菜单栏并设置样式
         self.setup_menu()
@@ -40,11 +41,15 @@ class MyMainWindow(MainWindow):
         modeMenu.setObjectName("menuMode")
 
         self.modeMeshLab = QAction('MeshLab', self)
-        self.modeMeshLab.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo1.png"))
+        self.modeMeshLab.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/logo1.png"))
         modeMenu.addAction(self.modeMeshLab)
         
+        self.modeSensor = QAction('Sensor', self)
+        self.modeSensor.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/logo2.png"))
+        modeMenu.addAction(self.modeSensor)
+        
         self.modePING = QAction('Ping', self)
-        self.modePING.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo3.png"))
+        self.modePING.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/logo3.png"))
         modeMenu.addAction(self.modePING)
 
         # 添加Mesh菜单
@@ -52,11 +57,11 @@ class MyMainWindow(MainWindow):
         fileMenu.setObjectName("menuFile")
 
         self.about = QAction('About', self)
-        self.about.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo4.png"))
+        self.about.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/logo4.png"))
         fileMenu.addAction(self.about)
         
         self.exit = QAction('Exit', self)
-        self.exit.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo5.png"))
+        self.exit.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/logo5.png"))
         self.exit.setShortcut('Ctrl+Q')
         fileMenu.addAction(self.exit)
 
@@ -100,18 +105,28 @@ class MyMainWindow(MainWindow):
     def connectFunction(self):
         self.exit.triggered.connect(self.close)
         self.modeMeshLab.triggered.connect(self.runMeshLab)
-        self.modePING.triggered.connect(self.runROSMode)
+        self.modeSensor.triggered.connect(self.runSensor)
+        self.modePING.triggered.connect(self.runPingMode)
 
     def runMeshLab(self):
         self.modeMeshLab.setDisabled(True)
+        self.modeSensor.setEnabled(True)
         self.modePING.setEnabled(True)
         self.UIMeshLab = MeshLabSplitter(Qt.Horizontal)
         self.splitter_0.replaceWidget(0,self.UIMeshLab)
         self.UIMeshLab.reLayout()
 
-    def runROSMode(self):
-        # Enable MeshLab mode button and disable ROS mode button
-        self.modeMeshLab.setDisabled(True)  # MeshLab mode can be activated again
+    def runSensor(self):
+        self.modeMeshLab.setEnabled(True)
+        self.modeSensor.setDisabled(True)
+        self.modePING.setEnabled(True)
+        self.modeSensor = SensorSplitter(Qt.Horizontal)
+        self.splitter_0.replaceWidget(0,self.modeSensor)
+        self.modeSensor.reLayout()
+
+    def runPingMode(self):
+        self.modeMeshLab.setEnabled(True)
+        self.modeSensor.setEnabled(True)
         self.modePING.setDisabled(True)  # Current mode, disable button to prevent reactivation
 
         # Update the label to show the ROS mode message

@@ -1,10 +1,12 @@
 from PyQt5 import QtCore
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QColor, QCursor
-from PyQt5.QtCore import pyqtSignal, Qt, QRect, QEvent
-from PyQt5.QtWidgets import QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QTabWidget, QDialog, QLineEdit, QTextEdit, QSlider, QGroupBox
+from PyQt5.QtCore import pyqtSignal, Qt, QRect, QEvent, QTimer
+from PyQt5.QtWidgets import QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QTabWidget, QDialog, QLineEdit, QTextEdit, QSlider, QGroupBox, QComboBox
 from pyvistaqt import QtInteractor
-from phd.dependence.sensor_serial_api_old import ArduinoCommander
+from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
+from phd.dependence.func_meshLab import MyMeshLab
+from phd.dependence.func_sensor import MySensor
 
 
 class PlotterWidget(QWidget):
@@ -32,10 +34,10 @@ class TreeWidgetItem(QTreeWidgetItem):
     def __init__(self, parent, name: str, level: int, type: int):
         super().__init__(parent)
         self.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)  # 第一列左对齐
-        self.iconVisible = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/visible.png")
-        self.iconUnvisible = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/unvisible.png")
-        self.iconVisibleSelected = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/visible_selected.png")
-        self.iconUnvisibleSelected = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/unvisible_selected.png")
+        self.iconVisible = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/visible.png")
+        self.iconUnvisible = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/unvisible.png")
+        self.iconVisibleSelected = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/visible_selected.png")
+        self.iconUnvisibleSelected = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/icon/unvisible_selected.png")
         self.level = level
         self._type = type
         self.visible = True
@@ -131,9 +133,8 @@ class PositionEntryWidget(QWidget):
         self.sliders = []
         self.setStyleSheet("QLabel, QLineEdit, QPushButton { color: white; }")
 
-
         # Preset values for joint angles
-        preset_angles = [-2.12, 0.54, 1.03, 0.00, 1.56, -0.54]
+        preset_angles = [1.0, -0.49, 1.57, 0.48, 1.57, 0.0]
 
         for i in range(1, 7):
             label = QLabel(f"Joint {i} Position:")
@@ -171,12 +172,13 @@ class PositionEntryWidget(QWidget):
         RobotController().send_positions_joint_angle(positions)
 
     def toggle_visibility(self):
-        isVisible = self.labels[0].isVisible()
+        isVisible = not self.isVisible()  # Check the current visibility and toggle it
         for label, edit, slider in zip(self.labels, self.position_edits, self.sliders):
-            label.setVisible(not isVisible)
-            edit.setVisible(not isVisible)
-            slider.setVisible(not isVisible)
-        self.send_button.setVisible(not isVisible)  # Toggle button visibility based on current state
+            label.setVisible(isVisible)
+            edit.setVisible(isVisible)
+            slider.setVisible(isVisible)
+        self.send_button.setVisible(isVisible)
+        self.setVisible(isVisible)
 
 
 class PositionQuaternionWidget(QWidget):
@@ -239,13 +241,6 @@ class PositionQuaternionWidget(QWidget):
         # Update the corresponding line edit from slider value
         self.line_edits[identifier].setText(f"{value / 100:.2f}")
 
-    def toggle_visibility(self):
-        isVisible = self.isVisible()
-        for widget in list(self.labels.values()) + list(self.line_edits.values()) + list(self.sliders.values()):
-            widget.setVisible(not isVisible)
-        self.send_button.setVisible(not isVisible)
-        self.setVisible(not isVisible)
-
     def send_positions(self):
         try:
             positions = [float(self.line_edits[coord].text()) for coord in ['X', 'Y', 'Z']]
@@ -254,6 +249,13 @@ class PositionQuaternionWidget(QWidget):
             RobotController().send_positions_tool_position(positions, quaternion)
         except ValueError:
             print("Invalid input! Please enter valid numbers.")
+
+    def toggle_visibility(self):
+        isVisible = not self.isVisible()  # Check the current visibility and toggle it
+        for widget in list(self.labels.values()) + list(self.line_edits.values()) + list(self.sliders.values()):
+            widget.setVisible(isVisible)
+        self.send_button.setVisible(isVisible)
+        self.setVisible(isVisible)
 
 
 class RosSplitter(QSplitter):
@@ -264,9 +266,13 @@ class RosSplitter(QSplitter):
         self.robot_api = RobotController()
         self.setHandleWidth(3)
         self.setup_layout()
+        self.mesh_functions = MyMeshLab(self)
+        self.sensor_functions = MySensor(self)
+        self.read_timer = QTimer(self)  # Timer for continuous reading
         self.connect_function()
 
     def setup_layout(self):
+        # SET UP WIDGET 1
         self.widget_plotter = PlotterWidget()
         self.widget_plotter.setObjectName("widgetPlotter")
         self.layout_plotter = QGridLayout(self.widget_plotter)
@@ -277,6 +283,7 @@ class RosSplitter(QSplitter):
         self.layout_plotter.addWidget(self.plotter.interactor)
         self.widget_plotter.setLayout(self.layout_plotter)
 
+        # SET UP WIDGET 2
         self.widget_plotter_2 = PlotterWidget()
         self.widget_plotter_2.setObjectName("widgetPlotter2")
         self.layout_plotter_2 = QGridLayout(self.widget_plotter_2)
@@ -287,22 +294,27 @@ class RosSplitter(QSplitter):
         self.layout_plotter_2.addWidget(self.plotter_2.interactor)
         self.widget_plotter_2.setLayout(self.layout_plotter_2)
 
+        # SET UP WIDGET 3
         self.log_display = QTextEdit()
         self.log_display.setReadOnly(True)
         self.log_display.setStyleSheet("QTextEdit { background-color: #202020; color: white; border: 1px solid #303030; }")
         self.log_display.setObjectName("logDisplay")
 
+        # SET UP SPLITTER 1
         self.splitter_1 = QSplitter(Qt.Horizontal, self)
         self.splitter_1.addWidget(self.widget_plotter)
         self.splitter_1.addWidget(self.log_display)
         self.splitter_1.setHandleWidth(3)
 
+        # SET UP SPLITTER 2
         self.splitter_2 = QSplitter(Qt.Vertical, self)
         self.splitter_2.setStyleSheet("background-color: #303030;")
         self.splitter_2.setHandleWidth(3)
 
+        # SET UP WIDGET 4 & 5
         self.position_entry_widget = PositionEntryWidget()
         self.position_quaternion_widget = PositionQuaternionWidget()
+        self.position_entry_widget.setVisible(False)
         self.position_quaternion_widget.setVisible(False)
 
         self.widget_func = QWidget()
@@ -310,6 +322,7 @@ class RosSplitter(QSplitter):
         self.layout_func.addWidget(self.position_entry_widget)
         self.layout_func.addWidget(self.position_quaternion_widget)
 
+        # SET UP TAB WIDGET
         self.tab_widget = QTabWidget()
         self.tab_widget.setUsesScrollButtons(False)
         self.setup_tabs()
@@ -332,8 +345,7 @@ class RosSplitter(QSplitter):
 
         tab3 = QWidget()
         tab3_layout = QVBoxLayout(tab3)
-        self.testing_button = QPushButton("Testing", tab3)
-        tab3_layout.addWidget(self.testing_button)
+        self.setup_tab3(tab3_layout)
         self.tab_widget.addTab(tab3, "Testing")
 
     def setup_tab1(self, layout):
@@ -343,16 +355,38 @@ class RosSplitter(QSplitter):
         send_layout = QVBoxLayout()
 
         self.read_sensor_button = QPushButton("Read Sensor")
-        self.send_sensor_button = QPushButton("Send Test")
-        self.send_sensor_button.clicked.connect(self.send_test)
+        self.record_sensor_button = QPushButton("Record Raw Data")
+
         read_layout.addWidget(self.read_sensor_button)
-        send_layout.addWidget(self.send_sensor_button)
+        read_layout.addWidget(self.record_sensor_button)
+
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
 
         layout.addWidget(read_group)
         layout.addWidget(send_group)
+
+        # NEW SENSOR WIDGET
+        self.sensor_choice = QComboBox(self.widget_func)
+        self.sensor_choice.addItem("2D")
+        self.sensor_choice.addItem("elbow")
+        self.sensor_choice.addItem("DualC")
+        send_layout.addWidget(self.sensor_choice)
+
+        self.serial_channel = QComboBox(self.widget_func)
+        send_layout.addWidget(self.serial_channel)
+
+        self.buildScene = QPushButton("buildScene", self.widget_func)
+        send_layout.addWidget(self.buildScene)
+
+        self.sensor_start = QPushButton("startSensor", self.widget_func)
+        send_layout.addWidget(self.sensor_start)
+        self.sensor_start.setDisabled(True)
+
+        self.sensor_update = QPushButton("updateSensor", self.widget_func)
+        send_layout.addWidget(self.sensor_update)
+        self.sensor_update.setDisabled(True)
 
     def setup_tab2(self, layout):
         read_group = QGroupBox("Read Operations")
@@ -364,11 +398,19 @@ class RosSplitter(QSplitter):
         self.read_tool_position_button = QPushButton("Read Tool Position")
         self.send_position_PTP_J_button = QPushButton("Send Joint Angle")
         self.send_position_PTP_T_button = QPushButton("Send Tool Position")
+        self.gesture_pull_back_button = QPushButton("Pull Back")
+        self.gesture_push_forward_button = QPushButton("Push Forward")
+        self.gesture_turn_left_button = QPushButton("Turn Left")
+        self.gesture_turn_right_button = QPushButton("Turn Right")
 
         read_layout.addWidget(self.read_joint_angle_button)
         read_layout.addWidget(self.read_tool_position_button)
         send_layout.addWidget(self.send_position_PTP_J_button)
         send_layout.addWidget(self.send_position_PTP_T_button)
+        send_layout.addWidget(self.gesture_pull_back_button)
+        send_layout.addWidget(self.gesture_push_forward_button)
+        send_layout.addWidget(self.gesture_turn_left_button)
+        send_layout.addWidget(self.gesture_turn_right_button)
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
@@ -376,41 +418,81 @@ class RosSplitter(QSplitter):
         layout.addWidget(read_group)
         layout.addWidget(send_group)
 
+    def setup_tab3(self, layout):
+        # Create a group box for testing buttons
+        test_group = QGroupBox("Testing Operations")
+        test_layout = QVBoxLayout()
+
+        # Button for 3D
+        self.show_robot_button = QPushButton("Show 3D Robot")
+
+        # Button for 2D
+        self.test_2d_button = QPushButton("Test 2D")
+
+        # Button for testing
+        self.plotter_visibility_button = QPushButton("Plotter Visibility")
+        self.continuous_read_button = QPushButton("Toggle Continuous Read", self.widget_func)
+        self.render_button = QPushButton("Render")
+
+        # Add buttons to layout
+        test_layout.addWidget(self.show_robot_button)
+        test_layout.addWidget(self.test_2d_button)
+        test_layout.addWidget(self.plotter_visibility_button)
+        test_layout.addWidget(self.continuous_read_button)
+        test_layout.addWidget(self.render_button)
+
+        # Set layout to group
+        test_group.setLayout(test_layout)
+
+        # Add group to tab layout
+        layout.addWidget(test_group)
+
     def connect_function(self):
-        self.read_sensor_button.pressed.connect(self.read_sensor)
-        self.read_joint_angle_button.pressed.connect(self.read_joint_angle)
-        self.read_tool_position_button.pressed.connect(self.read_tool_position)
+        self.read_sensor_button.pressed.connect(lambda: self.log_display.append(f"Sensor data: {self.sensor_api.read_raw()}"))
+        self.record_sensor_button.pressed.connect(lambda: self.log_display.append(f"Gesture data: {self.sensor_functions.gesture_recognition()}"))
+        self.read_joint_angle_button.pressed.connect(lambda: self.log_display.append(f"Joint Angles: {self.robot_api.get_current_positions()}"))
+        self.read_tool_position_button.pressed.connect(lambda: self.log_display.append(f"Tool Position: {self.robot_api.get_current_tool_position()[0]}, Orientation: {self.robot_api.get_current_tool_position()[1]}"))
         self.send_position_PTP_J_button.pressed.connect(self.position_entry_widget.toggle_visibility)
         self.send_position_PTP_T_button.pressed.connect(self.position_quaternion_widget.toggle_visibility)
-        self.testing_button.pressed.connect(self.toggle_plotter_visibility)
+        self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
+        self.test_2d_button.pressed.connect(lambda: self.log_display.append("Testing 2D..."))
+        self.plotter_visibility_button.pressed.connect(self.toggle_plotter_visibility)
+        self.render_button.pressed.connect(lambda: self.plotter.render())
+        self.continuous_read_button.pressed.connect(self.toggle_continuous_read)
+        self.read_timer.timeout.connect(self.update_robot_status)
+        self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
+        self.sensor_start.pressed.connect(lambda: self.sensor_functions.startSensor())
+        self.sensor_update.pressed.connect(lambda: self.sensor_functions.updateCal())
+        self.gesture_pull_back_button.pressed.connect(lambda: self.robot_api.pull_back(self.robot_api.get_current_positions()))
+        self.gesture_push_forward_button.pressed.connect(lambda: self.robot_api.push_forward(self.robot_api.get_current_positions()))
+        self.gesture_turn_left_button.pressed.connect(lambda: self.robot_api.turn_left(self.robot_api.get_current_positions()))
+        self.gesture_turn_right_button.pressed.connect(lambda: self.robot_api.turn_right(self.robot_api.get_current_positions()))
 
-    def send_test(self):
-        self.log_display.append("Testing...")
+    def toggle_continuous_read(self):
+        if self.read_timer.isActive():
+            self.read_timer.stop()
+            self.continuous_read_button.setText("Start Continuous Read")
+        else:
+            self.read_timer.start(0)  # Update every 0 milliseconds
+            self.continuous_read_button.setText("Stop Continuous Read")
 
-    def read_sensor(self):
-        sensor_data = self.sensor_api.read_raw()
-        self.log_display.append(f"Sensor data: {sensor_data}")
-
-    def read_joint_angle(self):
-        joint_angles = self.robot_api.get_current_positions()
-        self.log_display.append(f"Joint Angles: {joint_angles}")
-
-    def read_tool_position(self):
-        tool_position = self.robot_api.get_current_tool_position()
-        self.log_display.append(f"Tool Position: {tool_position[0]}, Orientation: {tool_position[1]}")
+    def update_robot_status(self):
+        current_positions = self.robot_api.get_current_positions()
+        self.mesh_functions.update_robot_joints(current_positions)
+        self.plotter.render()
 
     def toggle_plotter_visibility(self):
-        self.widget_plotter_2.setVisible(not self.widget_plotter_2.isVisible())
+        self.log_display.setVisible(not self.log_display.isVisible())
         self.adjust_splitter_sizes()
 
     def adjust_splitter_sizes(self):
-        if self.widget_plotter_2.isVisible():
+        if self.log_display.isVisible():
             self.splitter_1.setSizes([self.width() // 2, self.width() // 2])
         else:
             self.splitter_1.setSizes([self.width(), 0])
 
     def reLayout(self):
         self.setSizes([round((self.width() - 3) * 6 / 7), round((self.width() - 3) / 7)])
-        self.splitter_2.setSizes([round((self.height() - 3) / 2), self.height() - 3 - round((self.height() - 3) / 2)])
+        self.splitter_1.setSizes([self.width() // 2, self.width() // 2])
 
 

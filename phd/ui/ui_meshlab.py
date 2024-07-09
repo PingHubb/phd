@@ -1,7 +1,7 @@
 from PyQt5 import QtCore
-from PyQt5.QtGui import QDragEnterEvent,QDropEvent,QIcon,QColor,QCursor
-from PyQt5.QtCore import pyqtSignal,Qt,QRect,QEvent
-from PyQt5.QtWidgets import QSplitter,QWidget,QGridLayout,QTreeWidgetItem,QTreeWidget,QVBoxLayout,QPushButton,QCheckBox,QComboBox
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QColor, QCursor
+from PyQt5.QtCore import pyqtSignal, Qt, QRect, QEvent
+from PyQt5.QtWidgets import QSplitter, QWidget, QGridLayout, QTreeWidgetItem, QTreeWidget, QVBoxLayout, QPushButton, QCheckBox, QComboBox
 from pyvistaqt import QtInteractor
 from phd.dependence.func_meshLab import MyMeshLab
 
