@@ -1,12 +1,15 @@
+import numpy as np
 import rclpy
 import transforms3d
 from rclpy.node import Node
 from std_msgs.msg import Float32MultiArray, MultiArrayDimension, String
-from tm_msgs.srv import SetEvent, SetPositions
+from tm_msgs.srv import SetEvent, SetPositions, SendScript
 from sensor_msgs.msg import JointState
 from geometry_msgs.msg import PoseStamped
-from PyQt5.QtCore import QThread
+from PyQt5.QtCore import QThread, QTimer
 import pyvista as pv
+import time
+import math
 
 
 class ROSNodeThread(QThread):
@@ -16,6 +19,7 @@ class ROSNodeThread(QThread):
 
     def run(self):
         rclpy.spin(self.node)
+
 
 class RobotController(Node):
     def __init__(self):
@@ -30,6 +34,8 @@ class RobotController(Node):
         while not self.client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Waiting for SetPositions service to become available...')
 
+        self.send_script_client = self.create_client(SendScript, 'send_script')
+
         self.current_positions = None
         self.subscription = self.create_subscription(JointState, '/joint_states', self.joint_position_callback, 10)
 
@@ -39,6 +45,56 @@ class RobotController(Node):
         self.my_service_client = self.create_client(SetEvent, "/set_event")
         while not self.my_service_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('Waiting for SetEvent to become available...')
+
+    def send_and_process_request(self, positions):
+        # Convert positions from radians to a script command
+        command = self.convert_positions_to_script(positions)
+        self.send_request(command)
+        # time.sleep(0.1)
+        # command = 'StopAndClearBuffer()'
+        # self.send_request(command)
+
+    def send_request(self, command):
+        request = SendScript.Request()
+        request.id = 'damn'  # <-- not important can self-define
+        request.script = command
+        self.future = self.send_script_client.call_async(request)
+
+    def convert_positions_to_script(self, positions):
+        # Convert radians to degrees and format as a script command
+        positions_deg = [math.degrees(pos) for pos in positions]
+        position_str = ','.join(map(str, positions_deg))
+        return f"PTP(\"JPP\",{position_str},100,0,100,true)"
+
+    def enable_joint_velocity_mode(self,):
+        print("Enabling joint velocity mode")
+        return "ContinueVJog()"
+
+    def stop_joint_velocity_mode(self):
+        print("Stopping joint velocity mode")
+        return "StopContinueVmode()"
+
+    def set_joint_velocity(self, velocity):
+        print(f"Setting joint velocity to {velocity}")
+        velocity_str = ','.join(map(str, velocity))
+        return f"SetContinueVJog({velocity_str})"
+
+    def enable_end_effector_velocity_mode(self):
+        print("Enabling end effector velocity mode")
+        return "ContinueVLine()"
+
+    def stop_end_effector_velocity_mode(self):
+        print("Stopping end effector velocity mode")
+        return "StopContinueVmode()"
+
+    def set_end_effector_velocity(self, velocity):
+        print(f"Setting end effector velocity to {velocity}")
+        velocity_str = ','.join(map(str, velocity))
+        return f"SetContinueVLine({velocity_str})"
+
+    def stop_end_effector_velocity(self):
+        print("Stopping end effector velocity")
+        return "StopContinueVmode()"
 
     def send_positions_joint_angle(self, positions):
         req = SetPositions.Request()
@@ -86,46 +142,22 @@ class RobotController(Node):
             print("No tool pose data available.")
             return None, None
 
-    def pull_back(self, positions):
-        req = SetPositions.Request()
-        req.motion_type = 1
-        req.positions = positions
-        req.positions[1] = -1.5
-        req.velocity = 3.14
-        req.acc_time = 0.0
-        req.blend_percentage = 100
-        req.fine_goal = False
-        self.client.call_async(req)
+    def turn_left(self, velocity):
+        print("Turning left")
+        self.send_request("ContinueVJog()")
+        velocity_str = ','.join(map(str, velocity))
+        self.send_request(f"SetContinueVJog({velocity_str})")
 
-    def push_forward(self, positions):
-        req = SetPositions.Request()
-        req.motion_type = 1
-        req.positions = positions
-        req.positions[1] = 0.5
-        req.velocity = 3.14
-        req.acc_time = 0.0
-        req.blend_percentage = 100
-        req.fine_goal = False
-        self.client.call_async(req)
+    def turn_right(self, velocity):
+        print("Turning right")
+        self.send_request("ContinueVJog()")
+        velocity_str = ','.join(map(str, velocity))
+        self.send_request(f"SetContinueVJog({velocity_str})")
 
-    def turn_left(self, positions):
-        req = SetPositions.Request()
-        req.motion_type = 1
-        req.positions = positions
-        req.positions[0] = -2.0
-        req.velocity = 3.14
-        req.acc_time = 0.0
-        req.blend_percentage = 100
-        req.fine_goal = False
-        self.client.call_async(req)
 
-    def turn_right(self, positions):
-        req = SetPositions.Request()
-        req.motion_type = 1
-        req.positions = positions
-        req.positions[0] = 2.0
-        req.velocity = 3.14
-        req.acc_time = 0.0
-        req.blend_percentage = 100
-        req.fine_goal = False
-        self.client.call_async(req)
+
+
+
+
+
+

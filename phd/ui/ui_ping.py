@@ -299,11 +299,13 @@ class RosSplitter(QSplitter):
         self.log_display.setReadOnly(True)
         self.log_display.setStyleSheet("QTextEdit { background-color: #202020; color: white; border: 1px solid #303030; }")
         self.log_display.setObjectName("logDisplay")
+        self.log_display.setVisible(False)
 
         # SET UP SPLITTER 1
         self.splitter_1 = QSplitter(Qt.Horizontal, self)
         self.splitter_1.addWidget(self.widget_plotter)
-        self.splitter_1.addWidget(self.log_display)
+        # self.splitter_1.addWidget(self.log_display)
+        self.splitter_1.addWidget(self.widget_plotter_2)
         self.splitter_1.setHandleWidth(3)
 
         # SET UP SPLITTER 2
@@ -355,11 +357,8 @@ class RosSplitter(QSplitter):
         send_layout = QVBoxLayout()
 
         self.read_sensor_button = QPushButton("Read Sensor")
-        self.record_sensor_button = QPushButton("Record Raw Data")
 
         read_layout.addWidget(self.read_sensor_button)
-        read_layout.addWidget(self.record_sensor_button)
-
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
@@ -398,19 +397,17 @@ class RosSplitter(QSplitter):
         self.read_tool_position_button = QPushButton("Read Tool Position")
         self.send_position_PTP_J_button = QPushButton("Send Joint Angle")
         self.send_position_PTP_T_button = QPushButton("Send Tool Position")
-        self.gesture_pull_back_button = QPushButton("Pull Back")
-        self.gesture_push_forward_button = QPushButton("Push Forward")
-        self.gesture_turn_left_button = QPushButton("Turn Left")
-        self.gesture_turn_right_button = QPushButton("Turn Right")
+        self.send_script_button = QPushButton("Send Script")
+        self.enable_joint_velocity_mode_button = QPushButton("Enable Joint Velocity Mode")
+        self.stop_joint_velocity_mode_button = QPushButton("Stop Joint Velocity")
 
         read_layout.addWidget(self.read_joint_angle_button)
         read_layout.addWidget(self.read_tool_position_button)
         send_layout.addWidget(self.send_position_PTP_J_button)
         send_layout.addWidget(self.send_position_PTP_T_button)
-        send_layout.addWidget(self.gesture_pull_back_button)
-        send_layout.addWidget(self.gesture_push_forward_button)
-        send_layout.addWidget(self.gesture_turn_left_button)
-        send_layout.addWidget(self.gesture_turn_right_button)
+        send_layout.addWidget(self.send_script_button)
+        send_layout.addWidget(self.enable_joint_velocity_mode_button)
+        send_layout.addWidget(self.stop_joint_velocity_mode_button)
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
@@ -449,7 +446,9 @@ class RosSplitter(QSplitter):
 
     def connect_function(self):
         self.read_sensor_button.pressed.connect(lambda: self.log_display.append(f"Sensor data: {self.sensor_api.read_raw()}"))
-        self.record_sensor_button.pressed.connect(lambda: self.log_display.append(f"Gesture data: {self.sensor_functions.gesture_recognition()}"))
+        self.enable_joint_velocity_mode_button.pressed.connect(lambda: self.robot_api.send_request(self.robot_api.enable_joint_velocity_mode()))
+        self.stop_joint_velocity_mode_button.pressed.connect(lambda: self.robot_api.send_request(self.robot_api.stop_joint_velocity_mode()))
+        self.send_script_button.pressed.connect(lambda: self.robot_api.send_and_process_request([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
         self.read_joint_angle_button.pressed.connect(lambda: self.log_display.append(f"Joint Angles: {self.robot_api.get_current_positions()}"))
         self.read_tool_position_button.pressed.connect(lambda: self.log_display.append(f"Tool Position: {self.robot_api.get_current_tool_position()[0]}, Orientation: {self.robot_api.get_current_tool_position()[1]}"))
         self.send_position_PTP_J_button.pressed.connect(self.position_entry_widget.toggle_visibility)
@@ -463,10 +462,6 @@ class RosSplitter(QSplitter):
         self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
         self.sensor_start.pressed.connect(lambda: self.sensor_functions.startSensor())
         self.sensor_update.pressed.connect(lambda: self.sensor_functions.updateCal())
-        self.gesture_pull_back_button.pressed.connect(lambda: self.robot_api.pull_back(self.robot_api.get_current_positions()))
-        self.gesture_push_forward_button.pressed.connect(lambda: self.robot_api.push_forward(self.robot_api.get_current_positions()))
-        self.gesture_turn_left_button.pressed.connect(lambda: self.robot_api.turn_left(self.robot_api.get_current_positions()))
-        self.gesture_turn_right_button.pressed.connect(lambda: self.robot_api.turn_right(self.robot_api.get_current_positions()))
 
     def toggle_continuous_read(self):
         if self.read_timer.isActive():

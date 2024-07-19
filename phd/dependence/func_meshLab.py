@@ -13,6 +13,7 @@ class MyMeshLab():
     def __init__(self, parent) -> None:
         self.parent = parent
         self.plotter: QtInteractor = self.parent.plotter
+        self.plotter_2: QtInteractor = self.parent.plotter_2
         self.robotModel = []
         self.origin_list = []
         self.robotActor = []
@@ -38,25 +39,41 @@ class MyMeshLab():
         self.plotter.camera.focal_point = self.camera_focal
         self.plotter.camera.view_angle = self.camera_view_angle
 
+        self.plotter_2.camera.position = self.camera_pos
+        self.plotter_2.camera.focal_point = self.camera_focal
+        self.plotter_2.camera.view_angle = self.camera_view_angle
+
     def loadCameraPare(self, camera_pos, camera_focal, camera_view_angle):
         self.plotter.camera.position = camera_pos
         self.plotter.camera.focal_point = camera_focal
         self.plotter.camera.view_angle = camera_view_angle
 
+        self.plotter_2.camera.position = self.camera_pos
+        self.plotter_2.camera.focal_point = self.camera_focal
+        self.plotter_2.camera.view_angle = self.camera_view_angle
+
     def creatPlaneXY(self):
         self.plotter.camera.position = (1,-1,1)
+        self.plotter_2.camera.position = (1,-1,1)
+
         self.saveCameraPara()
         line = pv.Line((-50, 0, 0), (50, 0,0 ))
         
         # 添加X轴线段，并设置为红色
         self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
+        self.plotter_2.add_mesh(line, color='r', line_width=2, label='X Axis')
+
         line = pv.Line((0, -50, 0), (0,50, 0))
 
         # 添加Y轴线段，并设置为绿色
         self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        self.plotter_2.add_mesh(line, color='g', line_width=2, label='Y Axis')
+
         planeXY = pv.Plane((0,0,0),(0,0,1),100,100,100,100)
 
         self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray',style='wireframe')
+        self.actorPlaneXY_2 = self.plotter_2.add_mesh(planeXY, color='gray',style='wireframe')
+
 
     def add_sphere(self, showEdge):
         self.saveCameraPara()
