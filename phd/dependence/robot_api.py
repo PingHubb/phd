@@ -142,14 +142,7 @@ class RobotController(Node):
             print("No tool pose data available.")
             return None, None
 
-    def turn_left(self, velocity):
-        print("Turning left")
-        self.send_request("ContinueVJog()")
-        velocity_str = ','.join(map(str, velocity))
-        self.send_request(f"SetContinueVJog({velocity_str})")
-
-    def turn_right(self, velocity):
-        print("Turning right")
+    def combined_joint_velocity(self, velocity):
         self.send_request("ContinueVJog()")
         velocity_str = ','.join(map(str, velocity))
         self.send_request(f"SetContinueVJog({velocity_str})")

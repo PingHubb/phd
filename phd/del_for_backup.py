@@ -94,9 +94,7 @@ class MySensor():
         self.saved_col = None
         self.saved_value = None
         self.initial_message = ""
-        # self.positions = None  # To keep track of the current positions globally
-        # self.last_direction = None  # To track the last direction of movement
-        # self.counter = 0
+        self.reset_gesture_state()
 
     def saveCameraPara(self):
         self.camera_pos = self.plotter.camera.position
@@ -536,15 +534,21 @@ class MySensor():
         else:
             print("everything for mesh changes")
 
+    def reset_gesture_state(self):
+        self.initial_cell = None
+        self.movement_direction = None
+        self.consecutive_moves = 0
+        self.parent.robot_api.send_request("StopContinueVmode()")
+
     def gesture_recognition(self):
         diffPerDataAve_Reverse = self._data.diffPerDataAve.T
         for i in range(13):
             for j in range(10):
                 if self.check_cooldown(i, j):
-                    continue  # Skip detection if the cell is in cooldown
+                    continue
                 current_value = diffPerDataAve_Reverse[i][j]
                 if current_value < -3:
-                    if not self.timer_2.isActive():  # Only start the timer if it's not already running
+                    if not self.timer_2.isActive():
                         self.set_focus(i, j, current_value)
 
     def check_cooldown(self, row, col):
@@ -554,12 +558,13 @@ class MySensor():
         return False
 
     def set_focus(self, row, col, value):
-        self.saved_row = row
-        self.saved_col = col
+        if not self.initial_cell:
+            self.initial_cell = (row, col)
+        self.saved_row, self.saved_col = row, col
         self.saved_value = value
         self.found_finger_timer = time.time()
         self.initial_message = f"Initial detection at ({row}, {col})."
-        self.timer_2.start(0)  # Start the timer to check every 100 ms
+        self.timer_2.start(0)
 
     def handle_timer(self):
         if self.found_finger_timer is None:
@@ -570,15 +575,15 @@ class MySensor():
         current_time = time.time()
         elapsed_time = current_time - self.found_finger_timer
         current_value = self._data.diffPerDataAve.T[self.saved_row][self.saved_col]
+
         if current_value >= -1:
             self.timer_2.stop()
             print(f"\r{self.initial_message} Finger is removed.", flush=True)
-            self.parent.robot_api.send_request("StopContinueVmode()")
+            self.reset_gesture_state()
             return
 
         self.check_adjacent_cells()
-
-        if elapsed_time <= 4:
+        if elapsed_time <= 2:
             print(
                 f"\r{self.initial_message} Elapsed time since initial detection: {elapsed_time:.2f} seconds, Current value: {current_value:.2f}",
                 flush=True, end="")
@@ -588,15 +593,14 @@ class MySensor():
                 f"\r{self.initial_message} Elapsed time since initial detection: 2.00 seconds, Final value: {current_value:.2f}",
                 flush=True)
             print("2 seconds have passed since initial detection.", flush=True)
-            self.parent.robot_api.send_request("StopContinueVmode()")
+            self.reset_gesture_state()
 
     def check_adjacent_cells(self):
         # Check horizontally
-        self.check_cell(self.saved_row, self.saved_col - 1, "left")
-        self.check_cell(self.saved_row, self.saved_col + 1, "right")
-        # Check vertically
-        # self.check_cell(self.saved_row - 1, self.saved_col, "up")
-        # self.check_cell(self.saved_row + 1, self.saved_col, "down")
+        for direction, offset in [("left", -1), ("right", 1)]:
+            adjacent_col = self.saved_col + offset
+            if 0 <= adjacent_col < 10:
+                self.check_cell(self.saved_row, adjacent_col, direction)
 
     def check_cell(self, row, col, direction):
         if 0 <= row < 13 and 0 <= col < 10:
@@ -604,32 +608,36 @@ class MySensor():
                 return  # Skip if the cell is cooling down
             adjacent_value = self._data.diffPerDataAve.T[row][col]
             if adjacent_value < -3:
-                print(f"\r{direction.capitalize()} adjacent cell at [{row}][{col}] is touched.", flush=True)
+                move_direction = 'right' if direction == "right" else 'left'
+                if self.movement_direction == move_direction or not self.movement_direction:
+                    self.consecutive_moves += 1
+                    self.movement_direction = move_direction
+                    print(
+                        f"\r{self.consecutive_moves} {direction.capitalize()} adjacent cell at [{row}][{col}] is touched.",
+                        flush=True)
+                else:
+                    self.consecutive_moves = 1
+                    self.movement_direction = move_direction
+                    print(
+                        f"\rFirst {direction.capitalize()} adjacent cell at [{row}][{col}] is touched. Direction reset.",
+                        flush=True)
+
                 self.switch_focus(row, col, adjacent_value)
                 if hasattr(self.parent, 'robot_api'):
                     positions = self.parent.robot_api.get_current_positions()
+                    x_movement = 4.0 * self.consecutive_moves if direction == "left" else -4.0 * self.consecutive_moves
                     if direction == "left":
-                        self.parent.robot_api.turn_left([10.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                        self.parent.robot_api.turn_left([x_movement, 0.0, 0.0, 0.0, 0.0, 0.0])
                     elif direction == "right":
-                        self.parent.robot_api.turn_right([-10.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-                    # elif direction == "up":
-                    #     self.parent.robot_api.move_up()  # assuming move_up is implemented
-                    # elif direction == "down":
-                    #     self.parent.robot_api.move_down()  # assuming move_down is implemented
+                        self.parent.robot_api.turn_right([x_movement, 0.0, 0.0, 0.0, 0.0, 0.0])
                 return
 
     def switch_focus(self, row, col, value):
-        """Helper function to switch the detection focus to a new cell."""
-        self.cell_cooldowns[(self.saved_row, self.saved_col)] = time.time()  # Start cooldown for the old cell
-        self.saved_row = row
-        self.saved_col = col
+        self.cell_cooldowns[(self.saved_row, self.saved_col)] = time.time()
+        self.saved_row, self.saved_col = row, col
         self.saved_value = value
-        self.initial_message = f"Initial detection at ({row}, {col})."
-        self.found_finger_timer = time.time()  # Reset the timer start time
-        self.timer_2.start(0)  # Restart the timer
-
-
-
+        self.found_finger_timer = time.time()
+        self.timer_2.start(0)
 
 
 
