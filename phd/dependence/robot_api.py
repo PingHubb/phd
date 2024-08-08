@@ -92,10 +92,6 @@ class RobotController(Node):
         velocity_str = ','.join(map(str, velocity))
         return f"SetContinueVLine({velocity_str})"
 
-    def stop_end_effector_velocity(self):
-        print("Stopping end effector velocity")
-        return "StopContinueVmode()"
-
     def send_positions_joint_angle(self, positions):
         req = SetPositions.Request()
         req.motion_type = 1
@@ -147,6 +143,13 @@ class RobotController(Node):
         velocity_str = ','.join(map(str, velocity))
         self.send_request(f"SetContinueVJog({velocity_str})")
 
+    def combined_end_effector_velocity(self, velocity):
+        self.send_request("ContinueVLine(2000, 10000)")
+        velocity_str = ','.join(map(str, velocity))
+        self.send_request(f"SetContinueVLine({velocity_str})")
+
+    def experiment(self, velocity):
+        return
 
 
 

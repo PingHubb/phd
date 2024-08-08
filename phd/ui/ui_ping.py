@@ -188,7 +188,7 @@ class PositionQuaternionWidget(QWidget):
         self.setStyleSheet("QLabel, QLineEdit, QPushButton { color: white; }")
 
         # Preset values
-        preset_positions = [-0.486, -0.567, 0.4]
+        preset_positions = [-0.300, 0.750, 0.25]
         preset_quaternion = [0.0, 1.0, 0.0, 0.0]
 
         # Initialize dictionaries for storing widgets
@@ -350,6 +350,11 @@ class RosSplitter(QSplitter):
         self.setup_tab3(tab3_layout)
         self.tab_widget.addTab(tab3, "Testing")
 
+        tab4 = QWidget()
+        tab4_layout = QVBoxLayout(tab4)
+        self.setup_tab4(tab4_layout)
+        self.tab_widget.addTab(tab4, "AI")
+
     def setup_tab1(self, layout):
         read_group = QGroupBox("Read Operations")
         send_group = QGroupBox("Send Operations")
@@ -400,9 +405,13 @@ class RosSplitter(QSplitter):
         self.send_script_button = QPushButton("Send Script")
         self.enable_joint_velocity_mode_button = QPushButton("Enable Joint Velocity Mode")
         self.stop_joint_velocity_mode_button = QPushButton("Stop Joint Velocity")
+        self.show_robot_button = QPushButton("Import 3D Robot Model")
+        self.continuous_read_button = QPushButton("Real-time Live 3D Robot Model", self.widget_func)
 
         read_layout.addWidget(self.read_joint_angle_button)
         read_layout.addWidget(self.read_tool_position_button)
+        read_layout.addWidget(self.show_robot_button)
+        read_layout.addWidget(self.continuous_read_button)
         send_layout.addWidget(self.send_position_PTP_J_button)
         send_layout.addWidget(self.send_position_PTP_T_button)
         send_layout.addWidget(self.send_script_button)
@@ -420,29 +429,63 @@ class RosSplitter(QSplitter):
         test_group = QGroupBox("Testing Operations")
         test_layout = QVBoxLayout()
 
-        # Button for 3D
-        self.show_robot_button = QPushButton("Show 3D Robot")
-
-        # Button for 2D
-        self.test_2d_button = QPushButton("Test 2D")
-
         # Button for testing
-        self.plotter_visibility_button = QPushButton("Plotter Visibility")
-        self.continuous_read_button = QPushButton("Toggle Continuous Read", self.widget_func)
+        self.plotter_visibility_button = QPushButton("Show/Hide Log Display")
         self.render_button = QPushButton("Render")
+        self.experimental_button = QPushButton("Singa Experiment 1")
+        self.experimental_2_button = QPushButton("Singa Experiment 2")
 
         # Add buttons to layout
-        test_layout.addWidget(self.show_robot_button)
-        test_layout.addWidget(self.test_2d_button)
         test_layout.addWidget(self.plotter_visibility_button)
-        test_layout.addWidget(self.continuous_read_button)
         test_layout.addWidget(self.render_button)
+        test_layout.addWidget(self.experimental_button)
+        test_layout.addWidget(self.experimental_2_button)
 
         # Set layout to group
         test_group.setLayout(test_layout)
 
         # Add group to tab layout
         layout.addWidget(test_group)
+
+    def setup_tab4(self, layout):
+        gesture_1_group = QGroupBox("Gesture 1")
+        gesture_2_group = QGroupBox("Gesture 2")
+        gesture_3_group = QGroupBox("Gesture 3")
+        gesture_4_group = QGroupBox("Gesture 4")
+        gesture_5_group = QGroupBox("Gesture 5")
+        gesture_1_layout = QVBoxLayout()
+        gesture_2_layout = QVBoxLayout()
+        gesture_3_layout = QVBoxLayout()
+        gesture_4_layout = QVBoxLayout()
+        gesture_5_layout = QVBoxLayout()
+
+        # Button for AI
+        self.record_gesture_1_button = QPushButton("Record Gesture 1")
+        self.record_gesture_2_button = QPushButton("Record Gesture 2")
+        self.record_gesture_3_button = QPushButton("Record Gesture 3")
+        self.record_gesture_4_button = QPushButton("Record Gesture 4")
+        self.record_gesture_5_button = QPushButton("Record Gesture 5")
+
+        # Add buttons to layout
+        gesture_1_layout.addWidget(self.record_gesture_1_button)
+        gesture_2_layout.addWidget(self.record_gesture_2_button)
+        gesture_3_layout.addWidget(self.record_gesture_3_button)
+        gesture_4_layout.addWidget(self.record_gesture_4_button)
+        gesture_5_layout.addWidget(self.record_gesture_5_button)
+
+        # Set layout to group
+        gesture_1_group.setLayout(gesture_1_layout)
+        gesture_2_group.setLayout(gesture_2_layout)
+        gesture_3_group.setLayout(gesture_3_layout)
+        gesture_4_group.setLayout(gesture_4_layout)
+        gesture_5_group.setLayout(gesture_5_layout)
+
+        # Add group to tab layout
+        layout.addWidget(gesture_1_group)
+        layout.addWidget(gesture_2_group)
+        layout.addWidget(gesture_3_group)
+        layout.addWidget(gesture_4_group)
+        layout.addWidget(gesture_5_group)
 
     def connect_function(self):
         self.read_sensor_button.pressed.connect(lambda: self.log_display.append(f"Sensor data: {self.sensor_api.read_raw()}"))
@@ -454,7 +497,6 @@ class RosSplitter(QSplitter):
         self.send_position_PTP_J_button.pressed.connect(self.position_entry_widget.toggle_visibility)
         self.send_position_PTP_T_button.pressed.connect(self.position_quaternion_widget.toggle_visibility)
         self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
-        self.test_2d_button.pressed.connect(lambda: self.log_display.append("Testing 2D..."))
         self.plotter_visibility_button.pressed.connect(self.toggle_plotter_visibility)
         self.render_button.pressed.connect(lambda: self.plotter.render())
         self.continuous_read_button.pressed.connect(self.toggle_continuous_read)
@@ -462,6 +504,13 @@ class RosSplitter(QSplitter):
         self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
         self.sensor_start.pressed.connect(lambda: self.sensor_functions.startSensor())
         self.sensor_update.pressed.connect(lambda: self.sensor_functions.updateCal())
+        self.experimental_button.pressed.connect(lambda: self.sensor_functions.experiment())
+        self.experimental_2_button.pressed.connect(lambda: self.sensor_functions.experiment_2())
+        self.record_gesture_1_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(1))
+        self.record_gesture_2_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(2))
+        self.record_gesture_3_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(3))
+        self.record_gesture_4_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(4))
+        self.record_gesture_5_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(5))
 
     def toggle_continuous_read(self):
         if self.read_timer.isActive():

@@ -1,0 +1,25 @@
+3D Printed part:
+Button Left:
+Tool Position: -0.294, 0.546, 0.137, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+Button Right:
+Tool Position: -0.146, 0.690, 0.134, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+Top Right:
+Tool Position: -0.315, 0.844, 0.134, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+Top Left:
+Tool Position: -0.448, 0.715, 0.137, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+
+Metal part:
+Button Left:
+Tool Position: -0.294, 0.546, 0.133, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+Button Right:
+Tool Position: -0.146, 0.690, 0.130, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+Top Right:
+Tool Position: -0.315, 0.844, 0.130, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+Top Left:
+Tool Position: -0.448, 0.715, 0.133, Orientation: 0.000, -1.000, -0.000, -0.000, Normal vector: 0.000, 0.000, 1.000
+
+Starting position:
+Tool Position: -0.300, 0.750, 0.25, Orientation: 0.000, -1.000, -0.000, 0.000, Normal vector: 0.000, 0.000, 1.000
+
+Ending position:
+Tool Position: -0.300, 0.750, 0.203, Orientation: 0.000, 1.000, -0.000, 0.000, Normal vector: 0.000, 0.000, 1.000

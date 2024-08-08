@@ -12,7 +12,6 @@ from phd.ui.ui_design import TreeWidgetItem
 from tqdm import tqdm
 from math import sin, cos
 from phd.dependence.robot_api import RobotController
-# from phd.dependence.lstm_model import LSTMModel
 
 
 class data:
@@ -81,36 +80,21 @@ class MySensor():
         self.timer_2 = QTimer()
         self.timer_2.timeout.connect(self.handle_timer)
         self.timer_2.start(0)
+        # self.algo_timer = QTimer()  # New QTimer for continuous function calls
+        # self.algo_timer.timeout.connect(self.run_test_algo)
         self.frame_count = 0
+        self.counter = 0
         self.last_time = time.time()
         self.is_connected = False
         self.initChannel()
         self.startSensor_pressed = False
         self.found_finger_timer = None
         self.cell_cooldowns = {}  # Stores cooldown times for cells
-        self.counter = 0
         self.saved_row = None
         self.saved_col = None
         self.saved_value = None
         self.initial_message = ""
         self.reset_gesture_state()
-        self.initial_cell = None
-        self.four_fingers_detected = True
-        self.last_large_detection_time = None  # Timestamp for last large detection (>20 fingers)
-        self.timer_experiment = QTimer()
-        self.timer_experiment.timeout.connect(self.experiment)
-        self.flag = True
-        self.timer_experiment_2 = QTimer()
-        self.timer_experiment_2.timeout.connect(self.experiment_2)
-        self.flag_2 = True
-        # Initialize additional attributes for recording
-        self.timer_record_gesture = QTimer()
-        self.timer_record_gesture.timeout.connect(self.record_gesture)
-        self.is_recording = False
-        self.current_gesture_data = []
-        self.trial_number = None
-        self.gesture_number = None
-        self.start_record_pressed = False
 
     def saveCameraPara(self):
         self.camera_pos = self.plotter.camera.position
@@ -174,8 +158,6 @@ class MySensor():
                     self.init_jointConstruction()
                 elif self.parent.sensor_choice.currentIndex() == 2:
                     self.init_dualC()
-            # elif self.parent.sensor_choice.currentIndex() == 3:
-            #     self.cylinder()
             else:
                 self.is_connected = False
                 self.ser.close()
@@ -299,10 +281,10 @@ class MySensor():
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/mesh.obj'
+        filename = '/phd/resource/sensor/joint_1/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/singal.txt'
+        filename = '/phd/resource/sensor/joint_1/singal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -382,10 +364,10 @@ class MySensor():
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj'
+        filename = '/phd/resource/sensor/dualC/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/singal.txt'
+        filename = '/phd/resource/sensor/dualC/singal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -405,7 +387,7 @@ class MySensor():
                 for k in self.array_positions[i * self.n_row + j]:
                     self.colors[k] = [i / self.n_col, j / self.n_row, 0, 1]
         self.plotter.add_mesh(self._2D_map, show_edges=True, scalars=self.colors, rgb=True)
-        # TreeWidgetItem(self.parent.widget_tree,"_2D_map",0,0)
+        TreeWidgetItem(self.parent.widget_tree, "_2D_map", 0, 0)
 
         a = self._2D_map.extract_surface()
         b = a.point_normals
@@ -424,7 +406,7 @@ class MySensor():
         self.line_poly.lines = self.edges
         self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
                                                 render_points_as_spheres=True, rgb=True, name='3d')
-        # TreeWidgetItem(self.parent.widget_tree,"_3D_mesh",0,0)
+        TreeWidgetItem(self.parent.widget_tree, "_3D_mesh", 0, 0)
 
         self.parent.sensor_choice.setDisabled(True)
         self.parent.serial_channel.setDisabled(True)
@@ -474,8 +456,6 @@ class MySensor():
             self._data.calDiff()
             self._data.calDiffPer()
             self._data.getWin(self._data.windowSize)
-
-            # Visualization updates
             if self.parent.sensor_choice.currentIndex() == 0:
                 for i in range(self.n_row):
                     for j in range(self.n_col):
@@ -487,13 +467,11 @@ class MySensor():
                                                            1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
                                                            1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
                                                            1]
-
                 for i in range(len(self.colors)):
                     if i < self.n_row * self.n_col:
                         continue
                     else:
                         self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
-
             elif self.parent.sensor_choice.currentIndex() == 1:
                 for i in range(self.n_col):
                     for j in range(self.n_row):
@@ -504,7 +482,6 @@ class MySensor():
                         for k in self.array_positions[i * self.n_row + j]:
                             self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
                                               1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-
             elif self.parent.sensor_choice.currentIndex() == 2:
                 self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
                 self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
@@ -517,7 +494,6 @@ class MySensor():
                         for k in self.array_positions[i * self.n_row + j]:
                             self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
                                               1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
-
             self.line_poly.points = self.points
             self._2D_map.point_data.set_scalars(self.colors)
             self.plotter.render()
@@ -531,29 +507,9 @@ class MySensor():
             self.last_time = current_time
             self.frame_count = 0
 
-        # # My function to get the gesture
+        # My function to get the gesture
         if self.startSensor_pressed is True:
-            # self.gesture_recognition()
-            pass
-
-        if self.start_record_gesture is True:
-            # diffPerDataAve_Reverse = self._data.diffPerDataAve.T
-            #
-            # # Start or stop recording based on data conditions
-            # if not self.is_recording and np.any(diffPerDataAve_Reverse < -1):
-            #     self.is_recording = True
-            #     self.current_gesture_data = []  # Start fresh for new recording
-            #     print(f"Started recording gesture {self.gesture_number}.")
-            #
-            # elif self.is_recording and np.all(diffPerDataAve_Reverse > -1):
-            #     self.is_recording = False
-            #     self.save_gesture_data()
-            #     print(f"Stopped recording gesture {self.gesture_number} and data saved.")
-            #
-            # if self.is_recording:
-            #     # Append current data frame to the recording list
-            #     self.current_gesture_data.append(diffPerDataAve_Reverse.flatten())
-            pass
+            self.gesture_recognition()
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:
@@ -578,52 +534,28 @@ class MySensor():
         else:
             print("everything for mesh changes")
 
+    def reset_gesture_state(self):
+        self.initial_cell = None
+        self.movement_direction = None
+        self.consecutive_moves = 0
+        self.parent.robot_api.send_request("StopContinueVmode()")
+
     def gesture_recognition(self):
         diffPerDataAve_Reverse = self._data.diffPerDataAve.T
-        detected_fingers = 0
-
-        for i in range(self.n_col):
-            for j in range(self.n_row):
+        for i in range(13):
+            for j in range(10):
                 if self.check_cooldown(i, j):
                     continue
                 current_value = diffPerDataAve_Reverse[i][j]
-                if current_value < -1:
-                    detected_fingers += 1
-                    if not self.timer_2.isActive() and self.four_fingers_detected:
-                        self.add_initial_cell(i, j)
+                if current_value < -3:
+                    if not self.timer_2.isActive():
                         self.set_focus(i, j, current_value)
-                        print(f"No. of fingers detected: {detected_fingers}")
-
-        if detected_fingers > 20:
-            self.four_fingers_detected = False
-            print("10+ fingers are detected")
-            self.parent.robot_api.send_request("StopContinueVmode()")
-            self.parent.robot_api.send_request("StopAndClearBuffer()")
-            self.parent.robot_api.send_and_process_request([1.0, -0.49, 1.57, 0.48, 1.57, 0.0])
-            self.last_large_detection_time = time.time()  # Set the timestamp when more than 20 fingers are detected
-
-        # Check the time since last large detection
-        if detected_fingers == 4:
-            current_time = time.time()
-            if (self.last_large_detection_time is None or
-                    (current_time - self.last_large_detection_time) > 1):
-                self.four_fingers_detected = True
-                print("4 fingers are detected")
-            else:
-                print("Detection of 4 fingers ignored due to recent large detection")
 
     def check_cooldown(self, row, col):
         current_time = time.time()
         if (row, col) in self.cell_cooldowns and current_time - self.cell_cooldowns[(row, col)] < 0.5:
             return True
         return False
-
-    def add_initial_cell(self, row, col):
-        # Add cell to initial_cells and manage bounds
-        for (r, c) in self.initial_cells:
-            if abs(r - row) <= 1 and abs(c - col) <= 1:
-                return  # Already within the initial touch area
-        self.initial_cells.append((row, col))
 
     def set_focus(self, row, col, value):
         if not self.initial_cell:
@@ -632,7 +564,7 @@ class MySensor():
         self.saved_value = value
         self.found_finger_timer = time.time()
         self.initial_message = f"Initial detection at ({row}, {col})."
-        self.timer_2.start(0)  # This is handle_timer function
+        self.timer_2.start(0)
 
     def handle_timer(self):
         if self.found_finger_timer is None:
@@ -644,72 +576,61 @@ class MySensor():
         elapsed_time = current_time - self.found_finger_timer
         current_value = self._data.diffPerDataAve.T[self.saved_row][self.saved_col]
 
-        if current_value > -1:
+        if current_value >= -1:
             self.timer_2.stop()
-            # print(f"\r{self.initial_message} Finger is removed.", flush=True)
+            print(f"\r{self.initial_message} Finger is removed.", flush=True)
             self.reset_gesture_state()
             return
 
         self.check_adjacent_cells()
-        print(
-            f"\r{self.initial_message} Elapsed time since initial detection: {elapsed_time:.2f} seconds, Current value: {current_value:.2f}",
-            flush=True, end="")
-
-    def reset_gesture_state(self):
-        self.initial_cells = []
-        self.movement_direction = None
-        self.consecutive_moves = 0
-        self.last_joint_1_movement = 0.0
-        self.last_joint_3_movement = 0.0
-        self.parent.robot_api.send_request("SuspendContinueVmode()")
+        if elapsed_time <= 2:
+            print(
+                f"\r{self.initial_message} Elapsed time since initial detection: {elapsed_time:.2f} seconds, Current value: {current_value:.2f}",
+                flush=True, end="")
+        else:
+            self.timer_2.stop()
+            print(
+                f"\r{self.initial_message} Elapsed time since initial detection: 2.00 seconds, Final value: {current_value:.2f}",
+                flush=True)
+            print("2 seconds have passed since initial detection.", flush=True)
+            self.reset_gesture_state()
 
     def check_adjacent_cells(self):
-        # Calculate bounds of initial touch area
-        min_row = min(self.initial_cells, key=lambda x: x[0])[0]
-        max_row = max(self.initial_cells, key=lambda x: x[0])[0]
-        min_col = min(self.initial_cells, key=lambda x: x[1])[1]
-        max_col = max(self.initial_cells, key=lambda x: x[1])[1]
-
-        # Check horizontally adjacent cells at the bounds
-        for col in range(min_col - 1, max_col + 2):
-            self.check_cell(min_row - 1, col, "up")  # Check row above the top
-            self.check_cell(max_row + 1, col, "down")  # Check row below the bottom
-
-        # Check vertically adjacent cells at the bounds
-        for row in range(min_row, max_row + 1):
-            self.check_cell(row, min_col - 1, "left")  # Check column left of the leftmost
-            self.check_cell(row, max_col + 1, "right")  # Check column right of the rightmost
+        # Check horizontally
+        for direction, offset in [("left", -1), ("right", 1)]:
+            adjacent_col = self.saved_col + offset
+            if 0 <= adjacent_col < 10:
+                self.check_cell(self.saved_row, adjacent_col, direction)
 
     def check_cell(self, row, col, direction):
         if 0 <= row < 13 and 0 <= col < 10:
             if self.check_cooldown(row, col):
                 return  # Skip if the cell is cooling down
             adjacent_value = self._data.diffPerDataAve.T[row][col]
-            if adjacent_value < -1:
-                move_direction = 'right' if direction == "right" else 'left' if direction in ["left", "right"] else None
-                if move_direction and (move_direction == self.movement_direction or not self.movement_direction):
+            if adjacent_value < -3:
+                move_direction = 'right' if direction == "right" else 'left'
+                if self.movement_direction == move_direction or not self.movement_direction:
                     self.consecutive_moves += 1
-                    # print(
-                    #     f"\r{self.consecutive_moves} {direction.capitalize()} adjacent cell at [{row}][{col}] is touched.",
-                    #     flush=True)
+                    self.movement_direction = move_direction
+                    print(
+                        f"\r{self.consecutive_moves} {direction.capitalize()} adjacent cell at [{row}][{col}] is touched.",
+                        flush=True)
                 else:
                     self.consecutive_moves = 1
-                    # print(
-                    #     f"\rFirst {direction.capitalize()} adjacent cell at [{row}][{col}] is touched. Direction reset.",
-                    #     flush=True)
+                    self.movement_direction = move_direction
+                    print(
+                        f"\rFirst {direction.capitalize()} adjacent cell at [{row}][{col}] is touched. Direction reset.",
+                        flush=True)
 
                 self.switch_focus(row, col, adjacent_value)
                 if hasattr(self.parent, 'robot_api'):
-                    movement_factor = 0.05 * self.consecutive_moves
-                    if direction in ["left", "right"]:
-                        x_movement = -movement_factor if direction == "left" else movement_factor
-                        self.last_joint_1_movement = x_movement
-                    elif direction in ["up", "down"]:
-                        z_movement = -movement_factor if direction == "up" else movement_factor
-                        self.last_joint_3_movement = z_movement
-                    # Send the combined movement command
-                    self.parent.robot_api.combined_end_effector_velocity(
-                        [self.last_joint_1_movement, 0.0, self.last_joint_3_movement, 0.0, 0.0, 0.0])
+                    positions = self.parent.robot_api.get_current_positions()
+                    x_movement = 4.0 * self.consecutive_moves if direction == "left" else -4.0 * self.consecutive_moves
+                    if direction == "left":
+                        self.parent.robot_api.combined_joint_velocity([x_movement, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    elif direction == "right":
+                        self.parent.robot_api.combined_joint_velocity([x_movement, 0.0, 0.0, 0.0, 0.0, 0.0])
+                return
 
     def switch_focus(self, row, col, value):
         self.cell_cooldowns[(self.saved_row, self.saved_col)] = time.time()
@@ -717,129 +638,6 @@ class MySensor():
         self.saved_value = value
         self.found_finger_timer = time.time()
         self.timer_2.start(0)
-
-    def experiment(self):
-        if self.flag is True:
-            self.flag = False
-            self.parent.robot_api.send_positions_tool_position([-0.300, 0.750, 0.203], [0.0, 1.0, 0.0, 0.0])
-
-        self.timer_experiment.start(20)
-        # print(self._data.diffPerDataAve)
-        # print(self._data.rawDataAve)
-        self.counter += 1
-        print(self.counter)
-
-        diffPerDataAve_string = ' '.join(map(str, self._data.diffPerDataAve.flatten()))
-        rawDataAve_string = ' '.join(map(str, self._data.rawDataAve.flatten()))
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/diffPerDataAve_output.txt", "a") as file:
-            file.write(diffPerDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/rawDataAve_output.txt", "a") as file:
-            file.write(rawDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        if self.counter == 199:
-            self.timer_experiment.stop()
-            self.parent.robot_api.send_positions_tool_position([-0.300, 0.750, 0.25], [0.0, 1.0, 0.0, 0.0])
-            self.flag = True
-            self.counter = 0
-
-    def experiment_2(self):
-        if self.flag_2 is True:
-            self.flag_2 = False
-            self.parent.robot_api.send_positions_tool_position([-0.285, 0.700, 0.207], [0.0, 1.0, 0.0, 0.0])
-
-        self.timer_experiment_2.start(20)
-        # print(self._data.diffPerDataAve)
-        # print(self._data.rawDataAve)
-        self.counter += 1
-        print(self.counter)
-
-        diffPerDataAve_string = ' '.join(map(str, self._data.diffPerDataAve.flatten()))
-        rawDataAve_string = ' '.join(map(str, self._data.rawDataAve.flatten()))
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/dualC/diffPerDataAve_output.txt", "a") as file:
-            file.write(diffPerDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/dualC/rawDataAve_output.txt", "a") as file:
-            file.write(rawDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        if self.counter == 199:
-            self.timer_experiment_2.stop()
-            self.parent.robot_api.send_positions_tool_position([-0.285, 0.700, 0.254], [0.0, 1.0, 0.0, 0.0])
-            self.flag_2 = True
-            self.counter = 0
-
-    def start_record_gesture(self, gesture_number):
-        if not self.start_record_pressed:
-            # Start the recording
-            self.start_record_pressed = True
-            self.gesture_number = gesture_number
-            self.timer_record_gesture.start(0)  # Start with an appropriate interval, e.g., 100 ms
-            print(f"Recording started for gesture {gesture_number}.")
-        else:
-            # Stop the recording
-            self.timer_record_gesture.stop()
-            self.start_record_pressed = False
-            self.current_gesture_data = []
-            self.trial_number = None
-            print("Recording stopped.")
-
-    def record_gesture(self):
-        diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
-
-        # Check for the condition to start recording
-        if not self.is_recording and np.any(diffPerDataAve_Reverse < -1):
-            self.is_recording = True
-            self.trial_number = self.get_last_trial_number(self.gesture_number) + 1
-            self.current_gesture_data = []  # Start fresh for new recording
-            print(f"Started recording Gesture {self.gesture_number}, Trial {self.trial_number}.")
-
-        # Append data to the current recording if we are in a recording state
-        if self.is_recording:
-            self.current_gesture_data.append(diffPerDataAve_Reverse)
-
-        # Check for the condition to stop recording
-        if self.is_recording and np.all(diffPerDataAve_Reverse > -1):
-            self.is_recording = False
-            self.save_gesture_data()
-            print(f"Stopped recording Gesture {self.gesture_number}, Trial {self.trial_number}. Data saved.")
-            self.trial_number += 1  # Increment the trial number for the next round
-
-    def get_last_trial_number(self, gesture_number):
-        filename = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/gesture_{gesture_number}_data.txt"
-        try:
-            with open(filename, "r") as file:
-                lines = file.readlines()
-                if lines:
-                    last_line = lines[-1]
-                    last_trial_number = int(last_line.split()[0])
-                    print(f"Read last trial number: {last_trial_number} from {filename}")
-                    return last_trial_number
-        except FileNotFoundError:
-            print(f"File {filename} not found. Starting from trial number 0.")
-            return 0
-        except Exception as e:
-            print(f"Error reading file {filename}: {e}")
-        return 0
-
-    def save_gesture_data(self):
-        filename = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/gesture_{self.gesture_number}_data.txt"
-        with open(filename, "a") as file:
-            for data_entry in self.current_gesture_data:
-                file.write(f"{self.trial_number} " + ' '.join(map(str, data_entry)) + "\n")
-        print(f"Data for gesture {self.gesture_number} trial {self.trial_number} has been saved to {filename}.")
-
-
-
-
-
-
-
-
-
-
-
 
 
 

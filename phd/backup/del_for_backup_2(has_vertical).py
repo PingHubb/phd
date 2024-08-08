@@ -281,10 +281,10 @@ class MySensor():
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/mesh.obj'
+        filename = '/phd/resource/sensor/joint_1/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/singal.txt'
+        filename = '/phd/resource/sensor/joint_1/singal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -364,10 +364,10 @@ class MySensor():
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj'
+        filename = '/phd/resource/sensor/dualC/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/singal.txt'
+        filename = '/phd/resource/sensor/dualC/singal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
