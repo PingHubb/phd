@@ -12,7 +12,11 @@ from phd.ui.ui_design import TreeWidgetItem
 from tqdm import tqdm
 from math import sin, cos
 from phd.dependence.robot_api import RobotController
-# from phd.dependence.lstm_model import LSTMModel
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from torch import nn, optim
+import torch
+import pickle
 
 
 class data:
@@ -68,6 +72,49 @@ class data:
             self.diffPerDataAve = np.flipud(self.diffPerDataAve)
 
 
+class GestureCNNLSTM(nn.Module):
+    def __init__(self, input_size, hidden_dim, output_dim, num_layers, dropout_rate):
+        super(GestureCNNLSTM, self).__init__()
+        # Adjust the height and width based on input_size
+        self.height = 13
+        self.width = 10
+        if self.height * self.width != input_size:
+            raise ValueError(f'Input size {input_size} does not match expected grid size {self.height}x{self.width}')
+        self.conv = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, kernel_size=3, padding=1),
+            nn.ReLU(),
+            nn.MaxPool2d(2)
+        )
+        conv_output_size = self._get_conv_output_size()
+        self.lstm = nn.LSTM(conv_output_size, hidden_dim, num_layers=num_layers,
+                            batch_first=True, dropout=dropout_rate if num_layers > 1 else 0)
+        self.classifier = nn.Linear(hidden_dim, output_dim)
+
+    def _get_conv_output_size(self):
+        dummy_input = torch.zeros(1, 1, self.height, self.width)
+        output = self.conv(dummy_input)
+        output_size = output.view(1, -1).size(1)
+        return output_size
+
+    def forward(self, x):
+        # Unpack sequences
+        x, lengths = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
+        batch_size = x.size(0)
+        seq_len = x.size(1)
+        # Reshape to (batch_size * seq_len, 1, H, W)
+        x = x.contiguous().view(-1, 1, self.height, self.width)
+        x = self.conv(x)
+        x = x.view(batch_size, seq_len, -1)
+        # Pack sequences again
+        x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
+        packed_output, (hidden, _) = self.lstm(x)
+        logits = self.classifier(hidden[-1])
+        return logits
+
+
 class MySensor():
     def __init__(self, parent) -> None:
         self.parent = parent
@@ -97,20 +144,64 @@ class MySensor():
         self.initial_cell = None
         self.four_fingers_detected = True
         self.last_large_detection_time = None  # Timestamp for last large detection (>20 fingers)
-        self.timer_experiment = QTimer()
-        self.timer_experiment.timeout.connect(self.experiment)
-        self.flag = True
-        self.timer_experiment_2 = QTimer()
-        self.timer_experiment_2.timeout.connect(self.experiment_2)
-        self.flag_2 = True
         # Initialize additional attributes for recording
         self.timer_record_gesture = QTimer()
         self.timer_record_gesture.timeout.connect(self.record_gesture)
         self.is_recording = False
         self.current_gesture_data = []
+        self.current_gesture_data_diff = []
         self.trial_number = None
         self.gesture_number = None
         self.start_record_pressed = False
+        self.activate_rule_button = False
+        # Test gesture
+        self.last_prediction = None
+        self.movement_x = 0.0
+        self.movement_y = 0.0
+        self.movement_z = 0.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.rotation_z = 0.0
+        self.is_predicting = False
+        self.parse_parameters_and_initialize_model()
+        self.prediction_counter = 0  # Counter to control prediction frequency
+        self.prediction_interval = 5  # Predict every 5 data points (adjust as needed)
+        self.window_size = 50  # Adjust based on your needs
+        self.current_predict_data = []
+        self.minimum_sequence_length = 5  # Adjust based on experimentation
+
+    def parse_parameters_and_initialize_model(self):
+        try:
+            self.gesture_data_file_path = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/gesture_data.txt'
+            self.model_txt_path = '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_4.txt'
+            self.model_path = '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_4.pth'
+            parameters = self.parse_parameters_from_file(self.model_txt_path)
+            self.hidden_dim = parameters.get('hidden_dim', 80)
+            self.output_dim = parameters.get('output_dim', 8)
+            self.epochs = parameters.get('epochs', 100)
+            self.batch_size = parameters.get('batch_size', 32)
+            self.k_folds = parameters.get('k_folds', 5)
+            self.num_layers = parameters.get('num_layers', 1)
+            self.learning_rate = parameters.get('learning_rate', 0.01)
+            self.dropout_rate = parameters.get('dropout_rate', 0.5)
+            self.input_size = parameters.get('input_size', 130)
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.triggerd_value = -1
+            self.is_recognizing_gesture = False
+            self.recognition_timer = QTimer()
+            self.recognition_timer.timeout.connect(self.start_gesture_recognition)
+            self.current_predict_data = []
+            self.prediction_counter = 0  # Initialize counter
+
+            # Initialize the model
+            self.model = GestureCNNLSTM(self.input_size, self.hidden_dim, self.output_dim,
+                                        num_layers=self.num_layers,
+                                        dropout_rate=self.dropout_rate).to(self.device)
+            self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
+            self.model.eval()
+        except Exception as e:
+            print(f'Error loading gesture recognition models: {e}')
+            self.model = None
 
     def saveCameraPara(self):
         self.camera_pos = self.plotter.camera.position
@@ -147,9 +238,11 @@ class MySensor():
         ports = serial.tools.list_ports.comports()
         self.ser = None
         if len(ports):
+            ports = sorted(ports, key=lambda port: port.name != 'ttyACM0')
             for port in ports:
                 self.com_options.append(port.name)
                 self.parent.serial_channel.addItem(port.name)
+                print(port.name)
         else:
             print("No serial ports found. Please connect the device and retry.")
             return
@@ -167,20 +260,22 @@ class MySensor():
             )
             self.ser.write(b'ConnectionCheck')
             response = self.ser.readall()
-            if response == b'Connected\r\n':
-                if self.parent.sensor_choice.currentIndex() == 0:
-                    self.init_handConstruction()
-                elif self.parent.sensor_choice.currentIndex() == 1:
-                    self.init_jointConstruction()
-                elif self.parent.sensor_choice.currentIndex() == 2:
-                    self.init_dualC()
-            # elif self.parent.sensor_choice.currentIndex() == 3:
-            #     self.cylinder()
-            else:
-                self.is_connected = False
-                self.ser.close()
-                self.ser = None
-                return
+            # if response == b'Connected\r\n':
+            #     print("Connected")
+            if self.parent.sensor_choice.currentIndex() == 0:
+                self.init_jointConstruction()
+            elif self.parent.sensor_choice.currentIndex() == 1:
+                self.init_dualC()
+            elif self.parent.sensor_choice.currentIndex() == 2:
+                self.init_handConstruction()
+            elif self.parent.sensor_choice.currentIndex() == 3:
+                self.init_cylinder()
+            # else:
+            #     print("Error: The device is not connected.")
+            #     self.is_connected = False
+            #     self.ser.close()
+            #     self.ser = None
+            #     return
 
     def init_handConstruction(self):
         self.n_row = 10
@@ -251,14 +346,14 @@ class MySensor():
         self._2D_map = pv.Plane((9.5, 5, 0), (0, 0, 1), 19, 10, 19, 10)
         self.actionMap = self.plotter.add_mesh(self._2D_map, scalars=self.colors_face, show_edges=True, name='2d',
                                                rgb=True)
-        TreeWidgetItem(self.parent.widget_tree, "_2D_map", 0, 0)
+        # TreeWidgetItem(self.parent.widget_tree, "_2D_map", 0, 0)
 
         # register network
         self.line_poly = pv.PolyData(self.points)
         self.line_poly.lines = self.edges
         self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors, point_size=10, line_width=3,
                                                 render_points_as_spheres=True, rgb=True, name='3d')
-        TreeWidgetItem(self.parent.widget_tree, "_3D_mesh", 0, 0)
+        # TreeWidgetItem(self.parent.widget_tree, "_3D_mesh", 0, 0)
 
         # self.line_poly.points = self.points
         # self._2D_map.cell_data.set_scalars(self.colors_face)
@@ -287,6 +382,8 @@ class MySensor():
         self.show_PC = False
         self.show_FittedMesh = False
 
+        print("Done: Initiate the joint construction.")
+
         for i in range(self.n_col - 1):
             for j in range(self.n_row - 1):
                 self.edges[2 * (i * (self.n_row - 1) + j)] = [2, i * self.n_row + j, i * self.n_row + j + 1]
@@ -314,6 +411,8 @@ class MySensor():
             for idx, num in enumerate(numbers):
                 if num != -1:
                     self.array_positions[num].append(idx)
+
+        print("Done: Load the mesh and signal data.")
 
         for i in range((self.n_col) - 1, -1, -1):
             del self.array_positions[i * 12 + 11]
@@ -353,9 +452,90 @@ class MySensor():
         self.parent.buildScene.setDisabled(True)
         self.parent.sensor_start.setDisabled(False)
 
+        print("Done: Initiate the joint construction.")
+
     def init_dualC(self):
         self.n_row = 10
         self.n_col = 10
+        self.n_node = self.n_row * self.n_col
+
+        self._data = data(self.n_row, self.n_col)
+        self.points = np.zeros((self.n_node, 3))
+        self.edges = (np.ones(
+            ((self.n_col - 1) * (self.n_row - 1) * 2 + (self.n_col - 1) + (self.n_row - 1), 3)) * 2).astype(int)
+
+        self.colors_3d = np.ones((self.n_node, 4)) * 0.5
+
+        self.is_connected = False
+        self.show_2D = False
+        self.show_PC = False
+        self.show_FittedMesh = False
+
+        for i in range(self.n_col - 1):
+            for j in range(self.n_row - 1):
+                self.edges[2 * (i * (self.n_row - 1) + j)] = [2, i * self.n_row + j, i * self.n_row + j + 1]
+                self.edges[2 * (i * (self.n_row - 1) + j) + 1] = [2, i * self.n_row + j, (i + 1) * self.n_row + j]
+        for i in range(self.n_row - 1):
+            self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + i] = [2, (self.n_col - 1) * self.n_row + i,
+                                                                       (self.n_col - 1) * self.n_row + i + 1]
+        for i in range(self.n_col - 1):
+            self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + (self.n_row - 1) + i] = [2, ((i + 1) * self.n_row) - 1,
+                                                                                          ((
+                                                                                                       i + 1) * self.n_row) - 1 + self.n_row]
+
+        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj'
+        self._2D_map = pv.read(filename)
+
+        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/singal.txt'
+        with open(filename, 'r') as file:
+            lines = file.readlines()
+            numbers = [int(line.strip()) for line in lines]
+            self.array_positions = []
+            self.normals = np.zeros((self.n_node, 3))
+
+            for i in range(self.n_node):
+                self.array_positions.append([])
+            for idx, num in enumerate(numbers):
+                if num != -1:
+                    self.array_positions[num].append(idx)
+
+        self.colors = np.ones((self._2D_map.n_points, 4)) * 0.5
+        for i in range(self.n_col):
+            for j in range(self.n_row):
+                self.colors_3d[i * self.n_row + j] = [i / self.n_col, j / self.n_row, 0, 1]
+                for k in self.array_positions[i * self.n_row + j]:
+                    self.colors[k] = [i / self.n_col, j / self.n_row, 0, 1]
+        self.plotter.add_mesh(self._2D_map, show_edges=True, scalars=self.colors, rgb=True)
+        # TreeWidgetItem(self.parent.widget_tree,"_2D_map",0,0)
+
+        a = self._2D_map.extract_surface()
+        b = a.point_normals
+        self.points_origin = np.zeros((self.n_node, 3))
+        for i in tqdm(range(self.n_node)):
+            for j in self.array_positions[i]:
+                self.normals[i] += b[j]
+                self.points[i] += self._2D_map.GetPoint(j)
+            self.normals[i] = self.normals[i] / len(self.array_positions[i])
+            self.normals[i] = self.normals[i] / np.linalg.norm(self.normals[i])
+            self.points[i] = self.points[i] / len(self.array_positions[i])
+            self.points_origin[i] = self.points[i]
+            self.points[i] += self.normals[i] * 0.2
+
+        self.line_poly = pv.PolyData(self.points)
+        self.line_poly.lines = self.edges
+        self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
+                                                render_points_as_spheres=True, rgb=True, name='3d')
+        # TreeWidgetItem(self.parent.widget_tree,"_3D_mesh",0,0)
+
+        self.parent.sensor_choice.setDisabled(True)
+        self.parent.serial_channel.setDisabled(True)
+        self.parent.buildScene.setText("Scene Built")
+        self.parent.buildScene.setDisabled(True)
+        self.parent.sensor_start.setDisabled(False)
+
+    def init_cylinder(self):
+        self.n_row = 10
+        self.n_col = 11
         self.n_node = self.n_row * self.n_col
 
         self._data = data(self.n_row, self.n_col)
@@ -475,8 +655,32 @@ class MySensor():
             self._data.calDiffPer()
             self._data.getWin(self._data.windowSize)
 
-            # Visualization updates
             if self.parent.sensor_choice.currentIndex() == 0:
+                for i in range(self.n_col):
+                    for j in range(self.n_row):
+                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
+                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
+                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
+                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+                        for k in self.array_positions[i * self.n_row + j]:
+                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
+                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+
+            elif self.parent.sensor_choice.currentIndex() == 1:
+                self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
+                self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
+                for i in range(self.n_col):
+                    for j in range(self.n_row):
+                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
+                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.2
+                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
+                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
+                        for k in self.array_positions[i * self.n_row + j]:
+                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
+                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
+
+            # Visualization updates
+            elif self.parent.sensor_choice.currentIndex() == 2:
                 for i in range(self.n_row):
                     for j in range(self.n_col):
                         self.colors_face[i * self.n_col + j] = (
@@ -494,7 +698,7 @@ class MySensor():
                     else:
                         self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
 
-            elif self.parent.sensor_choice.currentIndex() == 1:
+            elif self.parent.sensor_choice.currentIndex() == 3:
                 for i in range(self.n_col):
                     for j in range(self.n_row):
                         self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
@@ -504,19 +708,6 @@ class MySensor():
                         for k in self.array_positions[i * self.n_row + j]:
                             self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
                                               1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-
-            elif self.parent.sensor_choice.currentIndex() == 2:
-                self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
-                self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.2
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
 
             self.line_poly.points = self.points
             self._2D_map.point_data.set_scalars(self.colors)
@@ -533,26 +724,68 @@ class MySensor():
 
         # # My function to get the gesture
         if self.startSensor_pressed is True:
-            # self.gesture_recognition()
-            pass
+            self.gesture_recognition()
 
-        if self.start_record_gesture is True:
-            # diffPerDataAve_Reverse = self._data.diffPerDataAve.T
+            # # Assuming diffPerDataAve_Reverse is already defined
+            # diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
             #
-            # # Start or stop recording based on data conditions
-            # if not self.is_recording and np.any(diffPerDataAve_Reverse < -1):
-            #     self.is_recording = True
-            #     self.current_gesture_data = []  # Start fresh for new recording
-            #     print(f"Started recording gesture {self.gesture_number}.")
+            # # Define conditions for each threshold, now going up to -4
+            # conditions = [
+            #     diffPerDataAve_Reverse > 2,  # Values greater than 2
+            #     diffPerDataAve_Reverse < -4,  # Values less than -4
+            #     diffPerDataAve_Reverse < -3.9,
+            #     diffPerDataAve_Reverse < -3.8,
+            #     diffPerDataAve_Reverse < -3.7,
+            #     diffPerDataAve_Reverse < -3.6,
+            #     diffPerDataAve_Reverse < -3.5,
+            #     diffPerDataAve_Reverse < -3.4,
+            #     diffPerDataAve_Reverse < -3.3,
+            #     diffPerDataAve_Reverse < -3.2,
+            #     diffPerDataAve_Reverse < -3.1,
+            #     diffPerDataAve_Reverse < -3.0,
+            #     diffPerDataAve_Reverse < -2.9,
+            #     diffPerDataAve_Reverse < -2.8,
+            #     diffPerDataAve_Reverse < -2.7,
+            #     diffPerDataAve_Reverse < -2.6,
+            #     diffPerDataAve_Reverse < -2.5,
+            #     diffPerDataAve_Reverse < -2.4,
+            #     diffPerDataAve_Reverse < -2.3,
+            #     diffPerDataAve_Reverse < -2.2,
+            #     diffPerDataAve_Reverse < -2.1,
+            #     diffPerDataAve_Reverse < -2.0,
+            #     diffPerDataAve_Reverse < -1.9,
+            #     diffPerDataAve_Reverse < -1.8,
+            #     diffPerDataAve_Reverse < -1.7,
+            #     diffPerDataAve_Reverse < -1.6,
+            #     diffPerDataAve_Reverse < -1.5,
+            #     diffPerDataAve_Reverse < -1.4,
+            #     diffPerDataAve_Reverse < -1.3,
+            #     diffPerDataAve_Reverse < -1.2,
+            #     diffPerDataAve_Reverse < -1.1,
+            #     diffPerDataAve_Reverse < -1.0,
+            #     diffPerDataAve_Reverse < -0.9,
+            #     diffPerDataAve_Reverse < -0.8,
+            #     diffPerDataAve_Reverse < -0.7,
+            #     diffPerDataAve_Reverse < -0.6,
+            #     diffPerDataAve_Reverse < -0.2,
+            #     diffPerDataAve_Reverse >= -0.5  # Catch the rest (between -0.5 and 2)
+            # ]
             #
-            # elif self.is_recording and np.all(diffPerDataAve_Reverse > -1):
-            #     self.is_recording = False
-            #     self.save_gesture_data()
-            #     print(f"Stopped recording gesture {self.gesture_number} and data saved.")
+            # # Define corresponding output values for each condition, matching the conditions
+            # choices = [
+            #     88,  # Corresponding to values > 2
+            #     -4,  # Corresponding to values < -4
+            #     -3.9, -3.8, -3.7, -3.6, -3.5, -3.4, -3.3, -3.2, -3.1,
+            #     -3.0, -2.9, -2.8, -2.7, -2.6, -2.5, -2.4, -2.3, -2.2, -2.1,
+            #     -2.0, -1.9, -1.8, -1.7, -1.6, -1.5, -1.4, -1.3, -1.2, -1.1,
+            #     -1.0, -0.9, -0.8, -0.7, -0.6, -0.2, 0  # Values >= -0.5 and <= 2
+            # ]
             #
-            # if self.is_recording:
-            #     # Append current data frame to the recording list
-            #     self.current_gesture_data.append(diffPerDataAve_Reverse.flatten())
+            # # Apply conditions to the array
+            # transformed_data = np.select(conditions, choices)
+            #
+            # print(transformed_data)
+
             pass
 
     def loadMesh(self, file_paths):
@@ -578,39 +811,56 @@ class MySensor():
         else:
             print("everything for mesh changes")
 
+    def read_sensor_diff_data(self):
+        diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
+        return diffPerDataAve_Reverse
+
+    def read_sensor_raw_data(self):
+        rawDataAve = self._data.rawDataAve.T.flatten()
+        return rawDataAve
+
+    def activate_rule_based(self):
+        self.activate_rule_button = not self.activate_rule_button
+        if self.activate_rule_button:
+            print("Activate Rule-Based")
+        else:
+            print("Deactivate Rule-Based")
+
     def gesture_recognition(self):
-        diffPerDataAve_Reverse = self._data.diffPerDataAve.T
-        detected_fingers = 0
 
-        for i in range(self.n_col):
-            for j in range(self.n_row):
-                if self.check_cooldown(i, j):
-                    continue
-                current_value = diffPerDataAve_Reverse[i][j]
-                if current_value < -1:
-                    detected_fingers += 1
-                    if not self.timer_2.isActive() and self.four_fingers_detected:
-                        self.add_initial_cell(i, j)
-                        self.set_focus(i, j, current_value)
-                        print(f"No. of fingers detected: {detected_fingers}")
+        if self.activate_rule_button is True:
+            diffPerDataAve_Reverse = self._data.diffPerDataAve.T
+            detected_fingers = 0
 
-        if detected_fingers > 20:
-            self.four_fingers_detected = False
-            print("10+ fingers are detected")
-            self.parent.robot_api.send_request("StopContinueVmode()")
-            self.parent.robot_api.send_request("StopAndClearBuffer()")
-            self.parent.robot_api.send_and_process_request([1.0, -0.49, 1.57, 0.48, 1.57, 0.0])
-            self.last_large_detection_time = time.time()  # Set the timestamp when more than 20 fingers are detected
+            for i in range(self.n_col):
+                for j in range(self.n_row):
+                    if self.check_cooldown(i, j):
+                        continue
+                    current_value = diffPerDataAve_Reverse[i][j]
+                    if current_value < -1:
+                        detected_fingers += 1
+                        if not self.timer_2.isActive() and self.four_fingers_detected:
+                            self.add_initial_cell(i, j)
+                            self.set_focus(i, j, current_value)
+                            # print(f"No. of fingers detected: {detected_fingers}")
 
-        # Check the time since last large detection
-        if detected_fingers == 4:
-            current_time = time.time()
-            if (self.last_large_detection_time is None or
-                    (current_time - self.last_large_detection_time) > 1):
-                self.four_fingers_detected = True
-                print("4 fingers are detected")
-            else:
-                print("Detection of 4 fingers ignored due to recent large detection")
+            if detected_fingers > 20:
+                self.four_fingers_detected = False
+                # print("10+ fingers are detected")
+                self.parent.robot_api.send_request("StopContinueVmode()")
+                self.parent.robot_api.send_request("StopAndClearBuffer()")
+                self.parent.robot_api.send_and_process_request([1.0, -0.49, 1.57, 0.48, 1.57, 0.0])
+                self.last_large_detection_time = time.time()  # Set the timestamp when more than 20 fingers are detected
+
+            # Check the time since last large detection
+            if detected_fingers == 4:
+                current_time = time.time()
+                if (self.last_large_detection_time is None or
+                        (current_time - self.last_large_detection_time) > 1):
+                    self.four_fingers_detected = True
+                    # print("4 fingers are detected")
+                else:
+                    print("Detection of 4 fingers ignored due to recent large detection")
 
     def check_cooldown(self, row, col):
         current_time = time.time()
@@ -651,9 +901,9 @@ class MySensor():
             return
 
         self.check_adjacent_cells()
-        print(
-            f"\r{self.initial_message} Elapsed time since initial detection: {elapsed_time:.2f} seconds, Current value: {current_value:.2f}",
-            flush=True, end="")
+        # print(
+        #     f"\r{self.initial_message} Elapsed time since initial detection: {elapsed_time:.2f} seconds, Current value: {current_value:.2f}",
+        #     flush=True, end="")
 
     def reset_gesture_state(self):
         self.initial_cells = []
@@ -718,132 +968,251 @@ class MySensor():
         self.found_finger_timer = time.time()
         self.timer_2.start(0)
 
-    def experiment(self):
-        if self.flag is True:
-            self.flag = False
-            self.parent.robot_api.send_positions_tool_position([-0.300, 0.750, 0.203], [0.0, 1.0, 0.0, 0.0])
-
-        self.timer_experiment.start(20)
-        # print(self._data.diffPerDataAve)
-        # print(self._data.rawDataAve)
-        self.counter += 1
-        print(self.counter)
-
-        diffPerDataAve_string = ' '.join(map(str, self._data.diffPerDataAve.flatten()))
-        rawDataAve_string = ' '.join(map(str, self._data.rawDataAve.flatten()))
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/diffPerDataAve_output.txt", "a") as file:
-            file.write(diffPerDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/rawDataAve_output.txt", "a") as file:
-            file.write(rawDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        if self.counter == 199:
-            self.timer_experiment.stop()
-            self.parent.robot_api.send_positions_tool_position([-0.300, 0.750, 0.25], [0.0, 1.0, 0.0, 0.0])
-            self.flag = True
-            self.counter = 0
-
-    def experiment_2(self):
-        if self.flag_2 is True:
-            self.flag_2 = False
-            self.parent.robot_api.send_positions_tool_position([-0.285, 0.700, 0.207], [0.0, 1.0, 0.0, 0.0])
-
-        self.timer_experiment_2.start(20)
-        # print(self._data.diffPerDataAve)
-        # print(self._data.rawDataAve)
-        self.counter += 1
-        print(self.counter)
-
-        diffPerDataAve_string = ' '.join(map(str, self._data.diffPerDataAve.flatten()))
-        rawDataAve_string = ' '.join(map(str, self._data.rawDataAve.flatten()))
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/dualC/diffPerDataAve_output.txt", "a") as file:
-            file.write(diffPerDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        with open("/home/ping2/ros2_ws/src/phd/phd/resource/singa_request/dualC/rawDataAve_output.txt", "a") as file:
-            file.write(rawDataAve_string + "\n")  # Each new entry on a new line, but data remains on one line
-
-        if self.counter == 199:
-            self.timer_experiment_2.stop()
-            self.parent.robot_api.send_positions_tool_position([-0.285, 0.700, 0.254], [0.0, 1.0, 0.0, 0.0])
-            self.flag_2 = True
-            self.counter = 0
-
     def start_record_gesture(self, gesture_number):
         if not self.start_record_pressed:
+            # Convert gesture_number to string for consistent handling
+            gesture_number = str(gesture_number)
+
             # Start the recording
             self.start_record_pressed = True
             self.gesture_number = gesture_number
-            self.timer_record_gesture.start(0)  # Start with an appropriate interval, e.g., 100 ms
-            print(f"Recording started for gesture {gesture_number}.")
+            self.trial_number = self.get_next_trial_number(gesture_number)
+            self.current_gesture_data_diff = []
+            self.timer_record_gesture.start(0)
+            print(f"Recording started for gesture {gesture_number}, trial {self.trial_number}.")
         else:
             # Stop the recording
             self.timer_record_gesture.stop()
             self.start_record_pressed = False
-            self.current_gesture_data = []
-            self.trial_number = None
+            self.current_gesture_data_diff = []
             print("Recording stopped.")
 
     def record_gesture(self):
         diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
 
+        # Transform the values: set values < -1 to 1 and others to 0
+        transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
+
+
+        # Define conditions for each threshold
+        conditions = [
+            diffPerDataAve_Reverse > 2,  # Values greater than 2
+            diffPerDataAve_Reverse < -1,
+            diffPerDataAve_Reverse < -0.2,
+            diffPerDataAve_Reverse >= -0.2  # Catch the rest (between -0.2 and 2)
+        ]
+        choices = [2, 1, 0.2, 0]
+        transformed_data = np.select(conditions, choices)
+        transformed_data = np.where(transformed_data == 0.0, 0, transformed_data)
+
         # Check for the condition to start recording
-        if not self.is_recording and np.any(diffPerDataAve_Reverse < -1):
+        if not self.is_recording and np.any(transformed_data == 0.2):
             self.is_recording = True
-            self.trial_number = self.get_last_trial_number(self.gesture_number) + 1
-            self.current_gesture_data = []  # Start fresh for new recording
+            self.current_gesture_data_diff = []
             print(f"Started recording Gesture {self.gesture_number}, Trial {self.trial_number}.")
 
         # Append data to the current recording if we are in a recording state
         if self.is_recording:
-            self.current_gesture_data.append(diffPerDataAve_Reverse)
+            self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
 
         # Check for the condition to stop recording
-        if self.is_recording and np.all(diffPerDataAve_Reverse > -1):
+        if self.is_recording and np.all(transformed_data == 0):
             self.is_recording = False
             self.save_gesture_data()
+            self.updateCal()
             print(f"Stopped recording Gesture {self.gesture_number}, Trial {self.trial_number}. Data saved.")
-            self.trial_number += 1  # Increment the trial number for the next round
+            self.trial_number += 1  # Prepare for the next trial
 
-    def get_last_trial_number(self, gesture_number):
-        filename = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/gesture_{gesture_number}_data.txt"
-        try:
-            with open(filename, "r") as file:
-                lines = file.readlines()
-                if lines:
-                    last_line = lines[-1]
-                    last_trial_number = int(last_line.split()[0])
-                    print(f"Read last trial number: {last_trial_number} from {filename}")
-                    return last_trial_number
-        except FileNotFoundError:
-            print(f"File {filename} not found. Starting from trial number 0.")
-            return 0
-        except Exception as e:
-            print(f"Error reading file {filename}: {e}")
-        return 0
+    def get_next_trial_number(self, gesture_number):
+        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{gesture_number}"
+
+        if not os.path.exists(gesture_diff_dir):
+            os.makedirs(gesture_diff_dir)
+        files = os.listdir(gesture_diff_dir)
+        return len(files) + 1
 
     def save_gesture_data(self):
-        filename = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/gesture_{self.gesture_number}_data.txt"
-        with open(filename, "a") as file:
-            for data_entry in self.current_gesture_data:
-                file.write(f"{self.trial_number} " + ' '.join(map(str, data_entry)) + "\n")
-        print(f"Data for gesture {self.gesture_number} trial {self.trial_number} has been saved to {filename}.")
+        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{self.gesture_number}"
 
+        filename = os.path.join(gesture_diff_dir, f"{self.trial_number}.txt")
+        with open(filename, 'w') as file:
+            for data_entry in self.current_gesture_data_diff:
+                file.write(' '.join(map(str, data_entry)) + "\n")
 
+        self.current_gesture_data_diff = []
 
+    def toggle_gesture_recognition(self):
+        """Toggle the real-time gesture recognition process."""
+        if not self.is_recognizing_gesture:
+            self.is_recognizing_gesture = True
+            self.recognition_timer.start(0)
+            print("Gesture recognition started.")
+            self.current_predict_data = []  # Reset the data at the start
+            self.parent.robot_api.send_request(self.parent.robot_api.enable_end_effector_velocity_mode())
+        else:
+            self.recognition_timer.stop()
+            self.is_recognizing_gesture = False
+            self.parent.robot_api.send_request(self.parent.robot_api.stop_end_effector_velocity_mode())
+            self.current_predict_data = []  # Reset after saving and prediction
+            print("Gesture recognition stopped.")
 
+    def start_gesture_recognition(self):
+        """Handle the real-time recording and continuous prediction of gestures."""
+        diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
+        transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
 
+        # Check if finger is touching the sensor
+        if np.any(transformed_data == 1):
+            self.current_predict_data.append(transformed_data.tolist())
 
+            # Ensure the data buffer does not exceed the window size
+            if len(self.current_predict_data) > self.window_size:
+                self.current_predict_data.pop(0)
 
+            # Only start making predictions after minimum sequence length
+            if len(self.current_predict_data) >= self.minimum_sequence_length:
+                # Predict every time new data comes in
+                self.predict_gesture(self.current_predict_data)
 
+                # Optionally, you can clear the data to use only recent samples
+                # self.current_predict_data = []
+        else:
+            # Finger is lifted; reset data and counter
+            if self.current_predict_data:
+                # Optionally, make a final prediction with the accumulated data
+                # print("Finger lifted; making final prediction.")
+                self.predict_gesture(self.current_predict_data)
+                self.movement_x = 0.0
+                self.movement_y = 0.0
+                self.movement_z = 0.0
+                self.rotation_x = 0.0
+                self.rotation_y = 0.0
+                self.rotation_z = 0.0
+                self.parent.robot_api.send_request(self.parent.robot_api.suspend_end_effector_velocity_mode())
 
+            self.current_predict_data = []
+            self.prediction_counter = 0
+            self.last_prediction = None  # Reset the last prediction when finger is lifted
 
+    def predict_gesture(self, gesture_data):
+        """Predict the gesture from processed data."""
+        # gesture_data is a list of lists
+        # Convert to numpy array
+        gesture_data = np.array(gesture_data, dtype=np.float32)
+        seq_length, input_size = gesture_data.shape
 
+        # Ensure input_size matches model's expected input size
+        if input_size != self.input_size:
+            print(f"Input size mismatch: expected {self.input_size}, got {input_size}")
+            return
 
+        # Reshape data to match model input shape (batch_size, seq_length, input_size)
+        gesture_data = gesture_data.reshape(1, seq_length, input_size)
 
+        # Convert to tensor
+        data_tensor = torch.tensor(gesture_data, dtype=torch.float32).to(self.device)
+        lengths = torch.tensor([seq_length], dtype=torch.long).to(self.device)
 
+        # Prepare the data for the model
+        packed_input = nn.utils.rnn.pack_padded_sequence(
+            data_tensor, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
 
+        # Run the model
+        self.model.eval()
+        with torch.no_grad():
+            outputs = self.model(packed_input)
+            probabilities = torch.softmax(outputs.data, dim=1)
+            max_prob, predicted = torch.max(probabilities, 1)
+            pred = predicted.item()
+            confidence = max_prob.item()
 
+            # Set a confidence threshold
+            confidence_threshold = 0.6  # Adjust this value based on your requirements
+            if confidence < confidence_threshold:
+                print(f"Low confidence ({confidence:.2f}) for {pred}, prediction ignored.")
+                return
 
+            # Check if prediction is the same as the last
+            if pred == self.last_prediction:
+                # print("Prediction unchanged, no command sent.")
+                return
+            else:
+                self.last_prediction = pred  # Update the last prediction
 
+            # Proceed with handling the new prediction
+            # Reset movement variables
+            self.movement_x = 0.0
+            self.movement_y = 0.0
+            self.movement_z = 0.0
+            self.rotation_x = 0.0
+            self.rotation_y = 0.0
+            self.rotation_z = 0.0
+
+            if pred == 0:
+                print("Predicted Gesture (0): <---- ")
+                self.movement_y = -0.1
+            elif pred == 1:
+                print("Predicted Gesture (1): ----> ")
+                self.movement_y = 0.1
+            elif pred == 2:
+                print("Predicted Gesture (2): v ")
+                self.movement_z = -0.1
+            elif pred == 3:
+                print("Predicted Gesture (3): ^ ")
+                self.movement_z = 0.1
+            elif pred == 4:
+                print("Predicted Gesture (4): <<---- ")
+                # Define action for gesture 4 if needed
+            elif pred == 5:
+                print("Predicted Gesture (5): ---->> ")
+                # Define action for gesture 5 if needed
+            elif pred == 6:
+                print("Predicted Gesture (6): vv ")
+                self.movement_x = -0.1
+            elif pred == 7:
+                print("Predicted Gesture (7): ^^ ")
+                self.movement_x = 0.1
+            elif pred == 8:
+                print("Predicted Gesture (8): ..<---- ")
+            elif pred == 9:
+                print("Predicted Gesture (9): ---->.. ")
+            elif pred == 10:
+                print("Predicted Gesture (10): ZOOM IN ")
+                self.parent.robot_api.send_request(self.parent.robot_api.stop_end_effector_velocity_mode())
+                self.parent.robot_api.send_and_process_request([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            elif pred == 11:
+                print("Predicted Gesture (11): ZOOM OUT ")
+                self.parent.robot_api.send_request(self.parent.robot_api.stop_end_effector_velocity_mode())
+                # self.parent.robot_api.send_and_process_request([1.0, 0.0, 1.57, 0.0, 1.57, 0.0])
+                self.parent.robot_api.send_and_process_request([-0.3, -0.7, 1.8, 0.5, 1.6, -1.3])
+                self.parent.robot_api.send_request(self.parent.robot_api.enable_end_effector_velocity_mode())
+            elif pred == 12:
+                print("Predicted Gesture (12): ROTATE Clockwise ")
+                # Define action for gesture 12 if needed
+            elif pred == 13:
+                print("Predicted Gesture (13): ROTATE Anti-Clockwise ")
+                # Define action for gesture 13 if needed
+            elif pred == 14:
+                print("Predicted Gesture (14): PALM ")
+                # Define action for gesture 14 if needed
+
+            # Send the command to the robot if the prediction is within the specified range
+            if 0 <= pred <= 9:
+                self.parent.robot_api.send_request(self.parent.robot_api.set_end_effector_velocity([
+                    self.movement_x,
+                    self.movement_y,
+                    self.movement_z,
+                    self.rotation_x,
+                    self.rotation_y,
+                    self.rotation_z
+                ]))
+
+    def parse_parameters_from_file(self, file_path):
+        params = {}
+        with open(file_path, 'r') as file:
+            for line in file:
+                if ': ' in line:
+                    key, value = line.strip().split(': ')
+                    params[key] = float(value) if '.' in value else int(value)
+        return params

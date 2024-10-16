@@ -67,30 +67,38 @@ class RobotController(Node):
         return f"PTP(\"JPP\",{position_str},100,0,100,true)"
 
     def enable_joint_velocity_mode(self,):
-        print("Enabling joint velocity mode")
+        # print("Enabling joint velocity mode")
         return "ContinueVJog()"
 
     def stop_joint_velocity_mode(self):
-        print("Stopping joint velocity mode")
+        # print("Stopping joint velocity mode")
         return "StopContinueVmode()"
 
     def set_joint_velocity(self, velocity):
-        print(f"Setting joint velocity to {velocity}")
+        # print(f"Setting joint velocity to {velocity}")
         velocity_str = ','.join(map(str, velocity))
         return f"SetContinueVJog({velocity_str})"
 
     def enable_end_effector_velocity_mode(self):
-        print("Enabling end effector velocity mode")
-        return "ContinueVLine()"
+        # print("Enabling end effector velocity mode")
+        return "ContinueVLine(5000, 10000)"
+
+    def suspend_end_effector_velocity_mode(self):
+        # print("Suspending end effector velocity mode")
+        return "SuspendContinueVmode()"
 
     def stop_end_effector_velocity_mode(self):
-        print("Stopping end effector velocity mode")
+        # print("Stopping end effector velocity mode")
         return "StopContinueVmode()"
 
     def set_end_effector_velocity(self, velocity):
-        print(f"Setting end effector velocity to {velocity}")
+        # print(f"Setting end effector velocity to {velocity}")
         velocity_str = ','.join(map(str, velocity))
         return f"SetContinueVLine({velocity_str})"
+
+    def stop_and_clear_buffer(self):
+        # print("Stopping and clearing buffer")
+        return "StopAndClearBuffer()"
 
     def send_positions_joint_angle(self, positions):
         req = SetPositions.Request()
@@ -102,7 +110,8 @@ class RobotController(Node):
         req.fine_goal = False
         self.client.call_async(req)
 
-    def send_positions_tool_position(self, positions, quaternion, velocity=0.25, acc_time=0.0, blend_percentage=100, fine_goal=False):
+    def send_positions_tool_position(self, positions, quaternion, velocity=3.14, acc_time=0.0, blend_percentage=100, fine_goal=False):
+        # singa experiment velocity = 0.05
         request = SetPositions.Request()
         euler = transforms3d.euler.quat2euler(quaternion, axes='sxyz')
         full_position = positions + list(euler)
@@ -144,6 +153,7 @@ class RobotController(Node):
         self.send_request(f"SetContinueVJog({velocity_str})")
 
     def combined_end_effector_velocity(self, velocity):
+        # self.send_request("SuspendContinueVmode()")
         self.send_request("ContinueVLine(2000, 10000)")
         velocity_str = ','.join(map(str, velocity))
         self.send_request(f"SetContinueVLine({velocity_str})")

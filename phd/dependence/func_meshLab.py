@@ -166,7 +166,7 @@ class MyMeshLab():
 
         # self.parent.log_display.append(f"Angles: {new_angles}")
         self.joints = new_angles
-        self.update_robot_model()  # Call to update the robot's visual model
+        self.update_robot_model()  # Call to update the robot's visual models
 
     def update_robot_model(self):
         # for idx, i in enumerate(self.robotModel):

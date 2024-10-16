@@ -1,7 +1,7 @@
 from PyQt5 import QtCore
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QColor, QCursor
 from PyQt5.QtCore import pyqtSignal, Qt, QRect, QEvent, QTimer
-from PyQt5.QtWidgets import QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QTabWidget, QDialog, QLineEdit, QTextEdit, QSlider, QGroupBox, QComboBox
+from PyQt5.QtWidgets import QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QHBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem, QTabWidget, QDialog, QLineEdit, QTextEdit, QSlider, QGroupBox, QComboBox, QScrollArea
 from pyvistaqt import QtInteractor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
@@ -134,7 +134,7 @@ class PositionEntryWidget(QWidget):
         self.setStyleSheet("QLabel, QLineEdit, QPushButton { color: white; }")
 
         # Preset values for joint angles
-        preset_angles = [1.0, -0.49, 1.57, 0.48, 1.57, 0.0]
+        preset_angles = [1.0, 0.0, 1.57, 0.0, 1.57, 0.0]
 
         for i in range(1, 7):
             label = QLabel(f"Joint {i} Position:")
@@ -188,7 +188,7 @@ class PositionQuaternionWidget(QWidget):
         self.setStyleSheet("QLabel, QLineEdit, QPushButton { color: white; }")
 
         # Preset values
-        preset_positions = [-0.300, 0.750, 0.25]
+        preset_positions = [-0.455, -0.575, 0.29]
         preset_quaternion = [0.0, 1.0, 0.0, 0.0]
 
         # Initialize dictionaries for storing widgets
@@ -282,6 +282,7 @@ class RosSplitter(QSplitter):
         self.widget_plotter.setAcceptDrops(True)
         self.layout_plotter.addWidget(self.plotter.interactor)
         self.widget_plotter.setLayout(self.layout_plotter)
+        self.widget_plotter.setVisible(False)
 
         # SET UP WIDGET 2
         self.widget_plotter_2 = PlotterWidget()
@@ -361,9 +362,13 @@ class RosSplitter(QSplitter):
         read_layout = QVBoxLayout()
         send_layout = QVBoxLayout()
 
-        self.read_sensor_button = QPushButton("Read Sensor")
+        self.read_sensor_raw_button = QPushButton("Read Sensor Raw Data")
+        self.read_sensor_diff_button = QPushButton("Read Sensor Diff Data")
+        self.read_sensor_raw_2_button = QPushButton("Read Sensor Raw Data 2")
 
-        read_layout.addWidget(self.read_sensor_button)
+        read_layout.addWidget(self.read_sensor_raw_button)
+        read_layout.addWidget(self.read_sensor_diff_button)
+        read_layout.addWidget(self.read_sensor_raw_2_button)
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
@@ -373,9 +378,11 @@ class RosSplitter(QSplitter):
 
         # NEW SENSOR WIDGET
         self.sensor_choice = QComboBox(self.widget_func)
-        self.sensor_choice.addItem("2D")
         self.sensor_choice.addItem("elbow")
         self.sensor_choice.addItem("DualC")
+        self.sensor_choice.addItem("2D")
+        self.sensor_choice.addItem("Cylinder (FAKE)")
+
         send_layout.addWidget(self.sensor_choice)
 
         self.serial_channel = QComboBox(self.widget_func)
@@ -403,8 +410,6 @@ class RosSplitter(QSplitter):
         self.send_position_PTP_J_button = QPushButton("Send Joint Angle")
         self.send_position_PTP_T_button = QPushButton("Send Tool Position")
         self.send_script_button = QPushButton("Send Script")
-        self.enable_joint_velocity_mode_button = QPushButton("Enable Joint Velocity Mode")
-        self.stop_joint_velocity_mode_button = QPushButton("Stop Joint Velocity")
         self.show_robot_button = QPushButton("Import 3D Robot Model")
         self.continuous_read_button = QPushButton("Real-time Live 3D Robot Model", self.widget_func)
 
@@ -415,8 +420,7 @@ class RosSplitter(QSplitter):
         send_layout.addWidget(self.send_position_PTP_J_button)
         send_layout.addWidget(self.send_position_PTP_T_button)
         send_layout.addWidget(self.send_script_button)
-        send_layout.addWidget(self.enable_joint_velocity_mode_button)
-        send_layout.addWidget(self.stop_joint_velocity_mode_button)
+
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
@@ -432,14 +436,22 @@ class RosSplitter(QSplitter):
         # Button for testing
         self.plotter_visibility_button = QPushButton("Show/Hide Log Display")
         self.render_button = QPushButton("Render")
-        self.experimental_button = QPushButton("Singa Experiment 1")
-        self.experimental_2_button = QPushButton("Singa Experiment 2")
+        self.enable_joint_velocity_mode_button = QPushButton("Enable Joint Velocity Mode")
+        self.suspend_end_effector_velocity_mode_button = QPushButton("Suspend End Effector Velocity")
+        self.stop_joint_velocity_mode_button = QPushButton("Stop Joint Velocity")
+        self.enable_end_effector_velocity_mode_button = QPushButton("Enable End Effector Velocity")
+        self.stop_end_effector_velocity_mode_button = QPushButton("Stop End Effector Velocity")
+        self.stop_and_clear_buffer_button = QPushButton("Stop and Clear Buffer")
 
         # Add buttons to layout
         test_layout.addWidget(self.plotter_visibility_button)
         test_layout.addWidget(self.render_button)
-        test_layout.addWidget(self.experimental_button)
-        test_layout.addWidget(self.experimental_2_button)
+        test_layout.addWidget(self.enable_joint_velocity_mode_button)
+        test_layout.addWidget(self.stop_joint_velocity_mode_button)
+        test_layout.addWidget(self.enable_end_effector_velocity_mode_button)
+        test_layout.addWidget(self.suspend_end_effector_velocity_mode_button)
+        test_layout.addWidget(self.stop_end_effector_velocity_mode_button)
+        test_layout.addWidget(self.stop_and_clear_buffer_button)
 
         # Set layout to group
         test_group.setLayout(test_layout)
@@ -448,54 +460,104 @@ class RosSplitter(QSplitter):
         layout.addWidget(test_group)
 
     def setup_tab4(self, layout):
-        gesture_1_group = QGroupBox("Gesture 1")
-        gesture_2_group = QGroupBox("Gesture 2")
-        gesture_3_group = QGroupBox("Gesture 3")
-        gesture_4_group = QGroupBox("Gesture 4")
-        gesture_5_group = QGroupBox("Gesture 5")
-        gesture_1_layout = QVBoxLayout()
-        gesture_2_layout = QVBoxLayout()
-        gesture_3_layout = QVBoxLayout()
-        gesture_4_layout = QVBoxLayout()
-        gesture_5_layout = QVBoxLayout()
+        # Create group boxes
+        training_group = QGroupBox("Gesture")
+        testing_group = QGroupBox("Testing Operations")
 
-        # Button for AI
-        self.record_gesture_1_button = QPushButton("Record Gesture 1")
-        self.record_gesture_2_button = QPushButton("Record Gesture 2")
-        self.record_gesture_3_button = QPushButton("Record Gesture 3")
-        self.record_gesture_4_button = QPushButton("Record Gesture 4")
-        self.record_gesture_5_button = QPushButton("Record Gesture 5")
+        # Create layouts for the groups
+        gesture_layout = QHBoxLayout()
+        testing_layout = QVBoxLayout()
 
-        # Add buttons to layout
-        gesture_1_layout.addWidget(self.record_gesture_1_button)
-        gesture_2_layout.addWidget(self.record_gesture_2_button)
-        gesture_3_layout.addWidget(self.record_gesture_3_button)
-        gesture_4_layout.addWidget(self.record_gesture_4_button)
-        gesture_5_layout.addWidget(self.record_gesture_5_button)
+        # Create a label, input field, and record button
+        gesture_label = QLabel("Enter Gesture Number:")
+        self.gesture_number_input = QLineEdit()
+        self.gesture_number_input.setFixedSize(50, 30)
+        self.record_gesture_button = QPushButton("Record")
+        self.record_gesture_button.setFixedSize(100, 40)
 
-        # Set layout to group
-        gesture_1_group.setLayout(gesture_1_layout)
-        gesture_2_group.setLayout(gesture_2_layout)
-        gesture_3_group.setLayout(gesture_3_layout)
-        gesture_4_group.setLayout(gesture_4_layout)
-        gesture_5_group.setLayout(gesture_5_layout)
+        # Add widgets to the gesture layout
+        gesture_layout.addWidget(gesture_label)
+        gesture_layout.addWidget(self.gesture_number_input)
+        gesture_layout.addWidget(self.record_gesture_button)
 
-        # Add group to tab layout
-        layout.addWidget(gesture_1_group)
-        layout.addWidget(gesture_2_group)
-        layout.addWidget(gesture_3_group)
-        layout.addWidget(gesture_4_group)
-        layout.addWidget(gesture_5_group)
+        # Create the test gesture button
+        self.record_gesture_test_button = QPushButton("Record Test Gesture")
+        self.record_gesture_test_button.setFixedSize(150, 40)
+        gesture_layout.addWidget(self.record_gesture_test_button)
+
+        # Create additional testing operation buttons
+        self.predict_gesture_button = QPushButton("Predict Gesture")
+        self.update_sensor_button = QPushButton("Update Sensor")
+        self.activate_rule_based_button = QPushButton("Activate Rule Based")
+
+        # Set fixed sizes for consistency
+        for btn in [
+            self.predict_gesture_button,
+            self.update_sensor_button,
+            self.activate_rule_based_button,
+        ]:
+            btn.setFixedSize(150, 40)
+
+        # Add testing operation buttons to the testing layout
+        testing_layout.addWidget(self.predict_gesture_button)
+        testing_layout.addWidget(self.update_sensor_button)
+        testing_layout.addWidget(self.activate_rule_based_button)
+
+        # Assign layouts to their respective group boxes
+        training_group.setLayout(gesture_layout)
+        testing_group.setLayout(testing_layout)
+
+        # Add group boxes to the main layout
+        layout.addWidget(training_group)
+        layout.addWidget(testing_group)
 
     def connect_function(self):
-        self.read_sensor_button.pressed.connect(lambda: self.log_display.append(f"Sensor data: {self.sensor_api.read_raw()}"))
-        self.enable_joint_velocity_mode_button.pressed.connect(lambda: self.robot_api.send_request(self.robot_api.enable_joint_velocity_mode()))
-        self.stop_joint_velocity_mode_button.pressed.connect(lambda: self.robot_api.send_request(self.robot_api.stop_joint_velocity_mode()))
-        self.send_script_button.pressed.connect(lambda: self.robot_api.send_and_process_request([0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
-        self.read_joint_angle_button.pressed.connect(lambda: self.log_display.append(f"Joint Angles: {self.robot_api.get_current_positions()}"))
-        self.read_tool_position_button.pressed.connect(lambda: self.log_display.append(f"Tool Position: {self.robot_api.get_current_tool_position()[0]}, Orientation: {self.robot_api.get_current_tool_position()[1]}"))
-        self.send_position_PTP_J_button.pressed.connect(self.position_entry_widget.toggle_visibility)
-        self.send_position_PTP_T_button.pressed.connect(self.position_quaternion_widget.toggle_visibility)
+        # Existing button connections
+        self.read_sensor_raw_button.pressed.connect(
+            lambda: self.log_display.append(f"Sensor raw data: {self.sensor_api.read_raw()}")
+        )
+        self.read_sensor_diff_button.pressed.connect(
+            lambda: self.log_display.append(f"Sensor diff data: {self.sensor_functions.read_sensor_diff_data()}")
+        )
+        self.read_sensor_raw_2_button.pressed.connect(
+            lambda: self.log_display.append(f"Sensor raw data 2: {self.sensor_functions.read_sensor_raw_data()}")
+        )
+        self.enable_joint_velocity_mode_button.pressed.connect(
+            lambda: self.robot_api.send_request(self.robot_api.enable_joint_velocity_mode())
+        )
+        self.stop_joint_velocity_mode_button.pressed.connect(
+            lambda: self.robot_api.send_request(self.robot_api.stop_joint_velocity_mode())
+        )
+        self.enable_end_effector_velocity_mode_button.pressed.connect(
+            lambda: self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
+        )
+        self.suspend_end_effector_velocity_mode_button.pressed.connect(
+            lambda: self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+        )
+        self.stop_end_effector_velocity_mode_button.pressed.connect(
+            lambda: self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
+        )
+        self.stop_and_clear_buffer_button.pressed.connect(
+            lambda: self.robot_api.send_request(self.robot_api.stop_and_clear_buffer())
+        )
+        self.send_script_button.pressed.connect(
+            lambda: self.robot_api.send_and_process_request([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        )
+        self.read_joint_angle_button.pressed.connect(
+            lambda: self.log_display.append(f"Joint Angles: {self.robot_api.get_current_positions()}")
+        )
+        self.read_tool_position_button.pressed.connect(
+            lambda: self.log_display.append(
+                f"Tool Position: {self.robot_api.get_current_tool_position()[0]}, "
+                f"Orientation: {self.robot_api.get_current_tool_position()[1]}"
+            )
+        )
+        self.send_position_PTP_J_button.pressed.connect(
+            self.position_entry_widget.toggle_visibility
+        )
+        self.send_position_PTP_T_button.pressed.connect(
+            self.position_quaternion_widget.toggle_visibility
+        )
         self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
         self.plotter_visibility_button.pressed.connect(self.toggle_plotter_visibility)
         self.render_button.pressed.connect(lambda: self.plotter.render())
@@ -504,13 +566,34 @@ class RosSplitter(QSplitter):
         self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
         self.sensor_start.pressed.connect(lambda: self.sensor_functions.startSensor())
         self.sensor_update.pressed.connect(lambda: self.sensor_functions.updateCal())
-        self.experimental_button.pressed.connect(lambda: self.sensor_functions.experiment())
-        self.experimental_2_button.pressed.connect(lambda: self.sensor_functions.experiment_2())
-        self.record_gesture_1_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(1))
-        self.record_gesture_2_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(2))
-        self.record_gesture_3_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(3))
-        self.record_gesture_4_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(4))
-        self.record_gesture_5_button.pressed.connect(lambda: self.sensor_functions.start_record_gesture(5))
+
+        # Connect the record gesture button
+        self.record_gesture_button.pressed.connect(self.start_record_gesture)
+
+        # Connect the test gesture button separately
+        self.record_gesture_test_button.pressed.connect(
+            lambda: self.sensor_functions.start_record_gesture("test")
+        )
+
+        # Connect testing operation buttons
+        self.predict_gesture_button.pressed.connect(
+            lambda: self.sensor_functions.toggle_gesture_recognition()
+        )
+        self.update_sensor_button.pressed.connect(
+            lambda: self.sensor_functions.updateCal()
+        )
+        self.activate_rule_based_button.pressed.connect(
+            lambda: self.sensor_functions.activate_rule_based()
+        )
+
+    def start_record_gesture(self):
+        gesture_number_str = self.gesture_number_input.text()
+        try:
+            gesture_number = int(gesture_number_str)
+            self.sensor_functions.start_record_gesture(gesture_number)
+        except ValueError:
+            # Handle invalid input
+            self.log_display.append("Invalid gesture number. Please enter an integer.")
 
     def toggle_continuous_read(self):
         if self.read_timer.isActive():
