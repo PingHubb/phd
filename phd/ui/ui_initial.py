@@ -23,7 +23,7 @@ class MyMainWindow(MainWindow):
 
         self.connectFunction()
         
-        style_file = '/home/ping2/ros2_ws/src/phd/phd/stylesheets/ui_style.qss'
+        style_file = '/home/ping2/ros2_ws/src/phd/phd/resource/stylesheets/ui_style.qss'
         with open(style_file, 'r',  encoding='UTF-8') as file:
             self.style_sheet = file.read()
         self.setObjectName("windowMain")

@@ -126,7 +126,7 @@ class MyMainWindow(MainWindow):
         self.setMinimumSize(192*5, 108*5)
         self.resize(192*8, 108*8)
         self.setWindowIcon(QIcon('./resource/logo0.png'))
-        style_file = './stylesheets/ui_style.qss'
+        style_file = '/home/ping2/ros2_ws/src/phd/phd/resource/stylesheets/ui_style.qss'
         with open(style_file, 'r',  encoding='UTF-8') as file:
             self.style_sheet = file.read()
         self.setObjectName("windowMain")

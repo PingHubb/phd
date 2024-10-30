@@ -6,7 +6,7 @@ from pyvistaqt import QtInteractor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
 from phd.dependence.func_meshLab import MyMeshLab
-from phd.dependence.func_sensor import MySensor
+from phd.dependence.func_sensor import MySensor, LSTM
 
 
 class PlotterWidget(QWidget):
@@ -575,22 +575,21 @@ class RosSplitter(QSplitter):
             lambda: self.sensor_functions.start_record_gesture("test")
         )
 
-        # Connect testing operation buttons
         self.predict_gesture_button.pressed.connect(
-            lambda: self.sensor_functions.toggle_gesture_recognition()
+            lambda: self.sensor_functions.lstm_class.toggle_gesture_recognition()
         )
         self.update_sensor_button.pressed.connect(
             lambda: self.sensor_functions.updateCal()
         )
         self.activate_rule_based_button.pressed.connect(
-            lambda: self.sensor_functions.activate_rule_based()
+            lambda: self.sensor_functions.rule_based_class.activate_rule_based()
         )
 
     def start_record_gesture(self):
         gesture_number_str = self.gesture_number_input.text()
         try:
             gesture_number = int(gesture_number_str)
-            self.sensor_functions.start_record_gesture(gesture_number)
+            self.sensor_functions.record_gesture_class.start_record_gesture(gesture_number)
         except ValueError:
             # Handle invalid input
             self.log_display.append("Invalid gesture number. Please enter an integer.")

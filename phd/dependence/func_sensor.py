@@ -115,8 +115,9 @@ class GestureCNNLSTM(nn.Module):
         return logits
 
 
-class MySensor():
+class MySensor:
     def __init__(self, parent) -> None:
+        print("Initializing MySensor...")
         self.parent = parent
         self.plotter: QtInteractor = self.parent.plotter_2
         self.listModel = []
@@ -125,83 +126,15 @@ class MySensor():
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
         self.timer.start(0)
-        self.timer_2 = QTimer()
-        self.timer_2.timeout.connect(self.handle_timer)
-        self.timer_2.start(0)
         self.frame_count = 0
         self.last_time = time.time()
         self.is_connected = False
         self.initChannel()
-        self.startSensor_pressed = False
-        self.found_finger_timer = None
-        self.cell_cooldowns = {}  # Stores cooldown times for cells
-        self.counter = 0
-        self.saved_row = None
-        self.saved_col = None
-        self.saved_value = None
-        self.initial_message = ""
-        self.reset_gesture_state()
-        self.initial_cell = None
-        self.four_fingers_detected = True
-        self.last_large_detection_time = None  # Timestamp for last large detection (>20 fingers)
-        # Initialize additional attributes for recording
-        self.timer_record_gesture = QTimer()
-        self.timer_record_gesture.timeout.connect(self.record_gesture)
-        self.is_recording = False
-        self.current_gesture_data = []
-        self.current_gesture_data_diff = []
-        self.trial_number = None
-        self.gesture_number = None
-        self.start_record_pressed = False
-        self.activate_rule_button = False
-        # Test gesture
-        self.last_prediction = None
-        self.movement_x = 0.0
-        self.movement_y = 0.0
-        self.movement_z = 0.0
-        self.rotation_x = 0.0
-        self.rotation_y = 0.0
-        self.rotation_z = 0.0
-        self.is_predicting = False
-        self.parse_parameters_and_initialize_model()
-        self.prediction_counter = 0  # Counter to control prediction frequency
-        self.prediction_interval = 5  # Predict every 5 data points (adjust as needed)
-        self.window_size = 50  # Adjust based on your needs
-        self.current_predict_data = []
-        self.minimum_sequence_length = 5  # Adjust based on experimentation
-
-    def parse_parameters_and_initialize_model(self):
-        try:
-            self.gesture_data_file_path = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/gesture_data.txt'
-            self.model_txt_path = '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_4.txt'
-            self.model_path = '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_4.pth'
-            parameters = self.parse_parameters_from_file(self.model_txt_path)
-            self.hidden_dim = parameters.get('hidden_dim', 80)
-            self.output_dim = parameters.get('output_dim', 8)
-            self.epochs = parameters.get('epochs', 100)
-            self.batch_size = parameters.get('batch_size', 32)
-            self.k_folds = parameters.get('k_folds', 5)
-            self.num_layers = parameters.get('num_layers', 1)
-            self.learning_rate = parameters.get('learning_rate', 0.01)
-            self.dropout_rate = parameters.get('dropout_rate', 0.5)
-            self.input_size = parameters.get('input_size', 130)
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.triggerd_value = -1
-            self.is_recognizing_gesture = False
-            self.recognition_timer = QTimer()
-            self.recognition_timer.timeout.connect(self.start_gesture_recognition)
-            self.current_predict_data = []
-            self.prediction_counter = 0  # Initialize counter
-
-            # Initialize the model
-            self.model = GestureCNNLSTM(self.input_size, self.hidden_dim, self.output_dim,
-                                        num_layers=self.num_layers,
-                                        dropout_rate=self.dropout_rate).to(self.device)
-            self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
-            self.model.eval()
-        except Exception as e:
-            print(f'Error loading gesture recognition models: {e}')
-            self.model = None
+        # Initialize other classes instance
+        self.lstm_class = LSTM(self.parent, self)
+        self.rule_based_class = RuleBased(self.parent, self)
+        self.record_gesture_class = RecordGesture(self)
+        print("Finished Initializing all classes...")
 
     def saveCameraPara(self):
         self.camera_pos = self.plotter.camera.position
@@ -636,7 +569,6 @@ class MySensor():
             self._data.getWin(i)
         self.is_connected = True
         self.parent.sensor_update.setDisabled(False)
-        self.startSensor_pressed = True
 
     def updateCal(self):
         self.is_connected = False
@@ -713,80 +645,14 @@ class MySensor():
             self._2D_map.point_data.set_scalars(self.colors)
             self.plotter.render()
 
-        # 计算帧率
-        current_time = time.time()
-        self.frame_count += 1
-        if current_time - self.last_time >= 0.1:
-            fps = self.frame_count / (current_time - self.last_time)
-            # self.message(f"FPS: {fps:.2f}")
-            self.last_time = current_time
-            self.frame_count = 0
-
-        # # My function to get the gesture
-        if self.startSensor_pressed is True:
-            self.gesture_recognition()
-
-            # # Assuming diffPerDataAve_Reverse is already defined
-            # diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
-            #
-            # # Define conditions for each threshold, now going up to -4
-            # conditions = [
-            #     diffPerDataAve_Reverse > 2,  # Values greater than 2
-            #     diffPerDataAve_Reverse < -4,  # Values less than -4
-            #     diffPerDataAve_Reverse < -3.9,
-            #     diffPerDataAve_Reverse < -3.8,
-            #     diffPerDataAve_Reverse < -3.7,
-            #     diffPerDataAve_Reverse < -3.6,
-            #     diffPerDataAve_Reverse < -3.5,
-            #     diffPerDataAve_Reverse < -3.4,
-            #     diffPerDataAve_Reverse < -3.3,
-            #     diffPerDataAve_Reverse < -3.2,
-            #     diffPerDataAve_Reverse < -3.1,
-            #     diffPerDataAve_Reverse < -3.0,
-            #     diffPerDataAve_Reverse < -2.9,
-            #     diffPerDataAve_Reverse < -2.8,
-            #     diffPerDataAve_Reverse < -2.7,
-            #     diffPerDataAve_Reverse < -2.6,
-            #     diffPerDataAve_Reverse < -2.5,
-            #     diffPerDataAve_Reverse < -2.4,
-            #     diffPerDataAve_Reverse < -2.3,
-            #     diffPerDataAve_Reverse < -2.2,
-            #     diffPerDataAve_Reverse < -2.1,
-            #     diffPerDataAve_Reverse < -2.0,
-            #     diffPerDataAve_Reverse < -1.9,
-            #     diffPerDataAve_Reverse < -1.8,
-            #     diffPerDataAve_Reverse < -1.7,
-            #     diffPerDataAve_Reverse < -1.6,
-            #     diffPerDataAve_Reverse < -1.5,
-            #     diffPerDataAve_Reverse < -1.4,
-            #     diffPerDataAve_Reverse < -1.3,
-            #     diffPerDataAve_Reverse < -1.2,
-            #     diffPerDataAve_Reverse < -1.1,
-            #     diffPerDataAve_Reverse < -1.0,
-            #     diffPerDataAve_Reverse < -0.9,
-            #     diffPerDataAve_Reverse < -0.8,
-            #     diffPerDataAve_Reverse < -0.7,
-            #     diffPerDataAve_Reverse < -0.6,
-            #     diffPerDataAve_Reverse < -0.2,
-            #     diffPerDataAve_Reverse >= -0.5  # Catch the rest (between -0.5 and 2)
-            # ]
-            #
-            # # Define corresponding output values for each condition, matching the conditions
-            # choices = [
-            #     88,  # Corresponding to values > 2
-            #     -4,  # Corresponding to values < -4
-            #     -3.9, -3.8, -3.7, -3.6, -3.5, -3.4, -3.3, -3.2, -3.1,
-            #     -3.0, -2.9, -2.8, -2.7, -2.6, -2.5, -2.4, -2.3, -2.2, -2.1,
-            #     -2.0, -1.9, -1.8, -1.7, -1.6, -1.5, -1.4, -1.3, -1.2, -1.1,
-            #     -1.0, -0.9, -0.8, -0.7, -0.6, -0.2, 0  # Values >= -0.5 and <= 2
-            # ]
-            #
-            # # Apply conditions to the array
-            # transformed_data = np.select(conditions, choices)
-            #
-            # print(transformed_data)
-
-            pass
+        # # Calculate the FPS
+        # current_time = time.time()
+        # self.frame_count += 1
+        # if current_time - self.last_time >= 0.1:
+        #     fps = self.frame_count / (current_time - self.last_time)
+        #     # self.message(f"FPS: {fps:.2f}")
+        #     self.last_time = current_time
+        #     self.frame_count = 0
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:
@@ -819,21 +685,141 @@ class MySensor():
         rawDataAve = self._data.rawDataAve.T.flatten()
         return rawDataAve
 
+
+class RecordGesture:
+    def __init__(self, my_sensor_instance):
+        self.my_sensor = my_sensor_instance
+        # Initialize additional attributes for recording
+        self.timer_record_gesture = QTimer()
+        self.timer_record_gesture.timeout.connect(self.record_gesture)
+        self.is_recording = False
+        self.current_gesture_data = []
+        self.current_gesture_data_diff = []
+        self.trial_number = None
+        self.gesture_number = None
+        self.triggerd_value = -1
+        self.start_record_pressed = False
+
+
+    def start_record_gesture(self, gesture_number):
+        if not self.start_record_pressed:
+            # Convert gesture_number to string for consistent handling
+            gesture_number = str(gesture_number)
+
+            # Start the recording
+            self.start_record_pressed = True
+            self.gesture_number = gesture_number
+            self.trial_number = self.get_next_trial_number(gesture_number)
+            self.current_gesture_data_diff = []
+            self.timer_record_gesture.start(0)
+            print(f"Recording started for gesture {gesture_number}, trial {self.trial_number}.")
+        else:
+            # Stop the recording
+            self.timer_record_gesture.stop()
+            self.start_record_pressed = False
+            self.current_gesture_data_diff = []
+            print("Recording stopped.")
+
+    def record_gesture(self):
+        diffPerDataAve_Reverse = self.my_sensor._data.diffPerDataAve.T.flatten()
+
+        # Transform the values: set values < -1 to 1 and others to 0
+        transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
+
+        # Define conditions for each threshold
+        conditions = [
+            diffPerDataAve_Reverse > 2,  # Values greater than 2
+            diffPerDataAve_Reverse < -1,
+            diffPerDataAve_Reverse < -0.2,
+            diffPerDataAve_Reverse >= -0.2  # Catch the rest (between -0.2 and 2)
+        ]
+        choices = [2, 1, 0.2, 0]
+        transformed_data = np.select(conditions, choices)
+        transformed_data = np.where(transformed_data == 0.0, 0, transformed_data)
+
+        # Check for the condition to start recording
+        if not self.is_recording and np.any(transformed_data == 0.2):
+            self.is_recording = True
+            self.current_gesture_data_diff = []
+            print(f"Started recording Gesture {self.gesture_number}, Trial {self.trial_number}.")
+
+        # Append data to the current recording if we are in a recording state
+        if self.is_recording:
+            self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
+
+        # Check for the condition to stop recording
+        if self.is_recording and np.all(transformed_data == 0):
+            self.is_recording = False
+            self.save_gesture_data()
+            self.my_sensor.updateCal()
+            print(f"Stopped recording Gesture {self.gesture_number}, Trial {self.trial_number}. Data saved.")
+            self.trial_number += 1  # Prepare for the next trial
+
+    def get_next_trial_number(self, gesture_number):
+        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{gesture_number}"
+
+        if not os.path.exists(gesture_diff_dir):
+            os.makedirs(gesture_diff_dir)
+        files = os.listdir(gesture_diff_dir)
+        return len(files) + 1
+
+    def save_gesture_data(self):
+        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{self.gesture_number}"
+
+        filename = os.path.join(gesture_diff_dir, f"{self.trial_number}.txt")
+        with open(filename, 'w') as file:
+            for data_entry in self.current_gesture_data_diff:
+                file.write(' '.join(map(str, data_entry)) + "\n")
+
+        self.current_gesture_data_diff = []
+
+
+class RuleBased:
+    def __init__(self, ros_splitter_instance, my_sensor_instance):
+        self.ros_splitter = ros_splitter_instance
+        self.my_sensor = my_sensor_instance
+        # Initialize attributes that were previously in MySensor
+        self.reset_gesture_state()
+        self.activate_rule_button = False
+        self.initial_cells = []
+        self.initial_cell = None
+        self.four_fingers_detected = True
+        self.last_large_detection_time = None
+        self.found_finger_timer = None
+        self.cell_cooldowns = {}
+        self.saved_row = None
+        self.saved_col = None
+        self.saved_value = None
+        self.consecutive_moves = 0
+        self.movement_direction = None
+        self.last_joint_1_movement = 0.0
+        self.last_joint_3_movement = 0.0
+        self.initial_message = ""
+        # Initialize the timer
+        self.timer_2 = QTimer()
+        self.timer_2.timeout.connect(self.handle_timer)
+        # Initialize the gesture recognition timer
+        self.gesture_timer = QTimer()
+        self.gesture_timer.timeout.connect(self.gesture_recognition)
+
     def activate_rule_based(self):
         self.activate_rule_button = not self.activate_rule_button
         if self.activate_rule_button:
             print("Activate Rule-Based")
+            # Start the gesture recognition timer with an interval (e.g., 50 ms)
+            self.gesture_timer.start(0)  # Adjust the interval as needed
         else:
             print("Deactivate Rule-Based")
+            # Stop the gesture recognition timer
+            self.gesture_timer.stop()
 
     def gesture_recognition(self):
-
         if self.activate_rule_button is True:
-            diffPerDataAve_Reverse = self._data.diffPerDataAve.T
+            diffPerDataAve_Reverse = self.my_sensor._data.diffPerDataAve.T
             detected_fingers = 0
 
-            for i in range(self.n_col):
-                for j in range(self.n_row):
+            for i in range(self.my_sensor.n_col):
+                for j in range(self.my_sensor.n_row):
                     if self.check_cooldown(i, j):
                         continue
                     current_value = diffPerDataAve_Reverse[i][j]
@@ -847,9 +833,9 @@ class MySensor():
             if detected_fingers > 20:
                 self.four_fingers_detected = False
                 # print("10+ fingers are detected")
-                self.parent.robot_api.send_request("StopContinueVmode()")
-                self.parent.robot_api.send_request("StopAndClearBuffer()")
-                self.parent.robot_api.send_and_process_request([1.0, -0.49, 1.57, 0.48, 1.57, 0.0])
+                self.ros_splitter.robot_api.send_request("StopContinueVmode()")
+                self.ros_splitter.robot_api.send_request("StopAndClearBuffer()")
+                self.ros_splitter.robot_api.send_and_process_request([1.0, -0.49, 1.57, 0.48, 1.57, 0.0])
                 self.last_large_detection_time = time.time()  # Set the timestamp when more than 20 fingers are detected
 
             # Check the time since last large detection
@@ -892,7 +878,7 @@ class MySensor():
 
         current_time = time.time()
         elapsed_time = current_time - self.found_finger_timer
-        current_value = self._data.diffPerDataAve.T[self.saved_row][self.saved_col]
+        current_value = self.my_sensor._data.diffPerDataAve.T[self.saved_row][self.saved_col]
 
         if current_value > -1:
             self.timer_2.stop()
@@ -911,7 +897,7 @@ class MySensor():
         self.consecutive_moves = 0
         self.last_joint_1_movement = 0.0
         self.last_joint_3_movement = 0.0
-        self.parent.robot_api.send_request("SuspendContinueVmode()")
+        self.ros_splitter.robot_api.send_request("SuspendContinueVmode()")
 
     def check_adjacent_cells(self):
         # Calculate bounds of initial touch area
@@ -934,7 +920,7 @@ class MySensor():
         if 0 <= row < 13 and 0 <= col < 10:
             if self.check_cooldown(row, col):
                 return  # Skip if the cell is cooling down
-            adjacent_value = self._data.diffPerDataAve.T[row][col]
+            adjacent_value = self.my_sensor._data.diffPerDataAve.T[row][col]
             if adjacent_value < -1:
                 move_direction = 'right' if direction == "right" else 'left' if direction in ["left", "right"] else None
                 if move_direction and (move_direction == self.movement_direction or not self.movement_direction):
@@ -949,7 +935,7 @@ class MySensor():
                     #     flush=True)
 
                 self.switch_focus(row, col, adjacent_value)
-                if hasattr(self.parent, 'robot_api'):
+                if hasattr(self.ros_splitter, 'robot_api'):
                     movement_factor = 0.05 * self.consecutive_moves
                     if direction in ["left", "right"]:
                         x_movement = -movement_factor if direction == "left" else movement_factor
@@ -958,7 +944,7 @@ class MySensor():
                         z_movement = -movement_factor if direction == "up" else movement_factor
                         self.last_joint_3_movement = z_movement
                     # Send the combined movement command
-                    self.parent.robot_api.combined_end_effector_velocity(
+                    self.ros_splitter.robot_api.combined_end_effector_velocity(
                         [self.last_joint_1_movement, 0.0, self.last_joint_3_movement, 0.0, 0.0, 0.0])
 
     def switch_focus(self, row, col, value):
@@ -968,78 +954,97 @@ class MySensor():
         self.found_finger_timer = time.time()
         self.timer_2.start(0)
 
-    def start_record_gesture(self, gesture_number):
-        if not self.start_record_pressed:
-            # Convert gesture_number to string for consistent handling
-            gesture_number = str(gesture_number)
 
-            # Start the recording
-            self.start_record_pressed = True
-            self.gesture_number = gesture_number
-            self.trial_number = self.get_next_trial_number(gesture_number)
-            self.current_gesture_data_diff = []
-            self.timer_record_gesture.start(0)
-            print(f"Recording started for gesture {gesture_number}, trial {self.trial_number}.")
-        else:
-            # Stop the recording
-            self.timer_record_gesture.stop()
-            self.start_record_pressed = False
-            self.current_gesture_data_diff = []
-            print("Recording stopped.")
+class LSTM:
+    def __init__(self, ros_splitter_instance, my_sensor_instance):
+        self.ros_splitter = ros_splitter_instance
+        self.my_sensor = my_sensor_instance
+        # Rest of your initialization code
+        self.last_prediction = None
+        self.movement_x = 0.0
+        self.movement_y = 0.0
+        self.movement_z = 0.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.rotation_z = 0.0
+        self.prediction_counter = 0
+        self.window_size = 50
+        self.minimum_sequence_length = 5
+        self.triggerd_value = -1
+        self.is_recognizing_gesture = False
+        self.recognition_timer = QTimer()
+        self.recognition_timer.timeout.connect(self.start_gesture_recognition)
+        self.current_predict_data = []
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.touching = False  # Add this line
 
-    def record_gesture(self):
-        diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
+        # Define model paths and parameters
+        self.model_paths = {
+            'model1': {
+                'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/0_1_2_3_8_9_6_7_11/best_model_9.txt',
+                'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/0_1_2_3_8_9_6_7_11/best_model_9.pth'
+                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model(0-14_binary_15-16_floating).txt',
+                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model(0-14_binary_15-16_floating).pth'
 
-        # Transform the values: set values < -1 to 1 and others to 0
+            },
+            'model2': {
+                'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/15_16_17/best_model_21.txt',
+                'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/15_16_17/best_model_21.pth'
+                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_proximity(0-3,15,16).txt',
+                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_proximity(0-3,15,16).pth'
+            }
+        }
+
+        # Define transformation functions
+        self.transformation_functions = {
+            'model1': self.transformation_function_model1,
+            'model2': self.transformation_function_model2,
+        }
+
+        self.current_model_name = 'model1'
+        self.load_model(self.current_model_name)
+
+    def load_model(self, model_name):
+        try:
+            paths = self.model_paths[model_name]
+            model_txt_path = paths['model_txt_path']
+            model_path = paths['model_path']
+            parameters = self.parse_parameters_from_file(model_txt_path)
+            self.hidden_dim = parameters.get('hidden_dim', 80)
+            self.output_dim = parameters.get('output_dim', 8)
+            print(f"Loaded {model_name} with {self.output_dim} classes.")
+            self.epochs = parameters.get('epochs', 100)
+            self.batch_size = parameters.get('batch_size', 32)
+            self.k_folds = parameters.get('k_folds', 5)
+            self.num_layers = parameters.get('num_layers', 1)
+            self.learning_rate = parameters.get('learning_rate', 0.01)
+            self.dropout_rate = parameters.get('dropout_rate', 0.5)
+            self.input_size = parameters.get('input_size', 130)
+
+            # Initialize the model
+            self.model = GestureCNNLSTM(
+                self.input_size, self.hidden_dim, self.output_dim,
+                num_layers=self.num_layers,
+                dropout_rate=self.dropout_rate
+            ).to(self.device)
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            self.model.eval()
+            self.current_transformation = self.transformation_functions[model_name]
+            self.current_model_name = model_name
+            print(f"Model {model_name} loaded.")
+        except Exception as e:
+            print(f'Error loading gesture recognition model {model_name}: {e}')
+            self.model = None
+
+    def transformation_function_model1(self, diffPerDataAve_Reverse):
         transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
+        return transformed_data
 
-
-        # Define conditions for each threshold
-        conditions = [
-            diffPerDataAve_Reverse > 2,  # Values greater than 2
-            diffPerDataAve_Reverse < -1,
-            diffPerDataAve_Reverse < -0.2,
-            diffPerDataAve_Reverse >= -0.2  # Catch the rest (between -0.2 and 2)
-        ]
-        choices = [2, 1, 0.2, 0]
-        transformed_data = np.select(conditions, choices)
-        transformed_data = np.where(transformed_data == 0.0, 0, transformed_data)
-
-        # Check for the condition to start recording
-        if not self.is_recording and np.any(transformed_data == 0.2):
-            self.is_recording = True
-            self.current_gesture_data_diff = []
-            print(f"Started recording Gesture {self.gesture_number}, Trial {self.trial_number}.")
-
-        # Append data to the current recording if we are in a recording state
-        if self.is_recording:
-            self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
-
-        # Check for the condition to stop recording
-        if self.is_recording and np.all(transformed_data == 0):
-            self.is_recording = False
-            self.save_gesture_data()
-            self.updateCal()
-            print(f"Stopped recording Gesture {self.gesture_number}, Trial {self.trial_number}. Data saved.")
-            self.trial_number += 1  # Prepare for the next trial
-
-    def get_next_trial_number(self, gesture_number):
-        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{gesture_number}"
-
-        if not os.path.exists(gesture_diff_dir):
-            os.makedirs(gesture_diff_dir)
-        files = os.listdir(gesture_diff_dir)
-        return len(files) + 1
-
-    def save_gesture_data(self):
-        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{self.gesture_number}"
-
-        filename = os.path.join(gesture_diff_dir, f"{self.trial_number}.txt")
-        with open(filename, 'w') as file:
-            for data_entry in self.current_gesture_data_diff:
-                file.write(' '.join(map(str, data_entry)) + "\n")
-
-        self.current_gesture_data_diff = []
+    def transformation_function_model2(self, diffPerDataAve_Reverse):
+        transformed_data = np.where(diffPerDataAve_Reverse > 2, 2,
+                                    np.where(diffPerDataAve_Reverse < -1, 1,
+                                             np.where(diffPerDataAve_Reverse < -0.2, 0.2, 0)))
+        return transformed_data
 
     def toggle_gesture_recognition(self):
         """Toggle the real-time gesture recognition process."""
@@ -1048,55 +1053,75 @@ class MySensor():
             self.recognition_timer.start(0)
             print("Gesture recognition started.")
             self.current_predict_data = []  # Reset the data at the start
-            self.parent.robot_api.send_request(self.parent.robot_api.enable_end_effector_velocity_mode())
+            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
         else:
             self.recognition_timer.stop()
             self.is_recognizing_gesture = False
-            self.parent.robot_api.send_request(self.parent.robot_api.stop_end_effector_velocity_mode())
+            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
             self.current_predict_data = []  # Reset after saving and prediction
             print("Gesture recognition stopped.")
 
     def start_gesture_recognition(self):
-        """Handle the real-time recording and continuous prediction of gestures."""
-        diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
-        transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
+        diffPerDataAve_Reverse = self.my_sensor._data.diffPerDataAve.T.flatten()
+        transformed_data = self.current_transformation(diffPerDataAve_Reverse)
 
-        # Check if finger is touching the sensor
-        if np.any(transformed_data == 1):
+        touching_now = np.any(transformed_data > 0)
+
+        if touching_now and not self.touching:
+            # Touch has just started
+            self.touching = True
+            self.current_predict_data = []  # Reset data collected
+            self.touch_start_time = time.time()  # Record touch start time if needed
+        elif not touching_now and self.touching:
+            # Touch has just ended
+            self.touching = False
+            if self.current_predict_data:
+                print("Finger lifted")
+
+                if self.current_model_name == 'model2':
+                    # For model2, now make the prediction
+                    if len(self.current_predict_data) >= self.minimum_sequence_length:
+                        self.predict_gesture(self.current_predict_data)
+                    else:
+                        print("Not enough data to make a prediction for model2.")
+                    # Reset movement variables
+                    self.reset_movement_variables()
+                    self.ros_splitter.robot_api.send_request(
+                        self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
+                elif self.current_model_name == 'model1':
+                    # For model1, reset variables if needed
+                    self.reset_movement_variables()
+                    self.ros_splitter.robot_api.send_request(
+                        self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
+                    # No need to predict again
+
+            # Reset variables
+            self.current_predict_data = []
+            self.prediction_counter = 0
+            self.last_prediction = None  # Reset the last prediction when finger is lifted
+        elif touching_now:
+            # Touch is continuing
             self.current_predict_data.append(transformed_data.tolist())
 
             # Ensure the data buffer does not exceed the window size
             if len(self.current_predict_data) > self.window_size:
                 self.current_predict_data.pop(0)
 
-            # Only start making predictions after minimum sequence length
-            if len(self.current_predict_data) >= self.minimum_sequence_length:
-                # Predict every time new data comes in
-                self.predict_gesture(self.current_predict_data)
-
-                # Optionally, you can clear the data to use only recent samples
-                # self.current_predict_data = []
+            if self.current_model_name == 'model1':
+                # For model1, only start predicting after 5 data frames collected since touch started
+                if len(self.current_predict_data) >= self.minimum_sequence_length:
+                    self.predict_gesture(self.current_predict_data)
+                else:
+                    # Not enough data collected yet, wait
+                    pass
+            else:
+                # For model2, do not predict yet
+                pass
         else:
-            # Finger is lifted; reset data and counter
-            if self.current_predict_data:
-                # Optionally, make a final prediction with the accumulated data
-                # print("Finger lifted; making final prediction.")
-                self.predict_gesture(self.current_predict_data)
-                self.movement_x = 0.0
-                self.movement_y = 0.0
-                self.movement_z = 0.0
-                self.rotation_x = 0.0
-                self.rotation_y = 0.0
-                self.rotation_z = 0.0
-                self.parent.robot_api.send_request(self.parent.robot_api.suspend_end_effector_velocity_mode())
-
-            self.current_predict_data = []
-            self.prediction_counter = 0
-            self.last_prediction = None  # Reset the last prediction when finger is lifted
+            # Not touching, and touch has not just ended
+            pass
 
     def predict_gesture(self, gesture_data):
-        """Predict the gesture from processed data."""
-        # gesture_data is a list of lists
         # Convert to numpy array
         gesture_data = np.array(gesture_data, dtype=np.float32)
         seq_length, input_size = gesture_data.shape
@@ -1106,7 +1131,7 @@ class MySensor():
             print(f"Input size mismatch: expected {self.input_size}, got {input_size}")
             return
 
-        # Reshape data to match model input shape (batch_size, seq_length, input_size)
+        # Reshape data to match model input shape
         gesture_data = gesture_data.reshape(1, seq_length, input_size)
 
         # Convert to tensor
@@ -1127,86 +1152,118 @@ class MySensor():
             pred = predicted.item()
             confidence = max_prob.item()
 
-            # Set a confidence threshold
-            confidence_threshold = 0.6  # Adjust this value based on your requirements
-            if confidence < confidence_threshold:
-                print(f"Low confidence ({confidence:.2f}) for {pred}, prediction ignored.")
-                return
+        # Call the appropriate handler based on the current model
+        if self.current_model_name == 'model1':
+            self.handle_prediction_model1(pred, confidence)
+        elif self.current_model_name == 'model2':
+            self.handle_prediction_model2(pred, confidence)
+        else:
+            print(f"Unknown model {self.current_model_name}")
 
-            # Check if prediction is the same as the last
-            if pred == self.last_prediction:
-                # print("Prediction unchanged, no command sent.")
-                return
-            else:
-                self.last_prediction = pred  # Update the last prediction
+    def handle_prediction_model1(self, pred, confidence):
+        # Set a confidence threshold
+        confidence_threshold = 0.8
+        if confidence < confidence_threshold:
+            print(f"Low confidence ({confidence:.2f}) for {pred}, prediction ignored.")
+            return
 
-            # Proceed with handling the new prediction
-            # Reset movement variables
-            self.movement_x = 0.0
-            self.movement_y = 0.0
-            self.movement_z = 0.0
-            self.rotation_x = 0.0
-            self.rotation_y = 0.0
-            self.rotation_z = 0.0
+        # Check if prediction is the same as the last
+        if pred == self.last_prediction:
+            return
+        else:
+            self.last_prediction = pred
 
-            if pred == 0:
-                print("Predicted Gesture (0): <---- ")
-                self.movement_y = -0.1
-            elif pred == 1:
-                print("Predicted Gesture (1): ----> ")
-                self.movement_y = 0.1
-            elif pred == 2:
-                print("Predicted Gesture (2): v ")
-                self.movement_z = -0.1
-            elif pred == 3:
-                print("Predicted Gesture (3): ^ ")
-                self.movement_z = 0.1
-            elif pred == 4:
-                print("Predicted Gesture (4): <<---- ")
-                # Define action for gesture 4 if needed
-            elif pred == 5:
-                print("Predicted Gesture (5): ---->> ")
-                # Define action for gesture 5 if needed
-            elif pred == 6:
-                print("Predicted Gesture (6): vv ")
-                self.movement_x = -0.1
-            elif pred == 7:
-                print("Predicted Gesture (7): ^^ ")
-                self.movement_x = 0.1
-            elif pred == 8:
-                print("Predicted Gesture (8): ..<---- ")
-            elif pred == 9:
-                print("Predicted Gesture (9): ---->.. ")
-            elif pred == 10:
-                print("Predicted Gesture (10): ZOOM IN ")
-                self.parent.robot_api.send_request(self.parent.robot_api.stop_end_effector_velocity_mode())
-                self.parent.robot_api.send_and_process_request([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-            elif pred == 11:
-                print("Predicted Gesture (11): ZOOM OUT ")
-                self.parent.robot_api.send_request(self.parent.robot_api.stop_end_effector_velocity_mode())
-                # self.parent.robot_api.send_and_process_request([1.0, 0.0, 1.57, 0.0, 1.57, 0.0])
-                self.parent.robot_api.send_and_process_request([-0.3, -0.7, 1.8, 0.5, 1.6, -1.3])
-                self.parent.robot_api.send_request(self.parent.robot_api.enable_end_effector_velocity_mode())
-            elif pred == 12:
-                print("Predicted Gesture (12): ROTATE Clockwise ")
-                # Define action for gesture 12 if needed
-            elif pred == 13:
-                print("Predicted Gesture (13): ROTATE Anti-Clockwise ")
-                # Define action for gesture 13 if needed
-            elif pred == 14:
-                print("Predicted Gesture (14): PALM ")
-                # Define action for gesture 14 if needed
+        # Check for gesture to switch to model2
+        if pred == 8 and self.current_model_name != 'model2':
+            print("Switching to model2")
+            self.load_model('model2')
+            self.current_predict_data = []
+            return  # Wait for new data with the new model
 
-            # Send the command to the robot if the prediction is within the specified range
-            if 0 <= pred <= 9:
-                self.parent.robot_api.send_request(self.parent.robot_api.set_end_effector_velocity([
-                    self.movement_x,
-                    self.movement_y,
-                    self.movement_z,
-                    self.rotation_x,
-                    self.rotation_y,
-                    self.rotation_z
-                ]))
+        # Reset movement variables
+        self.movement_x = 0.0
+        self.movement_y = 0.0
+        self.movement_z = 0.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.rotation_z = 0.0
+
+        # Define actions for model1's gestures
+        if pred == 0:
+            print("Model1 Predicted Gesture (0): Left")
+            self.movement_y = -0.1
+        elif pred == 1:
+            print("Model1 Predicted Gesture (1): Right")
+            self.movement_y = 0.1
+        elif pred == 2:
+            print("Model1 Predicted Gesture (2): Down")
+            self.movement_z = -0.1
+        elif pred == 3:
+            print("Model1 Predicted Gesture (3): Up")
+            self.movement_z = 0.1
+        elif pred == 4:
+            print("Model1 Predicted Gesture (4): Double Left")
+        elif pred == 5:
+            print("Model1 Predicted Gesture (5): Double Right")
+        elif pred == 6:
+            print("Model1 Predicted Gesture (6): Double Down")
+        elif pred == 7:
+            print("Model1 Predicted Gesture (7): Double Up")
+        elif pred == 8:
+            print("Model1 Predicted Gesture (8): Switch to model2")
+
+
+        # Send the movement command
+        self.ros_splitter.robot_api.send_request(
+            self.ros_splitter.robot_api.set_end_effector_velocity([
+                self.movement_x,
+                self.movement_y,
+                self.movement_z,
+                self.rotation_x,
+                self.rotation_y,
+                self.rotation_z
+            ])
+        )
+
+    def handle_prediction_model2(self, pred, confidence):
+        # Set a confidence threshold
+        confidence_threshold = 0.7
+        if confidence < confidence_threshold:
+            print(f"Low confidence ({confidence:.2f}) for {pred}, prediction ignored.")
+            return
+
+        # Check if prediction is the same as the last
+        if pred == self.last_prediction:
+            return
+        else:
+            self.last_prediction = pred
+
+        # Check for gesture to switch back to model1
+        if pred == 5 and self.current_model_name != 'model1':
+            print("Switching back to model1")
+            self.load_model('model1')
+            self.current_predict_data = []
+            return  # Wait for new data with the new model
+
+        # Define actions for model2's gestures
+        if pred == 0:
+            print("Model2 Predicted Gesture (0): Swipe to Left")
+            # Perform action for gesture 0 in model2
+        elif pred == 1:
+            print("Model2 Predicted Gesture (1): Swipe to Right")
+            # Perform action for gesture 1 in model2
+        elif pred == 2:
+            print("Model2 Predicted Gesture (2): Proximity Zoom out")
+            # Perform action for gesture 2 in model2
+        # Add other gestures as needed
+
+    def reset_movement_variables(self):
+        self.movement_x = 0.0
+        self.movement_y = 0.0
+        self.movement_z = 0.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.rotation_z = 0.0
 
     def parse_parameters_from_file(self, file_path):
         params = {}
@@ -1216,3 +1273,4 @@ class MySensor():
                     key, value = line.strip().split(': ')
                     params[key] = float(value) if '.' in value else int(value)
         return params
+
