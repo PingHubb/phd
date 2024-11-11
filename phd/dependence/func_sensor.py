@@ -468,7 +468,7 @@ class MySensor:
 
     def init_cylinder(self):
         self.n_row = 10
-        self.n_col = 11
+        self.n_col = 10
         self.n_node = self.n_row * self.n_col
 
         self._data = data(self.n_row, self.n_col)
@@ -494,11 +494,10 @@ class MySensor:
             self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + (self.n_row - 1) + i] = [2, ((i + 1) * self.n_row) - 1,
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
-
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj'
+        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/half_cylinder.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/singal.txt'
+        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/vertex_groups.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -644,15 +643,6 @@ class MySensor:
             self.line_poly.points = self.points
             self._2D_map.point_data.set_scalars(self.colors)
             self.plotter.render()
-
-        # # Calculate the FPS
-        # current_time = time.time()
-        # self.frame_count += 1
-        # if current_time - self.last_time >= 0.1:
-        #     fps = self.frame_count / (current_time - self.last_time)
-        #     # self.message(f"FPS: {fps:.2f}")
-        #     self.last_time = current_time
-        #     self.frame_count = 0
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:
@@ -971,27 +961,25 @@ class LSTM:
         self.window_size = 50
         self.minimum_sequence_length = 5
         self.triggerd_value = -1
+        self.proximity_triggerd_value = -0.3
         self.is_recognizing_gesture = False
         self.recognition_timer = QTimer()
         self.recognition_timer.timeout.connect(self.start_gesture_recognition)
         self.current_predict_data = []
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.touching = False  # Add this line
+        self.delay_active = False  # Flag to indicate delay state
+        self.pred_2_counter = 0  # Counter for consecutive pred == 2 detections
 
         # Define model paths and parameters
         self.model_paths = {
             'model1': {
                 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/0_1_2_3_8_9_6_7_11/best_model_9.txt',
                 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/0_1_2_3_8_9_6_7_11/best_model_9.pth'
-                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model(0-14_binary_15-16_floating).txt',
-                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model(0-14_binary_15-16_floating).pth'
-
             },
             'model2': {
                 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/15_16_17/best_model_21.txt',
                 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/15_16_17/best_model_21.pth'
-                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_proximity(0-3,15,16).txt',
-                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/models/best_model_proximity(0-3,15,16).pth'
             }
         }
 
@@ -1036,6 +1024,14 @@ class LSTM:
             print(f'Error loading gesture recognition model {model_name}: {e}')
             self.model = None
 
+    def reset_movement_variables(self):
+        self.movement_x = 0.0
+        self.movement_y = 0.0
+        self.movement_z = 0.0
+        self.rotation_x = 0.0
+        self.rotation_y = 0.0
+        self.rotation_z = 0.0
+
     def transformation_function_model1(self, diffPerDataAve_Reverse):
         transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
         return transformed_data
@@ -1043,7 +1039,7 @@ class LSTM:
     def transformation_function_model2(self, diffPerDataAve_Reverse):
         transformed_data = np.where(diffPerDataAve_Reverse > 2, 2,
                                     np.where(diffPerDataAve_Reverse < -1, 1,
-                                             np.where(diffPerDataAve_Reverse < -0.2, 0.2, 0)))
+                                             np.where(diffPerDataAve_Reverse < self.proximity_triggerd_value, 0.2, 0)))
         return transformed_data
 
     def toggle_gesture_recognition(self):
@@ -1062,6 +1058,10 @@ class LSTM:
             print("Gesture recognition stopped.")
 
     def start_gesture_recognition(self):
+        if self.delay_active:
+            # Skip processing during delay
+            return
+
         diffPerDataAve_Reverse = self.my_sensor._data.diffPerDataAve.T.flatten()
         transformed_data = self.current_transformation(diffPerDataAve_Reverse)
 
@@ -1072,33 +1072,29 @@ class LSTM:
             self.touching = True
             self.current_predict_data = []  # Reset data collected
             self.touch_start_time = time.time()  # Record touch start time if needed
+            # Reset last prediction and counter on touch start
+            self.last_prediction = None
         elif not touching_now and self.touching:
             # Touch has just ended
             self.touching = False
             if self.current_predict_data:
                 print("Finger lifted")
 
-                if self.current_model_name == 'model2':
-                    # For model2, now make the prediction
-                    if len(self.current_predict_data) >= self.minimum_sequence_length:
-                        self.predict_gesture(self.current_predict_data)
-                    else:
-                        print("Not enough data to make a prediction for model2.")
-                    # Reset movement variables
-                    self.reset_movement_variables()
-                    self.ros_splitter.robot_api.send_request(
-                        self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
-                elif self.current_model_name == 'model1':
-                    # For model1, reset variables if needed
-                    self.reset_movement_variables()
-                    self.ros_splitter.robot_api.send_request(
-                        self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
-                    # No need to predict again
+                if len(self.current_predict_data) >= self.minimum_sequence_length:
+                    # For both models, make a final prediction after touch ends
+                    self.predict_gesture(self.current_predict_data)
+                else:
+                    print("Not enough data to make a final prediction.")
+
+                # Reset movement variables
+                self.reset_movement_variables()
+                self.ros_splitter.robot_api.send_request(
+                    self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
 
             # Reset variables
             self.current_predict_data = []
             self.prediction_counter = 0
-            self.last_prediction = None  # Reset the last prediction when finger is lifted
+            # Do not reset last_prediction here to keep track between touches
         elif touching_now:
             # Touch is continuing
             self.current_predict_data.append(transformed_data.tolist())
@@ -1108,14 +1104,11 @@ class LSTM:
                 self.current_predict_data.pop(0)
 
             if self.current_model_name == 'model1':
-                # For model1, only start predicting after 5 data frames collected since touch started
+                # For model1, only start predicting after minimum_sequence_length data frames collected
                 if len(self.current_predict_data) >= self.minimum_sequence_length:
                     self.predict_gesture(self.current_predict_data)
-                else:
-                    # Not enough data collected yet, wait
-                    pass
             else:
-                # For model2, do not predict yet
+                # For model2, do not predict yet during touch
                 pass
         else:
             # Not touching, and touch has not just ended
@@ -1162,31 +1155,34 @@ class LSTM:
 
     def handle_prediction_model1(self, pred, confidence):
         # Set a confidence threshold
-        confidence_threshold = 0.8
+        confidence_threshold = 0.7
         if confidence < confidence_threshold:
             print(f"Low confidence ({confidence:.2f}) for {pred}, prediction ignored.")
             return
 
-        # Check if prediction is the same as the last
-        if pred == self.last_prediction:
-            return
-        else:
-            self.last_prediction = pred
+        if pred == 8:
+            if self.touching:
+                print("Touching is True, ignoring pred == 8 during touch")
+                return
+            else:
+                print("Touch has ended, handling pred == 8")
+                print("Model1 Predicted Gesture (8): Switch to model2 after 1 second delay")
+                self.delay_active = True  # Activate the delay
+                self.start_delay_timer('model2')
+                self.current_predict_data = []
+                return  # Wait for delay to finish
 
-        # Check for gesture to switch to model2
-        if pred == 8 and self.current_model_name != 'model2':
-            print("Switching to model2")
-            self.load_model('model2')
-            self.current_predict_data = []
-            return  # Wait for new data with the new model
+        # For other predictions, act as before
+        if self.touching:
+            # During touch, check if prediction is same as last
+            if pred == self.last_prediction:
+                return
+            else:
+                self.last_prediction = pred
 
+        # For other predictions, act as before
         # Reset movement variables
-        self.movement_x = 0.0
-        self.movement_y = 0.0
-        self.movement_z = 0.0
-        self.rotation_x = 0.0
-        self.rotation_y = 0.0
-        self.rotation_z = 0.0
+        self.reset_movement_variables()
 
         # Define actions for model1's gestures
         if pred == 0:
@@ -1203,15 +1199,16 @@ class LSTM:
             self.movement_z = 0.1
         elif pred == 4:
             print("Model1 Predicted Gesture (4): Double Left")
+            self.movement_x = -0.1
         elif pred == 5:
             print("Model1 Predicted Gesture (5): Double Right")
+            self.movement_x = 0.1
         elif pred == 6:
             print("Model1 Predicted Gesture (6): Double Down")
+            self.movement_z = -0.1
         elif pred == 7:
             print("Model1 Predicted Gesture (7): Double Up")
-        elif pred == 8:
-            print("Model1 Predicted Gesture (8): Switch to model2")
-
+            self.movement_z = 0.1
 
         # Send the movement command
         self.ros_splitter.robot_api.send_request(
@@ -1232,38 +1229,53 @@ class LSTM:
             print(f"Low confidence ({confidence:.2f}) for {pred}, prediction ignored.")
             return
 
-        # Check if prediction is the same as the last
-        if pred == self.last_prediction:
-            return
+        # Handle pred == 2 detections
+        if pred == 2:
+            if not self.touching:
+                # Touch has ended after pred == 2
+                self.pred_2_counter += 1
+                print(f"pred == 2 detected after touch end. Counter: {self.pred_2_counter}")
+            else:
+                # Touch is ongoing, do not increment counter
+                print("Touching is True, pred == 2 detected during touch")
+                return
+
+            if self.pred_2_counter >= 2:
+                print("Two consecutive pred == 2 detected after touch end. Switching back to model1")
+                self.pred_2_counter = 0  # Reset counter
+                self.delay_active = True
+                self.start_delay_timer('model1')
+                self.current_predict_data = []
+                self.ros_splitter.robot_api.send_request(
+                    self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
+                return  # Wait for delay to finish
         else:
-            self.last_prediction = pred
+            # If any other prediction is detected, reset the counter
+            self.pred_2_counter = 0
 
-        # Check for gesture to switch back to model1
-        if pred == 5 and self.current_model_name != 'model1':
-            print("Switching back to model1")
-            self.load_model('model1')
-            self.current_predict_data = []
-            return  # Wait for new data with the new model
-
-        # Define actions for model2's gestures
+        # Handle other gestures
         if pred == 0:
             print("Model2 Predicted Gesture (0): Swipe to Left")
-            # Perform action for gesture 0 in model2
+            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
+            self.ros_splitter.robot_api.send_and_process_request([-0.3, -0.7, 1.8, 0.5, 1.6, -1.3])
         elif pred == 1:
             print("Model2 Predicted Gesture (1): Swipe to Right")
-            # Perform action for gesture 1 in model2
-        elif pred == 2:
-            print("Model2 Predicted Gesture (2): Proximity Zoom out")
-            # Perform action for gesture 2 in model2
-        # Add other gestures as needed
+            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
+            self.ros_splitter.robot_api.send_and_process_request([1.0, 0.0, 1.57, 0.0, 1.57, 0.0])
+        # ... [other gestures]
 
-    def reset_movement_variables(self):
-        self.movement_x = 0.0
-        self.movement_y = 0.0
-        self.movement_z = 0.0
-        self.rotation_x = 0.0
-        self.rotation_y = 0.0
-        self.rotation_z = 0.0
+    def start_delay_timer(self, model_name):
+        self.delay_timer = QTimer()
+        self.delay_timer.setSingleShot(True)  # Timer will fire only once
+        self.delay_timer.timeout.connect(lambda: self.finish_delay(model_name))
+        self.delay_timer.start(1000)  # Delay duration in milliseconds (1000ms = 1 second)
+        print(f"Delay timer started for switching to {model_name}")
+
+    def finish_delay(self, model_name):
+        self.delay_active = False
+        self.my_sensor.updateCal()
+        self.load_model(model_name)
+        print(f"Delay finished. Switched to {model_name}. Gesture recognition can start.")
 
     def parse_parameters_from_file(self, file_path):
         params = {}
@@ -1273,4 +1285,8 @@ class LSTM:
                     key, value = line.strip().split(': ')
                     params[key] = float(value) if '.' in value else int(value)
         return params
+
+
+class Denoise:
+    pass
 

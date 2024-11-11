@@ -45,7 +45,7 @@ class ArduinoCommander:
                 data_list = [int(value) for value in response.split() if value.isdigit()]
 
                 if command == "readRaw":
-                    # print(f"Response from {command}: {data_list[2:-2]}")
+                    # print(f"Data length: {len(data_list)}")
                     return data_list[2:-2]
                 elif command == "readCal":
                     # print(f"Response from {command}: {data_list[2:-2]}")

@@ -6,7 +6,7 @@ from pyvistaqt import QtInteractor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
 from phd.dependence.func_meshLab import MyMeshLab
-from phd.dependence.func_sensor import MySensor, LSTM
+from phd.dependence.func_sensor import MySensor
 
 
 class PlotterWidget(QWidget):
@@ -378,10 +378,10 @@ class RosSplitter(QSplitter):
 
         # NEW SENSOR WIDGET
         self.sensor_choice = QComboBox(self.widget_func)
-        self.sensor_choice.addItem("elbow")
-        self.sensor_choice.addItem("DualC")
+        self.sensor_choice.addItem("Elbow")
+        self.sensor_choice.addItem("Double Curve")
         self.sensor_choice.addItem("2D")
-        self.sensor_choice.addItem("Cylinder (FAKE)")
+        self.sensor_choice.addItem("Half Cylinder Surface")
 
         send_layout.addWidget(self.sensor_choice)
 

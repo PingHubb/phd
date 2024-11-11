@@ -56,7 +56,7 @@ class RobotController(Node):
 
     def send_request(self, command):
         request = SendScript.Request()
-        request.id = 'damn'  # <-- not important can self-define
+        request.id = 'ping'  # <-- not important can self-define
         request.script = command
         self.future = self.send_script_client.call_async(request)
 
