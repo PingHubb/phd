@@ -4,7 +4,9 @@ import numpy as np
 import serial
 import serial.tools.list_ports
 import time
+import random
 import os
+import re
 from pyvistaqt import QtInteractor, MainWindow
 from PyQt5.QtCore import QTimer
 from PyQt5.QtWidgets import QMessageBox, QLabel, QSplitter
@@ -115,6 +117,80 @@ class GestureCNNLSTM(nn.Module):
         return logits
 
 
+class DenoisingCNNLSTMAutoencoder(nn.Module):
+    def __init__(self, hidden_dim, num_layers, dropout_rate):
+        super(DenoisingCNNLSTMAutoencoder, self).__init__()
+        # Sensor grid dimensions
+        self.height = 10
+        self.width = 10
+
+        # Encoder CNN
+        self.encoder_cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1),  # Input channels = 1
+            nn.ReLU(),
+            nn.MaxPool2d(2)  # Output size: (16, H/2, W/2)
+        )
+
+        # Compute the size after CNN layers
+        self.cnn_output_size = 16 * (self.height // 2) * (self.width // 2)
+
+        # Encoder LSTM
+        self.encoder_lstm = nn.LSTM(
+            input_size=self.cnn_output_size,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout_rate if num_layers > 1 else 0
+        )
+
+        # Decoder LSTM
+        self.decoder_lstm = nn.LSTM(
+            input_size=hidden_dim,
+            hidden_size=self.cnn_output_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout_rate if num_layers > 1 else 0
+        )
+
+        # Decoder CNN
+        self.decoder_cnn = nn.Sequential(
+            nn.ConvTranspose2d(16, 1, kernel_size=2, stride=2),  # Upsample back to original size
+            nn.Sigmoid()  # Output values between 0 and 1
+        )
+
+    def forward(self, x):
+        # x is of shape [batch_size, seq_len, feature_size]
+        batch_size, seq_len, feature_size = x.size()
+        expected_feature_size = self.height * self.width  # Should be 100
+        if feature_size != expected_feature_size:
+            raise ValueError(f"Expected feature size {expected_feature_size}, but got {feature_size}")
+
+        # Reshape for CNN
+        x = x.contiguous().view(-1, 1, self.height, self.width)
+
+        # Encoder CNN
+        x = self.encoder_cnn(x)
+
+        # Prepare for LSTM
+        x = x.view(batch_size, seq_len, -1)
+
+        # Encoder LSTM
+        x, _ = self.encoder_lstm(x)
+
+        # Decoder LSTM
+        x, _ = self.decoder_lstm(x)
+
+        # Reshape for Decoder CNN
+        x = x.contiguous().view(-1, 16, self.height // 2, self.width // 2)
+
+        # Decoder CNN
+        x = self.decoder_cnn(x)
+
+        # Reshape to original size
+        x = x.view(batch_size, seq_len, 1, self.height, self.width)
+        return x  # Returns a tensor
+
+
 class MySensor:
     def __init__(self, parent) -> None:
         print("Initializing MySensor...")
@@ -134,6 +210,7 @@ class MySensor:
         self.lstm_class = LSTM(self.parent, self)
         self.rule_based_class = RuleBased(self.parent, self)
         self.record_gesture_class = RecordGesture(self)
+        self.denoise_class = Denoise(self.parent, self)  # Pass parent and self
         print("Finished Initializing all classes...")
 
     def saveCameraPara(self):
@@ -577,6 +654,7 @@ class MySensor:
         self.saveCameraPara()
 
         if self.is_connected:
+            # Read raw data from the sensor
             self.ser.write(b'readRaw')
             response = self.ser.readline().decode('utf-8').rstrip()
             data_list = [int(value) for value in response.split() if value.isdigit()]
@@ -586,63 +664,90 @@ class MySensor:
             self._data.calDiffPer()
             self._data.getWin(self._data.windowSize)
 
-            if self.parent.sensor_choice.currentIndex() == 0:
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+            # Check if denoising is active
+            if self.denoise_class.denoising_active:
+                denoised_data_np = self.denoise_class.process_denoising()
+            else:
+                denoised_data_np = self._data.diffPerDataAve
 
-            elif self.parent.sensor_choice.currentIndex() == 1:
-                self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
-                self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.2
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
+            # Update visualization with the denoised or raw data
+            self.update_visualization(denoised_data_np)
 
-            # Visualization updates
-            elif self.parent.sensor_choice.currentIndex() == 2:
-                for i in range(self.n_row):
-                    for j in range(self.n_col):
-                        self.colors_face[i * self.n_col + j] = (
-                        1, 1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-                        1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255, 1)
-                        self.points[i * self.n_col + j][2] = 3 - abs(self._data.diffPerDataAve[i][j]) * 2
-                        self.colors[i * self.n_col + j] = [1,
-                                                           1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-                                                           1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-                                                           1]
+            # if self.parent.sensor_choice.currentIndex() == 0:
+            #     for i in range(self.n_col):
+            #         for j in range(self.n_row):
+            #             self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
+            #                 i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
+            #             self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
+            #                                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+            #             for k in self.array_positions[i * self.n_row + j]:
+            #                 self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
+            #                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+            #
+            # elif self.parent.sensor_choice.currentIndex() == 1:
+            #     self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
+            #     self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
+            #     for i in range(self.n_col):
+            #         for j in range(self.n_row):
+            #             self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
+            #                 i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.2
+            #             self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
+            #                                                   1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
+            #             for k in self.array_positions[i * self.n_row + j]:
+            #                 self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
+            #                                   1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
+            #
+            # # Visualization updates
+            # elif self.parent.sensor_choice.currentIndex() == 2:
+            #     for i in range(self.n_row):
+            #         for j in range(self.n_col):
+            #             self.colors_face[i * self.n_col + j] = (
+            #             1, 1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
+            #             1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255, 1)
+            #             self.points[i * self.n_col + j][2] = 3 - abs(self._data.diffPerDataAve[i][j]) * 2
+            #             self.colors[i * self.n_col + j] = [1,
+            #                                                1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
+            #                                                1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
+            #                                                1]
+            #
+            #     for i in range(len(self.colors)):
+            #         if i < self.n_row * self.n_col:
+            #             continue
+            #         else:
+            #             self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
+            #
+            # elif self.parent.sensor_choice.currentIndex() == 3:
+            #     for i in range(self.n_col):
+            #         for j in range(self.n_row):
+            #             self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
+            #                 i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
+            #             self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
+            #                                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+            #             for k in self.array_positions[i * self.n_row + j]:
+            #                 self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
+            #                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+            #
+            # self.line_poly.points = self.points
+            # self._2D_map.point_data.set_scalars(self.colors)
+            # self.plotter.render()
 
-                for i in range(len(self.colors)):
-                    if i < self.n_row * self.n_col:
-                        continue
-                    else:
-                        self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
+    def update_visualization(self, data):
+        for i in range(self.n_col):
+            for j in range(self.n_row):
+                index = i * self.n_row + j
+                # Update points position
+                self.points[index] = self.points_origin[index] + \
+                                     self.normals[index] * (1.5 - abs(data[j][i])) * 0.03
+                # Update colors based on data
+                intensity = 1 - abs(data[j][i]) * 150 / 255
+                self.colors_3d[index] = [1, intensity, intensity, 1]
+                for k in self.array_positions[index]:
+                    self.colors[k] = [1, intensity, intensity, 1]
 
-            elif self.parent.sensor_choice.currentIndex() == 3:
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-
-            self.line_poly.points = self.points
-            self._2D_map.point_data.set_scalars(self.colors)
-            self.plotter.render()
+        # Update the mesh
+        self.line_poly.points = self.points
+        self._2D_map.point_data.set_scalars(self.colors)
+        self.plotter.render()  # <---- Enable this will be very lag
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:
@@ -690,63 +795,158 @@ class RecordGesture:
         self.triggerd_value = -1
         self.start_record_pressed = False
 
+        # For automatic noise recording
+        self.auto_recording = False
+        self.auto_timer = QTimer()
+        self.auto_timer.setSingleShot(True)
+        self.auto_timer.timeout.connect(self.auto_record_timeout)
+
+        # New attribute to keep track of the trigger mode
+        self.trigger_mode = None  # Can be 'trigger' or 'no_trigger'
+
+    def set_trigger_mode(self, mode):
+        if mode in ["trigger", "no_trigger"]:
+            self.trigger_mode = mode
+            print(f"Trigger mode set to '{self.trigger_mode}'.")
+        else:
+            print("Invalid trigger mode specified.")
 
     def start_record_gesture(self, gesture_number):
-        if not self.start_record_pressed:
-            # Convert gesture_number to string for consistent handling
-            gesture_number = str(gesture_number)
-
-            # Start the recording
-            self.start_record_pressed = True
-            self.gesture_number = gesture_number
-            self.trial_number = self.get_next_trial_number(gesture_number)
-            self.current_gesture_data_diff = []
-            self.timer_record_gesture.start(0)
-            print(f"Recording started for gesture {gesture_number}, trial {self.trial_number}.")
+        if self.trigger_mode is None:
+            print("Warning: Trigger mode not set. Please set the trigger mode before recording.")
+            return  # Do nothing
+        if gesture_number == "noise_auto":
+            # Handle automatic noise recording
+            if not self.auto_recording:
+                # Start automatic recording
+                self.auto_recording = True
+                self.gesture_number = "noise"  # Use "noise" as the gesture_number
+                self.trial_number = self.get_next_trial_number(self.gesture_number)
+                self.current_gesture_data_diff = []
+                self.start_auto_recording()
+                print("Automatic noise recording started.")
+            else:
+                # Stop automatic recording
+                self.auto_timer.stop()
+                if self.is_recording:
+                    self.timer_record_gesture.stop()
+                    self.is_recording = False
+                    self.save_gesture_data()
+                    self.my_sensor.updateCal()
+                    print(f"Recording stopped for gesture '{self.gesture_number}', trial {self.trial_number}. Data saved.")
+                    self.trial_number += 1
+                self.auto_recording = False
+                print("Automatic noise recording stopped.")
         else:
-            # Stop the recording
-            self.timer_record_gesture.stop()
-            self.start_record_pressed = False
-            self.current_gesture_data_diff = []
-            print("Recording stopped.")
+            if not self.start_record_pressed:
+                # Start the recording
+                self.start_record_pressed = True
+                # Sanitize the gesture_number
+                gesture_number = self.sanitize_gesture_number(gesture_number)
+                self.gesture_number = gesture_number
+                self.trial_number = self.get_next_trial_number(self.gesture_number)
+                self.current_gesture_data_diff = []
+                self.is_recording = True  # Start recording immediately
+                self.timer_record_gesture.start(0)
+                print(f"Recording started for gesture '{self.gesture_number}', trial {self.trial_number}.")
+            else:
+                # Stop the recording
+                self.timer_record_gesture.stop()
+                self.start_record_pressed = False
+                self.is_recording = False  # Stop recording
+                self.save_gesture_data()
+                self.my_sensor.updateCal()
+                print(f"Recording stopped for gesture '{self.gesture_number}', trial {self.trial_number}. Data saved.")
+                self.trial_number += 1  # Prepare for the next trial
 
-    def record_gesture(self):
-        diffPerDataAve_Reverse = self.my_sensor._data.diffPerDataAve.T.flatten()
+    def start_auto_recording(self):
+        # Generate a random duration between 5 and 10 seconds
+        self.random_duration = random.randint(5, 10)
+        print(f"Next recording will be for {self.random_duration} seconds.")
+        # Start recording
+        self.current_gesture_data_diff = []
+        self.is_recording = True
+        self.timer_record_gesture.start(0)  # Start the data collection timer
+        # Set auto_timer to stop recording after random_duration seconds
+        self.auto_timer.start(self.random_duration * 1000)  # Convert to milliseconds
 
-        # Transform the values: set values < -1 to 1 and others to 0
-        transformed_data = np.where(diffPerDataAve_Reverse < self.triggerd_value, 1, 0)
+    def auto_record_timeout(self):
+        # Stop the current recording
+        self.timer_record_gesture.stop()
+        self.is_recording = False
+        self.save_gesture_data()
+        self.my_sensor.updateCal()
+        print(f"Recording stopped for gesture '{self.gesture_number}', trial {self.trial_number}. Data saved.")
+        self.trial_number += 1
+        if self.auto_recording:
+            # Start a new recording
+            self.start_auto_recording()
+
+    def _transform_data(self, data):
+        """
+        Transforms the input data based on defined conditions.
+        """
+        # Use the trigger value to control recording
+        # transformed_data = np.where(data < self.triggerd_value, 1, 0)
 
         # Define conditions for each threshold
         conditions = [
-            diffPerDataAve_Reverse > 2,  # Values greater than 2
-            diffPerDataAve_Reverse < -1,
-            diffPerDataAve_Reverse < -0.2,
-            diffPerDataAve_Reverse >= -0.2  # Catch the rest (between -0.2 and 2)
+            data > 2,       # Values greater than 2
+            data < -1,
+            data < -0.2,
+            data >= -0.2    # Catch the rest (between -0.2 and 2)
         ]
         choices = [2, 1, 0.2, 0]
         transformed_data = np.select(conditions, choices)
         transformed_data = np.where(transformed_data == 0.0, 0, transformed_data)
 
-        # Check for the condition to start recording
-        if not self.is_recording and np.any(transformed_data == 0.2):
-            self.is_recording = True
-            self.current_gesture_data_diff = []
-            print(f"Started recording Gesture {self.gesture_number}, Trial {self.trial_number}.")
+        return transformed_data
 
-        # Append data to the current recording if we are in a recording state
-        if self.is_recording:
-            self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
+    def sanitize_gesture_number(self, gesture_number):
+        # Remove any characters that are not alphanumeric or underscores
+        sanitized = re.sub(r'[^a-zA-Z0-9_]', '_', gesture_number)
+        return sanitized
 
-        # Check for the condition to stop recording
-        if self.is_recording and np.all(transformed_data == 0):
-            self.is_recording = False
-            self.save_gesture_data()
-            self.my_sensor.updateCal()
-            print(f"Stopped recording Gesture {self.gesture_number}, Trial {self.trial_number}. Data saved.")
-            self.trial_number += 1  # Prepare for the next trial
+    def record_gesture(self):
+        diffPerDataAve_Reverse = self.my_sensor._data.diffPerDataAve.T.flatten()
+
+        if self.gesture_number in ["noise", "noise_auto"]:
+            # For noise recording, record data continuously without transformation
+            if self.is_recording:
+                self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
+        else:
+            if self.trigger_mode == "no_trigger":
+                # Record data immediately without checking trigger conditions
+                if self.is_recording:
+                    self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
+            elif self.trigger_mode == "trigger":
+                # Use the transformation method
+                transformed_data = self._transform_data(diffPerDataAve_Reverse)
+
+                # Check for the condition to start recording
+                if not self.is_recording and np.any(transformed_data == 0.2):
+                    self.is_recording = True
+                    self.current_gesture_data_diff = []
+                    print(f"Started recording Gesture '{self.gesture_number}', Trial {self.trial_number}.")
+
+                # Append data to the current recording if we are in a recording state
+                if self.is_recording:
+                    self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
+
+                # Check for the condition to stop recording
+                if self.is_recording and np.all(transformed_data == 0):
+                    self.is_recording = False
+                    self.save_gesture_data()
+                    self.my_sensor.updateCal()
+                    print(f"Stopped recording Gesture '{self.gesture_number}', Trial {self.trial_number}. Data saved.")
+                    self.trial_number += 1  # Prepare for the next trial
+            else:
+                # If trigger_mode is somehow invalid, print a warning
+                print("Invalid trigger mode. Cannot record data.")
+                return
 
     def get_next_trial_number(self, gesture_number):
-        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{gesture_number}"
+        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{gesture_number}"
 
         if not os.path.exists(gesture_diff_dir):
             os.makedirs(gesture_diff_dir)
@@ -754,7 +954,7 @@ class RecordGesture:
         return len(files) + 1
 
     def save_gesture_data(self):
-        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{self.gesture_number}"
+        gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{self.gesture_number}"
 
         filename = os.path.join(gesture_diff_dir, f"{self.trial_number}.txt")
         with open(filename, 'w') as file:
@@ -1288,5 +1488,109 @@ class LSTM:
 
 
 class Denoise:
-    pass
+    def __init__(self, ros_splitter_instance, my_sensor_instance):
+        self.ros_splitter = ros_splitter_instance
+        self.my_sensor = my_sensor_instance
+        # Denoise-specific initialization
+        self.denoising_active = False
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.load_denoising_model()
+        self.sensor_data_buffer = []
+        self.max_buffer_size = 50  # Adjust as needed
+
+    def load_denoising_model(self):
+        # Load the trained denoising model
+        hidden_dim = 128
+        num_layers = 2
+        dropout_rate = 0.3
+
+        self.denoising_model = DenoisingCNNLSTMAutoencoder(hidden_dim, num_layers, dropout_rate).to(self.device)
+        model_path = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/denoising_autoencoder.pth'  # Update this path as necessary
+        self.denoising_model.load_state_dict(torch.load(model_path, map_location=self.device))
+        self.denoising_model.eval()
+
+    def start_denoising(self):
+        self.denoising_active = not self.denoising_active
+        if self.denoising_active:
+            print("Denoising activated.")
+        else:
+            print("Denoising deactivated.")
+
+    def update_animation(self):
+        self.my_sensor.saveCameraPara()
+
+        if self.my_sensor.is_connected:
+            # Read raw data from the sensor
+            self.my_sensor.ser.write(b'readRaw')
+            response = self.my_sensor.ser.readline().decode('utf-8').rstrip()
+            data_list = [int(value) for value in response.split() if value.isdigit()]
+            rawDataList = data_list[2:-2 - self.my_sensor.n_row]
+            self.my_sensor._data.getRaw(np.array(rawDataList).reshape(self.my_sensor.n_col, self.my_sensor.n_row))
+            self.my_sensor._data.calDiff()
+            self.my_sensor._data.calDiffPer()
+            self.my_sensor._data.getWin(self.my_sensor._data.windowSize)
+
+            if self.denoising_active:
+                denoised_data_np = self.process_denoising()
+            else:
+                denoised_data_np = self.my_sensor._data.diffPerDataAve
+
+            # Update visualization
+            self.update_visualization(denoised_data_np)
+            self.my_sensor.plotter.render()
+
+    def process_denoising(self):
+        try:
+            # Prepare the data for the model
+            sensor_data = self.my_sensor._data.diffPerDataAve.flatten()  # Shape: [n_features]
+
+            # Normalize the data
+            sensor_data_normalized = (sensor_data - sensor_data.min()) / (sensor_data.max() - sensor_data.min() + 1e-8)
+
+            # Convert to tensor
+            sensor_data_tensor = torch.tensor(sensor_data_normalized, dtype=torch.float32).to(self.device)
+
+            # Append to the buffer
+            self.sensor_data_buffer.append(sensor_data_tensor)
+            if len(self.sensor_data_buffer) > self.max_buffer_size:
+                self.sensor_data_buffer.pop(0)
+
+            # Check if buffer has enough data
+            if len(self.sensor_data_buffer) >= self.max_buffer_size:
+                # Prepare input sequence
+                input_sequence = torch.stack(self.sensor_data_buffer).unsqueeze(0)  # Shape: [1, seq_len, n_features]
+
+                # Model inference
+                with torch.no_grad():
+                    outputs = self.denoising_model(input_sequence)
+                    # outputs is a Tensor of shape [batch_size, seq_len, 1, height, width]
+
+                    # Get the last time step and remove channel dimension
+                    denoised_data = outputs[0, -1, 0]  # Shape: [height, width]
+                    denoised_data_np = denoised_data.cpu().numpy()
+            else:
+                # Not enough data; use raw data
+                denoised_data_np = self.my_sensor._data.diffPerDataAve
+
+            return denoised_data_np
+        except Exception as e:
+            print(f"Error during denoising: {e}")
+            return self.my_sensor._data.diffPerDataAve  # Fallback to raw data
+
+    def update_visualization(self, data):
+        for i in range(self.my_sensor.n_col):
+            for j in range(self.my_sensor.n_row):
+                index = i * self.my_sensor.n_row + j
+                # Update points position
+                self.my_sensor.points[index] = self.my_sensor.points_origin[index] + \
+                    self.my_sensor.normals[index] * (1.5 - abs(data[j][i])) * 0.03
+                # Update colors based on data
+                intensity = 1 - abs(data[j][i]) * 150 / 255
+                self.my_sensor.colors_3d[index] = [1, intensity, intensity, 1]
+                for k in self.my_sensor.array_positions[index]:
+                    self.my_sensor.colors[k] = [1, intensity, intensity, 1]
+
+        # Update the mesh
+        self.my_sensor.line_poly.points = self.my_sensor.points
+        self.my_sensor._2D_map.point_data.set_scalars(self.my_sensor.colors)
 

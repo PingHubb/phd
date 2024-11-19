@@ -2,8 +2,8 @@ import os
 
 number = 3
 # Define your input and output folder paths
-gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{number}"
-output_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/continues/gesture_{number}"
+gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{number}"
+output_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/discrete/gesture_{number}"
 
 # Create the output directory if it doesn't exist
 if not os.path.exists(output_dir):

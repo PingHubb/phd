@@ -3,7 +3,7 @@ import os
 gesture_number = 3
 
 # Define the folder path
-folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{gesture_number}"  # Replace with your folder path
+folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{gesture_number}"  # Replace with your folder path
 
 
 # Function to find .txt files with fewer than 10 lines

@@ -268,8 +268,10 @@ class RosSplitter(QSplitter):
         self.setup_layout()
         self.mesh_functions = MyMeshLab(self)
         self.sensor_functions = MySensor(self)
-        self.read_timer = QTimer(self)  # Timer for continuous reading
+        self.read_timer = QTimer()  # Timer for continuous reading
         self.connect_function()
+        # Adjust sizes after setup
+        self.adjust_splitter_sizes()
 
     def setup_layout(self):
         # SET UP WIDGET 1
@@ -305,8 +307,8 @@ class RosSplitter(QSplitter):
         # SET UP SPLITTER 1
         self.splitter_1 = QSplitter(Qt.Horizontal, self)
         self.splitter_1.addWidget(self.widget_plotter)
-        # self.splitter_1.addWidget(self.log_display)
         self.splitter_1.addWidget(self.widget_plotter_2)
+        self.splitter_1.addWidget(self.log_display)  # Add log_display to the splitter
         self.splitter_1.setHandleWidth(3)
 
         # SET UP SPLITTER 2
@@ -349,12 +351,12 @@ class RosSplitter(QSplitter):
         tab3 = QWidget()
         tab3_layout = QVBoxLayout(tab3)
         self.setup_tab3(tab3_layout)
-        self.tab_widget.addTab(tab3, "Testing")
+        self.tab_widget.addTab(tab3, "AI")
 
         tab4 = QWidget()
         tab4_layout = QVBoxLayout(tab4)
         self.setup_tab4(tab4_layout)
-        self.tab_widget.addTab(tab4, "AI")
+        self.tab_widget.addTab(tab4, "Extra")
 
     def setup_tab1(self, layout):
         read_group = QGroupBox("Read Operations")
@@ -429,6 +431,78 @@ class RosSplitter(QSplitter):
         layout.addWidget(send_group)
 
     def setup_tab3(self, layout):
+        # Create group boxes
+        training_group = QGroupBox("Gesture")
+        testing_group = QGroupBox("Algorithm")
+
+        # Create a vertical layout for the gesture group
+        gesture_layout = QVBoxLayout()
+        testing_layout = QVBoxLayout()
+
+        self.set_no_trigger_button = QPushButton("Set No Trigger Mode")
+        self.set_no_trigger_button.setFixedSize(200, 40)
+        gesture_layout.addWidget(self.set_no_trigger_button)
+        self.set_trigger_button = QPushButton("Set Trigger Mode")
+        self.set_trigger_button.setFixedSize(200, 40)
+        gesture_layout.addWidget(self.set_trigger_button)
+
+        # Create a horizontal layout for the first row
+        first_row_layout = QHBoxLayout()
+
+        # Create a label and input field
+        gesture_label = QLabel("Enter Gesture Number:")
+        self.gesture_number_input = QLineEdit()
+        self.gesture_number_input.setFixedSize(50, 40)
+
+        # Add label and input field to the first row layout
+        first_row_layout.addWidget(gesture_label)
+        first_row_layout.addWidget(self.gesture_number_input)
+
+        # Create the record gesture button
+        self.record_gesture_button = QPushButton("Record")
+        self.record_gesture_button.setFixedSize(100, 40)
+
+        # Add the first row layout and the button to the main gesture layout
+        gesture_layout.addLayout(first_row_layout)
+        gesture_layout.addWidget(self.record_gesture_button)
+
+        # Continue with the rest of your code...
+        # Create the test gesture button
+        self.record_noise_auto_button = QPushButton("Record Noise Auto")
+        self.record_noise_auto_button.setFixedSize(200, 40)
+        gesture_layout.addWidget(self.record_noise_auto_button)
+
+
+        # Create additional testing operation buttons
+        self.predict_gesture_button = QPushButton("Predict Gesture")
+        self.denoise_button = QPushButton("Denoise")
+        self.update_sensor_button = QPushButton("Update Sensor")
+        self.activate_rule_based_button = QPushButton("Activate Rule Based")
+
+        # Set fixed sizes for consistency
+        for btn in [
+            self.predict_gesture_button,
+            self.denoise_button,
+            self.update_sensor_button,
+            self.activate_rule_based_button,
+        ]:
+            btn.setFixedSize(200, 40)
+
+        # Add testing operation buttons to the testing layout
+        testing_layout.addWidget(self.predict_gesture_button)
+        testing_layout.addWidget(self.denoise_button)
+        testing_layout.addWidget(self.update_sensor_button)
+        testing_layout.addWidget(self.activate_rule_based_button)
+
+        # Assign layouts to their respective group boxes
+        training_group.setLayout(gesture_layout)
+        testing_group.setLayout(testing_layout)
+
+        # Add group boxes to the main layout
+        layout.addWidget(training_group)
+        layout.addWidget(testing_group)
+
+    def setup_tab4(self, layout):
         # Create a group box for testing buttons
         test_group = QGroupBox("Testing Operations")
         test_layout = QVBoxLayout()
@@ -459,65 +533,13 @@ class RosSplitter(QSplitter):
         # Add group to tab layout
         layout.addWidget(test_group)
 
-    def setup_tab4(self, layout):
-        # Create group boxes
-        training_group = QGroupBox("Gesture")
-        testing_group = QGroupBox("Testing Operations")
-
-        # Create layouts for the groups
-        gesture_layout = QHBoxLayout()
-        testing_layout = QVBoxLayout()
-
-        # Create a label, input field, and record button
-        gesture_label = QLabel("Enter Gesture Number:")
-        self.gesture_number_input = QLineEdit()
-        self.gesture_number_input.setFixedSize(50, 30)
-        self.record_gesture_button = QPushButton("Record")
-        self.record_gesture_button.setFixedSize(100, 40)
-
-        # Add widgets to the gesture layout
-        gesture_layout.addWidget(gesture_label)
-        gesture_layout.addWidget(self.gesture_number_input)
-        gesture_layout.addWidget(self.record_gesture_button)
-
-        # Create the test gesture button
-        self.record_gesture_test_button = QPushButton("Record Test Gesture")
-        self.record_gesture_test_button.setFixedSize(150, 40)
-        gesture_layout.addWidget(self.record_gesture_test_button)
-
-        # Create additional testing operation buttons
-        self.predict_gesture_button = QPushButton("Predict Gesture")
-        self.update_sensor_button = QPushButton("Update Sensor")
-        self.activate_rule_based_button = QPushButton("Activate Rule Based")
-
-        # Set fixed sizes for consistency
-        for btn in [
-            self.predict_gesture_button,
-            self.update_sensor_button,
-            self.activate_rule_based_button,
-        ]:
-            btn.setFixedSize(150, 40)
-
-        # Add testing operation buttons to the testing layout
-        testing_layout.addWidget(self.predict_gesture_button)
-        testing_layout.addWidget(self.update_sensor_button)
-        testing_layout.addWidget(self.activate_rule_based_button)
-
-        # Assign layouts to their respective group boxes
-        training_group.setLayout(gesture_layout)
-        testing_group.setLayout(testing_layout)
-
-        # Add group boxes to the main layout
-        layout.addWidget(training_group)
-        layout.addWidget(testing_group)
-
     def connect_function(self):
         # Existing button connections
         self.read_sensor_raw_button.pressed.connect(
             lambda: self.log_display.append(f"Sensor raw data: {self.sensor_api.read_raw()}")
         )
         self.read_sensor_diff_button.pressed.connect(
-            lambda: self.log_display.append(f"Sensor diff data: {self.sensor_functions.read_sensor_diff_data()}")
+            lambda: self.log_display.append(f"Sensor offset data: {self.sensor_functions.read_sensor_diff_data()}")
         )
         self.read_sensor_raw_2_button.pressed.connect(
             lambda: self.log_display.append(f"Sensor raw data 2: {self.sensor_functions.read_sensor_raw_data()}")
@@ -571,12 +593,20 @@ class RosSplitter(QSplitter):
         self.record_gesture_button.pressed.connect(self.start_record_gesture)
 
         # Connect the test gesture button separately
-        self.record_gesture_test_button.pressed.connect(
-            lambda: self.sensor_functions.start_record_gesture("test")
+        self.record_noise_auto_button.pressed.connect(
+            lambda: self.sensor_functions.record_gesture_class.start_record_gesture("noise_auto")
         )
-
+        self.set_no_trigger_button.pressed.connect(
+            lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("no_trigger")
+        )
+        self.set_trigger_button.pressed.connect(
+            lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("trigger")
+        )
         self.predict_gesture_button.pressed.connect(
             lambda: self.sensor_functions.lstm_class.toggle_gesture_recognition()
+        )
+        self.denoise_button.pressed.connect(
+            self.sensor_functions.denoise_class.start_denoising
         )
         self.update_sensor_button.pressed.connect(
             lambda: self.sensor_functions.updateCal()
@@ -586,13 +616,12 @@ class RosSplitter(QSplitter):
         )
 
     def start_record_gesture(self):
-        gesture_number_str = self.gesture_number_input.text()
-        try:
-            gesture_number = int(gesture_number_str)
-            self.sensor_functions.record_gesture_class.start_record_gesture(gesture_number)
-        except ValueError:
-            # Handle invalid input
-            self.log_display.append("Invalid gesture number. Please enter an integer.")
+        gesture_number = self.gesture_number_input.text().strip()
+        if not gesture_number:
+            self.log_display.append("Please enter a gesture number or name.")
+            return
+        # Pass the gesture_number directly, whether it's a number or a string like "test"
+        self.sensor_functions.record_gesture_class.start_record_gesture(gesture_number)
 
     def toggle_continuous_read(self):
         if self.read_timer.isActive():
@@ -612,10 +641,21 @@ class RosSplitter(QSplitter):
         self.adjust_splitter_sizes()
 
     def adjust_splitter_sizes(self):
+        total_width = self.splitter_1.width()
         if self.log_display.isVisible():
-            self.splitter_1.setSizes([self.width() // 2, self.width() // 2])
+            # Allocate space for log_display
+            self.splitter_1.setSizes([
+                int(total_width * 0.4),  # widget_plotter
+                int(total_width * 0.4),  # widget_plotter_2
+                int(total_width * 0.2)   # log_display
+            ])
         else:
-            self.splitter_1.setSizes([self.width(), 0])
+            # Hide log_display by setting its size to zero
+            self.splitter_1.setSizes([
+                int(total_width * 0.5),  # widget_plotter
+                int(total_width * 0.5),  # widget_plotter_2
+                0                        # log_display
+            ])
 
     def reLayout(self):
         self.setSizes([round((self.width() - 3) * 6 / 7), round((self.width() - 3) / 7)])
