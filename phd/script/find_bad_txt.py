@@ -1,6 +1,6 @@
 import os
 
-gesture_number = 3
+gesture_number = 0
 
 # Define the folder path
 folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{gesture_number}"  # Replace with your folder path
@@ -22,7 +22,7 @@ def find_files_with_few_lines(folder):
                 lines = file.readlines()
 
                 # If the file has fewer than 10 lines, add it to the list
-                if len(lines) < 20:
+                if len(lines) < 30:
                     files_with_few_lines.append(file_name)
 
     return files_with_few_lines

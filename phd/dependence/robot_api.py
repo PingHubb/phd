@@ -138,11 +138,17 @@ class RobotController(Node):
 
     def get_current_tool_position(self):
         if self.current_tool_pose is not None:
+            # position = self.current_tool_pose.position
+            # quaternion = self.current_tool_pose.orientation
+            # position_str = f"{position.x:.3f}, {position.y:.3f}, {position.z:.3f}"
+            # quaternion_str = f"{quaternion.w:.3f}, {quaternion.x:.3f}, {quaternion.y:.3f}, {quaternion.z:.3f}"
+            # return position_str, quaternion_str
             position = self.current_tool_pose.position
             quaternion = self.current_tool_pose.orientation
-            position_str = f"{position.x:.3f}, {position.y:.3f}, {position.z:.3f}"
-            quaternion_str = f"{quaternion.w:.3f}, {quaternion.x:.3f}, {quaternion.y:.3f}, {quaternion.z:.3f}"
-            return position_str, quaternion_str
+            # Return tuples of floats directly
+            position_tuple = (position.x, position.y, position.z)
+            quaternion_tuple = (quaternion.w, quaternion.x, quaternion.y, quaternion.z)
+            return position_tuple, quaternion_tuple
         else:
             print("No tool pose data available.")
             return None, None

@@ -211,6 +211,11 @@ class MySensor:
         self.rule_based_class = RuleBased(self.parent, self)
         self.record_gesture_class = RecordGesture(self)
         self.denoise_class = Denoise(self.parent, self)  # Pass parent and self
+
+        # Path tracking variables
+        self.is_tracking_path = False
+        self.tracked_path = []
+
         print("Finished Initializing all classes...")
 
     def saveCameraPara(self):
@@ -231,16 +236,20 @@ class MySensor:
     def creatPlaneXY(self):
         self.plotter.camera.position = (1, -1, 1)
         self.saveCameraPara()
-        line = pv.Line((-50, 0, 0), (50, 0, 0))
 
-        # 添加X轴线段，并设置为红色
-        self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
-        line = pv.Line((0, -50, 0), (0, 50, 0))
+        # X-axis line
+        line_x = pv.Line((-50, 0, 0), (50, 0, 0))
+        self.plotter.add_mesh(line_x, color='r', line_width=2, label='X Axis')
 
-        # 添加Y轴线段，并设置为绿色
-        self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        # Y-axis line
+        line_y = pv.Line((0, -50, 0), (0, 50, 0))
+        self.plotter.add_mesh(line_y, color='g', line_width=2, label='Y Axis')
+
+        # Z-axis line
+        # line_z = pv.Line((0, 0, -50), (0, 0, 50))
+        # self.plotter.add_mesh(line_z, color='b', line_width=2, label='Z Axis')
+
         planeXY = pv.Plane((0, 0, 0), (0, 0, 1), 100, 100, 100, 100)
-
         self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray', style='wireframe')
 
     def initChannel(self):
@@ -409,7 +418,7 @@ class MySensor:
         filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/singal.txt'
+        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/signal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -439,6 +448,7 @@ class MySensor:
 
         a = self._2D_map.extract_surface()
         b = a.point_normals
+
         self.points_origin = np.zeros((self.n_node, 3))
         for i in tqdm(range(self.n_node)):
             for j in self.array_positions[i]:
@@ -463,6 +473,8 @@ class MySensor:
         self.parent.sensor_start.setDisabled(False)
 
         print("Done: Initiate the joint construction.")
+        print("Number of points:", self.n_node)
+        # print("Coordinates of the points:", self.points)
 
     def init_dualC(self):
         self.n_row = 10
@@ -496,7 +508,7 @@ class MySensor:
         filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/singal.txt'
+        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/signal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -673,63 +685,17 @@ class MySensor:
             # Update visualization with the denoised or raw data
             self.update_visualization(denoised_data_np)
 
-            # if self.parent.sensor_choice.currentIndex() == 0:
-            #     for i in range(self.n_col):
-            #         for j in range(self.n_row):
-            #             self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-            #                 i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
-            #             self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-            #                                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-            #             for k in self.array_positions[i * self.n_row + j]:
-            #                 self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-            #                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-            #
-            # elif self.parent.sensor_choice.currentIndex() == 1:
-            #     self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
-            #     self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
-            #     for i in range(self.n_col):
-            #         for j in range(self.n_row):
-            #             self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-            #                 i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.2
-            #             self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-            #                                                   1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
-            #             for k in self.array_positions[i * self.n_row + j]:
-            #                 self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-            #                                   1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
-            #
-            # # Visualization updates
-            # elif self.parent.sensor_choice.currentIndex() == 2:
-            #     for i in range(self.n_row):
-            #         for j in range(self.n_col):
-            #             self.colors_face[i * self.n_col + j] = (
-            #             1, 1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-            #             1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255, 1)
-            #             self.points[i * self.n_col + j][2] = 3 - abs(self._data.diffPerDataAve[i][j]) * 2
-            #             self.colors[i * self.n_col + j] = [1,
-            #                                                1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-            #                                                1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-            #                                                1]
-            #
-            #     for i in range(len(self.colors)):
-            #         if i < self.n_row * self.n_col:
-            #             continue
-            #         else:
-            #             self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
-            #
-            # elif self.parent.sensor_choice.currentIndex() == 3:
-            #     for i in range(self.n_col):
-            #         for j in range(self.n_row):
-            #             self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-            #                 i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
-            #             self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-            #                                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-            #             for k in self.array_positions[i * self.n_row + j]:
-            #                 self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-            #                                   1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-            #
-            # self.line_poly.points = self.points
-            # self._2D_map.point_data.set_scalars(self.colors)
-            # self.plotter.render()
+            # If path tracking is active, record the touched points
+            if self.is_tracking_path:
+                diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
+                transformed_data = np.where(diffPerDataAve_Reverse < -1, 1, 0)
+                # Find indices where value == 1
+                touched_points = np.where(transformed_data == 1)[0]
+
+                # Append touched_points to tracked_path without duplicates
+                for p in touched_points:
+                    if p not in self.tracked_path:
+                        self.tracked_path.append(p)
 
     def update_visualization(self, data):
         for i in range(self.n_col):
@@ -747,7 +713,7 @@ class MySensor:
         # Update the mesh
         self.line_poly.points = self.points
         self._2D_map.point_data.set_scalars(self.colors)
-        self.plotter.render()  # <---- Enable this will be very lag
+        self.plotter.render()
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:
@@ -780,6 +746,136 @@ class MySensor:
         rawDataAve = self._data.rawDataAve.T.flatten()
         return rawDataAve
 
+    def show_curvature(self, curv_type='Mean'):
+        """
+        Compute and display curvature of the current model.
+
+        Parameters
+        ----------
+        curv_type : str
+            Type of curvature to compute. Options include:
+            - 'Mean'
+            - 'Gaussian'
+            - 'Maximum'
+            - 'Minimum'
+        """
+        if self._2D_map is None:
+            print("No model loaded to compute curvature.")
+            return
+
+        # Compute the curvature values using PyVista's built-in method
+        curvature_values = self._2D_map.curvature(curv_type=curv_type)
+        print("Curvature min:", curvature_values.min())
+        print("Curvature max:", curvature_values.max())
+
+        # Remove the existing meshes if necessary
+        # (Optional) If you have added multiple meshes and want a clean view:
+        self.plotter.clear()
+
+        # Add the mesh with curvature scalars
+        self.plotter.add_mesh(self._2D_map,
+                              scalars=curvature_values,
+                              cmap='jet',
+                              show_edges=True,
+                              clim=[curvature_values.min(), curvature_values.max()])
+
+        self.plotter.add_scalar_bar(title=f"{curv_type} Curvature", n_colors=256)
+
+        # Render the updated plot
+        self.plotter.render()
+        print(f"Displayed {curv_type} curvature.")
+
+    def toggle_path_tracking(self):
+        """
+        Toggle the path tracking state.
+        When activated, it will start recording the points touched.
+        When deactivated, it stops recording and saves the path info along with
+        initial and final end effector positions and orientations, and the delta orientation.
+        """
+        if not self.is_tracking_path:
+            # Start tracking
+            self.is_tracking_path = True
+            self.tracked_path = []  # Clear previous data
+            print("Path tracking started. Move your finger on the sensor...")
+
+            # Record initial end effector position and orientation
+            initial_tool_data = self.parent.robot_api.get_current_tool_position()
+            # Expecting initial_tool_data[0] = (x, y, z), initial_tool_data[1] = (w, x, y, z)
+            self.initial_tool_position = initial_tool_data[0]
+            self.initial_tool_orientation = initial_tool_data[1]
+
+        else:
+            # Stop tracking
+            self.is_tracking_path = False
+            print("Path tracking stopped.")
+
+            # Record final end effector position and orientation
+            final_tool_data = self.parent.robot_api.get_current_tool_position()
+            final_tool_position = final_tool_data[0]
+            final_tool_orientation = final_tool_data[1]
+
+            if self.tracked_path:
+                print("Points touched during path tracking:", self.tracked_path)
+                # Extract coordinates for each touched point from the original points
+                path_coords = [self.points_origin[idx] for idx in self.tracked_path]
+
+                # Use the first touched point as reference
+                x0, y0, z0 = path_coords[0]
+
+                # Calculate deltas for the tool position
+                dx_tool = final_tool_position[0] - self.initial_tool_position[0]
+                dy_tool = final_tool_position[1] - self.initial_tool_position[1]
+                dz_tool = final_tool_position[2] - self.initial_tool_position[2]
+
+                # Compute delta orientation
+                # initial quaternion
+                w1, x1, y1, z1 = self.initial_tool_orientation
+                # final quaternion
+                w2, x2, y2, z2 = final_tool_orientation
+
+                # Inverse of initial quaternion (assuming it is normalized):
+                # q^-1 = (w, -x, -y, -z)
+                w1_inv, x1_inv, y1_inv, z1_inv = w1, -x1, -y1, -z1
+
+                # Quaternion multiplication q_delta = q_init^-1 * q_final
+                # (w1_inv, x1_inv, y1_inv, z1_inv) * (w2, x2, y2, z2)
+                w_delta = w1_inv * w2 - x1_inv * x2 - y1_inv * y2 - z1_inv * z2
+                x_delta = w1_inv * x2 + x1_inv * w2 + y1_inv * z2 - z1_inv * y2
+                y_delta = w1_inv * y2 - x1_inv * z2 + y1_inv * w2 + z1_inv * x2
+                z_delta = w1_inv * z2 + x1_inv * y2 - y1_inv * x2 + z1_inv * w2
+
+                delta_orientation = (w_delta, x_delta, y_delta, z_delta)
+
+                # Save to a text file
+                filename = "/home/ping2/ros2_ws/src/phd/phd/resource/tracked_path.txt"
+                with open(filename, "w") as f:
+                    f.write("index,x,y,z,dx,dy,dz\n")
+                    for i, idx in enumerate(self.tracked_path):
+                        x, y, z = self.points_origin[idx]
+                        dx = x - x0
+                        dy = y - y0
+                        dz = z - z0
+                        f.write(f"{idx},{x},{y},{z},{dx},{dy},{dz}\n")
+
+                    f.write("\n")
+                    f.write("=== End Effector Data ===\n")
+                    f.write(f"Initial Tool Position: {self.initial_tool_position}\n")
+                    f.write(f"Initial Tool Orientation: {self.initial_tool_orientation}\n")
+                    f.write(f"Final Tool Position: {final_tool_position}\n")
+                    f.write(f"Final Tool Orientation: {final_tool_orientation}\n")
+                    f.write(f"Delta Tool Position: ({dx_tool}, {dy_tool}, {dz_tool})\n")
+                    f.write(f"Delta Tool Orientation (Quaternion): {delta_orientation}\n")
+
+                print(f"Path and position data saved to {filename}")
+                print(
+                    f"Initial EE Position: {self.initial_tool_position}, Orientation: {self.initial_tool_orientation}")
+                print(f"Final EE Position: {final_tool_position}, Orientation: {final_tool_orientation}")
+                print(f"Delta EE Position: ({dx_tool}, {dy_tool}, {dz_tool})")
+                print(f"Delta EE Orientation (Quaternion): {delta_orientation}")
+
+            else:
+                print("No points were touched or recorded.")
+
 
 class RecordGesture:
     def __init__(self, my_sensor_instance):
@@ -792,7 +888,6 @@ class RecordGesture:
         self.current_gesture_data_diff = []
         self.trial_number = None
         self.gesture_number = None
-        self.triggerd_value = -1
         self.start_record_pressed = False
 
         # For automatic noise recording
@@ -886,15 +981,13 @@ class RecordGesture:
         """
         Transforms the input data based on defined conditions.
         """
-        # Use the trigger value to control recording
-        # transformed_data = np.where(data < self.triggerd_value, 1, 0)
 
         # Define conditions for each threshold
         conditions = [
             data > 2,       # Values greater than 2
             data < -1,
             data < -0.2,
-            data >= -0.2    # Catch the rest (between -0.2 and 2)
+            data >= -0.2   # adjust this to make sure it don't detect the rubbish signal when leave the sensor
         ]
         choices = [2, 1, 0.2, 0]
         transformed_data = np.select(conditions, choices)
@@ -924,7 +1017,7 @@ class RecordGesture:
                 transformed_data = self._transform_data(diffPerDataAve_Reverse)
 
                 # Check for the condition to start recording
-                if not self.is_recording and np.any(transformed_data == 0.2):
+                if not self.is_recording and np.any(transformed_data == 1):  # <----------This is the trigger condition
                     self.is_recording = True
                     self.current_gesture_data_diff = []
                     print(f"Started recording Gesture '{self.gesture_number}', Trial {self.trial_number}.")
@@ -934,7 +1027,7 @@ class RecordGesture:
                     self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
 
                 # Check for the condition to stop recording
-                if self.is_recording and np.all(transformed_data == 0):
+                if self.is_recording and np.all(transformed_data != 1):  # <------------This is the stop condition
                     self.is_recording = False
                     self.save_gesture_data()
                     self.my_sensor.updateCal()
@@ -1256,6 +1349,24 @@ class LSTM:
             self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
             self.current_predict_data = []  # Reset after saving and prediction
             print("Gesture recognition stopped.")
+
+    def toggle_model(self):
+        """Toggle the currently loaded model."""
+        if self.current_model_name == 'model1':
+            print("Switching from model1 to model2")
+            # self.load_model('model2')
+            self.delay_active = True  # Activate the delay
+            self.start_delay_timer('model2')
+            self.current_predict_data = []
+        else:
+            print("Switching from model2 to model1")
+            # self.load_model('model1')
+            self.pred_2_counter = 0  # Reset counter
+            self.delay_active = True
+            self.start_delay_timer('model1')
+            self.current_predict_data = []
+            self.ros_splitter.robot_api.send_request(
+                self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
 
     def start_gesture_recognition(self):
         if self.delay_active:

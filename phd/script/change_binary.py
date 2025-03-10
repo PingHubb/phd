@@ -21,13 +21,20 @@ def process_file(file_path, output_path):
             # Split the line into individual elements
             elements = line.strip().split()
             # Convert elements to float, apply transformation (1 if < -1, otherwise 0), and convert back to string
+            # transformed_elements = [
+            #     '2' if float(el) > 2 else
+            #     '1' if float(el) < -1 else
+            #     '0.2' if float(el) < -0.2 else
+            #     '0' if float(el) >= -0.2 else el
+            #     for el in elements
+            # ]
+
             transformed_elements = [
-                '2' if float(el) > 2 else
                 '1' if float(el) < -1 else
-                '0.2' if float(el) < -0.2 else
-                '0' if float(el) >= -0.2 else el
+                '0'
                 for el in elements
             ]
+
             # Join the transformed elements and write to output file
             output_file.write(' '.join(transformed_elements) + '\n')
 

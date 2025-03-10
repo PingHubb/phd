@@ -5,6 +5,7 @@ from PyQt5.QtWidgets import QSplitter, QWidget, QGridLayout, QPushButton, QVBoxL
 from pyvistaqt import QtInteractor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
+from phd.dependence.mini_robot_api import MyCobotAPI
 from phd.dependence.func_meshLab import MyMeshLab
 from phd.dependence.func_sensor import MySensor
 
@@ -258,12 +259,66 @@ class PositionQuaternionWidget(QWidget):
         self.setVisible(isVisible)
 
 
+class ToolPositionController:
+    def __init__(self, mini_robot, coord_inputs, speed_input, angle_inputs, angle_speed_input, log_display):
+        """
+        mini_robot: Instance of MyCobotAPI.
+        coord_inputs: List of QLineEdit widgets for coordinates.
+        speed_input: QLineEdit widget for coordinate speed.
+        angle_inputs: List of QLineEdit widgets for joint angles.
+        angle_speed_input: QLineEdit widget for angle speed.
+        log_display: QTextEdit widget for logging.
+        """
+        self.mini_robot = mini_robot
+        self.coord_inputs = coord_inputs
+        self.speed_input = speed_input
+        self.angle_inputs = angle_inputs
+        self.angle_speed_input = angle_speed_input
+        self.log_display = log_display
+
+    def send_coords(self):
+        try:
+            coords = [float(edit.text()) for edit in self.coord_inputs]
+            speed = int(self.speed_input.text())
+            self.mini_robot.move_to_coords(coords, speed)
+            self.log_display.append(f"Sent coords: {coords} at speed {speed}")
+        except ValueError:
+            self.log_display.append("Invalid coordinate or speed input!")
+
+    def send_angles(self):
+        try:
+            angles = [float(edit.text()) for edit in self.angle_inputs]
+            speed = int(self.angle_speed_input.text())
+            self.mini_robot.send_angles(angles, speed)
+            self.log_display.append(f"Sent angles: {angles} at speed {speed}")
+        except ValueError:
+            self.log_display.append("Invalid angle or speed input!")
+
+    def get_coords(self):
+        coords = self.mini_robot.get_current_coords()
+        self.log_display.append("Current Coords: " + str(coords))
+
+    # Basic control functions
+    def stop(self):
+        self.mini_robot.stop()
+        self.log_display.append("Stop command sent.")
+
+    def pause(self):
+        self.mini_robot.pause()
+        self.log_display.append("Pause command sent.")
+
+    def resume(self):
+        self.mini_robot.resume()
+        self.log_display.append("Resume command sent.")
+
+
 class RosSplitter(QSplitter):
     def __init__(self, orientation: QtCore.Qt.Orientation):
         super().__init__(orientation)
         self.setStyleSheet("QPushButton { color: white; }")
         self.sensor_api = ArduinoCommander()
         self.robot_api = RobotController()
+        self.mini_robot = MyCobotAPI(serial_port="/dev/ttyACM1", baud_rate=115200)
         self.setHandleWidth(3)
         self.setup_layout()
         self.mesh_functions = MyMeshLab(self)
@@ -338,25 +393,35 @@ class RosSplitter(QSplitter):
         self.addWidget(self.splitter_2)
 
     def setup_tabs(self):
+        # Tab 1: Sensor
         tab1 = QWidget()
         tab1_layout = QVBoxLayout(tab1)
         self.setup_tab1(tab1_layout)
         self.tab_widget.addTab(tab1, "Sensor")
 
+        # Tab 2: Robot
         tab2 = QWidget()
         tab2_layout = QVBoxLayout(tab2)
         self.setup_tab2(tab2_layout)
         self.tab_widget.addTab(tab2, "Robot")
 
+        # Tab 3: AI
         tab3 = QWidget()
         tab3_layout = QVBoxLayout(tab3)
         self.setup_tab3(tab3_layout)
         self.tab_widget.addTab(tab3, "AI")
 
+        # Tab 4: Extra
         tab4 = QWidget()
         tab4_layout = QVBoxLayout(tab4)
         self.setup_tab4(tab4_layout)
         self.tab_widget.addTab(tab4, "Extra")
+
+        # Tab 5: Tool Position Control
+        tab5 = QWidget()
+        tab5_layout = QVBoxLayout(tab5)
+        self.setup_tab5(tab5_layout)
+        self.tab_widget.addTab(tab5, "Tool Position")
 
     def setup_tab1(self, layout):
         read_group = QGroupBox("Read Operations")
@@ -473,10 +538,11 @@ class RosSplitter(QSplitter):
         gesture_layout.addWidget(self.record_noise_auto_button)
 
 
-        # Create additional testing operation buttons
+        # Create additional Algorithm buttons
         self.predict_gesture_button = QPushButton("Predict Gesture")
         self.denoise_button = QPushButton("Denoise")
         self.update_sensor_button = QPushButton("Update Sensor")
+        self.activate_switch_model_button = QPushButton("Activate Switch Model")
         self.activate_rule_based_button = QPushButton("Activate Rule Based")
 
         # Set fixed sizes for consistency
@@ -484,6 +550,7 @@ class RosSplitter(QSplitter):
             self.predict_gesture_button,
             self.denoise_button,
             self.update_sensor_button,
+            self.activate_switch_model_button,
             self.activate_rule_based_button,
         ]:
             btn.setFixedSize(200, 40)
@@ -492,6 +559,7 @@ class RosSplitter(QSplitter):
         testing_layout.addWidget(self.predict_gesture_button)
         testing_layout.addWidget(self.denoise_button)
         testing_layout.addWidget(self.update_sensor_button)
+        testing_layout.addWidget(self.activate_switch_model_button)
         testing_layout.addWidget(self.activate_rule_based_button)
 
         # Assign layouts to their respective group boxes
@@ -516,6 +584,8 @@ class RosSplitter(QSplitter):
         self.enable_end_effector_velocity_mode_button = QPushButton("Enable End Effector Velocity")
         self.stop_end_effector_velocity_mode_button = QPushButton("Stop End Effector Velocity")
         self.stop_and_clear_buffer_button = QPushButton("Stop and Clear Buffer")
+        self.show_curvature_button = QPushButton("Show Curvature")
+        self.show_path_button = QPushButton("Show Path")
 
         # Add buttons to layout
         test_layout.addWidget(self.plotter_visibility_button)
@@ -526,12 +596,98 @@ class RosSplitter(QSplitter):
         test_layout.addWidget(self.suspend_end_effector_velocity_mode_button)
         test_layout.addWidget(self.stop_end_effector_velocity_mode_button)
         test_layout.addWidget(self.stop_and_clear_buffer_button)
+        test_layout.addWidget(self.show_curvature_button)
+        test_layout.addWidget(self.show_path_button)
 
         # Set layout to group
         test_group.setLayout(test_layout)
 
         # Add group to tab layout
         layout.addWidget(test_group)
+
+    def setup_tab5(self, layout):
+        # ---- Basic Controls Group ----
+        basic_group = QGroupBox("Basic Controls")
+        basic_layout = QVBoxLayout()
+        self.stop_button = QPushButton("Stop")
+        self.pause_button = QPushButton("Pause")
+        self.resume_button = QPushButton("Resume")
+        basic_layout.addWidget(self.stop_button)
+        basic_layout.addWidget(self.pause_button)
+        basic_layout.addWidget(self.resume_button)
+        basic_group.setLayout(basic_layout)
+        layout.addWidget(basic_group)
+
+        # ---- Coordinate Control Group ----
+        coord_group = QGroupBox("Coordinate Control")
+        coord_layout = QVBoxLayout()
+        self.coord_inputs = []
+        coord_labels = ["X", "Y", "Z", "Rx", "Ry", "Rz"]
+        for label_text in coord_labels:
+            hlayout = QHBoxLayout()
+            label = QLabel(f"{label_text}:")
+            line_edit = QLineEdit()
+            hlayout.addWidget(label)
+            hlayout.addWidget(line_edit)
+            coord_layout.addLayout(hlayout)
+            self.coord_inputs.append(line_edit)
+        speed_layout = QHBoxLayout()
+        speed_label = QLabel("Speed:")
+        self.speed_input = QLineEdit("50")
+        speed_layout.addWidget(speed_label)
+        speed_layout.addWidget(self.speed_input)
+        coord_layout.addLayout(speed_layout)
+        self.send_coords_button = QPushButton("Move to Coordinates")
+        coord_layout.addWidget(self.send_coords_button)
+        coord_group.setLayout(coord_layout)
+        layout.addWidget(coord_group)
+
+        # ---- Angle Control Group ----
+        angle_group = QGroupBox("Angle Control")
+        angle_layout = QVBoxLayout()
+        self.angle_inputs = []
+        angle_labels = ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]
+        for label_text in angle_labels:
+            hlayout = QHBoxLayout()
+            label = QLabel(f"{label_text}:")
+            line_edit = QLineEdit()
+            hlayout.addWidget(label)
+            hlayout.addWidget(line_edit)
+            angle_layout.addLayout(hlayout)
+            self.angle_inputs.append(line_edit)
+        angle_speed_layout = QHBoxLayout()
+        angle_speed_label = QLabel("Speed:")
+        self.angle_speed_input = QLineEdit("50")
+        angle_speed_layout.addWidget(angle_speed_label)
+        angle_speed_layout.addWidget(self.angle_speed_input)
+        angle_layout.addLayout(angle_speed_layout)
+        self.send_angles_button = QPushButton("Send Angles")
+        angle_layout.addWidget(self.send_angles_button)
+        angle_group.setLayout(angle_layout)
+        layout.addWidget(angle_group)
+
+        # Additional control: Get Current Coordinates
+        self.get_coords_button = QPushButton("Get Current Coordinates")
+        layout.addWidget(self.get_coords_button)
+
+        # ---- Create an instance of the controller ----
+        self.tool_controller = ToolPositionController(
+            mini_robot=self.mini_robot,
+            coord_inputs=self.coord_inputs,
+            speed_input=self.speed_input,
+            angle_inputs=self.angle_inputs,
+            angle_speed_input=self.angle_speed_input,
+            log_display=self.log_display
+        )
+
+        # ---- Connect UI buttons to controller methods ----
+        self.send_coords_button.clicked.connect(self.tool_controller.send_coords)
+        self.send_angles_button.clicked.connect(self.tool_controller.send_angles)
+        self.get_coords_button.clicked.connect(self.tool_controller.get_coords)
+
+        self.stop_button.clicked.connect(self.tool_controller.stop)
+        self.pause_button.clicked.connect(self.tool_controller.pause)
+        self.resume_button.clicked.connect(self.tool_controller.resume)
 
     def connect_function(self):
         # Existing button connections
@@ -611,8 +767,17 @@ class RosSplitter(QSplitter):
         self.update_sensor_button.pressed.connect(
             lambda: self.sensor_functions.updateCal()
         )
+        self.activate_switch_model_button.pressed.connect(
+            lambda: self.sensor_functions.lstm_class.toggle_model()
+        )
         self.activate_rule_based_button.pressed.connect(
             lambda: self.sensor_functions.rule_based_class.activate_rule_based()
+        )
+        self.show_curvature_button.pressed.connect(
+            lambda: self.sensor_functions.show_curvature()
+        )
+        self.show_path_button.pressed.connect(
+            lambda: self.sensor_functions.toggle_path_tracking()
         )
 
     def start_record_gesture(self):
