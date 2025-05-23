@@ -11,7 +11,7 @@ class ArduinoCommander:
             self.ser = serial.Serial(serial_port, baud_rate)
         except serial.SerialException:
             print(f"Serial port {serial_port} not found.")
-            sys.exit(1)
+            # sys.exit(1)
 
     def send_command(self, command):
         full_command = command + '\n'

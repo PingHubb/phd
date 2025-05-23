@@ -1,12 +1,11 @@
 import time
-
 from PyQt5.QtCore import pyqtSignal, Qt, QRect, QEvent, QSize
 from PyQt5.QtWidgets import QWidget, QAction, QGridLayout, QSplitter, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QPushButton, QTreeWidget, QTreeWidgetItem, QComboBox
 from pyvistaqt import QtInteractor, MainWindow
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent, QPixmap, QCursor, QColor, QBrush, QFont
 from phd.ui.ui_meshlab import MeshLabSplitter
 from phd.ui.ui_sensor import SensorSplitter
-from phd.ui.ui_ping import RosSplitter
+from phd.ui.ui_ping import UI
 
 
 class MyMainWindow(MainWindow):
@@ -139,7 +138,7 @@ class MyMainWindow(MainWindow):
         self.info_FPS.setText("FPS Display for PING")
 
         # Create a new ROS mode widget
-        self.UIROS = RosSplitter(Qt.Horizontal)
+        self.UIROS = UI(Qt.Horizontal)
         self.splitter_0.replaceWidget(0, self.UIROS)
         self.UIROS.reLayout()
 

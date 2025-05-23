@@ -29,10 +29,10 @@ class TreeWidgetItem(QTreeWidgetItem):
     def __init__(self,parent,name:str,level:int,type:int):
         super().__init__(parent)
         self.setTextAlignment(0, Qt.AlignLeft | Qt.AlignVCenter)  # 第一列左对齐
-        self.iconVisible = QIcon("./resource/visible.png")
-        self.iconUnvisible = QIcon("./resource/unvisible.png")
-        self.iconVisibleSelected = QIcon("./resource/visible_selected.png")
-        self.iconUnvisibleSelected = QIcon("./resource/unvisible_selected.png")
+        self.iconVisible = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/visible.png")
+        self.iconUnvisible = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/unvisible.png")
+        self.iconVisibleSelected = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/visible_selected.png")
+        self.iconUnvisibleSelected = QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/unvisible_selected.png")
         self.level = level
         self._type = type
         self.visible = True
@@ -125,7 +125,7 @@ class MyMainWindow(MainWindow):
         self.setWindowTitle("SingaLab")
         self.setMinimumSize(192*5, 108*5)
         self.resize(192*8, 108*8)
-        self.setWindowIcon(QIcon('./resource/logo0.png'))
+        self.setWindowIcon(QIcon('/home/ping2/ros2_ws/src/phd/phd/resource/logo0.png'))
         style_file = '/home/ping2/ros2_ws/src/phd/phd/resource/stylesheets/ui_style.qss'
         with open(style_file, 'r',  encoding='UTF-8') as file:
             self.style_sheet = file.read()
@@ -149,22 +149,22 @@ class MyMainWindow(MainWindow):
         modeMenu = mainMenu.addMenu('Mode')
         modeMenu.setObjectName("menuMode")
         self.modeMeshLab = QAction('MeshLab', self)
-        self.modeMeshLab.setIcon(QIcon("./resource/logo1.png"))
+        self.modeMeshLab.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo1.png"))
         modeMenu.addAction(self.modeMeshLab)
 
         self.modeROS = QAction('ROS', self)
-        self.modeROS.setIcon(QIcon("./resource/logo3.png"))
+        self.modeROS.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo3.png"))
         modeMenu.addAction(self.modeROS)
 
         # 添加Mesh菜单
         fileMenu = mainMenu.addMenu('Help')
         fileMenu.setObjectName("menuFile")
         self.about = QAction('About', self)
-        self.about.setIcon(QIcon("./resource/logo4.png"))
+        self.about.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo4.png"))
         fileMenu.addAction(self.about)
         
         exitButton = QAction('Exit', self)
-        exitButton.setIcon(QIcon("./resource/logo5.png"))
+        exitButton.setIcon(QIcon("/home/ping2/ros2_ws/src/phd/phd/resource/logo5.png"))
         exitButton.setShortcut('Ctrl+Q')
         exitButton.triggered.connect(self.close)
         fileMenu.addAction(exitButton)

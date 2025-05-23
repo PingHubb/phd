@@ -14,6 +14,7 @@ from phd.ui.ui_design import TreeWidgetItem
 from tqdm import tqdm
 from math import sin, cos
 from phd.dependence.robot_api import RobotController
+from phd.dependence.cnn_lstm import GestureCNNLSTM
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from torch import nn, optim
@@ -74,49 +75,6 @@ class data:
             self.diffPerDataAve = np.flipud(self.diffPerDataAve)
 
 
-class GestureCNNLSTM(nn.Module):
-    def __init__(self, input_size, hidden_dim, output_dim, num_layers, dropout_rate):
-        super(GestureCNNLSTM, self).__init__()
-        # Adjust the height and width based on input_size
-        self.height = 13
-        self.width = 10
-        if self.height * self.width != input_size:
-            raise ValueError(f'Input size {input_size} does not match expected grid size {self.height}x{self.width}')
-        self.conv = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        conv_output_size = self._get_conv_output_size()
-        self.lstm = nn.LSTM(conv_output_size, hidden_dim, num_layers=num_layers,
-                            batch_first=True, dropout=dropout_rate if num_layers > 1 else 0)
-        self.classifier = nn.Linear(hidden_dim, output_dim)
-
-    def _get_conv_output_size(self):
-        dummy_input = torch.zeros(1, 1, self.height, self.width)
-        output = self.conv(dummy_input)
-        output_size = output.view(1, -1).size(1)
-        return output_size
-
-    def forward(self, x):
-        # Unpack sequences
-        x, lengths = nn.utils.rnn.pad_packed_sequence(x, batch_first=True)
-        batch_size = x.size(0)
-        seq_len = x.size(1)
-        # Reshape to (batch_size * seq_len, 1, H, W)
-        x = x.contiguous().view(-1, 1, self.height, self.width)
-        x = self.conv(x)
-        x = x.view(batch_size, seq_len, -1)
-        # Pack sequences again
-        x = nn.utils.rnn.pack_padded_sequence(x, lengths, batch_first=True, enforce_sorted=False)
-        packed_output, (hidden, _) = self.lstm(x)
-        logits = self.classifier(hidden[-1])
-        return logits
-
-
 class MySensor:
     def __init__(self, parent) -> None:
         print("Initializing MySensor...")
@@ -136,6 +94,11 @@ class MySensor:
         self.lstm_class = LSTM(self.parent, self)
         self.rule_based_class = RuleBased(self.parent, self)
         self.record_gesture_class = RecordGesture(self)
+
+        # Path tracking variables
+        self.is_tracking_path = False
+        self.tracked_path = []
+
         print("Finished Initializing all classes...")
 
     def saveCameraPara(self):
@@ -156,16 +119,20 @@ class MySensor:
     def creatPlaneXY(self):
         self.plotter.camera.position = (1, -1, 1)
         self.saveCameraPara()
-        line = pv.Line((-50, 0, 0), (50, 0, 0))
 
-        # 添加X轴线段，并设置为红色
-        self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
-        line = pv.Line((0, -50, 0), (0, 50, 0))
+        # X-axis line
+        line_x = pv.Line((-50, 0, 0), (50, 0, 0))
+        self.plotter.add_mesh(line_x, color='r', line_width=2, label='X Axis')
 
-        # 添加Y轴线段，并设置为绿色
-        self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        # Y-axis line
+        line_y = pv.Line((0, -50, 0), (0, 50, 0))
+        self.plotter.add_mesh(line_y, color='g', line_width=2, label='Y Axis')
+
+        # Z-axis line
+        # line_z = pv.Line((0, 0, -50), (0, 0, 50))
+        # self.plotter.add_mesh(line_z, color='b', line_width=2, label='Z Axis')
+
         planeXY = pv.Plane((0, 0, 0), (0, 0, 1), 100, 100, 100, 100)
-
         self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray', style='wireframe')
 
     def initChannel(self):
@@ -198,13 +165,19 @@ class MySensor:
             # if response == b'Connected\r\n':
             #     print("Connected")
             if self.parent.sensor_choice.currentIndex() == 0:
-                self.init_jointConstruction()
+                self.init_elbow_model()
             elif self.parent.sensor_choice.currentIndex() == 1:
-                self.init_dualC()
+                self.init_double_curve_model()
             elif self.parent.sensor_choice.currentIndex() == 2:
-                self.init_handConstruction()
+                self.init_2d_model()
             elif self.parent.sensor_choice.currentIndex() == 3:
-                self.init_cylinder()
+                self.init_half_cylinder_surface_model()
+            elif self.parent.sensor_choice.currentIndex() == 4:
+                self.init_geneva_large()
+            elif self.parent.sensor_choice.currentIndex() == 5:
+                self.init_geneva_small()
+            elif self.parent.sensor_choice.currentIndex() == 6:
+                self.init_robot()
             # else:
             #     print("Error: The device is not connected.")
             #     self.is_connected = False
@@ -212,95 +185,97 @@ class MySensor:
             #     self.ser = None
             #     return
 
-    def init_handConstruction(self):
-        self.n_row = 10
-        self.n_col = 19
+    def init_2d_model(self):
+        self.n_row = 7
+        self.n_col = 8
+
+        total_points = self.n_row * self.n_col
+        total_edges = (self.n_col - 1) * (self.n_row - 1) * 2 + (self.n_col - 1) + (self.n_row - 1)
+
         self._data = data(self.n_row, self.n_col)
         size = 1
-        self.points = np.ones((190, 3)) * 3 * size
-        self.edges = (np.ones(
-            ((self.n_col - 1) * (self.n_row - 1) * 2 + (self.n_col - 1) + (self.n_row - 1), 3)) * 2).astype(int)
-        self.colors_face = np.ones((190, 4)) * 0.5
-        self.colors = np.ones((541, 4)) * 0.5
-        self.is_connected = False
-        self.show_2D = False
-        self.show_PC = False
-        self.show_FittedMesh = False
 
-        # define the points
-        for i in range(self.n_row):
-            for j in range(self.n_col):
-                self.points[i * (self.n_col) + j][0] = (j + 0.5) * size
-                self.points[i * (self.n_col) + j][1] = (i + 0.5) * size
+        # Temporary finer grid for averaging (simulate mesh averaging)
+        fine_scale = 5
+        fine_row, fine_col = self.n_row * fine_scale, self.n_col * fine_scale
+        fine_points = np.zeros((fine_row * fine_col, 3))
 
-        # define the edges
-        for i in range(self.n_row - 1):
-            for j in range(self.n_col - 1):
-                self.edges[2 * (i * (self.n_col - 1) + j)] = [2, i * self.n_col + j, i * self.n_col + j + 1]
-                self.edges[2 * (i * (self.n_col - 1) + j) + 1] = [2, i * self.n_col + j, (i + 1) * self.n_col + j]
+        for i in range(fine_col):
+            for j in range(fine_row):
+                idx = i * fine_row + j
+                fine_points[idx] = [(i + 0.5) * size / fine_scale, (j + 0.5) * size / fine_scale, 0]
+
+        # Initialize arrays
+        self.points = np.zeros((total_points, 3))
+        self.points_origin = np.zeros((total_points, 3))
+        self.normals = np.zeros((total_points, 3))
+        self.array_positions = [[] for _ in range(total_points)]
+
+        # Map fine points to coarse points (simulate averaging)
+        for i in range(self.n_col):
+            for j in range(self.n_row):
+                idx = i * self.n_row + j
+                # simulate a cluster of points (averaging)
+                for fi in range(fine_scale):
+                    for fj in range(fine_scale):
+                        fine_idx = (i * fine_scale + fi) * fine_row + (j * fine_scale + fj)
+                        self.points[idx] += fine_points[fine_idx]
+                        self.normals[idx] += [0, 0, 1]  # flat normals (upward)
+                self.points[idx] /= fine_scale ** 2
+                self.normals[idx] /= fine_scale ** 2
+                self.normals[idx] /= np.linalg.norm(self.normals[idx])
+
+                self.points_origin[idx] = self.points[idx]
+                self.points[idx] += self.normals[idx] * 0.02  # exactly like jointConstruction
+
+        # Define edges (same as before)
+        self.edges = (np.ones((total_edges, 3)) * 2).astype(int)
+        edge_idx = 0
         for i in range(self.n_col - 1):
-            self.edges[(self.n_col - 1) * (self.n_row - 1) * 2 + i] = [2, (self.n_row - 1) * self.n_col + i,
-                                                                       (self.n_row - 1) * self.n_col + i + 1]
+            for j in range(self.n_row - 1):
+                self.edges[edge_idx] = [2, i * self.n_row + j, i * self.n_row + j + 1]
+                edge_idx += 1
+                self.edges[edge_idx] = [2, i * self.n_row + j, (i + 1) * self.n_row + j]
+                edge_idx += 1
         for i in range(self.n_row - 1):
-            self.edges[(self.n_col - 1) * (self.n_row - 1) * 2 + (self.n_col - 1) + i] = [2, ((i + 1) * self.n_col) - 1,
-                                                                                          ((
-                                                                                                       i + 1) * self.n_col) - 1 + self.n_col]
+            self.edges[edge_idx] = [2, (self.n_col - 1) * self.n_row + i, (self.n_col - 1) * self.n_row + i + 1]
+            edge_idx += 1
+        for i in range(self.n_col - 1):
+            self.edges[edge_idx] = [2, ((i + 1) * self.n_row) - 1, ((i + 1) * self.n_row) - 1 + self.n_row]
+            edge_idx += 1
 
-        self.ser.write(b'readCal')
-        response = self.ser.readline().decode('utf-8').rstrip()
-        data_list = [int(value) for value in response.split() if value.isdigit()]
+        # Initialize colors
+        self.colors_face = np.ones((total_points, 4)) * 0.5
+        self.colors_3d = np.ones((total_points, 4)) * 0.5
+        self.colors = np.ones((total_points + total_edges, 4)) * 0.5
 
-        if len(data_list) != self.n_row * (self.n_col + 1) + 4:
-            print("Error: The Data length is", len(data_list), ", while the required input should be",
-                  int(self.n_row * (self.n_col + 1) + 4))
-            return
+        # Map color indices
+        for idx in range(total_points):
+            self.array_positions[idx].append(idx)
+        for edge_idx in range(total_edges):
+            edge_points = self.edges[edge_idx][1:]
+            color_idx = total_points + edge_idx
+            for point in edge_points:
+                self.array_positions[point].append(color_idx)
 
-        calDataList = data_list[2:-2 - self.n_row]
-        self._data.getCal(np.array(calDataList).reshape(self.n_col, self.n_row))
-        for i in range(self._data.windowSize):
-            self.ser.write(b'readRaw')
-            response = self.ser.readline().decode('utf-8').rstrip()
-            data_list = [int(value) for value in response.split() if value.isdigit()]
-            rawDataList = data_list[2:-2 - self.n_row]
-            self._data.getRaw(np.array(rawDataList).reshape(self.n_col, self.n_row))
-            self._data.calDiff()
-            self._data.calDiffPer()
-            self._data.getWin(i)
-        for i in range(self.n_row):
-            for j in range(self.n_col):
-                self.colors_face[i * self.n_col + j] = [i * 0.1, j * 0.05, 0, 1]
-                # self.points[i*self.n_col+j][2] = 3-abs(self._data.diffPerDataAve[i][j])*2
-                self.colors[i * self.n_col + j] = [i * 0.1, j * 0.05, 0, 1]
-        for i in range(len(self.colors)):
-            if i < 190:
-                continue
-            else:
-                self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
-
-        # register 2D map
-        self._2D_map = pv.Plane((9.5, 5, 0), (0, 0, 1), 19, 10, 19, 10)
-        self.actionMap = self.plotter.add_mesh(self._2D_map, scalars=self.colors_face, show_edges=True, name='2d',
-                                               rgb=True)
-        # TreeWidgetItem(self.parent.widget_tree, "_2D_map", 0, 0)
-
-        # register network
+        # Create visualization mesh
         self.line_poly = pv.PolyData(self.points)
         self.line_poly.lines = self.edges
-        self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors, point_size=10, line_width=3,
-                                                render_points_as_spheres=True, rgb=True, name='3d')
-        # TreeWidgetItem(self.parent.widget_tree, "_3D_mesh", 0, 0)
+        self.actionMesh = self.plotter.add_mesh(
+            self.line_poly, scalars=self.colors_3d,
+            point_size=10, line_width=3,
+            render_points_as_spheres=True,
+            rgb=True, name='3d'
+        )
 
-        # self.line_poly.points = self.points
-        # self._2D_map.cell_data.set_scalars(self.colors_face)
-        # self.plotter.render()
-
+        # Update UI elements
         self.parent.sensor_choice.setDisabled(True)
         self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Sence Builded")
+        self.parent.buildScene.setText("Scene Built")
         self.parent.buildScene.setDisabled(True)
         self.parent.sensor_start.setDisabled(False)
 
-    def init_jointConstruction(self):
+    def init_elbow_model(self):
         self.n_row = 10
         self.n_col = 13
         self.n_node = self.n_row * self.n_col
@@ -331,10 +306,10 @@ class MySensor:
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/mesh.obj'
+        filename = '/resource/sensor/joint_1/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/phd/resource/sensor/joint_1/signal.txt'
+        filename = '/resource/sensor/joint_1/signal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -364,6 +339,7 @@ class MySensor:
 
         a = self._2D_map.extract_surface()
         b = a.point_normals
+
         self.points_origin = np.zeros((self.n_node, 3))
         for i in tqdm(range(self.n_node)):
             for j in self.array_positions[i]:
@@ -388,8 +364,10 @@ class MySensor:
         self.parent.sensor_start.setDisabled(False)
 
         print("Done: Initiate the joint construction.")
+        print("Number of points:", self.n_node)
+        # print("Coordinates of the points:", self.points)
 
-    def init_dualC(self):
+    def init_double_curve_model(self):
         self.n_row = 10
         self.n_col = 10
         self.n_node = self.n_row * self.n_col
@@ -418,10 +396,10 @@ class MySensor:
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj'
+        filename = '/resource/sensor/dualC/mesh.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/phd/resource/sensor/dualC/signal.txt'
+        filename = '/resource/sensor/dualC/signal.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -468,7 +446,7 @@ class MySensor:
         self.parent.buildScene.setDisabled(True)
         self.parent.sensor_start.setDisabled(False)
 
-    def init_cylinder(self):
+    def init_half_cylinder_surface_model(self):
         self.n_row = 10
         self.n_col = 10
         self.n_node = self.n_row * self.n_col
@@ -496,10 +474,10 @@ class MySensor:
             self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + (self.n_row - 1) + i] = [2, ((i + 1) * self.n_row) - 1,
                                                                                           ((
                                                                                                        i + 1) * self.n_row) - 1 + self.n_row]
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/half_cylinder.obj'
+        filename = '/resource/sensor/half_cylinder_surface/half_cylinder.obj'
         self._2D_map = pv.read(filename)
 
-        filename = '/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/vertex_groups.txt'
+        filename = '/resource/sensor/half_cylinder_surface/vertex_groups.txt'
         with open(filename, 'r') as file:
             lines = file.readlines()
             numbers = [int(line.strip()) for line in lines]
@@ -545,6 +523,211 @@ class MySensor:
         self.parent.buildScene.setText("Scene Built")
         self.parent.buildScene.setDisabled(True)
         self.parent.sensor_start.setDisabled(False)
+
+    def init_geneva_large(self):
+        self.n_row = 16
+        self.n_col = 5
+        self.n_node = self.n_row * self.n_col
+
+        self._data = data(self.n_row, self.n_col)
+        self.points = np.zeros((self.n_node, 3))
+        self.edges = (np.ones(
+            ((self.n_col - 1) * (self.n_row - 1) * 2 + (self.n_col - 1) + (self.n_row - 1), 3)) * 2).astype(int)
+
+        self.colors_3d = np.ones((self.n_node, 4)) * 0.5
+
+        self.is_connected = False
+        self.show_2D = False
+        self.show_PC = False
+        self.show_FittedMesh = False
+
+        for i in range(self.n_col - 1):
+            for j in range(self.n_row - 1):
+                self.edges[2 * (i * (self.n_row - 1) + j)] = [2, i * self.n_row + j, i * self.n_row + j + 1]
+                self.edges[2 * (i * (self.n_row - 1) + j) + 1] = [2, i * self.n_row + j, (i + 1) * self.n_row + j]
+        for i in range(self.n_row - 1):
+            self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + i] = [2, (self.n_col - 1) * self.n_row + i,
+                                                                       (self.n_col - 1) * self.n_row + i + 1]
+        for i in range(self.n_col - 1):
+            self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + (self.n_row - 1) + i] = [2, ((i + 1) * self.n_row) - 1,
+                                                                                          (((
+                                                                                                        i + 1) * self.n_row) - 1 + self.n_row)]
+
+        filename = '/home/ping2/Downloads/geneva/large/knitting_mesh_raw.obj'
+        self._2D_map = pv.read(filename)
+        # Scale the mesh 1000 times:
+        # self._2D_map.points *= 1000
+
+        filename = '/home/ping2/Downloads/geneva/large/signal.txt'
+        with open(filename, 'r') as file:
+            lines = file.readlines()
+            numbers = [int(line.strip()) for line in lines]
+            self.array_positions = []
+            self.normals = np.zeros((self.n_node, 3))
+
+            for i in range(self.n_node):
+                self.array_positions.append([])
+            for idx, num in enumerate(numbers):
+                if num != -1:
+                    self.array_positions[num].append(idx)
+
+        self.colors = np.ones((self._2D_map.n_points, 4)) * 0.5
+        for i in range(self.n_col):
+            for j in range(self.n_row):
+                self.colors_3d[i * self.n_row + j] = [i / self.n_col, j / self.n_row, 0, 1]
+                for k in self.array_positions[i * self.n_row + j]:
+                    self.colors[k] = [i / self.n_col, j / self.n_row, 0, 1]
+        self.plotter.add_mesh(self._2D_map, show_edges=True, scalars=self.colors, rgb=True)
+
+        a = self._2D_map.extract_surface()
+        b = a.point_normals
+        self.points_origin = np.zeros((self.n_node, 3))
+        for i in tqdm(range(self.n_node)):
+            for j in self.array_positions[i]:
+                self.normals[i] += b[j]
+                self.points[i] += self._2D_map.GetPoint(j)
+            self.normals[i] = self.normals[i] / len(self.array_positions[i])
+            self.normals[i] = self.normals[i] / np.linalg.norm(self.normals[i])
+            self.points[i] = self.points[i] / len(self.array_positions[i])
+            self.points_origin[i] = self.points[i]
+            self.points[i] += self.normals[i] * 0.2
+
+        self.line_poly = pv.PolyData(self.points)
+        self.line_poly.lines = self.edges
+        self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
+                                                render_points_as_spheres=True, rgb=True, name='3d')
+
+        self.parent.sensor_choice.setDisabled(True)
+        self.parent.serial_channel.setDisabled(True)
+        self.parent.buildScene.setText("Scene Built")
+        self.parent.buildScene.setDisabled(True)
+        self.parent.sensor_start.setDisabled(False)
+
+    def init_geneva_small(self):
+        self.n_row = 14
+        self.n_col = 5
+        self.n_node = self.n_row * self.n_col
+
+        self._data = data(self.n_row, self.n_col)
+        self.points = np.zeros((self.n_node, 3))
+        self.edges = (np.ones(((self.n_col - 1) * (self.n_row - 1) * 2 +
+                               (self.n_col - 1) + (self.n_row - 1), 3)) * 2).astype(int)
+
+        self.colors_3d = np.ones((self.n_node, 4)) * 0.5
+
+        self.is_connected = False
+        self.show_2D = False
+        self.show_PC = False
+        self.show_FittedMesh = False
+
+        for i in range(self.n_col - 1):
+            for j in range(self.n_row - 1):
+                self.edges[2 * (i * (self.n_row - 1) + j)] = [2, i * self.n_row + j, i * self.n_row + j + 1]
+                self.edges[2 * (i * (self.n_row - 1) + j) + 1] = [2, i * self.n_row + j, (i + 1) * self.n_row + j]
+        for i in range(self.n_row - 1):
+            self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + i] = [2, (self.n_col - 1) * self.n_row + i,
+                                                                       (self.n_col - 1) * self.n_row + i + 1]
+        for i in range(self.n_col - 1):
+            self.edges[(self.n_row - 1) * (self.n_col - 1) * 2 + (self.n_row - 1) + i] = [
+                2, ((i + 1) * self.n_row) - 1, (((i + 1) * self.n_row) - 1 + self.n_row)
+            ]
+
+        filename = '/home/ping2/Downloads/geneva/small/knitting_mesh_raw.obj'
+        self._2D_map = pv.read(filename)
+        self._2D_map.points *= 1000
+
+        # --- Global Transformation using VTK Transform ---
+        # We want to undo the original transformation but apply the rotation relative to global axes.
+        #
+        # For example, assume:
+        #   Original Translation: (-57.05, -288, -74)
+        #   Original Rotation (local): (rx=90, ry=-90, rz=-90)
+        #
+        # To undo this globally, we want to apply:
+        #   Global Rotation: rx_global = -90, ry_global = +90, rz_global = +90
+        #   Global Translation: (+57.05, +288, +74)
+        #
+        # Here, we use a VTK transform with PreMultiply to make the rotation global.
+        import vtk
+        transform = vtk.vtkTransform()
+        transform.PreMultiply()  # This ensures new transforms are applied before the existing ones (global transform)
+
+        # If you want to rotate about a global pivot (here, the origin), first translate so that the pivot is at (0,0,0)
+        pivot = [0, 0, 0]
+        transform.Translate(-pivot[0], -pivot[1], -pivot[2])
+        # Apply global rotations (the angles here are the inverse rotations you want to apply globally)
+        transform.RotateX(0)  # Global rotation about X
+        transform.RotateY(90)  # Global rotation about Y
+        transform.RotateZ(90)  # Global rotation about Z
+        # Translate back from the pivot
+        transform.Translate(pivot[0], pivot[1], pivot[2])
+        # Finally, apply the inverse translation:
+        transform.Translate(57.05, 288, 74)
+
+        # Apply this global transform to the mesh:
+        self._2D_map.transform(transform)
+        # --- End Global Transformation ---
+
+        filename = '/home/ping2/Downloads/geneva/small/signal.txt'
+        with open(filename, 'r') as file:
+            lines = file.readlines()
+            numbers = [int(line.strip()) for line in lines]
+            self.array_positions = []
+            self.normals = np.zeros((self.n_node, 3))
+            for i in range(self.n_node):
+                self.array_positions.append([])
+            for idx, num in enumerate(numbers):
+                if num != -1:
+                    self.array_positions[num].append(idx)
+
+        self.colors = np.ones((self._2D_map.n_points, 4)) * 0.5
+        for i in range(self.n_col):
+            for j in range(self.n_row):
+                self.colors_3d[i * self.n_row + j] = [i / self.n_col, j / self.n_row, 0, 1]
+                for k in self.array_positions[i * self.n_row + j]:
+                    self.colors[k] = [i / self.n_col, j / self.n_row, 0, 1]
+        self.plotter.add_mesh(self._2D_map, show_edges=True, scalars=self.colors, rgb=True)
+
+        a = self._2D_map.extract_surface()
+        b = a.point_normals
+        self.points_origin = np.zeros((self.n_node, 3))
+        for i in tqdm(range(self.n_node)):
+            for j in self.array_positions[i]:
+                self.normals[i] += b[j]
+                self.points[i] += self._2D_map.GetPoint(j)
+            self.normals[i] = self.normals[i] / len(self.array_positions[i])
+            self.normals[i] = self.normals[i] / np.linalg.norm(self.normals[i])
+            self.points[i] = self.points[i] / len(self.array_positions[i])
+            self.points_origin[i] = self.points[i]
+            self.points[i] += self.normals[i] * 0.2
+
+        self.line_poly = pv.PolyData(self.points)
+        self.line_poly.lines = self.edges
+        self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors_3d,
+                                                point_size=10, line_width=3,
+                                                render_points_as_spheres=True,
+                                                rgb=True, name='3d')
+
+        # Create a small sphere at the pivot point
+        pivot_marker = pv.Sphere(radius=0.1, center=pivot)  # Adjust radius as needed
+
+        # Add the pivot marker to the plotter with a distinct color (e.g., green)
+        self.plotter.add_mesh(pivot_marker, color='green', opacity=1.0, name='pivot_marker')
+
+        self.parent.sensor_choice.setDisabled(True)
+        self.parent.serial_channel.setDisabled(True)
+        self.parent.buildScene.setText("Scene Built")
+        self.parent.buildScene.setDisabled(True)
+        self.parent.sensor_start.setDisabled(False)
+
+    def init_robot(self):
+
+        filename = '/home/ping2/Downloads/geneva/robot/robot.obj'
+
+        mesh = pv.read(filename)
+        print(f"Successfully loaded: {filename}")
+
+        self.plotter.add_mesh(mesh)
 
     def startSensor(self):
         self.ser.write(b'updateCal')
@@ -571,14 +754,11 @@ class MySensor:
         self.is_connected = True
         self.parent.sensor_update.setDisabled(False)
 
-    def updateCal(self):
-        self.is_connected = False
-        self.startSensor()
-
     def update_animation(self):
         self.saveCameraPara()
 
         if self.is_connected:
+            # Read raw data from the sensor
             self.ser.write(b'readRaw')
             response = self.ser.readline().decode('utf-8').rstrip()
             data_list = [int(value) for value in response.split() if value.isdigit()]
@@ -588,63 +768,45 @@ class MySensor:
             self._data.calDiffPer()
             self._data.getWin(self._data.windowSize)
 
-            if self.parent.sensor_choice.currentIndex() == 0:
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+            # Update visualization with the denoised or raw data
+            self.update_visualization(self._data.diffPerDataAve)
 
-            elif self.parent.sensor_choice.currentIndex() == 1:
-                self._data.diffPerDataAve = np.fliplr(self._data.diffPerDataAve)
-                self._data.diffPerDataAve = np.flipud(self._data.diffPerDataAve)
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.2
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 200 / 255, 1]
+            # If path tracking is active, record the touched points
+            if self.is_tracking_path:
+                diffPerDataAve_Reverse = self._data.diffPerDataAve.T.flatten()
+                transformed_data = np.where(diffPerDataAve_Reverse < -1, 1, 0)
+                # Find indices where value == 1
+                touched_points = np.where(transformed_data == 1)[0]
 
-            # Visualization updates
-            elif self.parent.sensor_choice.currentIndex() == 2:
-                for i in range(self.n_row):
-                    for j in range(self.n_col):
-                        self.colors_face[i * self.n_col + j] = (
-                        1, 1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-                        1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255, 1)
-                        self.points[i * self.n_col + j][2] = 3 - abs(self._data.diffPerDataAve[i][j]) * 2
-                        self.colors[i * self.n_col + j] = [1,
-                                                           1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-                                                           1 - abs(self._data.diffPerDataAve[i][j]) * 200 * 1.5 / 255,
-                                                           1]
+                # Append touched_points to tracked_path without duplicates
+                for p in touched_points:
+                    if p not in self.tracked_path:
+                        self.tracked_path.append(p)
 
-                for i in range(len(self.colors)):
-                    if i < self.n_row * self.n_col:
-                        continue
-                    else:
-                        self.colors[i] = (self.colors[self.edges[i - 190][1]] + self.colors[self.edges[i - 190][2]]) / 2
+    def update_visualization(self, data):
+        smoothing_factor = 0.05  # Adjust for smoothness
+        for i in range(self.n_col):
+            for j in range(self.n_row):
+                idx = i * self.n_row + j
+                displacement = (1.5 - abs(data[j][i])) * smoothing_factor
+                # Smooth movement using normals
+                target_position = self.points_origin[idx] + self.normals[idx] * displacement
+                # Interpolate for smooth transitions
+                self.points[idx] += (target_position - self.points[idx]) * 0.3
 
-            elif self.parent.sensor_choice.currentIndex() == 3:
-                for i in range(self.n_col):
-                    for j in range(self.n_row):
-                        self.points[i * self.n_row + j] = self.points_origin[i * self.n_row + j] + self.normals[
-                            i * self.n_row + j] * (1.5 - abs(self._data.diffPerDataAve[j][i])) * 0.03
-                        self.colors_3d[i * self.n_row + j] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
-                        for k in self.array_positions[i * self.n_row + j]:
-                            self.colors[k] = [1, 1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255,
-                                              1 - abs(self._data.diffPerDataAve[j][i]) * 150 / 255, 1]
+                # Update colors smoothly (optional)
+                intensity = np.clip(1 - abs(data[j][i]) * 150 / 255, 0, 1)
+                self.colors_3d[idx] = [1, intensity, intensity, 1]
+                for k in self.array_positions[idx]:
+                    self.colors[k] = [1, intensity, intensity, 1]
 
-            self.line_poly.points = self.points
-            self._2D_map.point_data.set_scalars(self.colors)
-            self.plotter.render()
+        self.line_poly.points = self.points
+        self.line_poly.point_data.set_scalars(self.colors_3d)
+        self.plotter.render()
+
+    def updateCal(self):
+        self.is_connected = False
+        self.startSensor()
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:
@@ -689,7 +851,6 @@ class RecordGesture:
         self.current_gesture_data_diff = []
         self.trial_number = None
         self.gesture_number = None
-        self.triggerd_value = -1
         self.start_record_pressed = False
 
         # For automatic noise recording
@@ -783,15 +944,13 @@ class RecordGesture:
         """
         Transforms the input data based on defined conditions.
         """
-        # Use the trigger value to control recording
-        # transformed_data = np.where(data < self.triggerd_value, 1, 0)
 
         # Define conditions for each threshold
         conditions = [
             data > 2,       # Values greater than 2
             data < -1,
             data < -0.2,
-            data >= -0.2    # Catch the rest (between -0.2 and 2)
+            data >= -0.2   # adjust this to make sure it don't detect the rubbish signal when leave the sensor
         ]
         choices = [2, 1, 0.2, 0]
         transformed_data = np.select(conditions, choices)
@@ -821,7 +980,7 @@ class RecordGesture:
                 transformed_data = self._transform_data(diffPerDataAve_Reverse)
 
                 # Check for the condition to start recording
-                if not self.is_recording and np.any(transformed_data == 0.2):
+                if not self.is_recording and np.any(transformed_data == 1):  # <----------This is the trigger condition
                     self.is_recording = True
                     self.current_gesture_data_diff = []
                     print(f"Started recording Gesture '{self.gesture_number}', Trial {self.trial_number}.")
@@ -831,7 +990,7 @@ class RecordGesture:
                     self.current_gesture_data_diff.append(diffPerDataAve_Reverse)
 
                 # Check for the condition to stop recording
-                if self.is_recording and np.all(transformed_data == 0):
+                if self.is_recording and np.all(transformed_data != 1):  # <------------This is the stop condition
                     self.is_recording = False
                     self.save_gesture_data()
                     self.my_sensor.updateCal()
@@ -1056,7 +1215,9 @@ class LSTM:
         self.rotation_z = 0.0
         self.prediction_counter = 0
         self.window_size = 50
-        self.minimum_sequence_length = 5
+        # self.minimum_sequence_length = 5
+        self.minimum_sequence_length = 20
+
         self.triggerd_value = -1
         self.proximity_triggerd_value = -0.3
         self.is_recognizing_gesture = False
@@ -1068,15 +1229,26 @@ class LSTM:
         self.delay_active = False  # Flag to indicate delay state
         self.pred_2_counter = 0  # Counter for consecutive pred == 2 detections
 
+        self.coords_list = [-170.2, -66.3, 240, 0.62, 0.78, -88.49]
+        self.coords_x_counter = 0
+        self.coords_y_counter = 0
+        self.coords_z_counter = 0
+
         # Define model paths and parameters
         self.model_paths = {
             'model1': {
-                'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/0_1_2_3_8_9_6_7_11/best_model_9.txt',
-                'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/0_1_2_3_8_9_6_7_11/best_model_9.pth'
+                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/old_chip/0_1_2_3_8_9_6_7_11/best_model_9.txt',
+                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/old_chip/0_1_2_3_8_9_6_7_11/best_model_9.pth',
+                'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/new_chip_for_elbow_0_1_2_3/best_model_15.txt',
+                'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/new_chip_for_elbow_0_1_2_3/best_model_15.pth',
+                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/new_chip_for_arm_0_1_2_3/best_model_7.txt',
+                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/new_chip_for_arm_0_1_2_3/best_model_7.pth'
             },
             'model2': {
-                'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/15_16_17/best_model_21.txt',
-                'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/15_16_17/best_model_21.pth'
+                # 'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/old_chip/15_16_17/best_model_21.txt',
+                # 'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/old_chip/15_16_17/best_model_21.pth',
+                'model_txt_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/new_chip_for_arm_0_1_2_3/best_model_7.txt',
+                'model_path': '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/new_chip_for_arm_0_1_2_3/best_model_7.pth'
             }
         }
 
@@ -1095,16 +1267,16 @@ class LSTM:
             model_txt_path = paths['model_txt_path']
             model_path = paths['model_path']
             parameters = self.parse_parameters_from_file(model_txt_path)
-            self.hidden_dim = parameters.get('hidden_dim', 80)
-            self.output_dim = parameters.get('output_dim', 8)
+            self.hidden_dim = parameters.get('hidden_dim', 64)
+            self.output_dim = parameters.get('output_dim', 4)
             print(f"Loaded {model_name} with {self.output_dim} classes.")
-            self.epochs = parameters.get('epochs', 100)
-            self.batch_size = parameters.get('batch_size', 32)
+            self.epochs = parameters.get('epochs', 50)
+            self.batch_size = parameters.get('batch_size', 16)
             self.k_folds = parameters.get('k_folds', 5)
             self.num_layers = parameters.get('num_layers', 1)
-            self.learning_rate = parameters.get('learning_rate', 0.01)
-            self.dropout_rate = parameters.get('dropout_rate', 0.5)
-            self.input_size = parameters.get('input_size', 130)
+            self.learning_rate = parameters.get('learning_rate', 0.001)
+            self.dropout_rate = parameters.get('dropout_rate', 0.3)
+            self.input_size = parameters.get('input_size', 130)   # 56
 
             # Initialize the model
             self.model = GestureCNNLSTM(
@@ -1154,6 +1326,24 @@ class LSTM:
             self.current_predict_data = []  # Reset after saving and prediction
             print("Gesture recognition stopped.")
 
+    def toggle_model(self):
+        """Toggle the currently loaded model."""
+        if self.current_model_name == 'model1':
+            print("Switching from model1 to model2")
+            # self.load_model('model2')
+            self.delay_active = True  # Activate the delay
+            self.start_delay_timer('model2')
+            self.current_predict_data = []
+        else:
+            print("Switching from model2 to model1")
+            # self.load_model('model1')
+            self.pred_2_counter = 0  # Reset counter
+            self.delay_active = True
+            self.start_delay_timer('model1')
+            self.current_predict_data = []
+            self.ros_splitter.robot_api.send_request(
+                self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
+
     def start_gesture_recognition(self):
         if self.delay_active:
             # Skip processing during delay
@@ -1177,11 +1367,13 @@ class LSTM:
             if self.current_predict_data:
                 print("Finger lifted")
 
-                if len(self.current_predict_data) >= self.minimum_sequence_length:
-                    # For both models, make a final prediction after touch ends
-                    self.predict_gesture(self.current_predict_data)
-                else:
-                    print("Not enough data to make a final prediction.")
+                # self.ros_splitter.mini_robot.sync_send_coords([-170.2, -66.3, 294.9, 0.62, 0.78, -88.49], 10, 1)
+
+                # if len(self.current_predict_data) >= self.minimum_sequence_length:
+                #     # For both models, make a final prediction after touch ends
+                #     self.predict_gesture(self.current_predict_data)
+                # else:
+                #     print("Not enough data to make a final prediction.")
 
                 # Reset movement variables
                 self.reset_movement_variables()
@@ -1285,15 +1477,27 @@ class LSTM:
         if pred == 0:
             print("Model1 Predicted Gesture (0): Left")
             self.movement_y = -0.1
+            self.new_coords_list = [self.coords_list[0], 200,
+                                    self.coords_list[2], self.coords_list[3], self.coords_list[4], self.coords_list[5]]
+            # self.ros_splitter.mini_robot.sync_send_coords(self.new_coords_list, 30, 1)
         elif pred == 1:
             print("Model1 Predicted Gesture (1): Right")
             self.movement_y = 0.1
+            self.new_coords_list = [self.coords_list[0], -200,
+                                    self.coords_list[2], self.coords_list[3], self.coords_list[4], self.coords_list[5]]
+            # self.ros_splitter.mini_robot.sync_send_coords(self.new_coords_list, 30, 1)
         elif pred == 2:
             print("Model1 Predicted Gesture (2): Down")
             self.movement_z = -0.1
+            self.new_coords_list = [self.coords_list[0], self.coords_list[1],
+                                    240, self.coords_list[3], self.coords_list[4], self.coords_list[5]]
+            # self.ros_splitter.mini_robot.sync_send_coords(self.new_coords_list, 30, 1)
         elif pred == 3:
             print("Model1 Predicted Gesture (3): Up")
             self.movement_z = 0.1
+            self.new_coords_list = [self.coords_list[0], self.coords_list[1],
+                                    360 , self.coords_list[3], self.coords_list[4], self.coords_list[5]]
+            # self.ros_splitter.mini_robot.sync_send_coords(self.new_coords_list, 30, 1)
         elif pred == 4:
             print("Model1 Predicted Gesture (4): Double Left")
             self.movement_x = -0.1
@@ -1384,6 +1588,6 @@ class LSTM:
         return params
 
 
-class Denoise:
-    pass
+
+
 
