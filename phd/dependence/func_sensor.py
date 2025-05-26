@@ -184,7 +184,6 @@ class data_3:
 
 class MySensor:
     def __init__(self, parent) -> None:
-        print("Initializing MySensor...")
         self.parent = parent
         self.plotter: QtInteractor = self.parent.plotter_2
         self.listModel = []
@@ -220,8 +219,6 @@ class MySensor:
         # Path tracking variables
         self.is_tracking_path = False
         self.tracked_path = []
-
-        print("Finished Initializing all classes...")
 
     def saveCameraPara(self):
         self.camera_pos = self.plotter.camera.position
@@ -271,7 +268,6 @@ class MySensor:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
                 item.setCheckState(Qt.Unchecked)
                 self.parent.serial_channel.addItem(item)
-                print(port.name)
         else:
             print("No serial ports found. Please connect the device and retry.")
             return
@@ -1000,12 +996,6 @@ class MySensor:
         self.parent.sensor_start.setDisabled(False)
 
     def init_robot(self):
-
-        ######################################### GENEVA ROBT MODEL ##################################################
-        # filename = '/home/ping2/Downloads/geneva/robot/robot.obj'
-        #
-        # mesh = pv.read(filename)
-        # print(f"Successfully loaded: {filename}")
 
         ######################################### GENEVA ARM MODEL ##################################################
 

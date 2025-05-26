@@ -280,6 +280,7 @@ class UI(QSplitter):
         # then toggle the subtabs under “Robots”
         self.robots_sub_tabs.setTabEnabled(0, not disable)  # Robot
         self.robots_sub_tabs.setTabEnabled(1, not disable)  # Mini Robot
+
     def setup_layout(self):
         # SET UP WIDGET 1
         self.widget_plotter = PlotterWidget()
@@ -799,7 +800,7 @@ class UI(QSplitter):
             ])
 
     def reLayout(self):
-        self.setSizes([round((self.width() - 3) * 6 / 7), round((self.width() - 3) / 7)])
-        self.splitter_1.setSizes([self.width() // 2, self.width() // 2])
+        self.setSizes([round((self.width()) * 4), round((self.width()))])
+        self.splitter_1.setSizes([self.width(), self.width()])
 
 
