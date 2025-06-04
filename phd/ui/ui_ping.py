@@ -384,19 +384,24 @@ class UI(QSplitter):
         tab4_layout = QVBoxLayout(tab4)
         self.setup_tab4(tab4_layout)
         self.tab_widget.addTab(tab4, "Extra")
+
     def setup_tab1(self, layout):
         read_group = QGroupBox("Read Operations")
         send_group = QGroupBox("Send Operations")
         read_layout = QVBoxLayout()
         send_layout = QVBoxLayout()
 
-        self.read_sensor_raw_button = QPushButton("Read Sensor Raw Data")
-        self.read_sensor_diff_button = QPushButton("Read Sensor Diff Data")
-        self.read_sensor_raw_2_button = QPushButton("Read Sensor Raw Data Ave")
+        self.read_sensor_api_button = QPushButton("Sensor API Raw Data")
+        self.read_sensor_raw_button = QPushButton("Sensor Raw Data")
+        self.read_sensor_raw_ave_button = QPushButton("Sensor Raw Ave Data")
+        self.read_sensor_diff_button = QPushButton("Sensor Diff Data")
+        self.read_sensor_channel_button = QPushButton("Sensor Channel")
 
+        read_layout.addWidget(self.read_sensor_api_button)
         read_layout.addWidget(self.read_sensor_raw_button)
+        read_layout.addWidget(self.read_sensor_raw_ave_button)
         read_layout.addWidget(self.read_sensor_diff_button)
-        read_layout.addWidget(self.read_sensor_raw_2_button)
+        read_layout.addWidget(self.read_sensor_channel_button)
 
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
@@ -421,27 +426,14 @@ class UI(QSplitter):
         self.serial_channel.setSelectionMode(QListWidget.MultiSelection)
         send_layout.addWidget(self.serial_channel)
 
-        self.buildScene = QPushButton("buildScene", self.widget_func)
+        self.buildScene = QPushButton("Build Scene", self.widget_func)
         send_layout.addWidget(self.buildScene)
 
-        self.sensor_start = QPushButton("startSensor", self.widget_func)
+        self.sensor_start = QPushButton("Start Sensor", self.widget_func)
         send_layout.addWidget(self.sensor_start)
-        # self.sensor_start.setDisabled(True)
 
-        self.sensor_update = QPushButton("updateSensor", self.widget_func)
+        self.sensor_update = QPushButton("Update Sensor", self.widget_func)
         send_layout.addWidget(self.sensor_update)
-        # self.sensor_update.setDisabled(True)
-
-        self.sensor_start_geneva = QPushButton("startSensorGeneva", self.widget_func)
-        send_layout.addWidget(self.sensor_start_geneva)
-        # self.sensor_start_geneva.setDisabled(True)
-
-        self.sensor_update_geneva = QPushButton("updateSensorGeneva", self.widget_func)
-        send_layout.addWidget(self.sensor_update_geneva)
-        # self.sensor_update_geneva.setDisabled(True)
-
-        self.erase_mesh = QPushButton("eraseMesh", self.widget_func)
-        send_layout.addWidget(self.erase_mesh)
 
     def setup_tab2(self, layout):
         # Read & Send operations for the main Robot
@@ -470,10 +462,11 @@ class UI(QSplitter):
         send_group.setLayout(send_layout)
         layout.addWidget(read_group)
         layout.addWidget(send_group)
+
     def setup_tab3(self, layout):
         # Create group boxes
-        training_group = QGroupBox("Gesture")
-        testing_group = QGroupBox("Algorithm")
+        training_group = QGroupBox("Data Training")
+        testing_group = QGroupBox("AI Model")
 
         # Create a vertical layout for the gesture group
         gesture_layout = QVBoxLayout()
@@ -548,27 +541,26 @@ class UI(QSplitter):
         test_layout = QVBoxLayout()
 
         # Button for testing
-        self.plotter_visibility_button = QPushButton("Show/Hide Log Display")
         self.read_raw_all_prots_button = QPushButton("Read All Port")
-        self.render_button = QPushButton("Render")
         self.enable_joint_velocity_mode_button = QPushButton("Enable Joint Velocity Mode")
         self.suspend_end_effector_velocity_mode_button = QPushButton("Suspend End Effector Velocity")
         self.stop_joint_velocity_mode_button = QPushButton("Stop Joint Velocity")
         self.enable_end_effector_velocity_mode_button = QPushButton("Enable End Effector Velocity")
         self.stop_end_effector_velocity_mode_button = QPushButton("Stop End Effector Velocity")
         self.stop_and_clear_buffer_button = QPushButton("Stop and Clear Buffer")
-
+        self.sensor_start_geneva = QPushButton("startSensorGeneva", self.widget_func)
+        self.sensor_update_geneva = QPushButton("updateSensorGeneva", self.widget_func)
 
         # Add buttons to layout
-        test_layout.addWidget(self.plotter_visibility_button)
         test_layout.addWidget(self.read_raw_all_prots_button)
-        test_layout.addWidget(self.render_button)
         test_layout.addWidget(self.enable_joint_velocity_mode_button)
         test_layout.addWidget(self.stop_joint_velocity_mode_button)
         test_layout.addWidget(self.enable_end_effector_velocity_mode_button)
         test_layout.addWidget(self.suspend_end_effector_velocity_mode_button)
         test_layout.addWidget(self.stop_end_effector_velocity_mode_button)
         test_layout.addWidget(self.stop_and_clear_buffer_button)
+        test_layout.addWidget(self.sensor_start_geneva)
+        test_layout.addWidget(self.sensor_update_geneva)
 
         # Set layout to group
         test_group.setLayout(test_layout)
@@ -698,16 +690,22 @@ class UI(QSplitter):
             btn.setDisabled(disable)
         # Also toggle the Mini‐Robot tab itself
         self.tab_widget.setTabEnabled(4, not disable)
+
     def connect_function(self):
-        # Existing button connections
+        self.read_sensor_api_button.pressed.connect(
+            lambda: self.log_display.append(f"API raw data: {self.sensor_api.read_raw()}")
+        )
         self.read_sensor_raw_button.pressed.connect(
-            lambda: self.log_display.append(f"Sensor raw data: {self.sensor_api.read_raw()}")
+            lambda: self.log_display.append(f"Sensor raw data: {self.sensor_functions.read_sensor_raw_data()}")
+        )
+        self.read_sensor_raw_ave_button.pressed.connect(
+            lambda: self.log_display.append(f"Sensor raw ave data: {self.sensor_functions.read_sensor_raw_ave_data()}")
         )
         self.read_sensor_diff_button.pressed.connect(
-            lambda: self.log_display.append(f"Sensor offset data: {self.sensor_functions.read_sensor_diff_data()}")
+            lambda: self.log_display.append(f"Sensor diff data: {self.sensor_functions.read_sensor_diff_data()}")
         )
-        self.read_sensor_raw_2_button.pressed.connect(
-            lambda: self.log_display.append(f"Sensor raw data 2: {self.sensor_functions.read_sensor_raw_data()}")
+        self.read_sensor_channel_button.pressed.connect(
+            lambda: self.log_display.append(f"Sensor channel data: {self.sensor_api.channel_check()}")
         )
         self.send_position_PTP_J_button.pressed.connect(
             self.position_entry_widget.toggle_visibility
@@ -716,9 +714,7 @@ class UI(QSplitter):
             self.position_quaternion_widget.toggle_visibility
         )
         self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
-        self.plotter_visibility_button.pressed.connect(self.toggle_plotter_visibility)
         self.read_raw_all_prots_button.pressed.connect(lambda: self.sensor_functions.read_raw_all_ports())
-        self.render_button.pressed.connect(lambda: self.plotter.render())
         self.continuous_read_button.pressed.connect(self.toggle_continuous_read)
         self.read_timer.timeout.connect(self.update_robot_status)
         self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
@@ -726,8 +722,6 @@ class UI(QSplitter):
         self.sensor_update.pressed.connect(lambda: self.sensor_functions.updateCal())
         self.sensor_start_geneva.pressed.connect(lambda: self.sensor_functions.startSensor_geneva())
         self.sensor_update_geneva.pressed.connect(lambda: self.sensor_functions.updateCal_geneva())
-
-        self.erase_mesh.pressed.connect(lambda: self.plotter.clear())
 
         # Connect the record gesture button
         self.record_gesture_button.pressed.connect(self.start_record_gesture)

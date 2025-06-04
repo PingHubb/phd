@@ -186,8 +186,8 @@ class MySensor:
     def __init__(self, parent) -> None:
         self.parent = parent
         self.plotter: QtInteractor = self.parent.plotter_2
-        self.listModel = []
-        self.listActor = []
+        self.actionMesh = None   # no mesh yet
+        self.objActor = None
         self.test = []
         self.test_1 = []
         self.creatPlaneXY()
@@ -197,8 +197,6 @@ class MySensor:
         self.timer_geneva = QTimer()
         self.timer_geneva.timeout.connect(self.update_animation_geneva)
         self.timer_geneva.start(0)
-        self.frame_count = 0
-        self.last_time = time.time()
         self.is_connected = False
         self.initChannel()
         # Initialize other classes instance
@@ -273,6 +271,26 @@ class MySensor:
             return
 
     def buildScene(self):
+        # 0) reset button appearance
+        self.parent.buildScene.setText("Build Scene")
+        self.parent.buildScene.setStyleSheet("color: white; font-weight: normal;")
+
+        # 1) remove existing OBJ mesh
+        if self.objActor is not None:
+            try:
+                self.plotter.remove_actor(self.objActor, reset_camera=False)
+            except Exception:
+                self.plotter.clear()
+            self.objActor = None
+
+        # 2) remove the line mesh
+        if self.actionMesh is not None:
+            try:
+                self.plotter.remove_actor(self.actionMesh, reset_camera=False)
+            except Exception:
+                self.plotter.clear()
+            self.actionMesh = None
+
         # Collect selected (checked) ports from the QListWidget
         selected_ports = []
         for index in range(self.parent.serial_channel.count()):
@@ -295,6 +313,9 @@ class MySensor:
             except Exception as e:
                 print(f"Failed to open /dev/{port}: {e}")
 
+        # Reset the parameters for the new model
+        self.clearParameters()
+
         # Now, process the sensor_choice. This is done once, outside the loop.
         sensor_index = self.parent.sensor_choice.currentIndex()
         if sensor_index == 0:
@@ -311,6 +332,8 @@ class MySensor:
             self.init_geneva_small()
         elif sensor_index == 1:
             self.init_robot()
+
+        self.update_ui_elements()
 
     def init_2d_model(self):
         self.n_row = 7  # 7
@@ -392,7 +415,7 @@ class MySensor:
             self.line_poly, scalars=self.colors_3d,
             point_size=10, line_width=3,
             render_points_as_spheres=True,
-            rgb=True, name='3d'
+            rgb=True, name='2d'
         )
 
         # # === Add labels for visualization ===
@@ -420,23 +443,20 @@ class MySensor:
         #     text_color='blue', name='edge_labels'
         # )
 
-        # Update UI elements
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
-
     def init_elbow_model(self):
+        # 1) now re-initialize your parameters
         self.n_row = 10
         self.n_col = 13
         self.n_node = self.n_row * self.n_col
 
         self._data = data(self.n_row, self.n_col)
-        self.points = np.zeros((self.n_node, 3))
-        self.edges = (np.ones(
-            ((self.n_col - 1) * (self.n_row - 1) * 2 + (self.n_col - 1) + (self.n_row - 1), 3)) * 2).astype(int)
 
+        # 2) fresh arrays
+        self.points = np.zeros((self.n_node, 3))
+        self.edges = np.ones(
+                ((self.n_col - 1) * (self.n_row - 1) * 2
+                          + + (self.n_col - 1) + (self.n_row - 1), 3)
+        ).astype(int) * 2
         self.colors_3d = np.ones((self.n_node, 4)) * 0.5
 
         self.is_connected = False
@@ -486,7 +506,14 @@ class MySensor:
                 self.colors_3d[i * self.n_row + j] = [i / self.n_col, j / self.n_row, 0, 1]
                 for k in self.array_positions[i * self.n_row + j]:
                     self.colors[k] = [i / self.n_col, j / self.n_row, 0, 1]
-        self.plotter.add_mesh(self._2D_map, show_edges=True, scalars=self.colors, rgb=True)
+        # save the handle so we can remove it later
+        self.objActor = self.plotter.add_mesh(
+            self._2D_map,
+            show_edges=True,
+            scalars=self.colors,
+            rgb=True,
+            name='elbow_obj'
+        )
         # TreeWidgetItem(self.parent.widget_tree,"_2D_map",0,0)
 
         a = self._2D_map.extract_surface()
@@ -506,7 +533,7 @@ class MySensor:
         self.line_poly = pv.PolyData(self.points)
         self.line_poly.lines = self.edges
         self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
-                                                render_points_as_spheres=True, rgb=True, name='3d')
+                                                render_points_as_spheres=True, rgb=True, name='elbow_mesh')
 
         # # --- Add labels for each point index ---
         # point_labels = [str(i) for i in range(self.n_node)]
@@ -521,12 +548,6 @@ class MySensor:
         # )
 
         self.elbow_skin_active = True
-
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Sence Builded")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
 
     def init_double_curve_model(self):
         self.n_row = 10
@@ -601,12 +622,6 @@ class MySensor:
                                                 render_points_as_spheres=True, rgb=True, name='3d')
         # TreeWidgetItem(self.parent.widget_tree,"_3D_mesh",0,0)
 
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
-
     def init_half_cylinder_surface_model(self):
         self.n_row = 10
         self.n_col = 10
@@ -677,12 +692,6 @@ class MySensor:
         self.line_poly.lines = self.edges
         self.actionMesh = self.plotter.add_mesh(self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
                                                 render_points_as_spheres=True, rgb=True, name='3d')
-
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
 
     def init_geneva_large(self):
         # Set grid dimensions (assumed built originally in row-major order)
@@ -832,12 +841,6 @@ class MySensor:
         #                               text_color='blue', name='edge_labels')
 
         self.large_skin_activated = True
-
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
 
     def init_geneva_small(self):
         # Set grid dimensions (originally in row-major order)
@@ -989,11 +992,6 @@ class MySensor:
         self.small_skin_activated = True
 
         # Update UI elements.
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
 
     def init_robot(self):
 
@@ -1506,12 +1504,6 @@ class MySensor:
                                                 render_points_as_spheres=True,
                                                 rgb=True, name='3d_3')
 
-        self.parent.sensor_choice.setDisabled(True)
-        self.parent.serial_channel.setDisabled(True)
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setDisabled(True)
-        self.parent.sensor_start.setDisabled(False)
-
     def startSensor(self):
 
         for i, ser in enumerate(self.ser_list):
@@ -1567,6 +1559,28 @@ class MySensor:
         self.is_connected_3 = True
 
         self.parent.sensor_update.setDisabled(False)
+
+    def clearParameters(self):
+        # 0) completely clear out anything left over from the last model
+        self.points = None  # wipe old geometry buffers
+        self.edges = None
+        self.colors = None
+        self.colors_3d = None
+        self.normals = None
+        self.colors_faces = None
+        self.line_poly = None
+        self.actionMesh = None
+        self.points_origin = None
+        self.array_positions = None
+        self.n_node = None
+        self._2D_map = None
+
+    def update_ui_elements(self):
+        self.parent.buildScene.setText("Scene Built")
+        self.parent.buildScene.setStyleSheet("""
+            color: #3498db;
+            font-weight: bold;
+        """)
 
     def startSensor_geneva(self):
         """
@@ -1912,6 +1926,10 @@ class MySensor:
         return diffPerDataAve_Reverse
 
     def read_sensor_raw_data(self):
+        rawData = self._data.rawData.flatten()
+        return rawData
+
+    def read_sensor_raw_ave_data(self):
         rawDataAve = self._data.rawDataAve.T.flatten()
         return rawDataAve
 
