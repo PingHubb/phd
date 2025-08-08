@@ -1,7 +1,7 @@
 import os
 import re
 
-gesture_number = 3
+gesture_number = 1
 
 def rename_files_in_folder(folder_path):
     # List all .txt files in the folder

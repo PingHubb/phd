@@ -22,7 +22,7 @@ def find_files_with_few_lines(folder):
                 lines = file.readlines()
 
                 # If the file has fewer than 10 lines, add it to the list
-                if len(lines) < 20:
+                if len(lines) < 30:
                     files_with_few_lines.append(file_name)
 
     return files_with_few_lines

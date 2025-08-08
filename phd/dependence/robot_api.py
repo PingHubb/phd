@@ -2,7 +2,6 @@ import numpy as np
 import subprocess
 import transforms3d
 import math
-
 # Attempt to import ROS2 dependencies; fallback if unavailable
 try:
     import rclpy
@@ -145,12 +144,17 @@ class RobotController(Node if ROSPY_AVAILABLE else object):
 
     # ---- Velocity Mode Helpers (return script strings) ----
     def enable_joint_velocity_mode(self):       return "ContinueVJog()"
+
     def stop_joint_velocity_mode(self):         return "StopContinueVmode()"
+
     def set_joint_velocity(self, v):            return f"SetContinueVJog({','.join(map(str, v))})"
 
     def enable_end_effector_velocity_mode(self):    return "ContinueVLine(5000,10000)"
+
     def suspend_end_effector_velocity_mode(self):   return "SuspendContinueVmode()"
+
     def stop_end_effector_velocity_mode(self):      return "StopContinueVmode()"
+
     def set_end_effector_velocity(self, v):         return f"SetContinueVLine({','.join(map(str, v))})"
 
     def stop_and_clear_buffer(self):               return "StopAndClearBuffer()"
@@ -158,11 +162,13 @@ class RobotController(Node if ROSPY_AVAILABLE else object):
     # ---- Callbacks & getters ----
     def _joint_cb(self, msg):
         self.current_positions = msg.position
+
     def get_current_positions(self):
         return self.current_positions
 
     def _tool_cb(self, msg):
         self.current_tool_pose = msg.pose
+
     def get_current_tool_position(self):
         if not self.current_tool_pose:
             return None, None

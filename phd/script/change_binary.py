@@ -1,6 +1,6 @@
 import os
 
-number = 3
+number = 11
 # Define your input and output folder paths
 gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{number}"
 output_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/discrete/gesture_{number}"

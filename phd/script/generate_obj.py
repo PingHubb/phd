@@ -83,7 +83,7 @@ vertices = np.column_stack((x_grid.flatten(), y_grid.flatten(), z_grid.flatten()
 normals = np.column_stack((normals_x.flatten(), normals_y.flatten(), normals_z.flatten()))
 
 # Write to .obj file
-with open('../resource/sensor/half_cylinder_surface/half_cylinder.obj', 'w') as file:
+with open('../resource/sensor/half_cylinder_surface/half_cylinder_2.obj', 'w') as file:
     # Write vertices
     for v in vertices:
         file.write(f"v {v[0]} {v[1]} {v[2]}\n")

@@ -41,19 +41,13 @@ class ArduinoCommander:
         while (time.time() - start_time) < timeout:
             if self.ser.in_waiting > 0:
                 response = self.ser.readline().decode('utf-8').rstrip()
-                # Optionally, process the response into a list
                 data_list = [int(value) for value in response.split() if value.isdigit()]
-
                 if command == "readRaw":
-                    # print(f"Data length: {len(data_list)}")
                     return data_list[2:-2]
                 elif command == "readCal":
-                    # print(f"Response from {command}: {data_list[2:-2]}")
                     return data_list[2:-2]
                 elif command == "updateCal":
-                    # print(f"Response from {command}: {data_list[2:-2]}")
                     return data_list[2:-2]
                 elif command == "channelCheck":
-                    # print(f"Response from {command}: {data_list}")
                     return data_list
         return None
