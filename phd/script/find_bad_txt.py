@@ -1,6 +1,6 @@
 import os
 
-gesture_number = 0
+gesture_number = "cylinder_1"
 
 # Define the folder path
 folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{gesture_number}"  # Replace with your folder path

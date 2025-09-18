@@ -310,6 +310,16 @@ class SensorSignalWindow(QWidget):
                         intensity_ratio = difference / max_value
                         red_intensity = max(0, min(255, int(intensity_ratio * 255)))
                         color = QColor(255, 255 - red_intensity, 255 - red_intensity)
+                        # Calculate the difference from the threshold
+
+                        # difference = diff - t_max
+                        # # Determine the intensity of the gray color based on the difference
+                        # intensity_ratio = difference / max_value
+                        # gray_intensity = max(0, min(255, int(intensity_ratio * 255)))
+                        # # Calculate the color value for grayscale (from white to black)
+                        # color_value = 255 - gray_intensity
+                        # # Set all three channels (R, G, B) to the same value for grayscale
+                        # color = QColor(color_value, color_value, color_value)
 
                     item = self.table.item(row, col)
                     if item is None:

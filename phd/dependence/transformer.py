@@ -34,6 +34,9 @@ class PositionalEncoding(nn.Module):
         x = x.permute(1, 0, 2)  # -> (Batch, Seq_len, Features)
         return self.dropout(x)
 
+        # x = x + self.pe[:x.size(0), :]  # Dont use this, this is rubbish for our case
+        # return self.dropout(x)
+
 
 class GestureBackbone(nn.Module):
     """

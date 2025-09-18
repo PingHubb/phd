@@ -149,7 +149,7 @@ class RobotController(Node if ROSPY_AVAILABLE else object):
 
     def set_joint_velocity(self, v):            return f"SetContinueVJog({','.join(map(str, v))})"
 
-    def enable_end_effector_velocity_mode(self):    return "ContinueVLine(5000,10000)"
+    def enable_end_effector_velocity_mode(self):    return "ContinueVLine(20000,100000)"
 
     def suspend_end_effector_velocity_mode(self):   return "SuspendContinueVmode()"
 
@@ -175,3 +175,97 @@ class RobotController(Node if ROSPY_AVAILABLE else object):
         p = self.current_tool_pose.position
         o = self.current_tool_pose.orientation
         return (p.x, p.y, p.z), (o.w, o.x, o.y, o.z)
+
+    def set_end_effector_velocity_pre_joint_frame(
+            self,
+            v_lin,
+            v_rot=(0.0, 0.0, 0.0),
+            joint: int = 6,
+            axes_map: dict = None,
+    ):
+        """
+        Express v_lin/v_rot in a frame tied to JOINT <joint>:
+          joint=6 → TOOL frame (no removal)
+          joint=5 → remove J6 (pre-roll)
+          joint=4 → remove J6,J5
+          joint=3 → remove J6,J5,J4
+          joint=2 → remove J6..J3
+          joint=1 → (alias to BASE in dispatcher)
+
+        NOTE: Origin remains at TCP; we only change axes.
+        """
+        # Adjust once if TM5-900 joint axes differ
+        if axes_map is None:
+            axes_map = {6: 'z', 5: 'y', 4: 'z', 3: 'y', 2: 'z', 1: 'z'}
+
+        pos_quat = self.get_current_tool_position()
+        if not pos_quat:
+            return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
+
+        # correct unpack: ((px,py,pz), (qw,qx,qy,qz))
+        _, quat = pos_quat
+        R = transforms3d.quaternions.quat2mat(quat)
+
+        # TOOL frame needs no joint states
+        if joint != 6:
+            joints = self.get_current_positions()
+            if not joints or len(joints) < 6:
+                return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
+
+            # peel off downstream joints J6..J(joint+1)
+            for j in range(6, joint, -1):  # 6,5,4,...,(joint+1)
+                axis = axes_map.get(j, 'z').lower()
+                q = float(joints[j - 1])  # 0-based index
+                c, s = math.cos(-q), math.sin(-q)
+                if axis == 'x':
+                    R = R.dot(np.array([[1, 0, 0], [0, c, -s], [0, s, c]], float))
+                elif axis == 'y':
+                    R = R.dot(np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], float))
+                else:  # 'z'
+                    R = R.dot(np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], float))
+
+        v_lin_world = R.dot(np.asarray(v_lin, dtype=float))
+        v_rot_world = R.dot(np.asarray(v_rot, dtype=float))
+        return self.set_end_effector_velocity(list(v_lin_world) + list(v_rot_world))
+
+    def set_end_effector_velocity_in_frame(self, v_lin, v_rot=(0.0, 0.0, 0.0), frame="tool"):
+        """
+        frame accepts:
+          - "base" (world-fixed axes)
+          - "tool", "tcp", or "joint6" (tool axes)
+          - "joint5", "joint4", "joint3", "joint2"
+          - "joint1" (alias to base)
+
+        Examples:
+          frame="base"   or "joint1"  -> base axes
+          frame="tool"   or "joint6"  -> tool axes
+          frame="joint5"               -> J5-aligned axes (pre-roll)
+          frame="joint4"/"joint3"/"joint2" -> pre-wrist / pre-forearm / pre-shoulder
+        """
+        # normalize & aliases
+        f = (frame or "tool").strip().lower()
+        aliases = {
+            "tcp": "joint6",
+            "tool": "joint6",
+            "world": "base",
+            "j1": "base",
+            "joint1": "base",
+            "j6": "joint6",
+        }
+        f = aliases.get(f, f)
+
+        if f == "base":
+            return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
+
+        if f.startswith("joint"):
+            n = int(f[5:])
+            if not (1 <= n <= 6):
+                raise ValueError("jointN must be between 1 and 6")
+            if n == 1:
+                # joint1 == base by your requirement
+                return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
+            return self.set_end_effector_velocity_pre_joint_frame(v_lin, v_rot, joint=n)
+
+        raise ValueError(f"Unknown frame '{frame}'")
+
+

@@ -1044,40 +1044,41 @@ class HierarchicalTransformer:
             print(f"Predicted: {finger_str} {gesture_str} (Conf F: {finger_conf:.2f}, G: {gesture_conf:.2f})")
             if finger_pred == 0:  # 1-Finger Gestures
                 if gesture_pred == 0:
-                    self.movement_y = -0.1  # Left
+                    self.movement_x = -0.1  # Left
                 elif gesture_pred == 1:
-                    self.movement_y = 0.1  # Right
+                    self.movement_x = 0.1  # Right
                 elif gesture_pred == 2:
-                    self.movement_z = -0.1  # Down
+                    self.movement_z = 0.1  # Down
                 elif gesture_pred == 3:
-                    self.movement_z = 0.1  # Up
+                    self.movement_z = -0.1  # Up
 
             elif finger_pred == 1:  # 2-Finger Gestures
                 if gesture_pred == 0:
-                    self.movement_y = -0.1  # Left
+                    self.movement_x = -0.1  # Left
                 elif gesture_pred == 1:
-                    self.movement_y = 0.1  # Right
+                    self.movement_x = 0.1  # Right
                 elif gesture_pred == 2:
-                    self.movement_z = -0.1  # Down
+                    self.movement_z = 0.1  # Down
                 elif gesture_pred == 3:
-                    self.movement_z = 0.1  # Up
+                    self.movement_z = -0.1  # Up
 
         else:
             print(f"Action: No action defined for this sensor size or combination.")
             return
 
         # Send the continuous velocity command to the robot
+        frame = "joint5"  # <-- change to "tool" if you want the old behavior
         self.ros_splitter.robot_api.send_request(
-            self.ros_splitter.robot_api.set_end_effector_velocity([
-                self.movement_x, self.movement_y, self.movement_z,
-                self.rotation_x, self.rotation_y, self.rotation_z
-            ])
+            self.ros_splitter.robot_api.set_end_effector_velocity_in_frame(
+                [self.movement_x, self.movement_y, self.movement_z],
+                [self.rotation_x, self.rotation_y, self.rotation_z],
+                frame=frame,
+            )
         )
 
 
 class ThreeLevelTransformer:
     def __init__(self, ros_splitter_instance, my_sensor_instance, n_row, n_col):
-        # ... (all other __init__ variables are the same)
         self.ros_splitter = ros_splitter_instance
         self.my_sensor = my_sensor_instance
         self.n_row = n_row
@@ -1086,7 +1087,23 @@ class ThreeLevelTransformer:
         self.recognition_timer = QTimer()
         self.recognition_timer.timeout.connect(self.run_recognition_step)
         self.current_gesture_data = []
-        self.window_size = 30
+        self.window_size = 20
+        self.latch_mode = False  # OFF by default
+        self.last_detected_finger = None  # remember the finger class when we latch
+        self._skip_velocity_once = False  # suppress velocity send after a jog
+        self._joint_velocity_vec = [0.0] * 6
+        self._joint_vel_mode_enabled = False
+        self._latest_raw_mean = 0.0
+        self.raw_mean_touch_threshold = -0.1  # if latest frame < this → force Do Nothing
+        self.performing_flag = False
+        self.waiting_flag = True
+        self.counter = 0
+
+        # --- Anchor Frame Variables ---
+        self._anchor_pos = None  # [x,y,z] at activation (not strictly needed for velocity)
+        self._anchor_quat = None  # (w,x,y,z) at activation
+        self._anchor_R = None  # 3x3 rotation (frozen axes) at activation
+        self.anchor_enabled = True
 
         # --- State Machine Variables ---
         self.STATE_WAITING = 0
@@ -1105,14 +1122,17 @@ class ThreeLevelTransformer:
         self.movement_x, self.movement_y, self.movement_z = 0.0, 0.0, 0.0
         self.rotation_x, self.rotation_y, self.rotation_z = 0.0, 0.0, 0.0
 
-        models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder_012345_threelevel(30frames)/'
-        models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder_012345_threelevel(30frames)/'
+        models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_012345_threelevel(30frames)/'
+        models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_012345_threelevel(30frames)/'
         if self.n_row == 13 and self.n_col == 10:
-            models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow_0123_threelevel_v6(30frames)/'
-            models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow_0123_threelevel_v6(30frames)/'
+            models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow/eblow_0123_threelevel_v6(30frames)/'
+            models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow/eblow_0123_threelevel_v6(30frames)/'
         if self.n_row == 9 and self.n_col == 10:
-            models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder_012345_threelevel(30frames)/'
-            models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder_012345_threelevel(30frames)/'
+            # models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/'
+            # models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/'
+            models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/num_123_experiment/'
+            models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/num_123_experiment/'
+
 
         self.model_path = os.path.join(models_path_3level_model, '3level_model.pth')
         self.config_path = os.path.join(models_path_3level_backbone, 'backbone_3level_config.txt')
@@ -1169,6 +1189,7 @@ class ThreeLevelTransformer:
     def reset_movement_variables(self):
         self.movement_x, self.movement_y, self.movement_z = 0.0, 0.0, 0.0
         self.rotation_x, self.rotation_y, self.rotation_z = 0.0, 0.0, 0.0
+        self._joint_velocity_vec = [0.0] * 6
 
     def toggle_gesture_recognition(self):
         if self.model is None:
@@ -1177,16 +1198,126 @@ class ThreeLevelTransformer:
 
         self.is_recognizing_gesture = not self.is_recognizing_gesture
         if self.is_recognizing_gesture:
-            self.recognition_timer.start()
-            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
-            print("3-Level Transformer Recognition STARTED.")
+            if self.n_row == 9 and self.n_col == 10:
+                self.recognition_timer.start()
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
+                print("3-Level Transformer Recognition STARTED (Frame Control).")
+            if self.n_row == 13 and self.n_col == 10:
+                self.recognition_timer.start()
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.enable_joint_velocity_mode())
+                print("3-Level Transformer Recognition STARTED (Joint Control).")
         else:
-            self.recognition_timer.stop()
-            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
-            print("3-Level Transformer Recognition STOPPED.")
+            if self.n_row == 9 and self.n_col == 10:
+                self.recognition_timer.stop()
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
+                print("3-Level Transformer Recognition STOPPED (Frame Control).")
+            if self.n_row == 13 and self.n_col == 10:
+                self.recognition_timer.stop()
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_joint_velocity_mode())
+                print("3-Level Transformer Recognition STOPPED (Joint Control).")
 
         self.current_gesture_data = []
         self.current_state = self.STATE_WAITING
+
+    def toggle_latch_mode(self):
+        self.latch_mode = not self.latch_mode
+        print(f"[3Level] Latch mode = {'ON' if self.latch_mode else 'OFF'}")
+
+    def _get_requested_frame(self):
+        # Look for the line edit we added to the UI
+        le = getattr(self.ros_splitter, "ai_frame_input", None)
+        if le is None:
+            return None
+        txt = le.text().strip().lower()
+        return txt or None  # None if blank
+
+    def _clear_anchor(self):
+        self._anchor_pos = None
+        self._anchor_quat = None
+        self._anchor_R = None
+
+    def _get_requested_frame(self):
+        # optional: read from the AI tab if you added the QLineEdit
+        le = getattr(self.ros_splitter, "ai_frame_input", None)
+        if le is None:
+            return None
+        t = le.text().strip().lower()
+        return t or None
+
+    def _get_R_for_frame(self, frame: str):
+        """
+        Build the current 3x3 rotation for the chosen frame.
+        base/joint1 -> I
+        tool/tcp/joint6 -> R_tool
+        jointN (2..5) -> R_tool * Π R_axis(-q_j) for j=6..N+1
+        """
+        import numpy as np, math, transforms3d
+        f = (frame or "tool").strip().lower()
+
+        if f in ("base", "world", "joint1", "j1"):
+            return np.eye(3, dtype=float)
+
+        # Read current tool pose
+        pos_quat = self.ros_splitter.robot_api.get_current_tool_position()
+        if not pos_quat or pos_quat[1] is None:
+            return np.eye(3, dtype=float)
+        _, quat = pos_quat
+        R = transforms3d.quaternions.quat2mat(quat)
+
+        if f in ("tool", "tcp", "joint6", "j6"):
+            return R
+
+        # jointN (2..5)
+        if not f.startswith("joint"):
+            return R
+        try:
+            n = int(f[5:])
+        except:
+            n = 6
+        n = max(1, min(6, n))
+        if n >= 6:
+            return R
+
+        joints = self.ros_splitter.robot_api.get_current_positions()
+        if not joints or len(joints) < 6:
+            return R
+
+        # Adjust once if TM5-900 axes differ
+        axes_map = {6: 'z', 5: 'y', 4: 'z', 3: 'y', 2: 'z', 1: 'z'}
+
+        def _Rx(t):
+            c, s = math.cos(t), math.sin(t)
+            return np.array([[1, 0, 0], [0, c, -s], [0, s, c]], float)
+
+        def _Ry(t):
+            c, s = math.cos(t), math.sin(t)
+            return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], float)
+
+        def _Rz(t):
+            c, s = math.cos(t), math.sin(t)
+            return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], float)
+
+        # Peel off downstream joints J6..J(n+1)
+        for j in range(6, n, -1):  # 6,5,4,...,(n+1)
+            axis = axes_map.get(j, 'z')
+            q = float(joints[j - 1])
+            R = R.dot(_Rx(-q) if axis == 'x' else _Ry(-q) if axis == 'y' else _Rz(-q))
+        return R
+
+    def _set_anchor_from_current_frame(self):
+        """Capture pose & the rotation matrix of the chosen frame at activation."""
+        import numpy as np
+        pos_quat = self.ros_splitter.robot_api.get_current_tool_position()
+        if not pos_quat:
+            return
+        (px, py, pz), quat = pos_quat
+        self._anchor_pos = np.array([px, py, pz], float)
+        self._anchor_quat = tuple(quat)
+        frame = self._get_requested_frame() or "tool"  # use whatever you were using
+        self._anchor_R = self._get_R_for_frame(frame)
 
     def run_recognition_step(self):
         """ The main recognition loop, simplified without cooldown. """
@@ -1202,6 +1333,11 @@ class ThreeLevelTransformer:
 
         if len(self.current_gesture_data) < self.window_size:
             return
+
+        raw_grid = self.my_sensor._data.diffPerDataAve  # 2D (n_row x n_col)
+        raw_mean = float(np.mean(raw_grid))
+        self._latest_raw_mean = raw_mean
+        # print(f"raw_mean = {raw_mean:.6f}")
 
         # --- Step 2: Predict on the current window ---
         self.predict_gesture(list(self.current_gesture_data))
@@ -1223,53 +1359,157 @@ class ThreeLevelTransformer:
             self.handle_state_logic(f_pred.item(), f_conf.item(), g_pred.item(), g_conf.item(), q_pred.item(),
                                     q_conf.item())
 
+    def _maybe_send_once(self):
+        """
+        Send robot command at most once per 'phase' when latch_mode=True,
+        print transitions, and (NEW) DO NOT send a command on PERFORMING -> WAITING.
+        """
+        latch = getattr(self, "latch_mode", False)
+
+        # ---- transition print + robot mode management ----
+        prev_state = getattr(self, "_last_state_for_print", None)
+        cur_state = getattr(self, "current_state", None)
+
+        suppress_send = False  # NEW: gate to skip send on PERFORMING->WAITING
+
+        if latch and prev_state is not None and prev_state != cur_state:
+            if prev_state == self.STATE_PERFORMING and cur_state == self.STATE_WAITING:
+                print("change from perform to waiting")
+                # stop velocity mode; do NOT send robot command this tick
+                try:
+                    # self.ros_splitter.robot_api.send_request(
+                    #     self.ros_splitter.robot_api.suspend_end_effector_velocity_mode()
+                    # )
+                    # self.ros_splitter.robot_api.send_request(
+                    #     self.ros_splitter.robot_api.stop_end_effector_velocity_mode()
+                    # )
+                    # self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_and_clear_buffer())  # This prevent the move after stop, but will have bug like random movement
+                    print("Entering Waiting state.")
+                except Exception:
+                    pass
+                suppress_send = False  # allow one zero-velocity send on PERFORMING->WAITING
+            elif prev_state == self.STATE_WAITING and cur_state == self.STATE_PERFORMING:
+                print("change from waiting to perform")
+                # enable velocity mode; allow sending the latched gesture once
+                try:
+                    # self.ros_splitter.robot_api.send_request(
+                    #     self.ros_splitter.robot_api.suspend_end_effector_velocity_mode()
+                    # )
+                    # self.ros_splitter.robot_api.send_request(
+                    #     self.ros_splitter.robot_api.enable_end_effector_velocity_mode()
+                    # )
+                    print("Entering Performing state.")
+                except Exception:
+                    pass
+
+        # snap state so prints happen only once per change
+        self._last_state_for_print = cur_state
+
+        # ---- send-once-per-phase logic ----
+        if latch:
+            # define a "phase" key so we only send once per phase
+            if self.current_state == self.STATE_WAITING:
+                key = ("WAITING", None)
+            else:
+                key = ("PERFORMING", getattr(self, "last_detected_gesture", None))
+
+            if getattr(self, "_last_command_key", None) != key:
+                # advance the phase no matter what...
+                self._last_command_key = key
+                # ...but SKIP sending if we just went PERFORMING -> WAITING
+                if not suppress_send:
+                    self.send_robot_command()
+                    print("Entering 1")
+        else:
+            # continuous mode: original behavior (send every frame)
+            self.send_robot_command()
+            print("Entering 2")
+
     def handle_state_logic(self, f_pred, f_conf, g_pred, g_conf, q_pred, q_conf):
         """
-        Implements the State Machine with an activation counter to START,
-        but an INSTANT deactivation to STOP.
+        State machine:
+          - Activation counter to enter PERFORMING
+          - Instant Do-Nothing if (PERFORMING and latest raw_mean > -0.1)
+          - Latch mode (hold until Do-Nothing)
+          - Continuous mode (tracks live prediction)
         """
-        # --- Step 1: Print raw prediction (no change) ---
-        finger_str = f"{f_pred + 1}-Finger"
-        gesture_map = {0: "Push", 1: "Pull", 2: "Down", 3: "Up", 4: "Do Nothing"}
-        gesture_str = gesture_map.get(g_pred, f"Unknown({g_pred})")
-        quality_str = "Good" if q_pred == 0 else "Damaged"
-        # print(f"Activation Counter: {self.activation_counter}, State: {self.current_state}")
+        # --- 0) Forced Do-Nothing via latest raw_mean (your new rule) ---
+        try:
+            raw_mean = float(getattr(self, "_latest_raw_mean", np.mean(self.my_sensor._data.diffPerDataAve)))
+        except Exception:
+            raw_mean = 0.0
 
-        # --- Step 2: High-Priority Quality Check (no change) ---
-        confidence_threshold = 0.8
-        is_good_quality = (q_pred == 0 and q_conf > confidence_threshold)
-        if not is_good_quality:
-            print("BROKEN!!!")
+        if self.current_state == self.STATE_PERFORMING and raw_mean > self.raw_mean_touch_threshold:
+            # Clear motion & window immediately
             self.reset_movement_variables()
-            self.send_robot_command()
-            self.my_sensor.updateCal()
-            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
-            self.current_gesture_data = []  # Clearing buffer might be useful here
-            # Reset all state
+            self.current_gesture_data.clear()  # clear the 30-frame buffer
             self.activation_counter = 0
+            self.potential_gesture_to_activate = None
+            self.last_detected_gesture = None
+
+            # Unlatch behavior mirrors your normal Do-Nothing path
+            if getattr(self, "latch_mode", False):
+                try:
+                    self.my_sensor.updateCal()
+                except Exception:
+                    pass
+
+            self.current_state = self.STATE_WAITING
+
+            # Prime anchor/zeros for the (single) send below
+            if self.anchor_enabled:
+                self._set_anchor_from_current_frame()
+            else:
+                self._clear_anchor()
+
+            # SEND-ONCE
+            self._maybe_send_once()
+            return
+
+        # --- 1) Quality gate (stop immediately on poor signal) ---
+        min_q = getattr(self, "min_quality_conf", 0.40)
+        # Assuming q_pred == 0 means "good quality" in your model
+        is_good_quality = (q_pred == 0 and q_conf >= min_q)
+
+        if not is_good_quality:
+            self.reset_movement_variables()
+            self.current_gesture_data.clear()  # clear the 30-frame buffer
+            self.activation_counter = 0
+            try:
+                self.my_sensor.updateCal()
+            except Exception:
+                pass
             self.potential_gesture_to_activate = None
             if self.current_state == self.STATE_PERFORMING:
                 self.current_state = self.STATE_WAITING
-                self.last_detected_gesture = None
-                print(">>> State: PERFORMING -> WAITING (due to poor signal quality)")
+
+            # Prime anchor/zeros, then SEND-ONCE
+            if self.anchor_enabled:
+                self._set_anchor_from_current_frame()
+            else:
+                self._clear_anchor()
+            self._maybe_send_once()
             return
 
-        # --- Step 3: State Machine Logic for GOOD Quality Signals ---
-
-        is_do_nothing = (g_pred == 6)
-
+        # --- 2) Do-Nothing detection by gesture class (model-specific) ---
         if self.n_row == 9 and self.n_col == 10:
-            is_do_nothing = (g_pred == 6)   # PLEASE EDIT THIS!!!
-        if self.n_row == 13 and self.n_col == 10:
-            is_do_nothing = (g_pred == 4)   # PLEASE EDIT THIS!!!
+            is_do_nothing = (f_pred == 0)
+        elif self.n_row == 13 and self.n_col == 10:
+            is_do_nothing = (g_pred == 4)
+        else:
+            # fallback: treat low gesture confidence as Do-Nothing
+            is_do_nothing = (g_conf < getattr(self, "min_gesture_conf", 0.55))
 
-        is_real_gesture = (not is_do_nothing and g_conf > confidence_threshold and f_conf > confidence_threshold)
+        # Real gesture if not Do-Nothing and both finger/gesture are confident
+        conf_f = getattr(self, "min_finger_conf", 0.55)
+        conf_g = getattr(self, "min_gesture_conf", 0.55)
+        is_real_gesture = (not is_do_nothing and f_conf >= conf_f and g_conf >= conf_g)
 
+        # --- 3) State machine ---
         if self.current_state == self.STATE_WAITING:
-            self.reset_movement_variables()
-            # Activation logic remains the same
+            # Activation counting
             if is_real_gesture:
-                if self.potential_gesture_to_activate is None:
+                if getattr(self, "potential_gesture_to_activate", None) is None:
                     self.potential_gesture_to_activate = g_pred
                     self.activation_counter = 1
                 elif g_pred == self.potential_gesture_to_activate:
@@ -1281,149 +1521,173 @@ class ThreeLevelTransformer:
                 self.activation_counter = 0
                 self.potential_gesture_to_activate = None
 
-            if self.activation_counter >= self.activation_threshold:
+            # Become PERFORMING after enough consistent frames
+            if self.activation_counter >= getattr(self, "activation_threshold", 10):
                 self.current_state = self.STATE_PERFORMING
                 self.last_detected_gesture = self.potential_gesture_to_activate
+                self.last_detected_finger = f_pred
+                self._set_anchor_from_current_frame()
+                # Prime motion once on entry (latched)
                 self.set_robot_movement(f_pred, self.last_detected_gesture)
                 self.activation_counter = 0
                 self.potential_gesture_to_activate = None
-                print(f">>> State: WAITING -> PERFORMING ({gesture_map.get(self.last_detected_gesture, 'Unknown')})")
+                # (No immediate send here; handled at bottom via _maybe_send_once)
 
-        elif self.current_state == self.STATE_PERFORMING:
-            # --- NEW, SIMPLIFIED DEACTIVATION LOGIC ---
-            if is_real_gesture and g_pred == self.last_detected_gesture:
-                # The gesture is still active. Continue the movement.
-                self.set_robot_movement(f_pred, g_pred)
+        else:  # STATE_PERFORMING
+            if getattr(self, "latch_mode", False):
+                # Latch: hold until Do-Nothing
+                if is_do_nothing:
+                    self.current_state = self.STATE_WAITING
+                    self.last_detected_gesture = None
+                    self.reset_movement_variables()
+                    try:
+                        self.my_sensor.updateCal()
+                    except Exception:
+                        pass
+                    if self.anchor_enabled:
+                        self._set_anchor_from_current_frame()
+                    else:
+                        self._clear_anchor()
+                    # (Send handled at bottom via _maybe_send_once)
+                else:
+                    # keep executing the latched gesture using remembered finger
+                    finger_used = getattr(self, "last_detected_finger", f_pred)
+                    self.set_robot_movement(finger_used, self.last_detected_gesture)
+                    # (No send here while latched; only on transition)
             else:
-                # The prediction is NO LONGER the active gesture. STOP IMMEDIATELY.
-                self.current_state = self.STATE_WAITING
-                self.last_detected_gesture = None
-                self.reset_movement_variables()
-                print(f">>> State: PERFORMING -> WAITING (Gesture Ended)")
+                # Continuous: Update & send every frame (old behavior via _maybe_send_once -> always send)
+                if is_real_gesture:
+                    self.set_robot_movement(f_pred, g_pred)
+                    self.last_detected_gesture = g_pred
+                else:
+                    self.current_state = self.STATE_WAITING
+                    self.last_detected_gesture = None
+                    self.reset_movement_variables()
+                    if self.anchor_enabled:
+                        self._set_anchor_from_current_frame()
+                    else:
+                        self._clear_anchor()
 
-        # Send the final command to the robot
-        self.send_robot_command()
+        # --- 4) Send command (once-per-transition in latch mode; every frame otherwise) ---
+        self._maybe_send_once()
 
     def set_robot_movement(self, finger_pred, gesture_pred):
         """A helper to set movement variables based on a valid gesture prediction."""
-        # Assuming 1-Finger for now
-        print("Row:", self.n_row, "Col:", self.n_col)
+        speed = 0.02
+        j_speed = 0.01  # deg/s; change if you want faster/slower
+        jv = [0.0] * 6
 
         if self.n_row == 9 and self.n_col == 10:
             if finger_pred == 0:
-                if gesture_pred == 0:
-                    print("Gesture: Push")
-                    # self.movement_x = -0.06
-                    # self.movement_y = -0.06
-                    self.movement_x = -0.06
-                    self.movement_y = -0.06
-                elif gesture_pred == 1:
-                    print("Gesture: Pull")
-                    # self.movement_x = 0.06
-                    # self.movement_y = 0.06
-                    self.movement_x = 0.06
-                    self.movement_y = 0.06
-                elif gesture_pred == 2:
-                    print("Gesture: Left")
-                    # self.movement_z = -0.06
-                    self.movement_x = 0.06
-                elif gesture_pred == 3:
-                    print("Gesture: Right")
-                    # self.movement_z = 0.06
-                    self.movement_y = 0.06
-                elif gesture_pred == 4:
-                    print("Gesture: Down")
-                    self.movement_z = -0.06
-                elif gesture_pred == 5:
-                    print("Gesture: Up")
-                    self.movement_z = 0.06
+                print("Gesture: Nothing")
+            if finger_pred == 1:
+                if gesture_pred == 1:  # Push (away from you along tool +X)
+                    print("Gesture: PUSH")
+                    self.movement_y = -speed
+                elif gesture_pred == 2:  # Pull (toward you along tool -X)
+                    print("Gesture: PULL")
+                    self.movement_y = +speed
+                elif gesture_pred == 3:  # Left (your left = tool -Y)
+                    print("Gesture: SWIPE LEFT")
+                    self.movement_x = -speed
+                elif gesture_pred == 4:  # Right (your right = tool +Y)
+                    print("Gesture: SWIPE RIGHT")
+                    self.movement_x = +speed
+                elif gesture_pred == 5:  # Down (toward table = tool -Z)
+                    print("Gesture: SWIPE DOWN")
+                    self.movement_z = +speed
+                elif gesture_pred == 6:  # Up (away from table = tool +Z)
+                    print("Gesture: SWIPE UP")
+                    self.movement_z = -speed
+                elif gesture_pred == 7:  # Clockwise rotation
+                    print("Gesture: CLOCKWISE")
+                    self.rotation_y = -0.0001
+                elif gesture_pred == 8:  # Anti-clockwise rotation
+                    print("Gesture: ANTI-CLOCKWISE")
+                    self.rotation_y = +0.0001
+            if finger_pred == 2:
+                if gesture_pred == 3:
+                    print("Finger: 2, Gesture: SWIPE LEFT")
+                    self.rotation_z = +0.0001
+                if gesture_pred == 4:
+                    print("Finger: 2, Gesture: SWIPE RIGHT")
+                    self.rotation_z = -0.0001
+                if gesture_pred == 5:
+                    print("Finger: 2, Gesture: SWIPE DoWN")
+                    self.rotation_x = -0.0001
+                if gesture_pred == 6:
+                    print("Finger: 2, Gesture: SWIPE UP")
+                    self.rotation_x = -0.0001
+                elif gesture_pred == 7:  # Clockwise rotation
+                    print("Finger: 2, Gesture: CLOCKWISE")
+                    self.rotation_y = -0.0001
+                elif gesture_pred == 8:  # Anti-clockwise rotation
+                    print("Finger: 2, Gesture: ANTI-CLOCKWISE")
+                    self.rotation_y = +0.0001
+            if finger_pred == 3:
+                if gesture_pred == 3:
+                    print("Finger: 5, Gesture: Pinch in")
+                if gesture_pred == 4:
+                    print("Finger: 5, Gesture: Pinch out")
+
 
         if self.n_row == 13 and self.n_col == 10:
+            # Use JV mode: build a 6-DOF vector of joint speeds (deg/s)
             if finger_pred == 0:
                 if gesture_pred == 0:
-                    print("Gesture: Push")
-                    self.movement_x = -0.06
-                    self.movement_y = -0.06
+                    print("Gesture: Push → J0 +")
+                    jv[0] = +j_speed
                 elif gesture_pred == 1:
-                    print("Gesture: Left")
-                    self.movement_x = 0.06
-                    self.movement_y = 0.06
+                    print("Gesture: Pull → J0 -")
+                    jv[0] = -j_speed
                 elif gesture_pred == 2:
-                    print("Gesture: Down")
-                    self.movement_z = -0.06
+                    print("Gesture: Down → J1 +")
+                    jv[1] = +j_speed
                 elif gesture_pred == 3:
-                    print("Gesture: Up")
-                    self.movement_z = 0.06
-
-    def set_robot_movement_JJJJJJJJJJJJJJJJJJJJJJJ(self, finger_pred, gesture_pred):
-        """
-        Sets the desired robot velocity, transforming it from the TOOL FRAME
-        to the WORLD FRAME using the robot's current orientation.
-        """
-        self.reset_movement_variables()
-
-        # --- Step 1: Define Desired Velocity in the TOOL's coordinate system ---
-        # Let's assume:
-        # - Tool X-axis is forward(+)/backward(-) -> Pull/Push
-        # - Tool Z-axis is up(+)/down(-)
-        # NOTE: You may need to swap axes or negate values depending on your tool's definition.
-        tool_velocity = np.array([0.0, 0.0, 0.0])
-        speed = 0.03  # m/s
-
-        if finger_pred == 0:  # 1-Finger Gestures
-            if gesture_pred == 0:  # Push
-                print("Gesture: Push (Tool Frame)")
-                tool_velocity[0] = -speed
-            elif gesture_pred == 1:  # Pull
-                print("Gesture: Pull (Tool Frame)")
-                tool_velocity[0] = speed
-            elif gesture_pred == 2:  # Down
-                print("Gesture: Down (Tool Frame)")
-                tool_velocity[2] = speed
-            elif gesture_pred == 3:  # Up
-                print("Gesture: Up (Tool Frame)")
-                tool_velocity[2] = -speed
-
-        # --- Step 2: Get the Robot's Current Orientation (Quaternion) ---
-        # This is the critical link to your robot_api.py
-        _, orientation_quat = self.ros_splitter.robot_api.get_current_tool_position()
-
-        if orientation_quat is None or R is None:
-            if R is None:
-                print("Scipy not available, cannot perform rotation.")
-            else:
-                print("Warning: Could not get robot orientation. Using global frame as fallback.")
-            # Fallback to old global coordinate behavior if orientation is not ready
-            self.movement_x, self.movement_y, self.movement_z = tool_velocity[0], tool_velocity[1], tool_velocity[2]
+                    print("Gesture: Up → J1 -")
+                    jv[1] = -j_speed
+                self._joint_velocity_vec = jv
             return
 
-        # --- Step 3: Transform Tool Velocity to World Velocity ---
-        try:
-            # Your API provides (w, x, y, z). Scipy expects (x, y, z, w).
-            # We need to reorder the quaternion components.
-            w, x, y, z = orientation_quat
-            scipy_quat = [x, y, z, w]
-
-            # Create a Rotation object from the quaternion
-            rotation = R.from_quat(scipy_quat)
-
-            # Use the 'apply' method to rotate the tool_velocity vector
-            # This transforms it from the tool's coordinate frame to the world's frame.
-            world_velocity = rotation.apply(tool_velocity)
-
-            # --- Step 4: Assign the new World-Frame Velocities ---
-            self.movement_x = world_velocity[0]
-            self.movement_y = world_velocity[1]
-            self.movement_z = world_velocity[2]
-
-        except Exception as e:
-            print(f"Error during velocity transformation: {e}. Using global frame as fallback.")
-            self.movement_x, self.movement_y, self.movement_z = tool_velocity[0], tool_velocity[1], tool_velocity[2]
-
     def send_robot_command(self):
-        self.ros_splitter.robot_api.send_request(
-            self.ros_splitter.robot_api.set_end_effector_velocity([
-                self.movement_x, self.movement_y, self.movement_z,
-                self.rotation_x, self.rotation_y, self.rotation_z
-            ])
-        )
+        # self.ros_splitter.robot_api.send_request(
+        #     self.ros_splitter.robot_api.set_end_effector_velocity([
+        #         self.movement_x, self.movement_y, self.movement_z,
+        #         self.rotation_x, self.rotation_y, self.rotation_z
+        #     ])
+        # )
+
+        v_lin = np.array([self.movement_x, self.movement_y, self.movement_z], float)
+        v_rot = np.array([self.rotation_x, self.rotation_y, self.rotation_z], float)
+
+        if self.n_row == 9 and self.n_col == 10:
+            if self.anchor_enabled and self.current_state == self.STATE_PERFORMING and self._anchor_R is not None:
+                # Anchored axes -> pre-rotate into world and send in base
+                v_lin_w = self._anchor_R.dot(v_lin)
+                v_rot_w = self._anchor_R.dot(v_rot)
+                self.ros_splitter.robot_api.send_request(
+                    self.ros_splitter.robot_api.set_end_effector_velocity_in_frame(
+                        v_lin_w.tolist(), v_rot_w.tolist(), frame="base"
+                    )
+                )
+            else:
+                # Live frame (or not performing): use whatever is in the AI frame box (default tool)
+                frame = self._get_requested_frame() or "tool"
+                self.ros_splitter.robot_api.send_request(
+                    self.ros_splitter.robot_api.set_end_effector_velocity_in_frame(
+                        v_lin.tolist(), v_rot.tolist(), frame=frame
+                    )
+                )
+
+        # Joint velocity mode (IGNORES the frame input)
+        if self.n_row == 13 and self.n_col == 10:
+            if not getattr(self, "_joint_vel_mode_enabled", False):
+                self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
+                self.ros_splitter.robot_api.send_request(
+                    self.ros_splitter.robot_api.enable_joint_velocity_mode()
+                )
+                self._joint_vel_mode_enabled = True
+            self.ros_splitter.robot_api.send_request(
+                self.ros_splitter.robot_api.set_joint_velocity(self._joint_velocity_vec)
+            )
+

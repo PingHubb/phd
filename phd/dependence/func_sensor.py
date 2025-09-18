@@ -319,11 +319,19 @@ class SensorModelFactory:
         if self._2D_map:
             self.colors = np.ones((self._2D_map.n_points, 4)) * 0.5
 
+        is_2d_procedural_model = not self.mesh_file
+
         # Color the coarse and fine meshes
         for i in range(self.n_col):
             for j in range(self.n_row):
                 idx = i * self.n_row + j
-                color = [i / self.n_col, j / self.n_row, 0.5, 1]
+
+                if is_2d_procedural_model:
+                    # --- THIS IS THE MODIFIED LINE ---
+                    color = [0.3, 0.3, 0.3, 1.0]  # A dimmer, darker gray
+                else:
+                    color = [i / self.n_col, j / self.n_row, 0.5, 1]
+
                 self.colors_3d[idx] = color
                 if self.colors is not None and idx < len(self.array_positions):
                     for k in self.array_positions[idx]:
@@ -331,7 +339,6 @@ class SensorModelFactory:
 
         self.line_poly = pv.PolyData(self.points)
         self.line_poly.lines = self.edges
-
 
 
 class MySensor:
@@ -342,6 +349,7 @@ class MySensor:
         self.objActor = None
         self.n_col = 0
         self.n_row = 0
+        self.touch_sensitivity_scale = 0.05
         self.test = []
         self.test_1 = []
         self.test_2 = []
@@ -529,6 +537,8 @@ class MySensor:
     def init_2d_model(self):
         """Initializes a flat 2D grid model."""
         model = SensorModelFactory(n_row=7, n_col=8, offset_scale=0.0005).build()
+        # model = SensorModelFactory(n_row=12, n_col=15, offset_scale=0.0005).build()
+
         self._initialize_from_factory(model)
 
     def init_elbow_model(self):
@@ -655,17 +665,15 @@ class MySensor:
                 self.update_visualization(self._data.diffPerDataAve)
 
     def update_visualization(self, data):
-        smoothing_factor = 0.05  # Adjust for smoothness
         for i in range(self.n_col):
             for j in range(self.n_row):
                 idx = i * self.n_row + j
-                displacement = (1.5 - abs(data[j][i])) * smoothing_factor
-                # Smooth movement using normals
+                # It uses the up-to-date value of self.touch_sensitivity_scale
+                displacement = (3 - abs(data[j][i])) * self.touch_sensitivity_scale
+
                 target_position = self.points_origin[idx] + self.normals[idx] * displacement
-                # Interpolate for smooth transitions
                 self.points[idx] += (target_position - self.points[idx]) * 0.3
 
-                # Update colors smoothly (optional)
                 intensity = np.clip(1 - abs(data[j][i]) * 150 / 255, 0, 1)
                 self.colors_3d[idx] = [1, intensity, intensity, 1]
                 for k in self.array_positions[idx]:
@@ -715,6 +723,13 @@ class MySensor:
 
         self.is_connected = True
         self.parent.sensor_update.setDisabled(False)
+
+    def set_touch_sensitivity(self, new_value: float):
+        """
+        Public method to safely update the visualization's touch sensitivity.
+        This will be called by the UI slider.
+        """
+        self.touch_sensitivity_scale = new_value
 
     def loadMesh(self, file_paths):
         for file_path in file_paths:

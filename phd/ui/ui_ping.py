@@ -2,7 +2,7 @@ from PyQt5 import QtCore
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtWidgets import (QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
-                             QTabWidget, QLineEdit, QTextEdit, QGroupBox, QListWidget, QMainWindow, QAction, QMenuBar)
+                             QTabWidget, QLineEdit, QTextEdit, QGroupBox, QListWidget, QMainWindow, QAction, QMenuBar, QSlider)
 from pyvistaqt import QtInteractor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
@@ -41,8 +41,8 @@ class RobotPositionWidget(QWidget):
         # --- MODIFICATION: Removed inline stylesheet ---
 
         self.presets = {
-            1: [1.0, 0.0, 1.57, 0.0, 1.57, 0.0],
-            2: [0.0, 0.5, 1.0, 0.5, 1.0, 0.0]
+            1: [-0.7261620039030, -0.43900, -1.005029724, -0.143107, -1.57, -1.661117],
+            2: [-0.72614336177, 0.48276635, 1.8201765, -0.20363143, -1.569981, -1.661155]
         }
 
         # --- MODIFICATION: Use QGroupBox for title and layout ---
@@ -117,8 +117,8 @@ class RobotToolPositionWidget(QWidget):
         # --- MODIFICATION: Removed inline stylesheet ---
 
         self.presets = {
-            1: ([-0.05, -0.2, 0.5], [0.0, 1.0, 0.0, 0.0]),
-            2: ([0.15, 0.3, 0.4], [0.0, 1.0, 0.0, 0.0])
+            1: ([-0.55, 0.1, 0.2], [0.0, -1.0, 0.0, 0.0]),
+            2: ([0.115, 0.322, 0.443], [0.01, 0.348, 0.937, 0.033])
         }
         self.labels = {}
         self.line_edits = {}
@@ -207,6 +207,119 @@ class RobotToolPositionWidget(QWidget):
         self.input_container.setVisible(isVisible)
         self.action_widget.setVisible(isVisible)
         self.setVisible(isVisible)
+
+
+class RobotToolFramePositionWidget(QWidget):
+    """
+    Control the end-effector velocity using keyboard number keys.
+    Movement is expressed in the TOOL frame.
+
+    The robot will continue moving at the specified velocity until a new
+    command (e.g., key '0' for stop) is sent.
+    """
+
+    def __init__(self, robot_api, parent=None):
+        super().__init__(parent)
+        self.robot_api = robot_api
+
+        # --- Configuration ---
+        self.linear_speed = 0.02  # meters/second
+        self.angular_speed = 0.0001  # radians/second
+
+        # --- UI Setup ---
+        outer = QVBoxLayout(self)
+        self.setLayout(outer)
+
+        control_group = QGroupBox("Keyboard Velocity Control (Tool Frame)")
+        outer.addWidget(control_group)
+
+        # Instructions Label
+        instructions_layout = QVBoxLayout(control_group)
+        instructions_text = (
+            "<b>Focus this window and use number keys to move the robot:</b><br>"
+            "&nbsp;1 / 2 : Move along +X / -X<br>"
+            "&nbsp;3 / 4 : Move along +Y / -Y<br>"
+            "&nbsp;5 / 6 : Move along +Z / -Z<br>"
+            "&nbsp;7 / 8 : Rotate around +Z / -Z<br><br>"
+            "&nbsp;<b>0 : STOP all movement</b>"
+        )
+        instructions_label = QLabel(instructions_text)
+        instructions_label.setWordWrap(True)
+        instructions_layout.addWidget(instructions_label)
+
+        # Ensure this widget can receive key press events
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setVisible(False)
+
+    def keyPressEvent(self, event: QtCore.QEvent):
+        """Handle key presses to send velocity commands."""
+        key = event.key()
+        v_lin = [0.0, 0.0, 0.0]
+        v_rot = [0.0, 0.0, 0.0]
+
+        # Map number keys to specific movements
+        if key == Qt.Key_1:  # +X Linear
+            v_lin[0] = self.linear_speed
+        elif key == Qt.Key_2:  # -X Linear
+            v_lin[0] = -self.linear_speed
+        elif key == Qt.Key_3:  # +Y Linear
+            v_lin[1] = self.linear_speed
+        elif key == Qt.Key_4:  # -Y Linear
+            v_lin[1] = -self.linear_speed
+        elif key == Qt.Key_5:  # +Z Linear
+            v_lin[2] = self.linear_speed
+        elif key == Qt.Key_6:  # -Z Linear
+            v_lin[2] = -self.linear_speed
+        elif key == Qt.Key_7:  # +Z Rotation
+            v_rot[2] = self.angular_speed
+        elif key == Qt.Key_8:  # -Z Rotation
+            v_rot[2] = -self.angular_speed
+        elif key == Qt.Key_9:  # -Z Rotation
+            self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+            self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
+        elif key == Qt.Key_0:  # Stop
+            # All velocities are already initialized to zero
+            pass
+        else:
+            # If the key is not one of our control keys, ignore it
+            # and let the parent class handle any default actions.
+            super().keyPressEvent(event)
+            return
+
+        # Send the calculated velocity command to the robot
+        self._send_velocity_command(v_lin, v_rot)
+        event.accept()
+
+    def _send_velocity_command(self, v_lin, v_rot):
+        """Sends the velocity vector to the robot API in the tool frame."""
+        try:
+            print(f"Sending velocity command: linear={v_lin}, angular={v_rot}, frame='tool'")
+
+            # This method name is based on your example.
+            # If your RobotController uses a different name, please adjust it here.
+            if hasattr(self.robot_api, 'set_end_effector_velocity_in_frame'):
+                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+                self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
+                self.robot_api.send_request(self.robot_api.set_end_effector_velocity_in_frame(
+                    v_lin, v_rot, frame="tool"
+                ))
+            else:
+                # Fallback for compatibility if the method is not directly on the api object
+                print("Attempting to send as a request...")
+                self.robot_api.send_request(self.robot_api.set_end_effector_velocity_in_frame(
+                    v_lin, v_rot, frame="tool"
+                ))
+
+        except Exception as e:
+            print(f"[VelocityControl] Failed to send velocity command: {e}")
+            self.log_display.append(f"❌ Velocity Error: {e}")
+
+    def toggle_visibility(self):
+        """Toggles the widget's visibility and sets focus when shown."""
+        is_visible = not self.isVisible()
+        self.setVisible(is_visible)
+        if is_visible:
+            self.setFocus()  # Automatically focus the widget to capture keys
 
 
 class MiniRobotToolPositionController:
@@ -298,6 +411,8 @@ class UI(QSplitter):
             self.robots_sub_tabs.setTabEnabled(1, False)
             self.disable_robot_controls(True)
 
+        self._init_ai_toggle_states()
+
     def disable_robot_controls(self, disable: bool):
         for btn in [self.send_coords_button, self.send_angles_button, self.get_coords_button,
                     self.stop_button, self.pause_button, self.resume_button]:
@@ -339,13 +454,17 @@ class UI(QSplitter):
 
         self.position_entry_widget = RobotPositionWidget()
         self.position_quaternion_widget = RobotToolPositionWidget()
+        self.position_toolframe_widget = RobotToolFramePositionWidget(self.robot_api)
+
         self.position_entry_widget.setVisible(False)
         self.position_quaternion_widget.setVisible(False)
+        self.position_toolframe_widget.setVisible(False)
 
         self.widget_func = QWidget()
         self.layout_func = QVBoxLayout(self.widget_func)
         self.layout_func.addWidget(self.position_entry_widget)
         self.layout_func.addWidget(self.position_quaternion_widget)
+        self.layout_func.addWidget(self.position_toolframe_widget)
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setUsesScrollButtons(False)
@@ -399,6 +518,10 @@ class UI(QSplitter):
     def setup_tab1(self, layout):
         read_group = QGroupBox("Read Operations")
         send_group = QGroupBox("Send Operations")
+
+        viz_group = QGroupBox("Visualization Settings")
+        viz_layout = QVBoxLayout(viz_group)
+
         read_layout = QVBoxLayout()
         send_layout = QVBoxLayout()
 
@@ -417,7 +540,32 @@ class UI(QSplitter):
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
 
+        # Create a horizontal container for the label and slider
+        slider_container = QWidget()
+        slider_layout = QHBoxLayout(slider_container)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 1. The Slider
+        self.sensitivity_slider = QSlider(Qt.Horizontal)
+        # QSlider works with integers, so we'll use a range of 0-100
+        # and map it to a float range of 0.0 to 0.1
+        self.sensitivity_slider.setRange(0, 100)
+        self.sensitivity_slider.setValue(50)  # Default 50 -> 0.05
+        self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
+        self.sensitivity_slider.setTickInterval(10)
+
+        # 2. The Label to show the current float value
+        self.sensitivity_value_label = QLabel("0.050")
+        self.sensitivity_value_label.setFixedWidth(40)  # Keep a fixed width
+
+        slider_layout.addWidget(QLabel("Sensitivity:"))
+        slider_layout.addWidget(self.sensitivity_slider)
+        slider_layout.addWidget(self.sensitivity_value_label)
+
+        viz_layout.addWidget(slider_container)
+
         layout.addWidget(read_group)
+        layout.addWidget(viz_group)
         layout.addWidget(send_group)
 
         self.sensor_choice = QListWidget(self.widget_func)
@@ -446,9 +594,12 @@ class UI(QSplitter):
         send_layout = QVBoxLayout()
 
         self.read_joint_angle_button = QPushButton("Read Joint Angle")
-        self.read_tool_position_button = QPushButton("Read Tool Position")
+        self.read_tool_position_button = QPushButton("Read Tool Position ")
+
         self.send_position_PTP_J_button = QPushButton("Send Joint Angle")
-        self.send_position_PTP_T_button = QPushButton("Send Tool Position")
+        self.send_position_PTP_T_button = QPushButton("Send Tool Position (Base Frame)")
+        self.send_position_PTP_T_toolframe_button = QPushButton("Send Tool Position (Tool Frame)")
+
         self.send_script_button = QPushButton("Send Script")
         self.show_robot_button = QPushButton("Import 3D Robot Model")
         self.continuous_read_button = QPushButton("Real-time Live 3D Robot Model", self.widget_func)
@@ -459,6 +610,7 @@ class UI(QSplitter):
         read_layout.addWidget(self.continuous_read_button)
         send_layout.addWidget(self.send_position_PTP_J_button)
         send_layout.addWidget(self.send_position_PTP_T_button)
+        send_layout.addWidget(self.send_position_PTP_T_toolframe_button)
         send_layout.addWidget(self.send_script_button)
 
         self.read_group_robot.setLayout(read_layout)
@@ -492,9 +644,30 @@ class UI(QSplitter):
         gesture_layout.addWidget(self.record_gesture_button)
 
         self.predict_lstm_gesture_button = QPushButton("Predict (LSTM)")
-        self.predict_hierarchical_transformer_gesture_button = QPushButton("Predict (HierarchicalTransformer)")
-        self.toggle_prediction_mode_button = QPushButton("Toggle Prediction Mode (Continues/Single)")
+        self.predict_hierarchical_transformer_gesture_button = QPushButton("Predict (Hierarchical)")
+        self.toggle_prediction_mode_button = QPushButton("Hierarchical Mode: Continues")
         self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict (ThreeLevel)")
+        self.btn_toggle_3lvl_latch = QPushButton("3-Level: Latch OFF")
+
+        frame_row = QWidget()
+        fr = QHBoxLayout(frame_row);
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.addWidget(QLabel("EE frame:"))
+        self.ai_frame_input = QLineEdit()
+        # --- MODIFICATION: Changed from setPlaceholderText to setText ---
+        self.ai_frame_input.setText("joint5")
+        fr.addWidget(self.ai_frame_input)
+        testing_layout.addWidget(frame_row)
+
+        # ---- Axes anchor toggle row ----
+        row_anchor = QWidget()
+        ha = QHBoxLayout(row_anchor);
+        ha.setContentsMargins(0, 0, 0, 0)
+        self.btn_toggle_anchor_axes = QPushButton("Axes: Anchored ON")  # label will be synced on init
+        ha.addWidget(self.btn_toggle_anchor_axes)
+        ha.addStretch()
+        testing_layout.addWidget(row_anchor)
+
         self.update_sensor_button = QPushButton("Update Sensor")
         self.activate_switch_model_button = QPushButton("Activate Switch Model")
         self.activate_rule_based_button = QPushButton("Activate Rule Based")
@@ -503,6 +676,8 @@ class UI(QSplitter):
         testing_layout.addWidget(self.predict_hierarchical_transformer_gesture_button)
         testing_layout.addWidget(self.toggle_prediction_mode_button)
         testing_layout.addWidget(self.predict_threelevel_hierarchical_transformer_gesture_button)
+        testing_layout.addWidget(self.btn_toggle_3lvl_latch)  # or the layout where your gesture buttons live
+
         testing_layout.addWidget(self.update_sensor_button)
         testing_layout.addWidget(self.activate_switch_model_button)
         testing_layout.addWidget(self.activate_rule_based_button)
@@ -646,6 +821,33 @@ class UI(QSplitter):
             btn.setDisabled(disable)
         self.tab_widget.setTabEnabled(4, not disable)
 
+    def _set_button_active(self, btn: QPushButton, active: bool):
+        """Green when active; when inactive, revert to the default theme."""
+        if active:
+            btn.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; }")
+        else:
+            btn.setStyleSheet("")  # clear → default OS/theme styling
+
+    def _init_ai_toggle_states(self):
+        self._lstm_active = False
+        self._hier_active = False
+        self._three_active = False
+        self._hier_mode_is_continues = True  # label shows Continues initially
+
+        # these now revert to default look when False
+        self._set_button_active(self.predict_lstm_gesture_button, False)
+        self._set_button_active(self.predict_hierarchical_transformer_gesture_button, False)
+        self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, False)
+        self._set_button_active(self.toggle_prediction_mode_button, False)  # default look for "Continues"
+
+        # latch button reflects real state if available
+        three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
+        latch_on = bool(getattr(three, "latch_mode", False)) if three else False
+
+        self._set_button_active(self.btn_toggle_3lvl_latch, latch_on)
+        self.btn_toggle_3lvl_latch.setText(f"3-Level: Latch {'ON' if latch_on else 'OFF'}")  # add this
+        self._update_anchor_button_label()
+
     def connect_function(self):
         self.read_sensor_api_button.pressed.connect(
             lambda: self.log_display.append(f"API raw data: {self.sensor_api.read_raw()}")
@@ -675,6 +877,9 @@ class UI(QSplitter):
         self.send_position_PTP_T_button.pressed.connect(
             self.toggle_tool_position_input
         )
+        self.send_position_PTP_T_toolframe_button.pressed.connect(
+            self.toggle_tool_frame_position_input
+        )
         self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
         self.read_raw_all_prots_button.pressed.connect(lambda: self.sensor_functions.read_raw_all_ports())
         self.continuous_read_button.pressed.connect(self.toggle_continuous_read)
@@ -697,16 +902,19 @@ class UI(QSplitter):
             lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("trigger")
         )
         self.predict_lstm_gesture_button.pressed.connect(
-            lambda: self.sensor_functions.lstm_class.toggle_gesture_recognition()
+            self._on_toggle_lstm_predict
         )
         self.predict_hierarchical_transformer_gesture_button.pressed.connect(
-            lambda: self.sensor_functions.hierarchical_transformer_class.toggle_gesture_recognition()
+            self._on_toggle_hier_predict
         )
         self.toggle_prediction_mode_button.pressed.connect(
-            lambda: self.sensor_functions.hierarchical_transformer_class.toggle_prediction_mode()
+            self._on_toggle_hier_mode
         )
         self.predict_threelevel_hierarchical_transformer_gesture_button.pressed.connect(
-            lambda: self.sensor_functions.threelevel_hierarchical_transformer_class.toggle_gesture_recognition()
+            self._on_toggle_threelevel_predict
+        )
+        self.btn_toggle_3lvl_latch.pressed.connect(
+            self.on_toggle_threelevel_latch
         )
         self.activate_switch_model_button.pressed.connect(
             lambda: self.sensor_functions.lstm_class.toggle_model()
@@ -716,6 +924,14 @@ class UI(QSplitter):
         )
         self.update_sensor_button.pressed.connect(
             lambda: self.sensor_functions.updateCal()
+        )
+        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
+
+        self.read_joint_angle_button.pressed.connect(
+            lambda: self.log_display.append(f"Joint angles: {self.robot_api.get_current_positions()}")
+        )
+        self.btn_toggle_anchor_axes.pressed.connect(
+            self._on_toggle_anchor_axes
         )
 
     def start_record_gesture(self):
@@ -752,10 +968,138 @@ class UI(QSplitter):
         self.position_quaternion_widget.toggle_visibility()
         self.read_group_robot.setVisible(not self.position_quaternion_widget.isVisible())
 
+    def toggle_tool_frame_position_input(self):
+        # Hide other editors if open
+        if self.position_entry_widget.isVisible():
+            self.position_entry_widget.toggle_visibility()
+        if self.position_quaternion_widget.isVisible():
+            self.position_quaternion_widget.toggle_visibility()
+
+        # Toggle tool-frame position panel
+        self.position_toolframe_widget.toggle_visibility()
+
+        # Hide the read group while an editor is open (matches your pattern)
+        self.read_group_robot.setVisible(not self.position_toolframe_widget.isVisible())
+
+    def on_toggle_threelevel_latch(self):
+        try:
+            three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
+            if not three:
+                print("[UI] 3-Level instance not available")
+                return
+            three.toggle_latch_mode()
+            latch = bool(getattr(three, "latch_mode", False))
+            self.btn_toggle_3lvl_latch.setText(f"3-Level: Latch {'ON' if latch else 'OFF'}")
+            self._set_button_active(self.btn_toggle_3lvl_latch, latch)  # <- color update
+        except Exception as e:
+            print(f"[UI] Could not toggle 3-Level latch mode: {e}")
+
     def show_log_if_hidden(self):
         if not self.log_display.isVisible():
             self.log_display.setVisible(True)
             self.adjust_splitter_sizes()
+
+    def _on_sensitivity_changed(self, value: int):
+        """
+        Handles the signal from the sensitivity slider.
+        Converts the slider's integer value to a float and updates the sensor logic.
+        """
+        # Convert integer (e.g., 50) to float (e.g., 0.05)
+        sensitivity_float = value / 1000.0
+
+        # Update the label in the UI to give the user feedback
+        self.sensitivity_value_label.setText(f"{sensitivity_float:.3f}")
+
+        # Call the method in MySensor to apply the change immediately
+        self.sensor_functions.set_touch_sensitivity(sensitivity_float)
+
+    def _on_toggle_lstm_predict(self):
+        # flip UI state then call device toggle
+        self._lstm_active = not getattr(self, "_lstm_active", False)
+        self._set_button_active(self.predict_lstm_gesture_button, self._lstm_active)
+        try:
+            self.sensor_functions.lstm_class.toggle_gesture_recognition()
+        except Exception as e:
+            print(f"[UI] LSTM toggle failed: {e}")
+            # revert UI if call failed
+            self._lstm_active = not self._lstm_active
+            self._set_button_active(self.predict_lstm_gesture_button, self._lstm_active)
+
+    def _on_toggle_hier_predict(self):
+        self._hier_active = not getattr(self, "_hier_active", False)
+        self._set_button_active(self.predict_hierarchical_transformer_gesture_button, self._hier_active)
+        try:
+            self.sensor_functions.hierarchical_transformer_class.toggle_gesture_recognition()
+        except Exception as e:
+            print(f"[UI] Hierarchical toggle failed: {e}")
+            self._hier_active = not self._hier_active
+            self._set_button_active(self.predict_hierarchical_transformer_gesture_button, self._hier_active)
+
+    def _on_toggle_threelevel_predict(self):
+        self._three_active = not getattr(self, "_three_active", False)
+        self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, self._three_active)
+        try:
+            self.sensor_functions.threelevel_hierarchical_transformer_class.toggle_gesture_recognition()
+        except Exception as e:
+            print(f"[UI] ThreeLevel toggle failed: {e}")
+            self._three_active = not self._three_active
+            self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, self._three_active)
+
+    def _on_toggle_hier_mode(self):
+        """
+        Show only one of the two texts:
+          - 'Hierarchical Mode: Continues'  (inactive/gray)
+          - 'Hierarchical Mode: Single'     (active/green)
+        Each press flips the text and color, and calls the underlying toggle.
+        """
+        self._hier_mode_is_continues = not getattr(self, "_hier_mode_is_continues", True)
+        if self._hier_mode_is_continues:
+            self.toggle_prediction_mode_button.setText("Hierarchical Mode: Continues")
+            self._set_button_active(self.toggle_prediction_mode_button, False)  # gray for Continues
+        else:
+            self.toggle_prediction_mode_button.setText("Hierarchical Mode: Single")
+            self._set_button_active(self.toggle_prediction_mode_button, True)  # green for Single
+        try:
+            self.sensor_functions.hierarchical_transformer_class.toggle_prediction_mode()
+        except Exception as e:
+            print(f"[UI] Toggle hier mode failed: {e}")
+            # revert UI on failure
+            self._hier_mode_is_continues = not self._hier_mode_is_continues
+            if self._hier_mode_is_continues:
+                self.toggle_prediction_mode_button.setText("Hierarchical Mode: Continues")
+                self._set_button_active(self.toggle_prediction_mode_button, False)
+            else:
+                self.toggle_prediction_mode_button.setText("Hierarchical Mode: Single")
+                self._set_button_active(self.toggle_prediction_mode_button, True)
+
+    def _update_anchor_button_label(self):
+        """Reflects threelevel.anchor_enabled on the button text + color."""
+        three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
+        anchored = bool(getattr(three, "anchor_enabled", True)) if three else True
+        if hasattr(self, "btn_toggle_anchor_axes"):
+            self.btn_toggle_anchor_axes.setText(f"Axes: Anchored {'ON' if anchored else 'OFF'}")
+            self._set_button_active(self.btn_toggle_anchor_axes, anchored)
+
+    def _on_toggle_anchor_axes(self):
+        three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
+        if not three:
+            print("[UI] 3-Level instance not available yet.")
+            return
+
+        # Flip the flag on the model object
+        new_val = not bool(getattr(three, "anchor_enabled", True))
+        setattr(three, "anchor_enabled", new_val)
+
+        # Optional: when turning ON, immediately capture a fresh anchor
+        if new_val and hasattr(three, "_set_anchor_from_current_frame"):
+            try:
+                three._set_anchor_from_current_frame()
+            except Exception as e:
+                print(f"[UI] Could not set anchor: {e}")
+
+        # Refresh button label + color
+        self._update_anchor_button_label()
+
 
     def adjust_splitter_sizes(self):
         total_width = self.splitter_1.width()
