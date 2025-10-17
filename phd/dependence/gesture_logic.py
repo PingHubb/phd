@@ -1128,10 +1128,10 @@ class ThreeLevelTransformer:
             models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow/eblow_0123_threelevel_v6(30frames)/'
             models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow/eblow_0123_threelevel_v6(30frames)/'
         if self.n_row == 9 and self.n_col == 10:
-            # models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/'
-            # models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/'
-            models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/num_123_experiment/'
-            models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/num_123_experiment/'
+            models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/'
+            models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/'
+            # models_path_3level_backbone = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/num_123_experiment_v2/'
+            # models_path_3level_model = '/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/num_123_experiment_v2/'
 
 
         self.model_path = os.path.join(models_path_3level_model, '3level_model.pth')
@@ -1573,7 +1573,7 @@ class ThreeLevelTransformer:
 
     def set_robot_movement(self, finger_pred, gesture_pred):
         """A helper to set movement variables based on a valid gesture prediction."""
-        speed = 0.02
+        speed = 0.1
         j_speed = 0.01  # deg/s; change if you want faster/slower
         jv = [0.0] * 6
 
@@ -1584,27 +1584,33 @@ class ThreeLevelTransformer:
                 if gesture_pred == 1:  # Push (away from you along tool +X)
                     print("Gesture: PUSH")
                     self.movement_y = -speed
+                    # self.movement_x = -speed
                 elif gesture_pred == 2:  # Pull (toward you along tool -X)
                     print("Gesture: PULL")
                     self.movement_y = +speed
+                    # self.movement_x = -speed
                 elif gesture_pred == 3:  # Left (your left = tool -Y)
                     print("Gesture: SWIPE LEFT")
                     self.movement_x = -speed
+                    # self.movement_y = -speed
                 elif gesture_pred == 4:  # Right (your right = tool +Y)
                     print("Gesture: SWIPE RIGHT")
                     self.movement_x = +speed
+                    # self.movement_y = +speed
                 elif gesture_pred == 5:  # Down (toward table = tool -Z)
                     print("Gesture: SWIPE DOWN")
                     self.movement_z = +speed
+                    # self.movement_z = +speed
                 elif gesture_pred == 6:  # Up (away from table = tool +Z)
                     print("Gesture: SWIPE UP")
                     self.movement_z = -speed
-                elif gesture_pred == 7:  # Clockwise rotation
-                    print("Gesture: CLOCKWISE")
-                    self.rotation_y = -0.0001
-                elif gesture_pred == 8:  # Anti-clockwise rotation
-                    print("Gesture: ANTI-CLOCKWISE")
-                    self.rotation_y = +0.0001
+                    # self.movement_z = -speed
+                # elif gesture_pred == 7:  # Clockwise rotation
+                #     print("Gesture: CLOCKWISE")
+                #     self.rotation_y = -0.0001
+                # elif gesture_pred == 8:  # Anti-clockwise rotation
+                #     print("Gesture: ANTI-CLOCKWISE")
+                #     self.rotation_y = +0.0001
             if finger_pred == 2:
                 if gesture_pred == 3:
                     print("Finger: 2, Gesture: SWIPE LEFT")
@@ -1614,21 +1620,21 @@ class ThreeLevelTransformer:
                     self.rotation_z = -0.0001
                 if gesture_pred == 5:
                     print("Finger: 2, Gesture: SWIPE DoWN")
-                    self.rotation_x = -0.0001
+                    self.rotation_x = +0.0001
                 if gesture_pred == 6:
                     print("Finger: 2, Gesture: SWIPE UP")
                     self.rotation_x = -0.0001
                 elif gesture_pred == 7:  # Clockwise rotation
                     print("Finger: 2, Gesture: CLOCKWISE")
-                    self.rotation_y = -0.0001
+                    self.rotation_y = +0.0001
                 elif gesture_pred == 8:  # Anti-clockwise rotation
                     print("Finger: 2, Gesture: ANTI-CLOCKWISE")
-                    self.rotation_y = +0.0001
-            if finger_pred == 3:
-                if gesture_pred == 3:
-                    print("Finger: 5, Gesture: Pinch in")
-                if gesture_pred == 4:
-                    print("Finger: 5, Gesture: Pinch out")
+                    self.rotation_y = -0.0001
+            # if finger_pred == 3:
+            #     if gesture_pred == 3:
+            #         print("Finger: 5, Gesture: Pinch in")
+            #     if gesture_pred == 4:
+            #         print("Finger: 5, Gesture: Pinch out")
 
 
         if self.n_row == 13 and self.n_col == 10:

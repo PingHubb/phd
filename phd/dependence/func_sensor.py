@@ -285,7 +285,45 @@ class SensorModelFactory:
             for old_idx in range(self.n_node):
                 c, r = old_idx // self.n_row, old_idx % self.n_row
                 mapping[old_idx] = c * self.n_row + (self.n_row - 1) - r
+
+        elif self.reorder_logic == 'test':
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                mapping[old_idx] = c * self.n_row + (self.n_row - 1) - r
+
+        # --- START: ADD THIS NEW CODE BLOCK ---
+        elif self.reorder_logic == 'horizontal_flip':
+            # This logic assumes the input is column-major and flips it left-to-right.
+            for old_idx in range(self.n_node):
+                # Deconstruct old index into column and row
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                # The new index uses the flipped column but the same row
+                mapping[old_idx] = ((self.n_col - 1) - c) * self.n_row + r
+        # --- END: ADD THIS NEW CODE BLOCK ---
+
+        elif self.reorder_logic == 'flip_and_rotate':
+            # This custom logic is specifically for the half-cylinder model to achieve:
+            # UL: 80, UR: 0, LL: 89, LR: 9
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+
+                # The new column is a horizontal flip of the old one.
+                new_c = (self.n_col - 1) - c
+
+                # The new index is constructed from the new column and original row.
+                mapping[old_idx] = new_c * self.n_row + r
+
+        elif self.reorder_logic == 'rotate_180':
+            # Assumes column-major input: Rotates 180 degrees
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                c_flipped = (self.n_col - 1) - c
+                r_flipped = (self.n_row - 1) - r
+                mapping[old_idx] = c_flipped * self.n_row + r_flipped
         else:
+            # No reordering logic specified or logic is unknown
+            if self.reorder_logic:
+                print(f"Warning: Unknown reorder_logic '{self.reorder_logic}'. No reordering applied.")
             return
 
         print(f"Applying reordering logic: {self.reorder_logic}")
@@ -534,10 +572,43 @@ class MySensor:
             render_points_as_spheres=True, rgb=True
         )
 
+        # --- NEW CODE TO DISPLAY POINT INDICES ---
+        # Generate a list of strings for the labels [ '0', '1', '2', ... ]
+        labels = [str(i) for i in range(self.n_node)]
+
+        # # Add the labels to the plotter at the location of each point
+        # self.plotter.add_point_labels(
+        #     self.points,
+        #     labels,
+        #     font_size=12,
+        #     text_color='white',
+        #     shape_color='black',
+        #     shape_opacity=0.6,
+        #     point_size=0  # Hides the small dot behind the label
+        # )
+        # # --- END OF NEW CODE ---
+
     def init_2d_model(self):
         """Initializes a flat 2D grid model."""
-        model = SensorModelFactory(n_row=7, n_col=8, offset_scale=0.0005).build()
-        # model = SensorModelFactory(n_row=12, n_col=15, offset_scale=0.0005).build()
+
+        # --- CHOOSE THE REORDERING LOGIC YOU WANT ---
+        # For example, to flip the grid left-to-right:
+        active_logic = 'vertical_flip'
+
+        # Or to rotate it by 180 degrees:
+        # active_logic = 'rotate_180'
+
+        # To apply no reordering, set it to None or an unknown string
+        # active_logic = None
+
+        model = SensorModelFactory(
+            # n_row=10,
+            # n_col=10,
+            n_row=7,
+            n_col=8,
+            offset_scale=0.0005,
+            reorder_logic=active_logic  # <-- ADD THIS PARAMETER
+        ).build()
 
         self._initialize_from_factory(model)
 
@@ -582,7 +653,7 @@ class MySensor:
             n_col=9,
             mesh_file='/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/half_cylinder_2.obj',
             signal_file='/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/vertex_groups_2.txt',
-            reorder_logic='vertical_flip',
+            reorder_logic='flip_and_rotate',
             offset_scale=0.2
         ).build()
         self._initialize_from_factory(model)
@@ -648,6 +719,12 @@ class MySensor:
                         data_list = data_list[:-10]
 
                     rawDataList = data_list[0: - self.n_row]
+
+                    # Replace the last 10 elements of the raw data list with the last 10 elements from the calibration data.
+                    if self.n_row == 10 and self.n_col == 10:  # For 2D!!!
+                        flat_cal_data = self._data.calData.T.flatten()
+                        rawDataList[-10:] = flat_cal_data[-10:]
+
                 except Exception as e:
                     print(f"Error reading from port {ser.port}: {e}")
                     continue
@@ -696,6 +773,7 @@ class MySensor:
 
             if self.n_row == 10 and self.n_col == 9:  # For Cylinder!!!
                 data_list = data_list[:-10]
+
 
             expected_length = self.n_row * (self.n_col + 1)
             if len(data_list) != expected_length:

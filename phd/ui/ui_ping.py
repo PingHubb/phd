@@ -42,7 +42,7 @@ class RobotPositionWidget(QWidget):
 
         self.presets = {
             1: [-0.7261620039030, -0.43900, -1.005029724, -0.143107, -1.57, -1.661117],
-            2: [-0.72614336177, 0.48276635, 1.8201765, -0.20363143, -1.569981, -1.661155]
+            2: [-0.7242335, 0.28315391, -1.523286731370, -0.32650261753, -1.5700302685, -1.659972941]
         }
 
         # --- MODIFICATION: Use QGroupBox for title and layout ---
@@ -271,9 +271,9 @@ class RobotToolFramePositionWidget(QWidget):
         elif key == Qt.Key_6:  # -Z Linear
             v_lin[2] = -self.linear_speed
         elif key == Qt.Key_7:  # +Z Rotation
-            v_rot[2] = self.angular_speed
+            v_rot[1] = self.angular_speed
         elif key == Qt.Key_8:  # -Z Rotation
-            v_rot[2] = -self.angular_speed
+            v_rot[1] = -self.angular_speed
         elif key == Qt.Key_9:  # -Z Rotation
             self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
             self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
