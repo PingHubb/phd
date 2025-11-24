@@ -2,7 +2,7 @@ from PyQt5 import QtCore
 from PyQt5.QtGui import QDragEnterEvent, QDropEvent
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtWidgets import (QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
-                             QTabWidget, QLineEdit, QTextEdit, QGroupBox, QListWidget, QMainWindow, QAction, QMenuBar, QSlider)
+                             QTabWidget, QLineEdit, QTextEdit, QGroupBox, QListWidget, QMainWindow, QAction, QMenuBar, QSlider, QSpinBox)
 from pyvistaqt import QtInteractor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.robot_api import RobotController
@@ -540,6 +540,27 @@ class UI(QSplitter):
         read_group.setLayout(read_layout)
         send_group.setLayout(send_layout)
 
+        # (place near the Sensitivity slider setup in setup_tab1())
+        grid_container = QWidget()
+        grid_layout = QHBoxLayout(grid_container)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+
+        grid_layout.addWidget(QLabel("2D Grid (rows × cols):"))
+
+        self.grid_rows_spin = QSpinBox()
+        self.grid_rows_spin.setRange(2, 100)  # adjust as you like
+        self.grid_rows_spin.setValue(10)  # default
+        grid_layout.addWidget(self.grid_rows_spin)
+
+        grid_layout.addWidget(QLabel("×"))
+
+        self.grid_cols_spin = QSpinBox()
+        self.grid_cols_spin.setRange(2, 100)
+        self.grid_cols_spin.setValue(10)  # default
+        grid_layout.addWidget(self.grid_cols_spin)
+
+        viz_layout.addWidget(grid_container)
+
         # Create a horizontal container for the label and slider
         slider_container = QWidget()
         slider_layout = QHBoxLayout(slider_container)
@@ -549,7 +570,7 @@ class UI(QSplitter):
         self.sensitivity_slider = QSlider(Qt.Horizontal)
         # QSlider works with integers, so we'll use a range of 0-100
         # and map it to a float range of 0.0 to 0.1
-        self.sensitivity_slider.setRange(0, 100)
+        self.sensitivity_slider.setRange(0, 1000)
         self.sensitivity_slider.setValue(50)  # Default 50 -> 0.05
         self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
         self.sensitivity_slider.setTickInterval(10)
@@ -648,6 +669,7 @@ class UI(QSplitter):
         self.toggle_prediction_mode_button = QPushButton("Hierarchical Mode: Continues")
         self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict (ThreeLevel)")
         self.btn_toggle_3lvl_latch = QPushButton("3-Level: Latch OFF")
+        self.proximity_control_button = QPushButton("Proximity Control")
 
         frame_row = QWidget()
         fr = QHBoxLayout(frame_row);
@@ -677,6 +699,7 @@ class UI(QSplitter):
         testing_layout.addWidget(self.toggle_prediction_mode_button)
         testing_layout.addWidget(self.predict_threelevel_hierarchical_transformer_gesture_button)
         testing_layout.addWidget(self.btn_toggle_3lvl_latch)  # or the layout where your gesture buttons live
+        testing_layout.addWidget(self.proximity_control_button)
 
         testing_layout.addWidget(self.update_sensor_button)
         testing_layout.addWidget(self.activate_switch_model_button)

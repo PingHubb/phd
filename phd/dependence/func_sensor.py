@@ -527,7 +527,13 @@ class MySensor:
         elif sensor_index == 2:
             self.init_double_curve_model()
         elif sensor_index == 3:
-            self.init_2d_model()
+            # Try to read from UI; fall back to defaults if controls not present
+            try:
+                n_row = self.parent.grid_rows_spin.value()
+                n_col = self.parent.grid_cols_spin.value()
+            except Exception:
+                n_row, n_col = 10, 10
+            self.init_2d_model(n_row=n_row, n_col=n_col)
         elif sensor_index == 4:
             self.init_half_cylinder_surface_model()
         elif sensor_index == 5:
@@ -588,26 +594,19 @@ class MySensor:
         # )
         # # --- END OF NEW CODE ---
 
-    def init_2d_model(self):
-        """Initializes a flat 2D grid model."""
+    def init_2d_model(self, n_row=None, n_col=None):
+        # Fallback to defaults if nothing provided
+        if n_row is None: n_row = 10
+        if n_col is None: n_col = 10
 
-        # --- CHOOSE THE REORDERING LOGIC YOU WANT ---
-        # For example, to flip the grid left-to-right:
-        active_logic = 'vertical_flip'
-
-        # Or to rotate it by 180 degrees:
-        # active_logic = 'rotate_180'
-
-        # To apply no reordering, set it to None or an unknown string
-        # active_logic = None
+        # Pick your reordering logic or None
+        active_logic = 'vertical_flip'  # or None / 'rotate_180' as you use
 
         model = SensorModelFactory(
-            # n_row=10,
-            # n_col=10,
-            n_row=7,
-            n_col=8,
+            n_row=n_row,
+            n_col=n_col,
             offset_scale=0.0005,
-            reorder_logic=active_logic  # <-- ADD THIS PARAMETER
+            reorder_logic=active_logic
         ).build()
 
         self._initialize_from_factory(model)
@@ -708,6 +707,8 @@ class MySensor:
         # --- MODIFIED METHOD ---
         self.saveCameraPara()
 
+        # start_time = time.time()
+
         if self.is_connected:
             for ser in self.ser_list:
                 try:
@@ -740,6 +741,10 @@ class MySensor:
                     continue
 
                 self.update_visualization(self._data.diffPerDataAve)
+
+        # end_time = time.time()
+        # print(f"Update animation took {end_time - start_time:.4f} seconds")
+        # print(f"frequency: {1/(end_time - start_time):.2f} Hz")
 
     def update_visualization(self, data):
         for i in range(self.n_col):
