@@ -11,7 +11,6 @@ from phd.dependence.func_meshLab import MyMeshLab
 from phd.dependence.func_sensor import MySensor
 import os
 
-
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
 

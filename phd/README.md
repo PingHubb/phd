@@ -1,4 +1,4 @@
-Hello everyone, FUCK
+Hello everyone :)
 
 I hope you have a good day. This is a framework for 3D and 2D demonstration.
 
