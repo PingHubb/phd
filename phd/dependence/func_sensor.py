@@ -270,58 +270,82 @@ class SensorModelFactory:
         """Reorders points, normals, and edges based on the specified logic."""
         mapping = np.zeros(self.n_node, dtype=int)
 
-        if self.reorder_logic == 'row_to_col_flipped':
+        if self.reorder_logic == 'row_to_col':
+            for old_idx in range(self.n_node):
+                r, c = old_idx // self.n_col, old_idx % self.n_col
+                mapping[old_idx] = c * self.n_row + r
+
+        elif self.reorder_logic == 'row_to_col_flipped':
             for old_idx in range(self.n_node):
                 r, c = old_idx // self.n_col, old_idx % self.n_col
                 r_flipped, c_flipped = (self.n_row - 1) - r, (self.n_col - 1) - c
                 mapping[old_idx] = c_flipped * self.n_row + r_flipped
 
-        elif self.reorder_logic == 'row_to_col':
+        elif self.reorder_logic == 'row_to_col_c_flip_only':
             for old_idx in range(self.n_node):
                 r, c = old_idx // self.n_col, old_idx % self.n_col
-                mapping[old_idx] = c * self.n_row + r
+                c_flipped = (self.n_col - 1) - c
+                r_keep = r
+                mapping[old_idx] = c_flipped * self.n_row + r_keep
+
+        elif self.reorder_logic == 'row_to_col_r_flip_only':
+            for old_idx in range(self.n_node):
+                r, c = old_idx // self.n_col, old_idx % self.n_col
+                r_flipped = (self.n_row - 1) - r
+                c_keep = c
+                mapping[old_idx] = c_keep * self.n_row + r_flipped
+
+        elif self.reorder_logic == 'col_to_row':
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                mapping[old_idx] = r * self.n_col + c
+
+        elif self.reorder_logic == 'col_to_row_flipped':
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                r_flipped = (self.n_row - 1) - r
+                c_flipped = (self.n_col - 1) - c
+                mapping[old_idx] = r_flipped * self.n_col + c_flipped
+
+        elif self.reorder_logic == 'col_to_row_c_flip_only':
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                c_flipped = (self.n_col - 1) - c
+                r_keep = r
+                mapping[old_idx] = r_keep * self.n_col + c_flipped
+
+        elif self.reorder_logic == 'col_to_row_r_flip_only':
+            for old_idx in range(self.n_node):
+                c, r = old_idx // self.n_row, old_idx % self.n_row
+                r_flipped = (self.n_row - 1) - r
+                c_keep = c
+                mapping[old_idx] = r_flipped * self.n_col + c_keep
 
         elif self.reorder_logic == 'vertical_flip':
             for old_idx in range(self.n_node):
                 c, r = old_idx // self.n_row, old_idx % self.n_row
                 mapping[old_idx] = c * self.n_row + (self.n_row - 1) - r
 
-        elif self.reorder_logic == 'test':
-            for old_idx in range(self.n_node):
-                c, r = old_idx // self.n_row, old_idx % self.n_row
-                mapping[old_idx] = c * self.n_row + (self.n_row - 1) - r
-
-        # --- START: ADD THIS NEW CODE BLOCK ---
         elif self.reorder_logic == 'horizontal_flip':
             # This logic assumes the input is column-major and flips it left-to-right.
             for old_idx in range(self.n_node):
-                # Deconstruct old index into column and row
                 c, r = old_idx // self.n_row, old_idx % self.n_row
-                # The new index uses the flipped column but the same row
                 mapping[old_idx] = ((self.n_col - 1) - c) * self.n_row + r
-        # --- END: ADD THIS NEW CODE BLOCK ---
 
         elif self.reorder_logic == 'flip_and_rotate':
-            # This custom logic is specifically for the half-cylinder model to achieve:
-            # UL: 80, UR: 0, LL: 89, LR: 9
             for old_idx in range(self.n_node):
                 c, r = old_idx // self.n_row, old_idx % self.n_row
-
-                # The new column is a horizontal flip of the old one.
                 new_c = (self.n_col - 1) - c
-
-                # The new index is constructed from the new column and original row.
                 mapping[old_idx] = new_c * self.n_row + r
 
         elif self.reorder_logic == 'rotate_180':
-            # Assumes column-major input: Rotates 180 degrees
             for old_idx in range(self.n_node):
                 c, r = old_idx // self.n_row, old_idx % self.n_row
                 c_flipped = (self.n_col - 1) - c
                 r_flipped = (self.n_row - 1) - r
                 mapping[old_idx] = c_flipped * self.n_row + r_flipped
+
         else:
-            # No reordering logic specified or logic is unknown
             if self.reorder_logic:
                 print(f"Warning: Unknown reorder_logic '{self.reorder_logic}'. No reordering applied.")
             return
@@ -388,16 +412,16 @@ class MySensor:
         self.n_col = 0
         self.n_row = 0
         self.touch_sensitivity_scale = 0.05
-        self.test = []
-        self.test_1 = []
-        self.test_2 = []
+        self.cal_data = []
+        self.cal_data_1 = []
+        self.cal_data_2 = []
         self.creatPlaneXY()
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
         self.timer.start(0)
-        self.timer_geneva = QTimer()
-        self.timer_geneva.timeout.connect(self.update_animation_geneva)
-        self.timer_geneva.start(0)
+        # self.timer_geneva = QTimer()
+        # self.timer_geneva.timeout.connect(self.update_animation_geneva)
+        # self.timer_geneva.start(0)
         self.is_connected = False
         self.initChannel()
 
@@ -578,11 +602,33 @@ class MySensor:
             render_points_as_spheres=True, rgb=True
         )
 
-        # --- NEW CODE TO DISPLAY POINT INDICES ---
-        # Generate a list of strings for the labels [ '0', '1', '2', ... ]
-        labels = [str(i) for i in range(self.n_node)]
-
-        # # Add the labels to the plotter at the location of each point
+        # # --- NEW CODE TO DISPLAY POINT INDICES ---
+        # labels = []
+        # for idx in range(self.n_node):
+        #     # 1. Determine the Visual Grid coordinates (i=col, j=row)
+        #     # This matches the loop logic in your update_visualization function
+        #     i = idx // self.n_row
+        #     j = idx % self.n_row
+        #
+        #     # 2. Reverse the Data Transformations to find the original Raw Index
+        #     #
+        #     # The data flow is:
+        #     # Raw[Raw_Row] -> Reshape -> Transpose -> FlipUD -> Visual[j][i]
+        #     #
+        #     # To get the label, we reverse the logic:
+        #     # We need to calculate what the index was BEFORE the FlipUD.
+        #     # FlipUD flips the row index (j).
+        #
+        #     j_unflipped = (self.n_row - 1) - j
+        #
+        #     # Now we calculate the original raw index based on the reshape logic.
+        #     # Based on how your code reshapes (np.array(rawDataList).reshape(n_col, n_row)),
+        #     # the raw index is calculated as:
+        #     raw_index = (i * self.n_row) + j_unflipped
+        #
+        #     labels.append(str(raw_index))
+        #
+        # # Add the labels to the plotter
         # self.plotter.add_point_labels(
         #     self.points,
         #     labels,
@@ -590,7 +636,7 @@ class MySensor:
         #     text_color='white',
         #     shape_color='black',
         #     shape_opacity=0.6,
-        #     point_size=0  # Hides the small dot behind the label
+        #     point_size=0
         # )
         # # --- END OF NEW CODE ---
 
@@ -599,14 +645,11 @@ class MySensor:
         if n_row is None: n_row = 10
         if n_col is None: n_col = 10
 
-        # Pick your reordering logic or None
-        active_logic = 'vertical_flip'  # or None / 'rotate_180' as you use
-
         model = SensorModelFactory(
             n_row=n_row,
             n_col=n_col,
             offset_scale=0.0005,
-            reorder_logic=active_logic
+            # reorder_logic= 'vertical_flip'
         ).build()
 
         self._initialize_from_factory(model)
@@ -703,11 +746,49 @@ class MySensor:
             font-weight: bold;
         """)
 
-    def update_animation(self):
-        # --- MODIFIED METHOD ---
-        self.saveCameraPara()
+    def updateCal(self):
 
-        # start_time = time.time()
+        for ser in self.ser_list:
+            try:
+                # Point the single API object to the correct serial port for this iteration
+                self.parent.sensor_api.ser = ser
+                data_list = self.parent.sensor_api.update_cal()
+            except Exception as e:
+                print(f"Error during calibration on port {ser.port}: {e}")
+                continue
+
+            if self.n_row == 10 and self.n_col == 9:  # For Cylinder, make it from 10x10 to 10x9
+                data_list = data_list[:-10]
+
+            expected_length = self.n_row * (self.n_col + 1)
+            if len(data_list) != expected_length:
+                print(f"Error on port {ser.port}: Data length is {len(data_list)}, expected {expected_length}")
+                continue
+
+            calDataList = data_list[0:- self.n_row]
+
+            self.cal_data = calDataList
+            self._data.getCal(np.array(calDataList).reshape(self.n_col, self.n_row))
+            self._data.clearData()
+
+            for j in range(self._data.windowSize):
+                try:
+                    # The API object still points to the correct 'ser' from the outer loop
+                    data_list = self.parent.sensor_api.read_raw()
+                    rawDataList = data_list[0:- self.n_row]
+                    self._data.getRaw(np.array(rawDataList).reshape(self.n_col, self.n_row))
+                    self._data.calDiff()
+                    self._data.calDiffPer()
+                    self._data.getWin(j)
+                except Exception as e:
+                    print(f"Error during raw data processing on port {ser.port}: {e}")
+                    break
+
+        self.is_connected = True
+        self.parent.sensor_update.setDisabled(False)
+
+    def update_animation(self):
+        self.saveCameraPara()
 
         if self.is_connected:
             for ser in self.ser_list:
@@ -716,15 +797,28 @@ class MySensor:
                     self.parent.sensor_api.ser = ser
                     data_list = self.parent.sensor_api.read_raw()
 
-                    if self.n_row == 10 and self.n_col == 9:  # For Cylinder!!!
+                    if self.n_row == 10 and self.n_col == 9:  # For Cylinder, make it from 10x10 to 10x9
                         data_list = data_list[:-10]
 
                     rawDataList = data_list[0: - self.n_row]
 
-                    # Replace the last 10 elements of the raw data list with the last 10 elements from the calibration data.
-                    if self.n_row == 10 and self.n_col == 10:  # For 2D!!!
+                    if self.n_row == 10 and self.n_col == 10:  # For 2D, replace last 10 values with cal data, it is still 10x10
                         flat_cal_data = self._data.calData.T.flatten()
                         rawDataList[-10:] = flat_cal_data[-10:]
+
+                    if self.n_row == 10 and self.n_col == 8:  # For KUKA, replace some values with cal data, it is still 10x8
+                        flat_cal_data = self._data.calData.T.flatten()
+                        rawDataList[0] = flat_cal_data[0]
+                        rawDataList[1] = flat_cal_data[1]
+                        rawDataList[8] = flat_cal_data[8]
+                        rawDataList[9] = flat_cal_data[9]
+                        rawDataList[69] = flat_cal_data[69]
+                        rawDataList[70] = flat_cal_data[70]
+                        rawDataList[71] = flat_cal_data[71]
+                        rawDataList[72] = flat_cal_data[72]
+                        rawDataList[77] = flat_cal_data[77]
+                        rawDataList[78] = flat_cal_data[78]
+                        rawDataList[79] = flat_cal_data[79]
 
                 except Exception as e:
                     print(f"Error reading from port {ser.port}: {e}")
@@ -741,10 +835,6 @@ class MySensor:
                     continue
 
                 self.update_visualization(self._data.diffPerDataAve)
-
-        # end_time = time.time()
-        # print(f"Update animation took {end_time - start_time:.4f} seconds")
-        # print(f"frequency: {1/(end_time - start_time):.2f} Hz")
 
     def update_visualization(self, data):
         for i in range(self.n_col):
@@ -764,48 +854,6 @@ class MySensor:
         self.line_poly.points = self.points
         self.line_poly.point_data.set_scalars(self.colors_3d)
         self.plotter.render()
-
-    def updateCal(self):
-
-        for ser in self.ser_list:
-            try:
-                # Point the single API object to the correct serial port for this iteration
-                self.parent.sensor_api.ser = ser
-                data_list = self.parent.sensor_api.update_cal()
-            except Exception as e:
-                print(f"Error during calibration on port {ser.port}: {e}")
-                continue
-
-            if self.n_row == 10 and self.n_col == 9:  # For Cylinder!!!
-                data_list = data_list[:-10]
-
-
-            expected_length = self.n_row * (self.n_col + 1)
-            if len(data_list) != expected_length:
-                print(f"Error on port {ser.port}: Data length is {len(data_list)}, expected {expected_length}")
-                continue
-
-            calDataList = data_list[0:- self.n_row]
-
-            self.test = calDataList
-            self._data.getCal(np.array(calDataList).reshape(self.n_col, self.n_row))
-            self._data.clearData()
-
-            for j in range(self._data.windowSize):
-                try:
-                    # The API object still points to the correct 'ser' from the outer loop
-                    data_list = self.parent.sensor_api.read_raw()
-                    rawDataList = data_list[0:- self.n_row]
-                    self._data.getRaw(np.array(rawDataList).reshape(self.n_col, self.n_row))
-                    self._data.calDiff()
-                    self._data.calDiffPer()
-                    self._data.getWin(j)
-                except Exception as e:
-                    print(f"Error during raw data processing on port {ser.port}: {e}")
-                    break
-
-        self.is_connected = True
-        self.parent.sensor_update.setDisabled(False)
 
     def set_touch_sensitivity(self, new_value: float):
         """
@@ -1416,8 +1464,8 @@ class MySensor:
                 continue
 
             calDataList = data_list[0: - n_row]
-            if i == 1: self.test_1 = calDataList
-            if i == 2: self.test_2 = calDataList
+            if i == 1: self.cal_data_1 = calDataList
+            if i == 2: self.cal_data_2 = calDataList
 
             data_obj.getCal(np.array(calDataList).reshape(n_col, n_row))
             data_obj.clearData()

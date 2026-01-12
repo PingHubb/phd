@@ -1,5 +1,5 @@
 from PyQt5 import QtCore
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent
+from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtWidgets import (QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
                              QTabWidget, QLineEdit, QTextEdit, QGroupBox, QListWidget, QMainWindow, QAction, QMenuBar, QSlider, QSpinBox)
@@ -10,6 +10,8 @@ from phd.dependence.mini_robot_api import MyCobotAPI
 from phd.dependence.func_meshLab import MyMeshLab
 from phd.dependence.func_sensor import MySensor
 import os
+import cv2
+from ultralytics import YOLO
 
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
@@ -384,6 +386,89 @@ class MiniRobotToolPositionController:
         self.log_display.append("Resume command sent.")
 
 
+class YoloWorker(QtCore.QThread):
+    image_signal = pyqtSignal(QImage)
+    # NEW: Signal to send data [list_of_detections, (width, height)]
+    data_signal = pyqtSignal(list, tuple)
+    finished_signal = pyqtSignal()
+
+    def __init__(self, dev_source="/dev/video4"):
+        super().__init__()
+        self.dev_source = dev_source
+        self.running = True
+
+    def run(self):
+        print(f"Loading YOLO Model for {self.dev_source}...")
+        try:
+            model = YOLO('yolov8n.pt')
+        except Exception as e:
+            print(f"Error loading YOLO: {e}")
+            self.finished_signal.emit()
+            return
+
+        cap = cv2.VideoCapture(self.dev_source, cv2.CAP_V4L2)
+        if not cap.isOpened():
+            print(f"Cannot open {self.dev_source}")
+            self.finished_signal.emit()
+            return
+
+        while self.running:
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            # Get frame dimensions
+            height, width, _ = frame.shape
+            frame_size = (width, height)
+
+            # 1. Detect
+            results = model(frame, stream=True, verbose=False)
+
+            # Prepare list to send to UI
+            detected_objects = []
+
+            for result in results:
+                # 2. Annotate image
+                annotated_frame = result.plot()
+
+                # 3. Extract Data for Logic
+                for box in result.boxes:
+                    # Get the bounding box coordinates [x1, y1, x2, y2]
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+                    # Get class name (e.g., "mouse", "person")
+                    cls_id = int(box.cls[0])
+                    name = model.names[cls_id]
+
+                    # Get confidence
+                    conf = float(box.conf[0])
+
+                    # Save this info to send to the UI
+                    detected_objects.append({
+                        "name": name,
+                        "box": [x1, y1, x2, y2],
+                        "conf": conf
+                    })
+
+                # 4. Convert Image for Display
+                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                bytes_per_line = ch * w
+                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
+
+                self.image_signal.emit(qt_image.copy())
+
+                # 5. Emit the Data
+                self.data_signal.emit(detected_objects, frame_size)
+
+        cap.release()
+        self.finished_signal.emit()
+
+    def stop(self):
+        self.running = False
+        self.wait()
+
+
 class UI(QSplitter):
     def __init__(self, orientation: QtCore.Qt.Orientation):
         super().__init__(orientation)
@@ -411,6 +496,9 @@ class UI(QSplitter):
             self.disable_robot_controls(True)
 
         self._init_ai_toggle_states()
+
+        self.yolo_worker = None
+        self.centering_active = False  # State for the new button
 
     def disable_robot_controls(self, disable: bool):
         for btn in [self.send_coords_button, self.send_angles_button, self.get_coords_button,
@@ -712,27 +800,34 @@ class UI(QSplitter):
     def setup_tab4(self, layout):
         test_group = QGroupBox("Testing Operations")
         test_layout = QVBoxLayout()
-        self.read_raw_all_prots_button = QPushButton("Read All Port")
-        self.enable_joint_velocity_mode_button = QPushButton("Enable Joint Velocity Mode")
-        self.suspend_end_effector_velocity_mode_button = QPushButton("Suspend End Effector Velocity")
-        self.stop_joint_velocity_mode_button = QPushButton("Stop Joint Velocity")
-        self.enable_end_effector_velocity_mode_button = QPushButton("Enable End Effector Velocity")
-        self.stop_end_effector_velocity_mode_button = QPushButton("Stop End Effector Velocity")
-        self.stop_and_clear_buffer_button = QPushButton("Stop and Clear Buffer")
-        self.sensor_start_geneva = QPushButton("startSensorGeneva", self.widget_func)
-        self.sensor_update_geneva = QPushButton("updateSensorGeneva", self.widget_func)
 
-        test_layout.addWidget(self.read_raw_all_prots_button)
-        test_layout.addWidget(self.enable_joint_velocity_mode_button)
-        test_layout.addWidget(self.stop_joint_velocity_mode_button)
-        test_layout.addWidget(self.enable_end_effector_velocity_mode_button)
-        test_layout.addWidget(self.suspend_end_effector_velocity_mode_button)
-        test_layout.addWidget(self.stop_end_effector_velocity_mode_button)
-        test_layout.addWidget(self.stop_and_clear_buffer_button)
+        self.sensor_start_geneva = QPushButton("startSensorGeneva (X)", self.widget_func)
+        self.sensor_update_geneva = QPushButton("updateSensorGeneva (X)", self.widget_func)
+
         test_layout.addWidget(self.sensor_start_geneva)
         test_layout.addWidget(self.sensor_update_geneva)
         test_group.setLayout(test_layout)
         layout.addWidget(test_group)
+
+        # --- AI Camera Section ---
+        camera_group = QGroupBox("AI Camera")
+        camera_layout = QVBoxLayout()
+
+        # 1. Camera Toggle Button
+        self.live_yolo_button = QPushButton("Start Live Object Detection")
+        self.live_yolo_button.clicked.connect(self.toggle_yolo_camera)
+
+        # 2. NEW: Auto-Center Button
+        self.auto_center_button = QPushButton("Auto-Center on Mouse")
+        self.auto_center_button.setCheckable(True)  # Make it toggleable
+        self.auto_center_button.setEnabled(False)  # Disabled until camera starts
+        self.auto_center_button.clicked.connect(self.toggle_centering_mode)
+
+        camera_layout.addWidget(self.live_yolo_button)
+        camera_layout.addWidget(self.auto_center_button)  # Add to layout
+
+        camera_group.setLayout(camera_layout)
+        layout.addWidget(camera_group)
 
     def setup_tab5(self, layout):
         basic_group = QGroupBox("Basic Controls")
@@ -903,7 +998,6 @@ class UI(QSplitter):
             self.toggle_tool_frame_position_input
         )
         self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
-        self.read_raw_all_prots_button.pressed.connect(lambda: self.sensor_functions.read_raw_all_ports())
         self.continuous_read_button.pressed.connect(self.toggle_continuous_read)
         self.read_timer.timeout.connect(self.update_robot_status)
         self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
@@ -1122,6 +1216,143 @@ class UI(QSplitter):
         # Refresh button label + color
         self._update_anchor_button_label()
 
+    def toggle_yolo_camera(self):
+        if self.yolo_worker is not None and self.yolo_worker.isRunning():
+            # STOPPING
+            self.yolo_worker.stop()
+            self.yolo_worker = None
+            if hasattr(self, 'cam_window') and self.cam_window.isVisible():
+                self.cam_window.close()
+
+            # Disable the centering button when camera stops
+            self.auto_center_button.setChecked(False)
+            self.toggle_centering_mode()  # Reset state
+            self.auto_center_button.setEnabled(False)
+
+            self.reset_yolo_button_state()
+        else:
+            # STARTING
+            # ... (Window setup code same as before) ...
+            self.cam_window = QWidget()
+            self.cam_window.setWindowTitle("Live Object Detection")
+            self.cam_window.resize(640, 480)
+            self.cam_label = QLabel(self.cam_window)
+            self.cam_label.setAlignment(Qt.AlignCenter)
+            layout = QVBoxLayout()
+            layout.addWidget(self.cam_label)
+            self.cam_window.setLayout(layout)
+
+            self.yolo_worker = YoloWorker(dev_source="/dev/video4")
+
+            # CONNECT IMAGE SIGNAL
+            self.yolo_worker.image_signal.connect(self.update_cam_window)
+
+            # --- NEW: CONNECT DATA SIGNAL ---
+            self.yolo_worker.data_signal.connect(self.process_yolo_data)
+            # --------------------------------
+
+            self.yolo_worker.finished_signal.connect(self.reset_yolo_button_state)
+            self.yolo_worker.start()
+            self.cam_window.show()
+
+            # Enable the centering button now that camera is running
+            self.auto_center_button.setEnabled(True)
+
+            self.live_yolo_button.setText("Stop Live Object Detection")
+            self._set_button_active(self.live_yolo_button, True)
+
+    def toggle_centering_mode(self):
+        """Toggle the tracking logic on/off"""
+        self.centering_active = self.auto_center_button.isChecked()
+
+        if self.centering_active:
+            self.auto_center_button.setText("Stop Auto-Centering")
+            self._set_button_active(self.auto_center_button, True)
+            print("Auto-Centering ACTIVATED: Looking for 'mouse'...")
+        else:
+            self.auto_center_button.setText("Auto-Center on Mouse")
+            self._set_button_active(self.auto_center_button, False)
+            print("Auto-Centering STOPPED")
+
+    def process_yolo_data(self, detections, frame_size):
+        """
+        Calculates distance from center for a 'mouse'.
+        detections: list of dicts {'name', 'box', ...}
+        frame_size: (width, height)
+        """
+        # Only calculate if the button is pressed
+        if not self.centering_active:
+            return
+
+        frame_w, frame_h = frame_size
+        center_x = frame_w / 2
+        center_y = frame_h / 2
+
+        found_mouse = False
+
+        for obj in detections:
+            if obj["name"] == "mouse":  # You can change this to "cup" or "bottle" to test
+                found_mouse = True
+
+                # 1. Calculate Object Center
+                x1, y1, x2, y2 = obj["box"]
+                obj_center_x = (x1 + x2) / 2
+                obj_center_y = (y1 + y2) / 2
+
+                # 2. Calculate Distance from Screen Center
+                # X axis (Left/Right)
+                diff_x = center_x - obj_center_x
+
+                # Y axis (Up/Down in image -> usually Z or X for robot)
+                diff_z = center_y - obj_center_y
+
+                # 3. Define a "Dead Zone" (Tolerance)
+                # If it's close enough (e.g., within 20 pixels), consider it centered
+                tolerance = 30
+
+                status_msg = f"Mouse found at ({int(obj_center_x)}, {int(obj_center_y)}) | "
+
+                # Logic for X (Left/Right)
+                if abs(diff_x) > tolerance:
+                    direction = "MOVE LEFT" if diff_x > 0 else "MOVE RIGHT"
+                    status_msg += f"X-Correction: {diff_x:.1f} ({direction}) "
+                else:
+                    status_msg += "X-Aligned "
+
+                # Logic for Z (Up/Down)
+                if abs(diff_z) > tolerance:
+                    direction = "MOVE UP" if diff_z > 0 else "MOVE DOWN"
+                    status_msg += f"| Z-Correction: {diff_z:.1f} ({direction})"
+                else:
+                    status_msg += "| Z-Aligned"
+
+                print(status_msg)
+
+                # TODO: Here is where you will add:
+                # self.robot_api.send_movement(diff_x, diff_z)
+
+                # We only track one mouse at a time, so break loop
+                break
+
+        if not found_mouse:
+            # Optional: Print only occasionally to avoid spam
+            # print("No mouse detected...")
+            pass
+
+    def update_cam_window(self, qt_image):
+        """Received a new frame from the thread, update the label."""
+        if hasattr(self, 'cam_window') and self.cam_window.isVisible():
+            # Scale image to fit window if needed, or just show it
+            self.cam_label.setPixmap(QPixmap.fromImage(qt_image))
+            self.cam_label.resize(qt_image.width(), qt_image.height())
+
+    def reset_yolo_button_state(self):
+        """Called when thread finishes (via Stop button, 'q', or window close)"""
+        self.live_yolo_button.setText("Start Live Object Detection")
+        self._set_button_active(self.live_yolo_button, False)
+        # Clean up reference if it finished naturally
+        if self.yolo_worker is not None and not self.yolo_worker.isRunning():
+            self.yolo_worker = None
 
     def adjust_splitter_sizes(self):
         total_width = self.splitter_1.width()

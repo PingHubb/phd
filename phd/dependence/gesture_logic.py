@@ -1323,6 +1323,7 @@ class ThreeLevelTransformer:
         """ The main recognition loop, simplified without cooldown. """
         # --- Step 1: Buffer the Data in a Sliding Window ---
         raw_data_frame = self.my_sensor._data.diffPerDataAve.T.flatten()
+        print(f"Length of raw_data_frame: {len(raw_data_frame)}")
         standardized_frame = (raw_data_frame - self.global_mean) / self.global_std
         self.current_gesture_data.append(standardized_frame)
 
