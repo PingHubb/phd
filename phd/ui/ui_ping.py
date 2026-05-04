@@ -1,17 +1,262 @@
+from __future__ import annotations
+
+import math
+from typing import Any, Optional
+
+import numpy as np
 from PyQt5 import QtCore
-from PyQt5.QtGui import QDragEnterEvent, QDropEvent, QImage, QPixmap
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
-from PyQt5.QtWidgets import (QSplitter, QWidget, QGridLayout, QPushButton, QVBoxLayout, QHBoxLayout, QLabel,
-                             QTabWidget, QLineEdit, QTextEdit, QGroupBox, QListWidget, QMainWindow, QAction, QMenuBar, QSlider, QSpinBox)
+from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
+from PyQt5.QtWidgets import (
+    QDialog,
+    QFileDialog,
+    QGroupBox,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QDoubleSpinBox,
+    QLineEdit,
+    QListWidget,
+    QPlainTextEdit,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QSplitter,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
 from pyvistaqt import QtInteractor
-from phd.dependence.sensor_api import ArduinoCommander
-from phd.dependence.robot_api import RobotController
-from phd.dependence.mini_robot_api import MyCobotAPI
-from phd.dependence.func_meshLab import MyMeshLab
-from phd.dependence.func_sensor import MySensor
-import os
-import cv2
-from ultralytics import YOLO
+from phd.ui.ui_ping_ai_controls import AiControlsMixin
+from phd.ui.ui_ping_camera_control import CameraControlMixin
+from phd.ui.ui_ping_direct_finger_motion import DirectFingerMotionMixin
+from phd.ui.ui_ping_robot_sensor_controls import RobotSensorControlsMixin
+from phd.ui.ui_ping_ui_interactions import UiInteractionsMixin
+
+
+def _safe_import(module_path: str, symbol: str):
+    try:
+        module = __import__(module_path, fromlist=[symbol])
+        return getattr(module, symbol), None
+    except Exception as exc:
+        return None, exc
+
+
+ArduinoCommander, _ARDUINO_IMPORT_ERROR = _safe_import('phd.dependence.sensor_api', 'ArduinoCommander')
+RobotController, _ROBOT_IMPORT_ERROR = _safe_import('phd.dependence.robot_api', 'RobotController')
+MyMeshLab, _MESHLAB_IMPORT_ERROR = _safe_import('phd.dependence.func_meshLab', 'MyMeshLab')
+MySensor, _SENSOR_IMPORT_ERROR = _safe_import('phd.dependence.func_sensor', 'MySensor')
+GripperHelper, _GRIPPER_IMPORT_ERROR = _safe_import('phd.dependence.gripper_api', 'GripperHelper')
+YoloWorker, _YOLO_IMPORT_ERROR = _safe_import('phd.dependence.camera_api', 'YoloWorker')
+
+
+class NullSensorApi:
+    def __init__(self):
+        self.ser = None
+
+    def read_raw(self):
+        return []
+
+    def measure_read_raw_hz(self, duration_sec=1.0):
+        return None
+
+    def channel_check(self):
+        return []
+
+    def update_cal(self):
+        return []
+
+
+class NullRobotApi:
+    use_ros = False
+
+    def get_current_positions(self):
+        return 'Robot API unavailable'
+
+    def get_current_tool_position(self):
+        return 'Robot API unavailable'
+
+    def send_request(self, request=None):
+        return None
+
+    def suspend_end_effector_velocity_mode(self):
+        return None
+
+    def enable_end_effector_velocity_mode(self):
+        return None
+
+    def stop_end_effector_velocity_mode(self):
+        return None
+
+    def set_end_effector_velocity_in_frame(self, *args, **kwargs):
+        return None
+
+    def send_positions_joint_angle(self, *args, **kwargs):
+        raise RuntimeError('Robot API unavailable')
+
+    def send_positions_tool_position(self, *args, **kwargs):
+        raise RuntimeError('Robot API unavailable')
+
+
+class NullGripper:
+    ACTION_LIFT = 'lift'
+    ACTION_RETRY = 'retry'
+    ACTION_RETRY_OPEN = 'retry_open'
+    ACTION_MANUAL = 'manual'
+
+    def set_slider_pos(self, *_args, **_kwargs):
+        return None
+
+    def open(self, *_args, **_kwargs):
+        return None
+
+    def close(self, *_args, **_kwargs):
+        return None
+
+    def get_pos_string(self):
+        return 'Gripper unavailable'
+
+    def evaluate_grip_attempt(self, grip_fail_count: int):
+        return self.ACTION_RETRY, grip_fail_count
+
+
+class _NoOpRecorder:
+    def set_trigger_mode(self, *_args, **_kwargs):
+        return None
+
+    def start_record_gesture(self, *_args, **_kwargs):
+        return None
+
+
+class _NoOpToggle:
+    def __init__(self):
+        self.is_recognizing_gesture = False
+        self.last_gesture_time = 0.0
+        self.latch_mode = False
+        self.anchor_enabled = True
+
+    def toggle_gesture_recognition(self):
+        self.is_recognizing_gesture = not self.is_recognizing_gesture
+
+    def toggle_prediction_mode(self):
+        return None
+
+    def toggle_model(self):
+        return None
+
+    def activate_rule_based(self):
+        return None
+
+    def toggle_latch_mode(self):
+        self.latch_mode = not self.latch_mode
+
+    def _set_anchor_from_current_frame(self):
+        return None
+
+    def toggle_direct_finger_motion(self):
+        return None
+
+    def toggle_direct_finger_motion_v2(self):
+        return None
+
+    def toggle_proximity_control(self):
+        return None
+
+    def teach_proximity_reference(self):
+        return False
+
+    def toggle_recording(self):
+        return False
+
+    def apply_runtime_params(self, **_kwargs):
+        return None
+
+    def get_settings(self):
+        return {}
+
+    def apply_settings(self, *_args, **_kwargs):
+        return None
+
+    def toggle_ai_direct_finger_motion(self, *args, **kwargs):
+        return None
+
+    def toggle_ai_direct_finger_motion_execution(self, *args, **kwargs):
+        return None
+
+
+class DisabledSensorFunctions:
+    DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH = (
+        "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/ai_direct_finger_motion/best_model.pt"
+    )
+    DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE = 3
+    DEFAULT_VISUALIZATION_TARGET_HZ = 30.0
+
+    def __init__(self, parent):
+        self.parent = parent
+        self.record_gesture_class = _NoOpRecorder()
+        self.lstm_class = _NoOpToggle()
+        self.rule_based_class = _NoOpToggle()
+        self.hierarchical_transformer_class = _NoOpToggle()
+        self.threelevel_hierarchical_transformer_class = _NoOpToggle()
+        self.proximity_control_class = _NoOpToggle()
+        self.direct_finger_motion_class = _NoOpToggle()
+        self.ai_direct_finger_motion_class = _NoOpToggle()
+        self.ai_direct_finger_motion_execution_class = _NoOpToggle()
+
+    def read_sensor_raw_data(self):
+        return []
+
+    def read_sensor_raw_ave_data(self):
+        return []
+
+    def read_sensor_diff_data(self):
+        return []
+
+    def read_sensor_diff_debug_views(self):
+        return "Sensor functions are not ready."
+
+    def read_runtime_hz_report(self):
+        return (
+            "sensor_update_hz: 0.00\n"
+            "direct_finger_motion_loop_hz: 0.00\n"
+            "direct_finger_motion_running: False\n"
+            f"sensor_average_window_size: {self.DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE}\n"
+            f"visualization_target_hz: {self.DEFAULT_VISUALIZATION_TARGET_HZ:.2f}"
+        )
+
+    def buildScene(self):
+        return None
+
+    def updateCal(self):
+        return None
+
+    def set_touch_sensitivity(self, *_args, **_kwargs):
+        return None
+
+    def get_sensor_average_window_size(self):
+        return self.DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE
+
+    def set_sensor_average_window_size(self, *_args, **_kwargs):
+        return None
+
+    def get_visualization_target_hz(self):
+        return self.DEFAULT_VISUALIZATION_TARGET_HZ
+
+    def set_visualization_target_hz(self, *_args, **_kwargs):
+        return None
+
+    def get_ai_direct_finger_motion_execution_default_model_path(self):
+        return self.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
+
+
+class NullMeshLab:
+    def __init__(self, parent):
+        self.parent = parent
+
+    def addRobot(self):
+        return None
+
 
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
@@ -33,17 +278,117 @@ class PlotterWidget(QWidget):
         self.filesDropped.emit(file_paths)
 
 
-class RobotPositionWidget(QWidget):
-    def __init__(self, parent=None):
+class ProximityRecordingChartWidget(QWidget):
+    def __init__(self, title: str, series, parent=None):
         super().__init__(parent)
+        self.title = title
+        self.series = list(series or [])
+        self.setMinimumHeight(260)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        rect = self.rect().adjusted(54, 30, -18, -38)
+        painter.setPen(QPen(QColor("#d0d0d0")))
+        painter.drawText(10, 20, self.title)
+        painter.drawRect(rect)
+
+        all_x = []
+        all_y = []
+        for _label, xs, ys, _color in self.series:
+            all_x.extend([x for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)])
+            all_y.extend([y for x, y in zip(xs, ys) if np.isfinite(x) and np.isfinite(y)])
+        if not all_x or not all_y:
+            painter.drawText(rect, Qt.AlignCenter, "No finite data")
+            return
+
+        x_min, x_max = min(all_x), max(all_x)
+        y_min, y_max = min(all_y), max(all_y)
+        if abs(x_max - x_min) < 1e-9:
+            x_max = x_min + 1.0
+        if abs(y_max - y_min) < 1e-9:
+            pad = max(1.0, abs(y_min) * 0.1)
+            y_min -= pad
+            y_max += pad
+        else:
+            pad = (y_max - y_min) * 0.08
+            y_min -= pad
+            y_max += pad
+
+        def map_xy(x, y):
+            px = rect.left() + (float(x) - x_min) / (x_max - x_min) * rect.width()
+            py = rect.bottom() - (float(y) - y_min) / (y_max - y_min) * rect.height()
+            return px, py
+
+        legend_x = rect.left()
+        legend_y = rect.bottom() + 18
+        for label, xs, ys, color in self.series:
+            pen = QPen(QColor(color), 2)
+            painter.setPen(pen)
+            previous = None
+            for x, y in zip(xs, ys):
+                if not (np.isfinite(x) and np.isfinite(y)):
+                    previous = None
+                    continue
+                point = map_xy(x, y)
+                if previous is not None:
+                    painter.drawLine(int(previous[0]), int(previous[1]), int(point[0]), int(point[1]))
+                previous = point
+            painter.drawLine(legend_x, legend_y - 4, legend_x + 18, legend_y - 4)
+            painter.setPen(QPen(QColor("#d0d0d0")))
+            painter.drawText(legend_x + 24, legend_y, label)
+            legend_x += 130
+
+        painter.setPen(QPen(QColor("#a0a0a0")))
+        painter.drawText(8, rect.top() + 5, f"{y_max:.3g}")
+        painter.drawText(8, rect.bottom(), f"{y_min:.3g}")
+        painter.drawText(rect.left(), self.height() - 8, f"{x_min:.2f}s")
+        painter.drawText(rect.right() - 60, self.height() - 8, f"{x_max:.2f}s")
+
+
+class RobotScriptSendWidget(QWidget):
+    """Script editor shown only after pressing Send Script (Robot tab)."""
+
+    transmit_script = QtCore.pyqtSignal(str)
+
+    def __init__(self, robot_api=None, parent=None):
+        super().__init__(parent)
+        self.robot_api = robot_api
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        outer.addWidget(QLabel("TM script (SendScript):"))
+        self.robot_script_input = QPlainTextEdit()
+        self.robot_script_input.setPlaceholderText(
+            'Example: PTP("JPP",0,-30,-45,0,-90,0,100,0,100,true)'
+        )
+        self.robot_script_input.setMinimumHeight(88)
+        self.robot_script_input.setTabChangesFocus(True)
+        outer.addWidget(self.robot_script_input)
+        self.transmit_script_button = QPushButton("Transmit script")
+        self.transmit_script_button.clicked.connect(self._on_transmit_clicked)
+        outer.addWidget(self.transmit_script_button)
+
+    def _on_transmit_clicked(self):
+        self.transmit_script.emit(self.robot_script_input.toPlainText().strip())
+
+    def toggle_visibility(self):
+        self.setVisible(not self.isVisible())
+
+
+class RobotPositionWidget(QWidget):
+    def __init__(self, robot_api=None, parent=None):
+        super().__init__(parent)
+        self.robot_api = robot_api
         self.setLayout(QVBoxLayout())
         self.position_edits = []
         self.labels = []
         # --- MODIFICATION: Removed inline stylesheet ---
 
         self.presets = {
-            1: [-0.7261620039030, -0.43900, -1.005029724, -0.143107, -1.57, -1.661117],
-            2: [-0.7242335, 0.28315391, -1.523286731370, -0.32650261753, -1.5700302685, -1.659972941]
+            1: [-0.7242335, 0.28315391, -1.523286731370, -0.32650261753, -1.5700302685, 0.0],
+            2: [-1.1, -0.43900, -1.005029724, -0.143107, -1.57, 0.0]
         }
 
         # --- MODIFICATION: Use QGroupBox for title and layout ---
@@ -52,17 +397,33 @@ class RobotPositionWidget(QWidget):
         grid_layout = QGridLayout(self.angle_group_box)
         grid_layout.setContentsMargins(10, 10, 10, 10)
 
+        step_rad = math.radians(10.0)
         for i in range(6):
+            row = i % 3
+            start_col = 0 if i < 3 else 2
+            row_widget = QWidget()
+            row_h = QHBoxLayout(row_widget)
+            row_h.setContentsMargins(0, 2, 0, 2)
+            row_h.setSpacing(6)
+
             label = QLabel(f"Joint {i + 1}:")
             line_edit = QLineEdit()
-            line_edit.setText(f"{self.presets[1][i]}")
+            line_edit.setText(f"{self.presets[1][i]:.4f}")
+            line_edit.setMinimumWidth(72)
 
-            # Arrange in 3 rows, 2 columns
-            row = i % 3
-            col = (i // 3) * 2  # Column 0 for first 3, Column 2 for next 3
+            btn_minus = QPushButton("-10°")
+            btn_plus = QPushButton("+10°")
+            btn_minus.setFixedWidth(52)
+            btn_plus.setFixedWidth(52)
+            btn_minus.clicked.connect(lambda checked, idx=i, dr=-step_rad: self._nudge_joint_rad(idx, dr))
+            btn_plus.clicked.connect(lambda checked, idx=i, dr=step_rad: self._nudge_joint_rad(idx, dr))
 
-            grid_layout.addWidget(label, row, col)
-            grid_layout.addWidget(line_edit, row, col + 1)
+            row_h.addWidget(label)
+            row_h.addWidget(line_edit, 1)
+            row_h.addWidget(btn_minus)
+            row_h.addWidget(btn_plus)
+
+            grid_layout.addWidget(row_widget, row, start_col, 1, 2)
 
             self.labels.append(label)
             self.position_edits.append(line_edit)
@@ -97,12 +458,33 @@ class RobotPositionWidget(QWidget):
         preset_values = self.presets.get(preset_number)
         if preset_values:
             for i, value in enumerate(preset_values):
-                self.position_edits[i].setText(f"{value:.2f}")
+                self.position_edits[i].setText(f"{value:.4f}")
+
+    def _nudge_joint_rad(self, index: int, delta_rad: float):
+        edit = self.position_edits[index]
+        try:
+            v = float(edit.text())
+        except ValueError:
+            v = 0.0
+        edit.setText(f"{v + float(delta_rad):.4f}")
 
     def send_positions(self):
-        positions = [float(edit.text()) for edit in self.position_edits]
-        print("Sending positions:", positions)
-        RobotController().send_positions_joint_angle(positions)
+        try:
+            positions = [float(edit.text()) for edit in self.position_edits]
+        except ValueError:
+            print("Invalid input! Please enter valid numbers.")
+            return
+
+        api = self.robot_api
+        if api is None or not hasattr(api, 'send_positions_joint_angle'):
+            print("Robot API unavailable.")
+            return
+
+        try:
+            print("Sending positions:", positions)
+            api.send_positions_joint_angle(positions)
+        except Exception as e:
+            print(f"Failed to send joint positions: {e}")
 
     def toggle_visibility(self):
         isVisible = not self.isVisible()
@@ -112,8 +494,9 @@ class RobotPositionWidget(QWidget):
 
 
 class RobotToolPositionWidget(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, robot_api=None, parent=None):
         super().__init__(parent)
+        self.robot_api = robot_api
         self.setLayout(QVBoxLayout())
         # --- MODIFICATION: Removed inline stylesheet ---
 
@@ -195,13 +578,20 @@ class RobotToolPositionWidget(QWidget):
         self.line_edits[identifier] = line_edit
 
     def send_positions(self):
+        api = self.robot_api
+        if api is None or not hasattr(api, 'send_positions_tool_position'):
+            print("Robot API unavailable.")
+            return
+
         try:
             positions = [float(self.line_edits[coord].text()) for coord in ['X', 'Y', 'Z']]
             quaternion = tuple(float(self.line_edits[part].text()) for part in ['w', 'i', 'j', 'k'])
             print("Sending tool position:", positions, "with quaternion:", quaternion)
-            RobotController().send_positions_tool_position(positions, quaternion)
+            api.send_positions_tool_position(positions, quaternion)
         except ValueError:
             print("Invalid input! Please enter valid numbers.")
+        except Exception as e:
+            print(f"Failed to send tool position: {e}")
 
     def toggle_visibility(self):
         isVisible = not self.isVisible()
@@ -212,300 +602,420 @@ class RobotToolPositionWidget(QWidget):
 
 class RobotToolFramePositionWidget(QWidget):
     """
-    Control the end-effector velocity using keyboard number keys.
-    Movement is expressed in the TOOL frame.
+    Button-based end-effector velocity control expressed in the TOOL frame.
 
-    The robot will continue moving at the specified velocity until a new
-    command (e.g., key '0' for stop) is sent.
+    Improved layout:
+      - speed sliders at top
+      - 2 sub-tabs: Linear / Angular
+      - compact stop buttons at bottom
     """
 
-    def __init__(self, robot_api, parent=None):
+    def __init__(self, robot_api, log_display=None, parent=None):
         super().__init__(parent)
         self.robot_api = robot_api
-
-        # --- Configuration ---
-        self.linear_speed = 0.02  # meters/second
-        self.angular_speed = 0.0001  # radians/second
-
-        # --- UI Setup ---
-        outer = QVBoxLayout(self)
-        self.setLayout(outer)
-
-        control_group = QGroupBox("Keyboard Velocity Control (Tool Frame)")
-        outer.addWidget(control_group)
-
-        # Instructions Label
-        instructions_layout = QVBoxLayout(control_group)
-        instructions_text = (
-            "<b>Focus this window and use number keys to move the robot:</b><br>"
-            "&nbsp;1 / 2 : Move along +X / -X<br>"
-            "&nbsp;3 / 4 : Move along +Y / -Y<br>"
-            "&nbsp;5 / 6 : Move along +Z / -Z<br>"
-            "&nbsp;7 / 8 : Rotate around +Z / -Z<br><br>"
-            "&nbsp;<b>0 : STOP all movement</b>"
-        )
-        instructions_label = QLabel(instructions_text)
-        instructions_label.setWordWrap(True)
-        instructions_layout.addWidget(instructions_label)
-
-        # Ensure this widget can receive key press events
-        self.setFocusPolicy(Qt.StrongFocus)
-        self.setVisible(False)
-
-    def keyPressEvent(self, event: QtCore.QEvent):
-        """Handle key presses to send velocity commands."""
-        key = event.key()
-        v_lin = [0.0, 0.0, 0.0]
-        v_rot = [0.0, 0.0, 0.0]
-
-        # Map number keys to specific movements
-        if key == Qt.Key_1:  # +X Linear
-            v_lin[0] = self.linear_speed
-        elif key == Qt.Key_2:  # -X Linear
-            v_lin[0] = -self.linear_speed
-        elif key == Qt.Key_3:  # +Y Linear
-            v_lin[1] = self.linear_speed
-        elif key == Qt.Key_4:  # -Y Linear
-            v_lin[1] = -self.linear_speed
-        elif key == Qt.Key_5:  # +Z Linear
-            v_lin[2] = self.linear_speed
-        elif key == Qt.Key_6:  # -Z Linear
-            v_lin[2] = -self.linear_speed
-        elif key == Qt.Key_7:  # +Z Rotation
-            v_rot[1] = self.angular_speed
-        elif key == Qt.Key_8:  # -Z Rotation
-            v_rot[1] = -self.angular_speed
-        elif key == Qt.Key_9:  # -Z Rotation
-            self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
-            self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
-        elif key == Qt.Key_0:  # Stop
-            # All velocities are already initialized to zero
-            pass
-        else:
-            # If the key is not one of our control keys, ignore it
-            # and let the parent class handle any default actions.
-            super().keyPressEvent(event)
-            return
-
-        # Send the calculated velocity command to the robot
-        self._send_velocity_command(v_lin, v_rot)
-        event.accept()
-
-    def _send_velocity_command(self, v_lin, v_rot):
-        """Sends the velocity vector to the robot API in the tool frame."""
-        try:
-            print(f"Sending velocity command: linear={v_lin}, angular={v_rot}, frame='tool'")
-
-            # This method name is based on your example.
-            # If your RobotController uses a different name, please adjust it here.
-            if hasattr(self.robot_api, 'set_end_effector_velocity_in_frame'):
-                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
-                self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
-                self.robot_api.send_request(self.robot_api.set_end_effector_velocity_in_frame(
-                    v_lin, v_rot, frame="tool"
-                ))
-            else:
-                # Fallback for compatibility if the method is not directly on the api object
-                print("Attempting to send as a request...")
-                self.robot_api.send_request(self.robot_api.set_end_effector_velocity_in_frame(
-                    v_lin, v_rot, frame="tool"
-                ))
-
-        except Exception as e:
-            print(f"[VelocityControl] Failed to send velocity command: {e}")
-            self.log_display.append(f"❌ Velocity Error: {e}")
-
-    def toggle_visibility(self):
-        """Toggles the widget's visibility and sets focus when shown."""
-        is_visible = not self.isVisible()
-        self.setVisible(is_visible)
-        if is_visible:
-            self.setFocus()  # Automatically focus the widget to capture keys
-
-
-class MiniRobotToolPositionController:
-    # (No changes needed in this class)
-    def __init__(self, mini_robot, coord_inputs, speed_input, angle_inputs, angle_speed_input, log_display):
-        self.mini_robot = mini_robot
-        self.coord_inputs = coord_inputs
-        self.speed_input = speed_input
-        self.angle_inputs = angle_inputs
-        self.angle_speed_input = angle_speed_input
         self.log_display = log_display
 
-    def send_coords(self):
-        if not self.mini_robot:
-            self.log_display.append("Robot not connected.")
-            return
+        self.linear_speed = 0.02   # m/s
+        self.angular_speed = 0.01  # rad/s
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.setSpacing(8)
+
+        control_group = QGroupBox("Velocity Control (Tool Frame)")
+        outer.addWidget(control_group)
+        main_layout = QVBoxLayout(control_group)
+        main_layout.setContentsMargins(8, 8, 8, 8)
+        main_layout.setSpacing(8)
+
+        info = QLabel(
+            "Set speed with the sliders, then click a direction button to send a tool-frame velocity command."
+        )
+        info.setWordWrap(True)
+        main_layout.addWidget(info)
+
+        # -------------------------
+        # Speed sliders
+        # -------------------------
+        linear_row = QHBoxLayout()
+        linear_row.addWidget(QLabel("XYZ speed:"))
+        self.linear_slider = QSlider(Qt.Horizontal)
+        self.linear_slider.setRange(1, 200)  # 0.001 -> 0.200 m/s
+        self.linear_slider.setValue(int(self.linear_speed * 1000))
+        self.linear_slider.valueChanged.connect(self._on_linear_slider)
+        self.linear_label = QLabel()
+        self.linear_label.setFixedWidth(90)
+        linear_row.addWidget(self.linear_slider)
+        linear_row.addWidget(self.linear_label)
+        main_layout.addLayout(linear_row)
+
+        angular_row = QHBoxLayout()
+        angular_row.addWidget(QLabel("RXYZ speed:"))
+        self.angular_slider = QSlider(Qt.Horizontal)
+        self.angular_slider.setRange(1, 200)  # 0.001 -> 0.200 rad/s
+        self.angular_slider.setValue(int(self.angular_speed * 1000))
+        self.angular_slider.valueChanged.connect(self._on_angular_slider)
+        self.angular_label = QLabel()
+        self.angular_label.setFixedWidth(90)
+        angular_row.addWidget(self.angular_slider)
+        angular_row.addWidget(self.angular_label)
+        main_layout.addLayout(angular_row)
+
+        self._refresh_speed_labels()
+
+        # -------------------------
+        # Sub-tabs for buttons
+        # -------------------------
+        self.motion_tabs = QTabWidget()
+        main_layout.addWidget(self.motion_tabs)
+
+        # Linear tab
+        linear_tab = QWidget()
+        linear_tab_layout = QGridLayout(linear_tab)
+        linear_tab_layout.setContentsMargins(8, 8, 8, 8)
+        linear_tab_layout.setHorizontalSpacing(8)
+        linear_tab_layout.setVerticalSpacing(8)
+
+        linear_tab_layout.addWidget(
+            self._make_btn("X+", lambda: self._send_linear(self.linear_speed, 0.0, 0.0)), 0, 0
+        )
+        linear_tab_layout.addWidget(
+            self._make_btn("X-", lambda: self._send_linear(-self.linear_speed, 0.0, 0.0)), 0, 1
+        )
+        linear_tab_layout.addWidget(
+            self._make_btn("Y+", lambda: self._send_linear(0.0, self.linear_speed, 0.0)), 1, 0
+        )
+        linear_tab_layout.addWidget(
+            self._make_btn("Y-", lambda: self._send_linear(0.0, -self.linear_speed, 0.0)), 1, 1
+        )
+        linear_tab_layout.addWidget(
+            self._make_btn("Z+", lambda: self._send_linear(0.0, 0.0, self.linear_speed)), 2, 0
+        )
+        linear_tab_layout.addWidget(
+            self._make_btn("Z-", lambda: self._send_linear(0.0, 0.0, -self.linear_speed)), 2, 1
+        )
+
+        self.motion_tabs.addTab(linear_tab, "Linear")
+
+        # Angular tab
+        angular_tab = QWidget()
+        angular_tab_layout = QGridLayout(angular_tab)
+        angular_tab_layout.setContentsMargins(8, 8, 8, 8)
+        angular_tab_layout.setHorizontalSpacing(8)
+        angular_tab_layout.setVerticalSpacing(8)
+
+        angular_tab_layout.addWidget(
+            self._make_btn("Rx+", lambda: self._send_angular(self.angular_speed, 0.0, 0.0)), 0, 0
+        )
+        angular_tab_layout.addWidget(
+            self._make_btn("Rx-", lambda: self._send_angular(-self.angular_speed, 0.0, 0.0)), 0, 1
+        )
+        angular_tab_layout.addWidget(
+            self._make_btn("Ry+", lambda: self._send_angular(0.0, self.angular_speed, 0.0)), 1, 0
+        )
+        angular_tab_layout.addWidget(
+            self._make_btn("Ry-", lambda: self._send_angular(0.0, -self.angular_speed, 0.0)), 1, 1
+        )
+        angular_tab_layout.addWidget(
+            self._make_btn("Rz+", lambda: self._send_angular(0.0, 0.0, self.angular_speed)), 2, 0
+        )
+        angular_tab_layout.addWidget(
+            self._make_btn("Rz-", lambda: self._send_angular(0.0, 0.0, -self.angular_speed)), 2, 1
+        )
+
+        self.motion_tabs.addTab(angular_tab, "Angular")
+
+        # -------------------------
+        # Stop buttons
+        # -------------------------
+        stop_row = QHBoxLayout()
+
+        self.btn_stop_all = QPushButton("STOP (All 0)")
+        self.btn_stop_all.setMinimumHeight(34)
+        self.btn_stop_all.clicked.connect(self.stop_all_velocity)
+        stop_row.addWidget(self.btn_stop_all)
+
+        self.btn_stop_velocity_mode = QPushButton("Stop Velocity Mode")
+        self.btn_stop_velocity_mode.setMinimumHeight(34)
+        self.btn_stop_velocity_mode.clicked.connect(self.stop_velocity_mode)
+        stop_row.addWidget(self.btn_stop_velocity_mode)
+
+        main_layout.addLayout(stop_row)
+
+        self.setVisible(False)
+
+    def _make_btn(self, text, fn):
+        btn = QPushButton(text)
+        btn.setMinimumHeight(34)
+        btn.clicked.connect(fn)
+        return btn
+
+    def _on_linear_slider(self, value: int):
+        self.linear_speed = value / 1000.0
+        self._refresh_speed_labels()
+
+    def _on_angular_slider(self, value: int):
+        self.angular_speed = value / 1000.0
+        self._refresh_speed_labels()
+
+    def _refresh_speed_labels(self):
+        self.linear_label.setText(f"{self.linear_speed:.3f} m/s")
+        self.angular_label.setText(f"{self.angular_speed:.3f} rad/s")
+
+    def _append_log(self, message: str):
+        if self.log_display is not None:
+            try:
+                self.log_display.append(message)
+            except Exception:
+                pass
+
+    def _send_linear(self, x, y, z):
+        self._send_velocity([float(x), float(y), float(z)], [0.0, 0.0, 0.0])
+
+    def _send_angular(self, rx, ry, rz):
+        self._send_velocity([0.0, 0.0, 0.0], [float(rx), float(ry), float(rz)])
+
+    def _send_velocity(self, v_lin, v_rot):
         try:
-            coords = [float(edit.text()) for edit in self.coord_inputs]
-            speed = int(self.speed_input.text())
-            self.mini_robot.move_to_coords(coords, speed)
-            self.log_display.append(f"Sent coords: {coords} at speed {speed}")
-        except ValueError:
-            self.log_display.append("Invalid coordinate or speed input!")
+            if not hasattr(self.robot_api, "send_request"):
+                print("[RobotToolFramePositionWidget] robot_api has no send_request()")
+                return
 
-    def send_angles(self):
-        if not self.mini_robot:
-            self.log_display.append("Robot not connected.")
-            return
-        try:
-            angles = [float(edit.text()) for edit in self.angle_inputs]
-            speed = int(self.angle_speed_input.text())
-            self.mini_robot.send_angles(angles, speed)
-            self.log_display.append(f"Sent angles: {angles} at speed {speed}")
-        except ValueError:
-            self.log_display.append("Invalid angle or speed input!")
+            if hasattr(self.robot_api, "suspend_end_effector_velocity_mode"):
+                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
 
-    def get_coords(self):
-        if not self.mini_robot:
-            self.log_display.append("Robot not connected.")
-            return
-        coords = self.mini_robot.get_current_coords()
-        self.log_display.append("Current Coords: " + str(coords))
+            if hasattr(self.robot_api, "enable_end_effector_velocity_mode"):
+                self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
 
-    def stop(self):
-        if not self.mini_robot:
-            self.log_display.append("Robot not connected.")
-            return
-        self.mini_robot.stop()
-        self.log_display.append("Stop command sent.")
+            if hasattr(self.robot_api, "set_end_effector_velocity_in_frame"):
+                self.robot_api.send_request(
+                    self.robot_api.set_end_effector_velocity_in_frame(v_lin, v_rot, frame="tool")
+                )
+            elif hasattr(self.robot_api, "set_end_effector_velocity"):
+                vel6 = [
+                    float(v_lin[0]), float(v_lin[1]), float(v_lin[2]),
+                    float(v_rot[0]), float(v_rot[1]), float(v_rot[2])
+                ]
+                self.robot_api.send_request(self.robot_api.set_end_effector_velocity(vel6))
 
-    def pause(self):
-        if not self.mini_robot:
-            self.log_display.append("Robot not connected.")
-            return
-        self.mini_robot.pause()
-        self.log_display.append("Pause command sent.")
-
-    def resume(self):
-        if not self.mini_robot:
-            self.log_display.append("Robot not connected.")
-            return
-        self.mini_robot.resume()
-        self.log_display.append("Resume command sent.")
-
-
-class YoloWorker(QtCore.QThread):
-    image_signal = pyqtSignal(QImage)
-    # NEW: Signal to send data [list_of_detections, (width, height)]
-    data_signal = pyqtSignal(list, tuple)
-    finished_signal = pyqtSignal()
-
-    def __init__(self, dev_source="/dev/video4"):
-        super().__init__()
-        self.dev_source = dev_source
-        self.running = True
-
-    def run(self):
-        print(f"Loading YOLO Model for {self.dev_source}...")
-        try:
-            model = YOLO('yolov8n.pt')
         except Exception as e:
-            print(f"Error loading YOLO: {e}")
-            self.finished_signal.emit()
-            return
+            msg = f"[VelocityControl] Failed to send velocity command: {e}"
+            print(msg)
+            self._append_log(f"❌ {msg}")
 
-        cap = cv2.VideoCapture(self.dev_source, cv2.CAP_V4L2)
-        if not cap.isOpened():
-            print(f"Cannot open {self.dev_source}")
-            self.finished_signal.emit()
-            return
+    def stop_all_velocity(self):
+        self._send_velocity([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
 
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                break
+    def stop_velocity_mode(self):
+        """Safely exit velocity mode: Suspend -> Stop."""
+        try:
+            if not hasattr(self.robot_api, "send_request"):
+                print("[RobotToolFramePositionWidget] robot_api has no send_request()")
+                return
 
-            # Get frame dimensions
-            height, width, _ = frame.shape
-            frame_size = (width, height)
+            if hasattr(self.robot_api, "suspend_end_effector_velocity_mode"):
+                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
 
-            # 1. Detect
-            results = model(frame, stream=True, verbose=False)
+            if hasattr(self.robot_api, "stop_end_effector_velocity_mode"):
+                self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
 
-            # Prepare list to send to UI
-            detected_objects = []
+        except Exception as e:
+            msg = f"[VelocityControl] Failed to stop velocity mode: {e}"
+            print(msg)
+            self._append_log(f"❌ {msg}")
 
-            for result in results:
-                # 2. Annotate image
-                annotated_frame = result.plot()
-
-                # 3. Extract Data for Logic
-                for box in result.boxes:
-                    # Get the bounding box coordinates [x1, y1, x2, y2]
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-                    # Get class name (e.g., "mouse", "person")
-                    cls_id = int(box.cls[0])
-                    name = model.names[cls_id]
-
-                    # Get confidence
-                    conf = float(box.conf[0])
-
-                    # Save this info to send to the UI
-                    detected_objects.append({
-                        "name": name,
-                        "box": [x1, y1, x2, y2],
-                        "conf": conf
-                    })
-
-                # 4. Convert Image for Display
-                rgb_image = cv2.cvtColor(annotated_frame, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                bytes_per_line = ch * w
-                qt_image = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format_RGB888)
-
-                self.image_signal.emit(qt_image.copy())
-
-                # 5. Emit the Data
-                self.data_signal.emit(detected_objects, frame_size)
-
-        cap.release()
-        self.finished_signal.emit()
-
-    def stop(self):
-        self.running = False
-        self.wait()
+    def toggle_visibility(self):
+        self.setVisible(not self.isVisible())
 
 
-class UI(QSplitter):
+class UI(
+    AiControlsMixin,
+    CameraControlMixin,
+    DirectFingerMotionMixin,
+    RobotSensorControlsMixin,
+    UiInteractionsMixin,
+    QSplitter,
+):
     def __init__(self, orientation: QtCore.Qt.Orientation):
         super().__init__(orientation)
-        # --- MODIFICATION: Removed inline stylesheet ---
 
-        # Core APIs
-        self.sensor_api = ArduinoCommander()
-        self.robot_api = RobotController()
-        self.mini_robot = None
-        self.mini_robot_connected = False
+        self._startup_messages = []
+        self.features = {
+            "sensor_driver": ArduinoCommander is not None,
+            "robot_driver": RobotController is not None,
+            "mesh_driver": MyMeshLab is not None,
+            "sensor_module": MySensor is not None,
+            "gripper_driver": GripperHelper is not None,
+            "camera_driver": YoloWorker is not None,
+        }
+
+        self.sensor_api = None
+        self.robot_api = None
+        self.gripper = None
+        self.mesh_functions = None
+        self.sensor_functions = None
+        self._yolo_worker_class = YoloWorker
+        self.yolo_worker = None
+        self.cam_window = None
+        self.cam_label = None
+        self.centering_active = False
+        self._is_shutting_down = False
+
+        self.gripper_closed_flag = False
+        self.grip_fail_count = 0
+        self.manual_mode_active = False
+        self.is_lifting = False
+        self.stationary_mode = False
+        self.grab_triggered = False
+
+        self.manual_watchdog_timer = QTimer(self)
+        self.manual_watchdog_timer.setInterval(500)
+        self.manual_watchdog_timer.timeout.connect(self.check_manual_timeout)
+
+        self._bootstrap_core_services()
 
         self.setHandleWidth(3)
         self.setup_layout()
+        self._bootstrap_ui_services()
+        self._flush_startup_messages()
 
-        self.mesh_functions = MyMeshLab(self)
-        self.sensor_functions = MySensor(self)
-        self.read_timer = QTimer()
         self.connect_function()
         self.adjust_splitter_sizes()
-
-        if not self.robot_api.use_ros:
-            self.tab_widget.setTabEnabled(1, False)
-            self.robots_sub_tabs.setTabEnabled(0, False)
-            self.robots_sub_tabs.setTabEnabled(1, False)
-            self.disable_robot_controls(True)
-
+        self._apply_startup_feature_state()
         self._init_ai_toggle_states()
+        self._install_keyboard_shortcuts()
 
-        self.yolo_worker = None
-        self.centering_active = False  # State for the new button
+    def _startup_log(self, message: str):
+        if hasattr(self, 'log_display'):
+            self.log_display.append(message)
+        else:
+            self._startup_messages.append(message)
 
-    def disable_robot_controls(self, disable: bool):
-        for btn in [self.send_coords_button, self.send_angles_button, self.get_coords_button,
-                    self.stop_button, self.pause_button, self.resume_button]:
-            btn.setDisabled(disable)
-        self.robots_sub_tabs.setTabEnabled(0, not disable)
-        self.robots_sub_tabs.setTabEnabled(1, not disable)
+    def _flush_startup_messages(self):
+        if not hasattr(self, 'log_display'):
+            return
+        for msg in self._startup_messages:
+            self.log_display.append(msg)
+        self._startup_messages.clear()
+
+    def _safe_create(self, cls, fallback, feature_key: str, label: str, *args, **kwargs):
+        if cls is None:
+            self.features[feature_key] = False
+            self._startup_log(f"⚠️ {label} unavailable: dependency import failed.")
+            return fallback
+        try:
+            obj = cls(*args, **kwargs)
+            self.features[feature_key] = True
+            return obj
+        except Exception as exc:
+            self.features[feature_key] = False
+            self._startup_log(f"⚠️ {label} unavailable: {exc}")
+            return fallback
+
+    def _bootstrap_core_services(self):
+        # Keep sensor startup lazy: the user selects ports/models later, so a failed
+        # sensor API constructor should not block the Sensor tab from opening.
+        self.sensor_api = NullSensorApi()
+        self.features['sensor_driver'] = bool(ArduinoCommander is not None)
+
+        self.robot_api = self._safe_create(RobotController, NullRobotApi(), 'robot_driver', 'Robot API')
+        self.gripper = self._safe_create(GripperHelper, NullGripper(), 'gripper_driver', 'Gripper API')
+
+        self.features['robot_ready'] = bool(getattr(self.robot_api, 'use_ros', False))
+        self.features['sensor_ready'] = bool(self.features['sensor_module'])
+        self.features['gripper_ready'] = bool(self.features['gripper_driver'])
+        self.features['camera_ready'] = bool(self.features['camera_driver'])
+
+    def _get_default_ai_execution_model_path(self) -> str:
+        helper = getattr(self, "sensor_functions", None)
+        if helper is None:
+            return DisabledSensorFunctions.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
+
+        try:
+            path = helper.get_ai_direct_finger_motion_execution_default_model_path()
+        except Exception:
+            path = ""
+
+        if isinstance(path, str) and path.strip():
+            return path.strip()
+        return DisabledSensorFunctions.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
+
+    def ensure_sensor_api(self) -> bool:
+        """Create the sensor API only when it is first needed."""
+        if self.sensor_api is not None and not isinstance(self.sensor_api, NullSensorApi):
+            return True
+
+        if ArduinoCommander is None:
+            self.features['sensor_driver'] = False
+            self._startup_log('⚠️ Sensor API unavailable: dependency import failed.')
+            return False
+
+        try:
+            self.sensor_api = ArduinoCommander()
+            self.features['sensor_driver'] = True
+            return True
+        except Exception as exc:
+            self.sensor_api = NullSensorApi()
+            self.features['sensor_driver'] = False
+            self._startup_log(f"⚠️ Sensor API not ready yet: {exc}")
+            return False
+
+    def _bootstrap_ui_services(self):
+        self.mesh_functions = self._safe_create(MyMeshLab, NullMeshLab(self), 'mesh_driver', 'Mesh functions', self)
+
+        if MySensor is None:
+            self.features['sensor_module'] = False
+            self.sensor_functions = DisabledSensorFunctions(self)
+            self._startup_log('⚠️ Sensor functions unavailable: dependency import failed.')
+        else:
+            try:
+                self.sensor_functions = MySensor(self)
+                self.features['sensor_module'] = True
+            except Exception as exc:
+                self.features['sensor_module'] = False
+                self.sensor_functions = DisabledSensorFunctions(self)
+                self._startup_log(f"⚠️ Sensor functions disabled: {exc}")
+
+        if hasattr(self, "ai_direct_execution_model_path_input"):
+            default_ai_model_path = self._get_default_ai_execution_model_path()
+            if default_ai_model_path and not self.ai_direct_execution_model_path_input.text().strip():
+                self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
+
+        if hasattr(self, "sensor_average_window_spin"):
+            self.sensor_average_window_spin.setValue(
+                int(self.sensor_functions.get_sensor_average_window_size())
+            )
+        if hasattr(self, "visualization_target_hz_spin"):
+            self.visualization_target_hz_spin.setValue(
+                float(self.sensor_functions.get_visualization_target_hz())
+            )
+
+        # The Sensor/AI tabs only need the sensor UI module to load. The serial/API
+        # connection itself is established lazily when the user actually starts using it.
+        self.features['sensor_ready'] = bool(self.features['sensor_module'])
+
+    def _set_widgets_enabled(self, widgets, enabled: bool):
+        for widget in widgets:
+            widget.setEnabled(enabled)
+
+    def _apply_startup_feature_state(self):
+        if not self.features.get('sensor_module', False):
+            self.tab_widget.setTabEnabled(0, False)
+            self.tab_widget.setTabEnabled(2, False)
+
+        if not self.features.get('robot_ready', False):
+            self.set_robot_subtab_enabled(False)
+            self.auto_center_button.setEnabled(False)
+
+        if not self.features.get('camera_ready', False):
+            self.live_yolo_button.setEnabled(False)
+            self.auto_center_button.setEnabled(False)
+
+        if not self.features.get('gripper_ready', False):
+            self._set_widgets_enabled(
+                [self.gripper_slider, self.btn_grip_open, self.btn_grip_close],
+                False,
+            )
 
     def setup_layout(self):
         self.widget_plotter = PlotterWidget()
@@ -539,19 +1049,22 @@ class UI(QSplitter):
         # --- MODIFICATION: Removed inline stylesheet ---
         self.splitter_2.setHandleWidth(3)
 
-        self.position_entry_widget = RobotPositionWidget()
-        self.position_quaternion_widget = RobotToolPositionWidget()
-        self.position_toolframe_widget = RobotToolFramePositionWidget(self.robot_api)
+        self.position_entry_widget = RobotPositionWidget(robot_api=self.robot_api)
+        self.position_quaternion_widget = RobotToolPositionWidget(robot_api=self.robot_api)
+        self.position_toolframe_widget = RobotToolFramePositionWidget(self.robot_api, log_display=self.log_display)
+        self.position_script_widget = RobotScriptSendWidget(robot_api=self.robot_api)
 
         self.position_entry_widget.setVisible(False)
         self.position_quaternion_widget.setVisible(False)
         self.position_toolframe_widget.setVisible(False)
+        self.position_script_widget.setVisible(False)
 
         self.widget_func = QWidget()
         self.layout_func = QVBoxLayout(self.widget_func)
         self.layout_func.addWidget(self.position_entry_widget)
         self.layout_func.addWidget(self.position_quaternion_widget)
         self.layout_func.addWidget(self.position_toolframe_widget)
+        self.layout_func.addWidget(self.position_script_widget)
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setUsesScrollButtons(False)
@@ -575,17 +1088,11 @@ class UI(QSplitter):
         self.robots_sub_tabs = QTabWidget()
         self.robots_sub_tabs.setUsesScrollButtons(False)
 
-        # ─── Subtab “Robot” ───
+        # ─── Subtab “TM Robot” ───
         robot_page = QWidget()
         robot_layout = QVBoxLayout(robot_page)
         self.setup_tab2(robot_layout)
-        self.robots_sub_tabs.addTab(robot_page, "Robot")
-
-        # ─── Subtab “Mini Robot” ───
-        mini_page = QWidget()
-        mini_layout = QVBoxLayout(mini_page)
-        self.setup_tab5(mini_layout)
-        self.robots_sub_tabs.addTab(mini_page, "Mini Robot")
+        self.robots_sub_tabs.addTab(robot_page, "TM Robot")
 
         robots_layout.addWidget(self.robots_sub_tabs)
         self.tab_widget.addTab(robots_tab, "Robots")
@@ -603,84 +1110,24 @@ class UI(QSplitter):
         self.tab_widget.addTab(tab4, "Extra")
 
     def setup_tab1(self, layout):
-        read_group = QGroupBox("Read Operations")
+        self.sensor_sub_tabs = QTabWidget()
+        self.sensor_sub_tabs.setUsesScrollButtons(False)
+
+        # ─── Subtab “Send Operation” ───
+        send_page = QWidget()
+        send_page_layout = QVBoxLayout(send_page)
+
         send_group = QGroupBox("Send Operations")
+        send_layout = QVBoxLayout()
 
         viz_group = QGroupBox("Visualization Settings")
         viz_layout = QVBoxLayout(viz_group)
 
-        read_layout = QVBoxLayout()
-        send_layout = QVBoxLayout()
-
-        self.read_sensor_api_button = QPushButton("Sensor API Raw Data (ADJUST IN API!!)")
-        self.read_sensor_channel_button = QPushButton("Sensor API Channel (ADJUST IN API!!)")
-        self.read_sensor_raw_button = QPushButton("Sensor Raw Data")
-        self.read_sensor_raw_ave_button = QPushButton("Sensor Raw Ave Data")
-        self.read_sensor_diff_button = QPushButton("Sensor Diff Data")
-
-        read_layout.addWidget(self.read_sensor_api_button)
-        read_layout.addWidget(self.read_sensor_channel_button)
-        read_layout.addWidget(self.read_sensor_raw_button)
-        read_layout.addWidget(self.read_sensor_raw_ave_button)
-        read_layout.addWidget(self.read_sensor_diff_button)
-
-        read_group.setLayout(read_layout)
-        send_group.setLayout(send_layout)
-
-        # (place near the Sensitivity slider setup in setup_tab1())
-        grid_container = QWidget()
-        grid_layout = QHBoxLayout(grid_container)
-        grid_layout.setContentsMargins(0, 0, 0, 0)
-
-        grid_layout.addWidget(QLabel("2D Grid (rows × cols):"))
-
-        self.grid_rows_spin = QSpinBox()
-        self.grid_rows_spin.setRange(2, 100)  # adjust as you like
-        self.grid_rows_spin.setValue(10)  # default
-        grid_layout.addWidget(self.grid_rows_spin)
-
-        grid_layout.addWidget(QLabel("×"))
-
-        self.grid_cols_spin = QSpinBox()
-        self.grid_cols_spin.setRange(2, 100)
-        self.grid_cols_spin.setValue(10)  # default
-        grid_layout.addWidget(self.grid_cols_spin)
-
-        viz_layout.addWidget(grid_container)
-
-        # Create a horizontal container for the label and slider
-        slider_container = QWidget()
-        slider_layout = QHBoxLayout(slider_container)
-        slider_layout.setContentsMargins(0, 0, 0, 0)
-
-        # 1. The Slider
-        self.sensitivity_slider = QSlider(Qt.Horizontal)
-        # QSlider works with integers, so we'll use a range of 0-100
-        # and map it to a float range of 0.0 to 0.1
-        self.sensitivity_slider.setRange(0, 1000)
-        self.sensitivity_slider.setValue(50)  # Default 50 -> 0.05
-        self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
-        self.sensitivity_slider.setTickInterval(10)
-
-        # 2. The Label to show the current float value
-        self.sensitivity_value_label = QLabel("0.050")
-        self.sensitivity_value_label.setFixedWidth(40)  # Keep a fixed width
-
-        slider_layout.addWidget(QLabel("Sensitivity:"))
-        slider_layout.addWidget(self.sensitivity_slider)
-        slider_layout.addWidget(self.sensitivity_value_label)
-
-        viz_layout.addWidget(slider_container)
-
-        layout.addWidget(read_group)
-        layout.addWidget(viz_group)
-        layout.addWidget(send_group)
-
+        # Sensor selection and connection widgets
         self.sensor_choice = QListWidget(self.widget_func)
         self.sensor_choice.setSelectionMode(QListWidget.SingleSelection)
         self.sensor_choice.addItems([
-            "Elbow", "Kuka", "Double Curve", "2D", "Half Cylinder Surface",
-            "Mini-Robot Large Skin", "Mini-Robot Small Skin", "Geneva Demo"
+            "Elbow", "Kuka", "Double Curve", "2D", "Half Cylinder Surface"
         ])
         self.sensor_choice.setCurrentRow(0)
         send_layout.addWidget(self.sensor_choice)
@@ -695,6 +1142,110 @@ class UI(QSplitter):
         self.sensor_update = QPushButton("Update Sensor", self.widget_func)
         send_layout.addWidget(self.sensor_update)
 
+        send_group.setLayout(send_layout)
+
+        # 2D grid controls
+        grid_container = QWidget()
+        grid_layout = QHBoxLayout(grid_container)
+        grid_layout.setContentsMargins(0, 0, 0, 0)
+
+        grid_layout.addWidget(QLabel("2D Grid (rows × cols):"))
+
+        self.grid_rows_spin = QSpinBox()
+        self.grid_rows_spin.setRange(2, 100)
+        self.grid_rows_spin.setValue(10)
+        grid_layout.addWidget(self.grid_rows_spin)
+
+        grid_layout.addWidget(QLabel("×"))
+
+        self.grid_cols_spin = QSpinBox()
+        self.grid_cols_spin.setRange(2, 100)
+        self.grid_cols_spin.setValue(10)
+        grid_layout.addWidget(self.grid_cols_spin)
+
+        viz_layout.addWidget(grid_container)
+
+        # Sensitivity slider
+        slider_container = QWidget()
+        slider_layout = QHBoxLayout(slider_container)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.sensitivity_slider = QSlider(Qt.Horizontal)
+        self.sensitivity_slider.setRange(0, 1000)
+        self.sensitivity_slider.setValue(50)
+        self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
+        self.sensitivity_slider.setTickInterval(10)
+
+        self.sensitivity_value_label = QLabel("0.050")
+        self.sensitivity_value_label.setFixedWidth(48)
+
+        slider_layout.addWidget(QLabel("Sensitivity:"))
+        slider_layout.addWidget(self.sensitivity_slider)
+        slider_layout.addWidget(self.sensitivity_value_label)
+
+        viz_layout.addWidget(slider_container)
+
+        avg_window_container = QWidget()
+        avg_window_layout = QHBoxLayout(avg_window_container)
+        avg_window_layout.setContentsMargins(0, 0, 0, 0)
+        self.sensor_average_window_spin = QSpinBox()
+        self.sensor_average_window_spin.setRange(1, 30)
+        self.sensor_average_window_spin.setValue(DisabledSensorFunctions.DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE)
+        avg_window_layout.addWidget(QLabel("Average Window:"))
+        avg_window_layout.addWidget(self.sensor_average_window_spin)
+        avg_window_layout.addStretch()
+        viz_layout.addWidget(avg_window_container)
+
+        render_hz_container = QWidget()
+        render_hz_layout = QHBoxLayout(render_hz_container)
+        render_hz_layout.setContentsMargins(0, 0, 0, 0)
+        self.visualization_target_hz_spin = QDoubleSpinBox()
+        self.visualization_target_hz_spin.setDecimals(1)
+        self.visualization_target_hz_spin.setRange(1.0, 240.0)
+        self.visualization_target_hz_spin.setSingleStep(1.0)
+        self.visualization_target_hz_spin.setValue(DisabledSensorFunctions.DEFAULT_VISUALIZATION_TARGET_HZ)
+        render_hz_layout.addWidget(QLabel("Render Hz:"))
+        render_hz_layout.addWidget(self.visualization_target_hz_spin)
+        render_hz_layout.addStretch()
+        viz_layout.addWidget(render_hz_container)
+
+        send_page_layout.addWidget(send_group)
+        send_page_layout.addWidget(viz_group)
+        send_page_layout.addStretch()
+
+        # ─── Subtab “Read Operation” ───
+        read_page = QWidget()
+        read_page_layout = QVBoxLayout(read_page)
+
+        read_group = QGroupBox("Read Operations")
+        read_layout = QVBoxLayout()
+
+        self.read_sensor_api_button = QPushButton("Sensor API Raw Data (ADJUST IN API!!)")
+        self.read_sensor_api_hz_button = QPushButton("Sensor API Raw Hz")
+        self.read_sensor_channel_button = QPushButton("Sensor API Channel (ADJUST IN API!!)")
+        self.read_sensor_raw_button = QPushButton("Sensor Raw Data")
+        self.read_sensor_raw_ave_button = QPushButton("Sensor Raw Ave Data")
+        self.read_sensor_diff_button = QPushButton("Sensor Diff Data")
+        self.read_sensor_diff_debug_button = QPushButton("Sensor Diff Debug Views")
+        self.read_runtime_hz_button = QPushButton("Sensor / DFM Runtime Hz")
+
+        read_layout.addWidget(self.read_sensor_api_button)
+        read_layout.addWidget(self.read_sensor_api_hz_button)
+        read_layout.addWidget(self.read_sensor_channel_button)
+        read_layout.addWidget(self.read_sensor_raw_button)
+        read_layout.addWidget(self.read_sensor_raw_ave_button)
+        read_layout.addWidget(self.read_sensor_diff_button)
+        read_layout.addWidget(self.read_sensor_diff_debug_button)
+        read_layout.addWidget(self.read_runtime_hz_button)
+
+        read_group.setLayout(read_layout)
+        read_page_layout.addWidget(read_group)
+        read_page_layout.addStretch()
+
+        self.sensor_sub_tabs.addTab(send_page, "Send Operation")
+        self.sensor_sub_tabs.addTab(read_page, "Read Operation")
+        layout.addWidget(self.sensor_sub_tabs)
+
     def setup_tab2(self, layout):
         self.read_group_robot = QGroupBox("Read Operations")
         send_group = QGroupBox("Send Operations")
@@ -706,7 +1257,7 @@ class UI(QSplitter):
 
         self.send_position_PTP_J_button = QPushButton("Send Joint Angle")
         self.send_position_PTP_T_button = QPushButton("Send Tool Position (Base Frame)")
-        self.send_position_PTP_T_toolframe_button = QPushButton("Send Tool Position (Tool Frame)")
+        self.send_position_PTP_T_toolframe_button = QPushButton("Send Tool Velocity (Tool Frame)")
 
         self.send_script_button = QPushButton("Send Script")
         self.show_robot_button = QPushButton("Import 3D Robot Model")
@@ -727,19 +1278,293 @@ class UI(QSplitter):
         layout.addWidget(send_group)
 
     def setup_tab3(self, layout):
-        training_group = QGroupBox("Data Training")
-        testing_group = QGroupBox("AI Model")
-        gesture_layout = QVBoxLayout()
-        testing_layout = QVBoxLayout()
+        self.ai_sub_tabs = QTabWidget()
+        self.ai_sub_tabs.setUsesScrollButtons(False)
+
+        # ─── Subtab “AI Model” ───
+        ai_model_page = QWidget()
+        ai_model_layout = QVBoxLayout(ai_model_page)
+
+        self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict (ThreeLevel)")
+        self.btn_toggle_3lvl_latch = QPushButton("3-Level: Latch OFF")
+        self.proximity_control_button = QPushButton("Proximity Control")
+        self.proximity_record_button = QPushButton("Record Proximity Data")
+
+        self.proximity_settings_dialog = QDialog(self.widget_func)
+        self.proximity_settings_dialog.setWindowTitle("Proximity Control Settings")
+        self.proximity_settings_dialog.setModal(False)
+        self.proximity_settings_dialog.resize(820, 560)
+        proximity_settings_layout = QVBoxLayout(self.proximity_settings_dialog)
+        proximity_settings_layout.setContentsMargins(10, 10, 10, 10)
+        proximity_settings_layout.setSpacing(8)
+        proximity_note = QLabel(
+            "Tune how the robot keeps the finger centered over the sensor and maintains the taught hover distance."
+        )
+        proximity_note.setWordWrap(True)
+        proximity_settings_layout.addWidget(proximity_note)
+
+        self.proximity_settings_group = QGroupBox("Proximity Control Parameters")
+        proximity_params_grid = QGridLayout(self.proximity_settings_group)
+        proximity_params_grid.setContentsMargins(10, 10, 10, 10)
+        proximity_params_grid.setHorizontalSpacing(12)
+        proximity_params_grid.setVerticalSpacing(8)
+
+        def _mk_dspin(default: float, minimum: float, maximum: float, step: float) -> QDoubleSpinBox:
+            sp = QDoubleSpinBox()
+            sp.setRange(minimum, maximum)
+            sp.setSingleStep(step)
+            sp.setDecimals(3)
+            sp.setValue(default)
+            sp.setMinimumWidth(120)
+            return sp
+
+        def _add_param_row(row: int, name: str, description: str, widget):
+            name_label = QLabel(name)
+            desc_label = QLabel(description)
+            desc_label.setWordWrap(True)
+            desc_label.setStyleSheet("color: #b0b0b0;")
+            tooltip = f"{name}\n\n{description}"
+            name_label.setToolTip(tooltip)
+            desc_label.setToolTip(tooltip)
+            widget.setToolTip(tooltip)
+            proximity_params_grid.addWidget(name_label, row, 0)
+            proximity_params_grid.addWidget(desc_label, row, 1)
+            proximity_params_grid.addWidget(widget, row, 2)
+
+        self.proximity_frame_interval_spin = QSpinBox()
+        self.proximity_frame_interval_spin.setRange(10, 500)
+        self.proximity_frame_interval_spin.setSingleStep(10)
+        self.proximity_frame_interval_spin.setValue(20)
+        self.proximity_frame_interval_spin.setMinimumWidth(120)
+        _add_param_row(
+            0,
+            "Control Loop Interval (ms)",
+            "How often Proximity Control updates the sensor reading and robot velocity. Lower values react faster.",
+            self.proximity_frame_interval_spin,
+        )
+
+        self.proximity_lateral_speed_spin = _mk_dspin(0.2, 0.001, 0.500, 0.01)
+        _add_param_row(
+            1,
+            "Planar Tracking Speed (m/s)",
+            "Maximum planar response used to move the sensor back under the finger in left/right/up/down directions.",
+            self.proximity_lateral_speed_spin,
+        )
+
+        self.proximity_normal_speed_spin = _mk_dspin(0.10, 0.001, 0.300, 0.005)
+        _add_param_row(
+            2,
+            "Normal Distance Speed (m/s)",
+            "Speed scale for moving toward/away from the finger after planar centering is stable.",
+            self.proximity_normal_speed_spin,
+        )
+
+        self.proximity_centroid_deadband_spin = _mk_dspin(0.040, 0.0, 0.300, 0.01)
+        _add_param_row(
+            3,
+            "Planar Center Deadband",
+            "Normalized row/column error treated as centered. Larger values are steadier but less precise.",
+            self.proximity_centroid_deadband_spin,
+        )
+
+        self.proximity_strength_deadband_spin = _mk_dspin(0.080, 0.0, 0.300, 0.01)
+        _add_param_row(
+            4,
+            "Normal Strength Deadband",
+            "Relative signal-strength error ignored for distance control. Larger values reduce normal-axis jitter.",
+            self.proximity_strength_deadband_spin,
+        )
+
+        self.proximity_max_linear_speed_spin = _mk_dspin(0.25, 0.01, 0.500, 0.01)
+        _add_param_row(
+            5,
+            "Maximum Linear Speed (m/s)",
+            "Final safety clamp applied to each linear velocity axis before sending the robot command.",
+            self.proximity_max_linear_speed_spin,
+        )
+
+        self.proximity_center_window_spin = QSpinBox()
+        self.proximity_center_window_spin.setRange(1, 15)
+        self.proximity_center_window_spin.setValue(3)
+        self.proximity_center_window_spin.setMinimumWidth(120)
+        _add_param_row(
+            6,
+            "Center Strength Window Size",
+            "Sensor-center patch size used to estimate hover-distance signal strength for normal control.",
+            self.proximity_center_window_spin,
+        )
+        self.proximity_smoothing_alpha_spin = _mk_dspin(0.75, 0.0, 1.0, 0.05)
+        _add_param_row(
+            7,
+            "Signal Smoothing Alpha",
+            "EMA smoothing for finger center and strength. Higher values follow fast motion more quickly; lower values are steadier.",
+            self.proximity_smoothing_alpha_spin,
+        )
+
+        self.proximity_lost_signal_recovery_frames_spin = QSpinBox()
+        self.proximity_lost_signal_recovery_frames_spin.setRange(0, 100)
+        self.proximity_lost_signal_recovery_frames_spin.setValue(12)
+        self.proximity_lost_signal_recovery_frames_spin.setMinimumWidth(120)
+        _add_param_row(
+            8,
+            "Lost-Signal Normal Recovery Frames",
+            "When the signal becomes too weak, keep moving along the normal direction for this many frames to reacquire a quickly pulled-away finger.",
+            self.proximity_lost_signal_recovery_frames_spin,
+        )
+
+        self.proximity_lost_signal_speed_ratio_spin = _mk_dspin(1.0, 0.0, 3.0, 0.1)
+        _add_param_row(
+            9,
+            "Lost-Signal Recovery Speed Ratio",
+            "Multiplier for normal speed during short lost-signal recovery. Higher values chase faster but can overshoot.",
+            self.proximity_lost_signal_speed_ratio_spin,
+        )
+        proximity_params_grid.setColumnStretch(1, 1)
+        proximity_settings_layout.addWidget(self.proximity_settings_group)
+
+        proximity_button_row = QWidget(self.proximity_settings_dialog)
+        proximity_button_layout = QHBoxLayout(proximity_button_row)
+        proximity_button_layout.setContentsMargins(0, 0, 0, 0)
+        self.apply_proximity_settings_button = QPushButton("Apply Proximity Params")
+        self.reload_proximity_settings_button = QPushButton("Reload Saved Params")
+        self.close_proximity_settings_button = QPushButton("Close")
+        proximity_button_layout.addWidget(self.apply_proximity_settings_button)
+        proximity_button_layout.addWidget(self.reload_proximity_settings_button)
+        proximity_button_layout.addStretch()
+        proximity_button_layout.addWidget(self.close_proximity_settings_button)
+        proximity_settings_layout.addWidget(proximity_button_row)
+
+        frame_row = QWidget()
+        frame_grid = QGridLayout(frame_row)
+        frame_grid.setContentsMargins(0, 0, 0, 0)
+        frame_grid.setHorizontalSpacing(8)
+        frame_grid.setVerticalSpacing(6)
+        frame_grid.addWidget(QLabel("EE frame:"), 0, 0)
+
+        self.ai_frame_buttons = {}
+        self.ai_selected_frame = "tool"
+
+        # Keep a hidden compatibility field so older logic that still reads
+        # ai_frame_input continues to work. The visible control is now the
+        # button selector below.
+        self.ai_frame_input = QLineEdit(self.widget_func)
+        self.ai_frame_input.setText(self.ai_selected_frame)
+        self.ai_frame_input.hide()
+
+        frame_button_order = [
+            ("joint1", "Base"),
+            ("joint2", "Joint2"),
+            ("joint3", "Joint3"),
+            ("joint4", "Joint4"),
+            ("joint5", "Joint5"),
+            ("tool", "Tool"),
+        ]
+        frame_button_positions = {
+            "joint1": (0, 1),
+            "joint2": (0, 2),
+            "joint3": (0, 3),
+            "joint4": (1, 1),
+            "joint5": (1, 2),
+            "tool": (1, 3),
+        }
+        for frame_key, frame_label in frame_button_order:
+            btn = QPushButton(frame_label)
+            btn.setCheckable(True)
+            btn.setMinimumWidth(90)
+            btn.setMinimumHeight(32)
+            btn.clicked.connect(lambda checked, key=frame_key: self._set_ai_frame(key))
+            self.ai_frame_buttons[frame_key] = btn
+            row, col = frame_button_positions[frame_key]
+            frame_grid.addWidget(btn, row, col)
+
+        frame_grid.setColumnStretch(4, 1)
+        self._update_ai_frame_buttons()
+        ai_model_layout.addWidget(frame_row)
+
+        # ---- Axes anchor toggle row ----
+        row_anchor = QWidget()
+        ha = QHBoxLayout(row_anchor)
+        ha.setContentsMargins(0, 0, 0, 0)
+        self.btn_toggle_anchor_axes = QPushButton("Axes: Anchored ON")  # label will be synced on init
+        ha.addWidget(self.btn_toggle_anchor_axes)
+        ha.addStretch()
+        ai_model_layout.addWidget(row_anchor)
+
+        self.update_sensor_button = QPushButton("Update Sensor")
+        self.direct_finger_motion_button = QPushButton("Direct Finger Motion")
+        self.direct_finger_motion_v2_button = QPushButton("Direct Finger Motion (Version 2)")
+        self.console_control_button = QPushButton("Console Control (PS5)")
+        self.console_control_sensor_button = QPushButton("Console Control (Sensor)")
+        self.direct_finger_motion_tool_pose_record_menu_button = QPushButton("Tool Pose Recording")
+        self.load_tool_pose_path_button = QPushButton("Load Tool Pose Path")
+        self.clear_tool_pose_path_button = QPushButton("Clear Tool Pose Path")
+        self.ai_direct_finger_motion_button = QPushButton("AI Direct Finger Motion (Record)")
+        self.ai_direct_finger_motion_execution_button = QPushButton("AI Direct Finger Motion (Execute)")
+
+        model_row = QWidget()
+        model_row_layout = QHBoxLayout(model_row)
+        model_row_layout.setContentsMargins(0, 0, 0, 0)
+        model_row_layout.addWidget(QLabel("Model Path:"))
+        self.ai_direct_execution_model_path_input = QLineEdit()
+        self.ai_direct_execution_model_path_input.setPlaceholderText(
+            "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/ai_direct_finger_motion/best_model.pt"
+        )
+        default_ai_model_path = self._get_default_ai_execution_model_path()
+        self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
+        model_row_layout.addWidget(self.ai_direct_execution_model_path_input)
+
+        threelevel_row = QWidget()
+        threelevel_row_layout = QHBoxLayout(threelevel_row)
+        threelevel_row_layout.setContentsMargins(0, 0, 0, 0)
+        threelevel_row_layout.setSpacing(6)
+        self.predict_threelevel_hierarchical_transformer_gesture_button.setMinimumWidth(0)
+        self.btn_toggle_3lvl_latch.setMinimumWidth(0)
+        threelevel_row_layout.addWidget(
+            self.predict_threelevel_hierarchical_transformer_gesture_button,
+            1,
+        )
+        threelevel_row_layout.addWidget(self.btn_toggle_3lvl_latch, 1)
+        ai_model_layout.addWidget(threelevel_row)
+        ai_model_layout.addWidget(self.proximity_control_button)
+        ai_model_layout.addWidget(self.proximity_record_button)
+        ai_model_layout.addWidget(self.update_sensor_button)
+        ai_model_layout.addWidget(self.direct_finger_motion_button)
+        ai_model_layout.addWidget(self.direct_finger_motion_v2_button)
+        console_row = QWidget()
+        console_row_layout = QHBoxLayout(console_row)
+        console_row_layout.setContentsMargins(0, 0, 0, 0)
+        console_row_layout.setSpacing(6)
+        self.console_control_button.setMinimumWidth(0)
+        self.console_control_sensor_button.setMinimumWidth(0)
+        console_row_layout.addWidget(self.console_control_button, 1)
+        console_row_layout.addWidget(self.console_control_sensor_button, 1)
+        ai_model_layout.addWidget(console_row)
+        ai_model_layout.addWidget(self.direct_finger_motion_tool_pose_record_menu_button)
+        tool_pose_path_row = QWidget()
+        tool_pose_path_row_layout = QHBoxLayout(tool_pose_path_row)
+        tool_pose_path_row_layout.setContentsMargins(0, 0, 0, 0)
+        tool_pose_path_row_layout.addWidget(self.load_tool_pose_path_button)
+        tool_pose_path_row_layout.addWidget(self.clear_tool_pose_path_button)
+        ai_model_layout.addWidget(tool_pose_path_row)
+        self._build_direct_finger_motion_settings_dialog()
+        self._build_direct_finger_motion_v2_settings_dialog()
+        self._build_console_control_settings_dialog()
+        ai_model_layout.addWidget(model_row)
+        ai_model_layout.addWidget(self.ai_direct_finger_motion_execution_button)
+        ai_model_layout.addStretch()
+
+        # ─── Subtab “Data Training” ───
+        training_page = QWidget()
+        training_layout = QVBoxLayout(training_page)
 
         self.set_no_trigger_button = QPushButton("Set No Trigger Mode")
-        gesture_layout.addWidget(self.set_no_trigger_button)
+        training_layout.addWidget(self.set_no_trigger_button)
         self.set_no_trigger_auto_button = QPushButton("Set No Trigger Auto Mode")
-        gesture_layout.addWidget(self.set_no_trigger_auto_button)
+        training_layout.addWidget(self.set_no_trigger_auto_button)
         self.set_no_trigger_no_updatecal_auto_button = QPushButton("Set No Trigger No UpdateCal Auto Mode")
-        gesture_layout.addWidget(self.set_no_trigger_no_updatecal_auto_button)
+        training_layout.addWidget(self.set_no_trigger_no_updatecal_auto_button)
         self.set_trigger_button = QPushButton("Set Trigger Mode")
-        gesture_layout.addWidget(self.set_trigger_button)
+        training_layout.addWidget(self.set_trigger_button)
 
         first_row_layout = QHBoxLayout()
         gesture_label = QLabel("Enter Gesture Number:")
@@ -748,195 +1573,67 @@ class UI(QSplitter):
         first_row_layout.addWidget(gesture_label)
         first_row_layout.addWidget(self.gesture_number_input)
         self.record_gesture_button = QPushButton("Record")
-        gesture_layout.addLayout(first_row_layout)
-        gesture_layout.addWidget(self.record_gesture_button)
+        training_layout.addLayout(first_row_layout)
+        training_layout.addWidget(self.record_gesture_button)
+        training_layout.addWidget(self.ai_direct_finger_motion_button)
+        training_layout.addStretch()
 
-        self.predict_lstm_gesture_button = QPushButton("Predict (LSTM)")
-        self.predict_hierarchical_transformer_gesture_button = QPushButton("Predict (Hierarchical)")
-        self.toggle_prediction_mode_button = QPushButton("Hierarchical Mode: Continues")
-        self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict (ThreeLevel)")
-        self.btn_toggle_3lvl_latch = QPushButton("3-Level: Latch OFF")
-        self.proximity_control_button = QPushButton("Proximity Control")
-
-        frame_row = QWidget()
-        fr = QHBoxLayout(frame_row);
-        fr.setContentsMargins(0, 0, 0, 0)
-        fr.addWidget(QLabel("EE frame:"))
-        self.ai_frame_input = QLineEdit()
-        # --- MODIFICATION: Changed from setPlaceholderText to setText ---
-        self.ai_frame_input.setText("joint5")
-        fr.addWidget(self.ai_frame_input)
-        testing_layout.addWidget(frame_row)
-
-        # ---- Axes anchor toggle row ----
-        row_anchor = QWidget()
-        ha = QHBoxLayout(row_anchor);
-        ha.setContentsMargins(0, 0, 0, 0)
-        self.btn_toggle_anchor_axes = QPushButton("Axes: Anchored ON")  # label will be synced on init
-        ha.addWidget(self.btn_toggle_anchor_axes)
-        ha.addStretch()
-        testing_layout.addWidget(row_anchor)
-
-        self.update_sensor_button = QPushButton("Update Sensor")
-        self.activate_switch_model_button = QPushButton("Activate Switch Model")
-        self.activate_rule_based_button = QPushButton("Activate Rule Based")
-
-        testing_layout.addWidget(self.predict_lstm_gesture_button)
-        testing_layout.addWidget(self.predict_hierarchical_transformer_gesture_button)
-        testing_layout.addWidget(self.toggle_prediction_mode_button)
-        testing_layout.addWidget(self.predict_threelevel_hierarchical_transformer_gesture_button)
-        testing_layout.addWidget(self.btn_toggle_3lvl_latch)  # or the layout where your gesture buttons live
-        testing_layout.addWidget(self.proximity_control_button)
-
-        testing_layout.addWidget(self.update_sensor_button)
-        testing_layout.addWidget(self.activate_switch_model_button)
-        testing_layout.addWidget(self.activate_rule_based_button)
-
-        training_group.setLayout(gesture_layout)
-        testing_group.setLayout(testing_layout)
-        layout.addWidget(training_group)
-        layout.addWidget(testing_group)
+        self.ai_sub_tabs.addTab(ai_model_page, "AI Model")
+        self.ai_sub_tabs.addTab(training_page, "Data Training")
+        layout.addWidget(self.ai_sub_tabs)
 
     def setup_tab4(self, layout):
-        test_group = QGroupBox("Testing Operations")
-        test_layout = QVBoxLayout()
+        # --- Gripper Manual Control ---
+        gripper_group = QGroupBox("Gripper Manual Control")
+        gripper_layout = QVBoxLayout()
 
-        self.sensor_start_geneva = QPushButton("startSensorGeneva (X)", self.widget_func)
-        self.sensor_update_geneva = QPushButton("updateSensorGeneva (X)", self.widget_func)
+        slider_row = QHBoxLayout()
+        self.gripper_slider = QSlider(Qt.Horizontal)
+        self.gripper_slider.setRange(0, 100)
+        self.gripper_slider.setValue(0)
+        self.gripper_slider.setTickPosition(QSlider.TicksBelow)
+        self.gripper_slider.setTickInterval(10)
 
-        test_layout.addWidget(self.sensor_start_geneva)
-        test_layout.addWidget(self.sensor_update_geneva)
-        test_group.setLayout(test_layout)
-        layout.addWidget(test_group)
+        self.gripper_label = QLabel("0.00 (Open)")
+        self.gripper_label.setFixedWidth(80)
+
+        slider_row.addWidget(QLabel("Open"))
+        slider_row.addWidget(self.gripper_slider)
+        slider_row.addWidget(QLabel("Closed"))
+        slider_row.addWidget(self.gripper_label)
+
+        btn_row = QHBoxLayout()
+        self.btn_grip_open = QPushButton("Fully Open")
+        self.btn_grip_close = QPushButton("Fully Close")
+        btn_row.addWidget(self.btn_grip_open)
+        btn_row.addWidget(self.btn_grip_close)
+
+        gripper_layout.addLayout(slider_row)
+        gripper_layout.addLayout(btn_row)
+        gripper_group.setLayout(gripper_layout)
+        layout.addWidget(gripper_group)
+
+        # Connections
+        self.gripper_slider.valueChanged.connect(self._update_slider_label)
+        self.gripper_slider.sliderReleased.connect(self._on_slider_released)
+        self.btn_grip_open.clicked.connect(lambda: self.set_gripper_manual(0))
+        self.btn_grip_close.clicked.connect(lambda: self.set_gripper_manual(100))
 
         # --- AI Camera Section ---
         camera_group = QGroupBox("AI Camera")
         camera_layout = QVBoxLayout()
-
-        # 1. Camera Toggle Button
         self.live_yolo_button = QPushButton("Start Live Object Detection")
         self.live_yolo_button.clicked.connect(self.toggle_yolo_camera)
 
-        # 2. NEW: Auto-Center Button
-        self.auto_center_button = QPushButton("Auto-Center on Mouse")
-        self.auto_center_button.setCheckable(True)  # Make it toggleable
-        self.auto_center_button.setEnabled(False)  # Disabled until camera starts
+        self.auto_center_button = QPushButton("Auto-Center on object")
+        self.auto_center_button.setCheckable(True)
+        self.auto_center_button.setEnabled(False)
         self.auto_center_button.clicked.connect(self.toggle_centering_mode)
 
         camera_layout.addWidget(self.live_yolo_button)
-        camera_layout.addWidget(self.auto_center_button)  # Add to layout
-
+        camera_layout.addWidget(self.auto_center_button)
         camera_group.setLayout(camera_layout)
         layout.addWidget(camera_group)
-
-    def setup_tab5(self, layout):
-        basic_group = QGroupBox("Basic Controls")
-        basic_layout = QVBoxLayout()
-        self.stop_button = QPushButton("Stop")
-        self.pause_button = QPushButton("Pause")
-        self.resume_button = QPushButton("Resume")
-        for btn in (self.stop_button, self.pause_button, self.resume_button):
-            basic_layout.addWidget(btn)
-        basic_group.setLayout(basic_layout)
-        layout.addWidget(basic_group)
-
-        conn_group = QGroupBox("Connect Mini Robot")
-        conn_layout = QHBoxLayout(conn_group)
-        conn_layout.addWidget(QLabel("/dev/ttyACM"))
-        self.port_input = QLineEdit()
-        self.port_input.setPlaceholderText("e.g. 3")
-        self.connect_robot_button = QPushButton("Connect")
-        conn_layout.addWidget(self.port_input)
-        conn_layout.addWidget(self.connect_robot_button)
-        layout.addWidget(conn_group)
-        self.connect_robot_button.clicked.connect(self.connect_mini_robot)
-
-        coord_group = QGroupBox("Coordinate Control")
-        coord_layout = QVBoxLayout()
-        self.coord_inputs = []
-        for label_text in ["X", "Y", "Z", "Rx", "Ry", "Rz"]:
-            h = QHBoxLayout()
-            h.addWidget(QLabel(f"{label_text}:"))
-            le = QLineEdit()
-            h.addWidget(le)
-            coord_layout.addLayout(h)
-            self.coord_inputs.append(le)
-        speed_h = QHBoxLayout()
-        speed_h.addWidget(QLabel("Speed:"))
-        self.speed_input = QLineEdit("50")
-        speed_h.addWidget(self.speed_input)
-        coord_layout.addLayout(speed_h)
-        self.send_coords_button = QPushButton("Move to Coordinates")
-        coord_layout.addWidget(self.send_coords_button)
-        coord_group.setLayout(coord_layout)
-        layout.addWidget(coord_group)
-
-        angle_group = QGroupBox("Angle Control")
-        angle_layout = QVBoxLayout()
-        self.angle_inputs = []
-        for jt in ["Joint1", "Joint2", "Joint3", "Joint4", "Joint5", "Joint6"]:
-            h = QHBoxLayout()
-            h.addWidget(QLabel(f"{jt}:"))
-            le = QLineEdit()
-            h.addWidget(le)
-            angle_layout.addLayout(h)
-            self.angle_inputs.append(le)
-        ah = QHBoxLayout()
-        ah.addWidget(QLabel("Speed:"))
-        self.angle_speed_input = QLineEdit("50")
-        ah.addWidget(self.angle_speed_input)
-        angle_layout.addLayout(ah)
-        self.send_angles_button = QPushButton("Send Angles")
-        angle_layout.addWidget(self.send_angles_button)
-        angle_group.setLayout(angle_layout)
-        layout.addWidget(angle_group)
-
-        self.get_coords_button = QPushButton("Get Current Coordinates")
-        layout.addWidget(self.get_coords_button)
-
-        self.tool_controller = MiniRobotToolPositionController(
-            mini_robot=self.mini_robot, coord_inputs=self.coord_inputs,
-            speed_input=self.speed_input, angle_inputs=self.angle_inputs,
-            angle_speed_input=self.angle_speed_input, log_display=self.log_display
-        )
-        self.send_coords_button.clicked.connect(self.tool_controller.send_coords)
-        self.send_angles_button.clicked.connect(self.tool_controller.send_angles)
-        self.get_coords_button.clicked.connect(self.tool_controller.get_coords)
-        self.stop_button.clicked.connect(self.tool_controller.stop)
-        self.pause_button.clicked.connect(self.tool_controller.pause)
-        self.resume_button.clicked.connect(self.tool_controller.resume)
-
-        self.disable_robot_controls(True)
-
-    def connect_mini_robot(self):
-        suffix = self.port_input.text().strip()
-        if not suffix.isdigit():
-            self.log_display.append("❌ Port suffix must be a number.")
-            return
-
-        port = f"/dev/ttyACM{suffix}"
-        if os.path.exists(port):
-            try:
-                self.mini_robot = MyCobotAPI(serial_port=port, baud_rate=115200)
-                self.mini_robot_connected = True
-                self.log_display.append(f"✅ Connected to mini robot on {port}")
-                self.tool_controller.mini_robot = self.mini_robot
-                self.disable_robot_controls(False)
-            except Exception as e:
-                self.mini_robot = None
-                self.log_display.append(f"❌ Failed to init mini robot: {e}")
-        else:
-            self.log_display.append(f"❌ Port {port} not found. Check cable & try again.")
-            self.mini_robot = None
-
-    def disable_robot_controls(self, disable: bool):
-        for btn in [
-            self.stop_button, self.pause_button, self.resume_button,
-            self.send_coords_button, self.send_angles_button,
-            self.get_coords_button
-        ]:
-            btn.setDisabled(disable)
-        self.tab_widget.setTabEnabled(4, not disable)
 
     def _set_button_active(self, btn: QPushButton, active: bool):
         """Green when active; when inactive, revert to the default theme."""
@@ -945,422 +1642,118 @@ class UI(QSplitter):
         else:
             btn.setStyleSheet("")  # clear → default OS/theme styling
 
-    def _init_ai_toggle_states(self):
-        self._lstm_active = False
-        self._hier_active = False
-        self._three_active = False
-        self._hier_mode_is_continues = True  # label shows Continues initially
-
-        # these now revert to default look when False
-        self._set_button_active(self.predict_lstm_gesture_button, False)
-        self._set_button_active(self.predict_hierarchical_transformer_gesture_button, False)
-        self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, False)
-        self._set_button_active(self.toggle_prediction_mode_button, False)  # default look for "Continues"
-
-        # latch button reflects real state if available
-        three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
-        latch_on = bool(getattr(three, "latch_mode", False)) if three else False
-
-        self._set_button_active(self.btn_toggle_3lvl_latch, latch_on)
-        self.btn_toggle_3lvl_latch.setText(f"3-Level: Latch {'ON' if latch_on else 'OFF'}")  # add this
-        self._update_anchor_button_label()
-
-    def connect_function(self):
-        self.read_sensor_api_button.pressed.connect(
-            lambda: self.log_display.append(f"API raw data: {self.sensor_api.read_raw()}")
-        )
-        self.read_sensor_channel_button.pressed.connect(
-            lambda: self.log_display.append(f"Sensor channel data: {self.sensor_api.channel_check()}")
-        )
-        self.read_sensor_raw_button.pressed.connect(
-            lambda: self.log_display.append(f"Raw data: {self.sensor_functions.read_sensor_raw_data()}")
-        )
-        self.read_sensor_raw_ave_button.pressed.connect(
-            lambda: self.log_display.append(f"Raw ave data: {self.sensor_functions.read_sensor_raw_ave_data()}")
-        )
-        self.read_sensor_diff_button.pressed.connect(
-            lambda: self.log_display.append(f"Diff data: {self.sensor_functions.read_sensor_diff_data()}")
-        )
-
-        self.read_joint_angle_button.pressed.connect(
-            lambda: self.log_display.append(f"Joint angles: {self.robot_api.get_current_positions()}")
-        )
-        self.read_tool_position_button.pressed.connect(
-            lambda: self.log_display.append(f"Tool position: {self.robot_api.get_current_tool_position()}")
-        )
-        self.send_position_PTP_J_button.pressed.connect(
-            self.toggle_joint_angle_input
-        )
-        self.send_position_PTP_T_button.pressed.connect(
-            self.toggle_tool_position_input
-        )
-        self.send_position_PTP_T_toolframe_button.pressed.connect(
-            self.toggle_tool_frame_position_input
-        )
-        self.show_robot_button.pressed.connect(lambda: self.mesh_functions.addRobot())
-        self.continuous_read_button.pressed.connect(self.toggle_continuous_read)
-        self.read_timer.timeout.connect(self.update_robot_status)
-        self.buildScene.pressed.connect(lambda: self.sensor_functions.buildScene())
-        self.sensor_update.pressed.connect(lambda: self.sensor_functions.updateCal())
-        self.sensor_start_geneva.pressed.connect(lambda: self.sensor_functions.startSensor_geneva())
-        self.sensor_update_geneva.pressed.connect(lambda: self.sensor_functions.updateCal_geneva())
-        self.record_gesture_button.pressed.connect(self.start_record_gesture)
-        self.set_no_trigger_button.pressed.connect(
-            lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("no_trigger")
-        )
-        self.set_no_trigger_auto_button.pressed.connect(
-            lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("no_trigger_auto")
-        )
-        self.set_no_trigger_no_updatecal_auto_button.pressed.connect(
-            lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("no_trigger_no_updatecal_auto")
-        )
-        self.set_trigger_button.pressed.connect(
-            lambda: self.sensor_functions.record_gesture_class.set_trigger_mode("trigger")
-        )
-        self.predict_lstm_gesture_button.pressed.connect(
-            self._on_toggle_lstm_predict
-        )
-        self.predict_hierarchical_transformer_gesture_button.pressed.connect(
-            self._on_toggle_hier_predict
-        )
-        self.toggle_prediction_mode_button.pressed.connect(
-            self._on_toggle_hier_mode
-        )
-        self.predict_threelevel_hierarchical_transformer_gesture_button.pressed.connect(
-            self._on_toggle_threelevel_predict
-        )
-        self.btn_toggle_3lvl_latch.pressed.connect(
-            self.on_toggle_threelevel_latch
-        )
-        self.activate_switch_model_button.pressed.connect(
-            lambda: self.sensor_functions.lstm_class.toggle_model()
-        )
-        self.activate_rule_based_button.pressed.connect(
-            lambda: self.sensor_functions.rule_based_class.activate_rule_based()
-        )
-        self.update_sensor_button.pressed.connect(
-            lambda: self.sensor_functions.updateCal()
-        )
-        self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
-
-        self.read_joint_angle_button.pressed.connect(
-            lambda: self.log_display.append(f"Joint angles: {self.robot_api.get_current_positions()}")
-        )
-        self.btn_toggle_anchor_axes.pressed.connect(
-            self._on_toggle_anchor_axes
-        )
-
-    def start_record_gesture(self):
-        gesture_number = self.gesture_number_input.text().strip()
-        if not gesture_number:
-            self.log_display.append("Please enter a gesture number or name.")
-            return
-        self.sensor_functions.record_gesture_class.start_record_gesture(gesture_number)
-
-    def toggle_continuous_read(self):
-        if self.read_timer.isActive():
-            self.read_timer.stop()
-            self.continuous_read_button.setText("Start Continuous Read")
-        else:
-            self.read_timer.start(0)
-            self.continuous_read_button.setText("Stop Continuous Read")
-
-    def update_robot_status(self):
-        print("DELETED")
-
-    def toggle_plotter_visibility(self):
-        self.log_display.setVisible(not self.log_display.isVisible())
-        self.adjust_splitter_sizes()
-
-    def toggle_joint_angle_input(self):
-        if self.position_quaternion_widget.isVisible():
-            self.position_quaternion_widget.toggle_visibility()
-        self.position_entry_widget.toggle_visibility()
-        self.read_group_robot.setVisible(not self.position_entry_widget.isVisible())
-
-    def toggle_tool_position_input(self):
-        if self.position_entry_widget.isVisible():
-            self.position_entry_widget.toggle_visibility()
-        self.position_quaternion_widget.toggle_visibility()
-        self.read_group_robot.setVisible(not self.position_quaternion_widget.isVisible())
-
-    def toggle_tool_frame_position_input(self):
-        # Hide other editors if open
-        if self.position_entry_widget.isVisible():
-            self.position_entry_widget.toggle_visibility()
-        if self.position_quaternion_widget.isVisible():
-            self.position_quaternion_widget.toggle_visibility()
-
-        # Toggle tool-frame position panel
-        self.position_toolframe_widget.toggle_visibility()
-
-        # Hide the read group while an editor is open (matches your pattern)
-        self.read_group_robot.setVisible(not self.position_toolframe_widget.isVisible())
-
-    def on_toggle_threelevel_latch(self):
-        try:
-            three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
-            if not three:
-                print("[UI] 3-Level instance not available")
-                return
-            three.toggle_latch_mode()
-            latch = bool(getattr(three, "latch_mode", False))
-            self.btn_toggle_3lvl_latch.setText(f"3-Level: Latch {'ON' if latch else 'OFF'}")
-            self._set_button_active(self.btn_toggle_3lvl_latch, latch)  # <- color update
-        except Exception as e:
-            print(f"[UI] Could not toggle 3-Level latch mode: {e}")
-
-    def show_log_if_hidden(self):
-        if not self.log_display.isVisible():
-            self.log_display.setVisible(True)
-            self.adjust_splitter_sizes()
-
-    def _on_sensitivity_changed(self, value: int):
-        """
-        Handles the signal from the sensitivity slider.
-        Converts the slider's integer value to a float and updates the sensor logic.
-        """
-        # Convert integer (e.g., 50) to float (e.g., 0.05)
-        sensitivity_float = value / 1000.0
-
-        # Update the label in the UI to give the user feedback
-        self.sensitivity_value_label.setText(f"{sensitivity_float:.3f}")
-
-        # Call the method in MySensor to apply the change immediately
-        self.sensor_functions.set_touch_sensitivity(sensitivity_float)
-
-    def _on_toggle_lstm_predict(self):
-        # flip UI state then call device toggle
-        self._lstm_active = not getattr(self, "_lstm_active", False)
-        self._set_button_active(self.predict_lstm_gesture_button, self._lstm_active)
-        try:
-            self.sensor_functions.lstm_class.toggle_gesture_recognition()
-        except Exception as e:
-            print(f"[UI] LSTM toggle failed: {e}")
-            # revert UI if call failed
-            self._lstm_active = not self._lstm_active
-            self._set_button_active(self.predict_lstm_gesture_button, self._lstm_active)
-
-    def _on_toggle_hier_predict(self):
-        self._hier_active = not getattr(self, "_hier_active", False)
-        self._set_button_active(self.predict_hierarchical_transformer_gesture_button, self._hier_active)
-        try:
-            self.sensor_functions.hierarchical_transformer_class.toggle_gesture_recognition()
-        except Exception as e:
-            print(f"[UI] Hierarchical toggle failed: {e}")
-            self._hier_active = not self._hier_active
-            self._set_button_active(self.predict_hierarchical_transformer_gesture_button, self._hier_active)
-
-    def _on_toggle_threelevel_predict(self):
-        self._three_active = not getattr(self, "_three_active", False)
-        self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, self._three_active)
-        try:
-            self.sensor_functions.threelevel_hierarchical_transformer_class.toggle_gesture_recognition()
-        except Exception as e:
-            print(f"[UI] ThreeLevel toggle failed: {e}")
-            self._three_active = not self._three_active
-            self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, self._three_active)
-
-    def _on_toggle_hier_mode(self):
-        """
-        Show only one of the two texts:
-          - 'Hierarchical Mode: Continues'  (inactive/gray)
-          - 'Hierarchical Mode: Single'     (active/green)
-        Each press flips the text and color, and calls the underlying toggle.
-        """
-        self._hier_mode_is_continues = not getattr(self, "_hier_mode_is_continues", True)
-        if self._hier_mode_is_continues:
-            self.toggle_prediction_mode_button.setText("Hierarchical Mode: Continues")
-            self._set_button_active(self.toggle_prediction_mode_button, False)  # gray for Continues
-        else:
-            self.toggle_prediction_mode_button.setText("Hierarchical Mode: Single")
-            self._set_button_active(self.toggle_prediction_mode_button, True)  # green for Single
-        try:
-            self.sensor_functions.hierarchical_transformer_class.toggle_prediction_mode()
-        except Exception as e:
-            print(f"[UI] Toggle hier mode failed: {e}")
-            # revert UI on failure
-            self._hier_mode_is_continues = not self._hier_mode_is_continues
-            if self._hier_mode_is_continues:
-                self.toggle_prediction_mode_button.setText("Hierarchical Mode: Continues")
-                self._set_button_active(self.toggle_prediction_mode_button, False)
-            else:
-                self.toggle_prediction_mode_button.setText("Hierarchical Mode: Single")
-                self._set_button_active(self.toggle_prediction_mode_button, True)
-
-    def _update_anchor_button_label(self):
-        """Reflects threelevel.anchor_enabled on the button text + color."""
-        three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
-        anchored = bool(getattr(three, "anchor_enabled", True)) if three else True
-        if hasattr(self, "btn_toggle_anchor_axes"):
-            self.btn_toggle_anchor_axes.setText(f"Axes: Anchored {'ON' if anchored else 'OFF'}")
-            self._set_button_active(self.btn_toggle_anchor_axes, anchored)
-
-    def _on_toggle_anchor_axes(self):
-        three = getattr(self.sensor_functions, "threelevel_hierarchical_transformer_class", None)
-        if not three:
-            print("[UI] 3-Level instance not available yet.")
+    def open_proximity_recording_viewer(self, session):
+        rows = list((session or {}).get("rows") or [])
+        if not rows:
             return
 
-        # Flip the flag on the model object
-        new_val = not bool(getattr(three, "anchor_enabled", True))
-        setattr(three, "anchor_enabled", new_val)
+        def col(name):
+            values = []
+            for row in rows:
+                try:
+                    values.append(float(row.get(name, float("nan"))))
+                except Exception:
+                    values.append(float("nan"))
+            return values
 
-        # Optional: when turning ON, immediately capture a fresh anchor
-        if new_val and hasattr(three, "_set_anchor_from_current_frame"):
-            try:
-                three._set_anchor_from_current_frame()
-            except Exception as e:
-                print(f"[UI] Could not set anchor: {e}")
+        t = col("t_sec")
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Proximity Recording Viewer")
+        dialog.resize(920, 720)
+        layout = QVBoxLayout(dialog)
+        tabs = QTabWidget(dialog)
+        layout.addWidget(tabs)
 
-        # Refresh button label + color
-        self._update_anchor_button_label()
+        summary = QTextEdit()
+        summary.setReadOnly(True)
+        csv_path = (session or {}).get("csv_path", "")
+        npz_path = (session or {}).get("npz_path", "")
+        signal = (session or {}).get("sensor_signal", None)
+        signal_shape = getattr(signal, "shape", None)
+        summary.setText(
+            "Proximity recording saved.\n\n"
+            f"Samples: {len(rows)}\n"
+            f"Duration: {t[-1] if t else 0.0:.3f} s\n"
+            f"CSV: {csv_path}\n"
+            f"NPZ: {npz_path}\n"
+            f"Sensor stack shape: {signal_shape}\n\n"
+            "CSV contains time-series values. NPZ contains full sensor_signal frames."
+        )
+        tabs.addTab(summary, "Summary")
 
-    def toggle_yolo_camera(self):
-        if self.yolo_worker is not None and self.yolo_worker.isRunning():
-            # STOPPING
-            self.yolo_worker.stop()
-            self.yolo_worker = None
-            if hasattr(self, 'cam_window') and self.cam_window.isVisible():
-                self.cam_window.close()
+        tabs.addTab(
+            ProximityRecordingChartWidget(
+                "Finger / Sensor State",
+                [
+                    ("center_col", t, col("center_col"), "#42a5f5"),
+                    ("center_row", t, col("center_row"), "#66bb6a"),
+                    ("strength", t, col("strength"), "#ffa726"),
+                    ("sensor_max", t, col("sensor_max"), "#ab47bc"),
+                ],
+            ),
+            "Finger",
+        )
+        tabs.addTab(
+            ProximityRecordingChartWidget(
+                "Tracking Errors",
+                [
+                    ("col_error", t, col("center_col_error"), "#42a5f5"),
+                    ("row_error", t, col("center_row_error"), "#66bb6a"),
+                    ("strength_error", t, col("strength_error"), "#ef5350"),
+                ],
+            ),
+            "Errors",
+        )
+        tabs.addTab(
+            ProximityRecordingChartWidget(
+                "Robot Velocity Commands (pre frame/sign flip)",
+                [
+                    ("vx", t, col("cmd_vx_pre"), "#42a5f5"),
+                    ("vy", t, col("cmd_vy_pre"), "#ef5350"),
+                    ("vz", t, col("cmd_vz_pre"), "#66bb6a"),
+                ],
+            ),
+            "Velocity",
+        )
+        tabs.addTab(
+            ProximityRecordingChartWidget(
+                "Robot Tool Position",
+                [
+                    ("tool_x", t, col("tool_x"), "#42a5f5"),
+                    ("tool_y", t, col("tool_y"), "#ef5350"),
+                    ("tool_z", t, col("tool_z"), "#66bb6a"),
+                ],
+            ),
+            "Tool Pose",
+        )
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(dialog.close)
+        layout.addWidget(close_button)
+        dialog.show()
+        self._proximity_recording_viewer = dialog
 
-            # Disable the centering button when camera stops
-            self.auto_center_button.setChecked(False)
-            self.toggle_centering_mode()  # Reset state
-            self.auto_center_button.setEnabled(False)
-
-            self.reset_yolo_button_state()
-        else:
-            # STARTING
-            # ... (Window setup code same as before) ...
-            self.cam_window = QWidget()
-            self.cam_window.setWindowTitle("Live Object Detection")
-            self.cam_window.resize(640, 480)
-            self.cam_label = QLabel(self.cam_window)
-            self.cam_label.setAlignment(Qt.AlignCenter)
-            layout = QVBoxLayout()
-            layout.addWidget(self.cam_label)
-            self.cam_window.setLayout(layout)
-
-            self.yolo_worker = YoloWorker(dev_source="/dev/video4")
-
-            # CONNECT IMAGE SIGNAL
-            self.yolo_worker.image_signal.connect(self.update_cam_window)
-
-            # --- NEW: CONNECT DATA SIGNAL ---
-            self.yolo_worker.data_signal.connect(self.process_yolo_data)
-            # --------------------------------
-
-            self.yolo_worker.finished_signal.connect(self.reset_yolo_button_state)
-            self.yolo_worker.start()
-            self.cam_window.show()
-
-            # Enable the centering button now that camera is running
-            self.auto_center_button.setEnabled(True)
-
-            self.live_yolo_button.setText("Stop Live Object Detection")
-            self._set_button_active(self.live_yolo_button, True)
-
-    def toggle_centering_mode(self):
-        """Toggle the tracking logic on/off"""
-        self.centering_active = self.auto_center_button.isChecked()
-
-        if self.centering_active:
-            self.auto_center_button.setText("Stop Auto-Centering")
-            self._set_button_active(self.auto_center_button, True)
-            print("Auto-Centering ACTIVATED: Looking for 'mouse'...")
-        else:
-            self.auto_center_button.setText("Auto-Center on Mouse")
-            self._set_button_active(self.auto_center_button, False)
-            print("Auto-Centering STOPPED")
-
-    def process_yolo_data(self, detections, frame_size):
+    def send_velocity_command(self, v_x, v_y, v_z):
         """
-        Calculates distance from center for a 'mouse'.
-        detections: list of dicts {'name', 'box', ...}
-        frame_size: (width, height)
+        Sends a velocity vector to the robot in the TOOL frame.
+        v_x, v_y, v_z are speeds in m/s (e.g., 0.02 or -0.02).
         """
-        # Only calculate if the button is pressed
-        if not self.centering_active:
+        if not self.features.get('robot_ready', False):
             return
 
-        frame_w, frame_h = frame_size
-        center_x = frame_w / 2
-        center_y = frame_h / 2
+        # Create the lists expected by the API
+        v_lin = [v_x, v_y, v_z]
+        v_rot = [0.0, 0.0, 0.0]  # We don't want to rotate, just move
 
-        found_mouse = False
+        try:
+            # We assume velocity mode is already enabled by the toggle button
+            self.robot_api.send_request(
+                self.robot_api.set_end_effector_velocity_in_frame(
+                    v_lin, v_rot, frame="tool"
+                )
+            )
+        except Exception as e:
+            print(f"Error sending velocity: {e}")
 
-        for obj in detections:
-            if obj["name"] == "mouse":  # You can change this to "cup" or "bottle" to test
-                found_mouse = True
-
-                # 1. Calculate Object Center
-                x1, y1, x2, y2 = obj["box"]
-                obj_center_x = (x1 + x2) / 2
-                obj_center_y = (y1 + y2) / 2
-
-                # 2. Calculate Distance from Screen Center
-                # X axis (Left/Right)
-                diff_x = center_x - obj_center_x
-
-                # Y axis (Up/Down in image -> usually Z or X for robot)
-                diff_z = center_y - obj_center_y
-
-                # 3. Define a "Dead Zone" (Tolerance)
-                # If it's close enough (e.g., within 20 pixels), consider it centered
-                tolerance = 30
-
-                status_msg = f"Mouse found at ({int(obj_center_x)}, {int(obj_center_y)}) | "
-
-                # Logic for X (Left/Right)
-                if abs(diff_x) > tolerance:
-                    direction = "MOVE LEFT" if diff_x > 0 else "MOVE RIGHT"
-                    status_msg += f"X-Correction: {diff_x:.1f} ({direction}) "
-                else:
-                    status_msg += "X-Aligned "
-
-                # Logic for Z (Up/Down)
-                if abs(diff_z) > tolerance:
-                    direction = "MOVE UP" if diff_z > 0 else "MOVE DOWN"
-                    status_msg += f"| Z-Correction: {diff_z:.1f} ({direction})"
-                else:
-                    status_msg += "| Z-Aligned"
-
-                print(status_msg)
-
-                # TODO: Here is where you will add:
-                # self.robot_api.send_movement(diff_x, diff_z)
-
-                # We only track one mouse at a time, so break loop
-                break
-
-        if not found_mouse:
-            # Optional: Print only occasionally to avoid spam
-            # print("No mouse detected...")
-            pass
-
-    def update_cam_window(self, qt_image):
-        """Received a new frame from the thread, update the label."""
-        if hasattr(self, 'cam_window') and self.cam_window.isVisible():
-            # Scale image to fit window if needed, or just show it
-            self.cam_label.setPixmap(QPixmap.fromImage(qt_image))
-            self.cam_label.resize(qt_image.width(), qt_image.height())
-
-    def reset_yolo_button_state(self):
-        """Called when thread finishes (via Stop button, 'q', or window close)"""
-        self.live_yolo_button.setText("Start Live Object Detection")
-        self._set_button_active(self.live_yolo_button, False)
-        # Clean up reference if it finished naturally
-        if self.yolo_worker is not None and not self.yolo_worker.isRunning():
-            self.yolo_worker = None
-
-    def adjust_splitter_sizes(self):
-        total_width = self.splitter_1.width()
-        if self.log_display.isVisible():
-            self.splitter_1.setSizes([int(total_width * 0.4), int(total_width * 0.4), int(total_width * 0.2)])
-        else:
-            self.splitter_1.setSizes([int(total_width * 0.5), int(total_width * 0.5), 0])
-
-    def reLayout(self):
-        self.setSizes([round(self.width() * 4), round(self.width())])
-        self.splitter_1.setSizes([self.width(), self.width(), 0])  # Log hidden initially
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)

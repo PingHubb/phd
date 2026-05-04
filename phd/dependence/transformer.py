@@ -129,3 +129,112 @@ class ThreeLevelHierarchicalModel(nn.Module):
         gesture_logits = self.gesture_classifier(cls_representation)
         quality_logits = self.quality_classifier(cls_representation)
         return finger_logits, gesture_logits, quality_logits
+
+
+class _AI_DFM_AuxMLP(nn.Module):
+    def __init__(self, aux_dim, d_model, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(aux_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class _AI_DFM_FrameEncoder(nn.Module):
+    def __init__(self, in_channels, d_model, dropout):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.MaxPool2d(2, ceil_mode=True),
+            nn.Conv2d(64, 96, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.GELU(),
+            nn.Conv2d(96, 128, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(128),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(128, d_model),
+        )
+
+    def forward(self, x):
+        return self.features(x)
+
+
+class _AI_DFM_CNNTactileTransformerAux(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        aux_dim,
+        seq_len,
+        d_model,
+        nhead,
+        num_layers,
+        dim_feedforward,
+        dropout,
+        num_mode_classes,
+        num_finger_classes,
+        use_aux_features=True,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.use_aux_features = use_aux_features and aux_dim > 0
+        self.frame_encoder = _AI_DFM_FrameEncoder(in_channels=in_channels, d_model=d_model, dropout=dropout)
+        if self.use_aux_features:
+            self.aux_encoder = _AI_DFM_AuxMLP(aux_dim=aux_dim, d_model=d_model, dropout=dropout)
+            self.fusion = nn.Sequential(
+                nn.Linear(d_model * 2, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, d_model),
+            )
+        self.pos_embedding = nn.Parameter(torch.randn(1, seq_len, d_model) * 0.02)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.mode_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_model, num_mode_classes)
+        )
+        self.finger_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_model, num_finger_classes)
+        )
+        self.velocity_head = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(d_model, 3)
+        )
+
+    def forward(self, x, aux=None):
+        b, t, c, h, w = x.shape
+        frame_tokens = self.frame_encoder(x.reshape(b * t, c, h, w)).reshape(b, t, -1)
+        if self.use_aux_features and aux is not None:
+            aux_tokens = self.aux_encoder(aux.reshape(b * t, -1)).reshape(b, t, -1)
+            frame_tokens = self.fusion(torch.cat([frame_tokens, aux_tokens], dim=-1))
+        frame_tokens = frame_tokens + self.pos_embedding[:, :t, :]
+        device = frame_tokens.device
+        causal_mask = torch.full((t, t), float("-inf"), device=device)
+        causal_mask = torch.triu(causal_mask, diagonal=1)
+        encoded = self.transformer(frame_tokens, mask=causal_mask)
+        final_token = self.norm(encoded[:, -1, :])
+        return {
+            "mode_logits": self.mode_head(final_token),
+            "finger_logits": self.finger_head(final_token),
+            "velocity": self.velocity_head(final_token),
+        }

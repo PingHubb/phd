@@ -1,0 +1,334 @@
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <vector>
+#include <string.h>
+
+#define BUTTON_1 1
+#define BUTTON_2 2
+// #define LED_2 3
+#define LED_3 4
+#define I2C_SDA_PIN 5   // 3 // 5 // 17
+#define I2C_SCL_PIN 6   // 2 // 6 // 18
+#define MCU_SDA 7
+#define MCU_SCL 8
+#define DEVICE_ADDRESS 0x5D  // 另一个设备的I2C地址 5D / 14
+#define RAW_ADDRESS 0X8B98
+#define CAL_ADDRESS 0X81C0
+
+constexpr uint32_t SERIAL_BAUD_RATE = 921600;
+constexpr uint16_t I2C_CHUNK_SIZE = 128;
+constexpr size_t SERIAL_LINE_BUFFER_SIZE = 2048;
+constexpr size_t REQUEST_BUFFER_SIZE = 32;
+
+uint16_t channelDrive;
+uint16_t channelSensor;
+std::vector<uint16_t> data;  // Declare a pointer
+bool flag_read = true;
+byte data1;
+char serialLineBuffer[SERIAL_LINE_BUFFER_SIZE];
+char requestBuffer[REQUEST_BUFFER_SIZE];
+size_t requestLength = 0;
+
+U8G2_SSD1316_128X32_F_SW_I2C u8g2(U8G2_R2, MCU_SCL, MCU_SDA);
+// GREEN ----> U8G2_SSD1316_128X32_F_SW_I2C u8g2(U8G2_R2, I2C_SCL_PIN, I2C_SDA_PIN);
+
+void setup() {
+  generalInit();
+  monitorInit();
+  GT9110Init();
+  channelInit();
+}
+
+void generalInit() {
+  pinMode(BUTTON_1, INPUT);
+  pinMode(BUTTON_2, INPUT);
+  // pinMode(LED_2, OUTPUT);
+  pinMode(LED_3, OUTPUT);
+  Serial.begin(SERIAL_BAUD_RATE);
+  Serial.setTimeout(0);  // Set a shorter timeout for serial reading
+  delay(100);
+}
+
+void monitorInit() {
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_ncenB12_tr);
+  u8g2.drawStr(15, 20, "Hi Ping");
+  u8g2.sendBuffer();
+  delay(100);
+}
+
+void GT9110Init() {
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);  // 初始化I2C总线，指定SDA和SCL引脚
+  Wire.setClock(400000);                 // 设置I2C时钟速率为400 kHz
+  delay(100);
+}
+
+void channelInit() {
+  Wire.beginTransmission(DEVICE_ADDRESS);
+  Wire.write(0x80);  // 发送高位字节
+  Wire.write(0x62);  // 发送低位字节
+  Wire.endTransmission();
+
+  Wire.requestFrom(DEVICE_ADDRESS, 3);
+  if (Wire.available()) {
+    data1 = Wire.read();  // 读取数据
+    channelDrive = data1 % 32;
+
+    data1 = Wire.read();  // 读取数据
+    channelDrive = channelDrive + data1 % 32;
+
+    data1 = Wire.read();  // 读取数据
+    channelSensor = int(data1 / 16) + data1 % 16;
+
+    Serial.println(channelDrive);
+    Serial.println(channelSensor);
+
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 10, "GT9110 is connected.");
+    u8g2.drawStr(0, 21, "Drive: Sensor:");
+    u8g2.drawStr(10, 32, String(channelDrive).c_str());
+    u8g2.drawStr(50, 32, String(channelSensor).c_str());
+    u8g2.sendBuffer();
+
+    for (int i = 0; i < channelDrive * channelSensor + 4; i++) {
+      data.push_back(999);
+    }
+
+    delay(1000);
+
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(0, 10, "Size is obtained.");
+    u8g2.drawStr(0, 21, "Drive: Sensor:");
+    u8g2.drawStr(10, 32, String(data.size()).c_str());
+    u8g2.sendBuffer();
+  }
+}
+
+void updateCal() {
+  Wire.beginTransmission(DEVICE_ADDRESS);
+  Wire.write(0x80);  // 发送高位字节
+  Wire.write(0x40);  // 发送低位字节
+  Wire.write(0x03);  // 发送更新指令
+  Wire.endTransmission();
+  delay(100);
+}
+
+void channelCheck() {
+  Wire.beginTransmission(DEVICE_ADDRESS);
+  Wire.write(0x80);  // 发送高位字节
+  Wire.write(0x62);  // 发送低位字节
+  Wire.endTransmission();
+
+  Wire.requestFrom(DEVICE_ADDRESS, 3);
+  if (Wire.available()) {
+    data1 = Wire.read();  // 读取数据
+    channelDrive = data1 % 32;
+
+    data1 = Wire.read();  // 读取数据
+    channelDrive = channelDrive + data1 % 32;
+
+    data1 = Wire.read();  // 读取数据
+    channelSensor = int(data1 / 16) + data1 % 16;
+
+    uint16_t channelData[6];
+    channelData[0] = 55555;
+    channelData[1] = 55555;
+    channelData[2] = channelDrive;
+    channelData[3] = channelSensor;
+    channelData[4] = 44444;
+    channelData[5] = 44444;
+
+    Serial.print("channelDrive: ");
+    Serial.print(channelDrive);
+    Serial.print("  ");
+    Serial.print("channelSensor: ");
+    Serial.println(channelSensor);
+  }
+}
+
+void appendCharToBuffer(char c, size_t &writePos) {
+  if (writePos + 1 < SERIAL_LINE_BUFFER_SIZE) {
+    serialLineBuffer[writePos++] = c;
+  }
+}
+
+void appendCStringToBuffer(const char *text, size_t &writePos) {
+  while (*text != '\0' && writePos + 1 < SERIAL_LINE_BUFFER_SIZE) {
+    serialLineBuffer[writePos++] = *text++;
+  }
+}
+
+void appendUInt16AndSpace(uint16_t value, size_t &writePos) {
+  char digits[6];
+  int digitCount = 0;
+
+  do {
+    digits[digitCount++] = char('0' + (value % 10));
+    value /= 10;
+  } while (value > 0 && digitCount < int(sizeof(digits)));
+
+  while (digitCount > 0 && writePos + 1 < SERIAL_LINE_BUFFER_SIZE) {
+    serialLineBuffer[writePos++] = digits[--digitCount];
+  }
+  appendCharToBuffer(' ', writePos);
+}
+
+void sendData(uint16_t address) {
+  int number = 2;
+
+  Wire.beginTransmission(DEVICE_ADDRESS);
+  Wire.write((address >> 8) & 0xFF);  // 发送高位字节
+  Wire.write((address) & 0xFF);       // 发送低位字节
+  Wire.endTransmission();
+
+  Wire.requestFrom(DEVICE_ADDRESS, 2 * channelDrive * channelSensor);
+
+  data[0] = 55555;
+  data[1] = 55555;
+  data[2 + channelDrive * channelSensor] = 44444;
+  data[3 + channelDrive * channelSensor] = 44444;
+
+  for (int i = 0; i < channelDrive; i++) {
+    for (int j = 0; j < channelSensor; j++) {
+      data1 = Wire.read();  // 读取数据
+      uint16_t value = data1 * 256;
+      data1 = Wire.read();  // 读取数据
+      value = value + data1;
+      data[number] = value;
+      number++;
+    }
+  }
+
+  // Print the data array contents to the serial monitor
+  for (int i = 0; i < number + 2; i++) {
+    Serial.print(data[i]);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+void sendData_Robust(uint16_t baseAddress) {
+  // Calculate the total number of 16-bit values to read.
+  uint16_t totalValues = channelDrive * channelSensor;
+  uint16_t totalBytes = totalValues * 2;
+
+  // --- CRITICAL DIAGNOSTIC ---
+  // Let's see how much data we're dealing with. This is very important.
+  // Serial.println("--------------------");
+  // Serial.print("Total Drive Channels: ");
+  // Serial.println(channelDrive);
+  // Serial.print("Total Sensor Channels: ");
+  // Serial.println(channelSensor);
+  // Serial.print("Calculated values to read: ");
+  // Serial.println(totalValues);
+  // Serial.println("--------------------");
+  // delay(100); // Allow time to print before starting the heavy lifting.
+
+  uint16_t bytesRead = 0;
+  size_t writePos = 0;
+  appendCStringToBuffer("55555 55555 ", writePos);
+
+  while (bytesRead < totalBytes) {
+    // Calculate the current memory address to read from the sensor
+    uint16_t currentAddress = baseAddress + bytesRead;
+
+    // 1. Set the register pointer on the I2C device
+    Wire.beginTransmission(DEVICE_ADDRESS);
+    Wire.write((currentAddress >> 8) & 0xFF);  // Send high byte of address
+    Wire.write(currentAddress & 0xFF);         // Send low byte of address
+    byte error = Wire.endTransmission();
+
+    if (error != 0) {
+      Serial.print("Error setting I2C address pointer. Code: ");
+      Serial.println(error);
+      return;  // Stop if we can't communicate
+    }
+
+    // 2. Request one chunk of data
+    uint16_t bytesToRequest = I2C_CHUNK_SIZE;
+
+    // If the remaining data is less than a full chunk, request only what's left.
+    if (totalBytes - bytesRead < I2C_CHUNK_SIZE) {
+      bytesToRequest = totalBytes - bytesRead;
+    }
+
+    Wire.requestFrom(DEVICE_ADDRESS, bytesToRequest);
+
+    // 3. Process the received chunk
+    while (Wire.available() >= 2) {
+      uint8_t highByte = Wire.read();
+      uint8_t lowByte = Wire.read();
+      uint16_t value = (highByte << 8) | lowByte;
+      appendUInt16AndSpace(value, writePos);
+
+      bytesRead += 2;
+    }
+
+    // This small delay is crucial. It gives the serial buffer time to send
+    // and allows other system tasks (like WiFi, etc.) to run.
+    // delay(5);
+  }
+
+  appendCStringToBuffer("44444 44444\n", writePos);
+  Serial.write(reinterpret_cast<const uint8_t *>(serialLineBuffer), writePos);
+  // Serial.println("--- READ COMPLETE ---");
+}
+
+void handleSerialRequest(const char *request) {
+  if (strcmp(request, "readRaw") == 0) {
+    sendData_Robust(RAW_ADDRESS);
+    flag_read = true;
+    return;
+  }
+
+  if (strcmp(request, "stop") == 0) {
+    flag_read = false;
+    return;
+  }
+
+  if (strcmp(request, "readCal") == 0) {
+    flag_read = false;
+    sendData_Robust(CAL_ADDRESS);
+    return;
+  }
+
+  if (strcmp(request, "updateCal") == 0) {
+    updateCal();
+    sendData_Robust(CAL_ADDRESS);
+    return;
+  }
+
+  if (strcmp(request, "channelCheck") == 0) {
+    channelCheck();
+  }
+}
+
+void loop() {
+  while (Serial.available() > 0) {
+    char incoming = char(Serial.read());
+
+    if (incoming == '\r') {
+      continue;
+    }
+
+    if (incoming == '\n') {
+      if (requestLength > 0) {
+        requestBuffer[requestLength] = '\0';
+        handleSerialRequest(requestBuffer);
+        requestLength = 0;
+      }
+      continue;
+    }
+
+    if (requestLength + 1 < REQUEST_BUFFER_SIZE) {
+      requestBuffer[requestLength++] = incoming;
+    } else {
+      requestLength = 0;
+    }
+  }
+
+  // Serial.println("Disconnected");
+}

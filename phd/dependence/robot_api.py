@@ -1,104 +1,202 @@
-import numpy as np
-import subprocess
-import transforms3d
 import math
-# Attempt to import ROS2 dependencies; fallback if unavailable
+import subprocess
+import time
+import re
+
+import numpy as np
+import transforms3d
+
 try:
     import rclpy
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.node import Node
-    from tm_msgs.srv import SetEvent, SetPositions, SendScript
-    from sensor_msgs.msg import JointState
+    from rclpy.qos import qos_profile_sensor_data
+
     from geometry_msgs.msg import PoseStamped
     from PyQt5.QtCore import QThread
-    ROSPY_AVAILABLE = True
+    from sensor_msgs.msg import JointState
+    from tm_msgs.srv import SendScript, SetEvent, SetPositions
+
+    ROS_AVAILABLE = True
 except ImportError:
-    ROSPY_AVAILABLE = False
+    ROS_AVAILABLE = False
 
 
-class ROSNodeThread(QThread if ROSPY_AVAILABLE else object):
-    """Spins the ROS node in its own thread."""
+class ROSNodeThread(QThread if ROS_AVAILABLE else object):
+    """Spin a ROS node in the background using its own executor."""
+
     def __init__(self, node):
-        if ROSPY_AVAILABLE:
+        if ROS_AVAILABLE:
             super().__init__()
-            self.node = node
+        self.node = node
+        self._stop_flag = False
+
     def run(self):
-        if ROSPY_AVAILABLE:
-            rclpy.spin(self.node)
-
-
-class RobotController(Node if ROSPY_AVAILABLE else object):
-    """
-    RobotController wraps ROS2 service calls for motion and script commands.
-    It auto-detects ROS availability at startup: if "/set_positions" is not found,
-    it runs in offline mode and skips all ROS interactions.
-    """
-    def __init__(self):
-        # 1) Auto-detect ROS2 + required service
-        self.use_ros = False
-        if ROSPY_AVAILABLE:
-            try:
-                services = subprocess.check_output(
-                    ["ros2", "service", "list"], stderr=subprocess.DEVNULL
-                ).decode()
-                if "/set_positions" in services:
-                    self.use_ros = True
-            except Exception:
-                self.use_ros = False
-
-        if not self.use_ros:
-            print("[RobotController] OFFLINE MODE – skipping ROS2 calls")
-            # placeholders so attribute lookups won't fail
-            self.service_ok = False
-            self.script_ok = False
-            self.event_ok = False
-            self.current_positions = None
-            self.current_tool_pose = None
+        if not ROS_AVAILABLE:
             return
 
-        # 2) Initialize ROS2 node
+        executor = SingleThreadedExecutor()
+        executor.add_node(self.node)
+
+        try:
+            while rclpy.ok() and not self._stop_flag:
+                try:
+                    executor.spin_once(timeout_sec=0.0)
+                    time.sleep(0.01)
+                except Exception as exc:
+                    print(f"[RobotController] Spin Error: {exc}")
+                    break
+        finally:
+            try:
+                executor.remove_node(self.node)
+            except Exception:
+                pass
+            executor.shutdown()
+
+    def stop(self):
+        self._stop_flag = True
+        if ROS_AVAILABLE:
+            try:
+                if self.isRunning():
+                    self.wait(1000)
+            except Exception:
+                pass
+
+
+class RobotController(Node if ROS_AVAILABLE else object):
+    """Wrap TM Robot ROS2 services for motion, scripts, and feedback."""
+
+    def __init__(self):
+        self._set_offline_defaults()
+
+        if not self._detect_ros_environment():
+            print("[RobotController] OFFLINE MODE – skipping ROS2 calls")
+            return
+
+        self._initialize_ros_node()
+        self._start_ros_thread()
+        self._setup_service_clients()
+        self._setup_feedback_subscriptions()
+
+    # ------------------------------------------------------------------
+    # Startup / shutdown
+    # ------------------------------------------------------------------
+    def _set_offline_defaults(self):
+        self.use_ros = False
+        self.service_ok = False
+        self.script_ok = False
+        self.event_ok = False
+        self.current_positions = None
+        self.current_tool_pose = None
+        self.client = None
+        self.send_script_client = None
+        self.event_client = None
+        self.ros_thread = None
+        self._node_started = False
+
+    def _detect_ros_environment(self):
+        if not ROS_AVAILABLE:
+            return False
+
+        try:
+            services = subprocess.check_output(
+                ["ros2", "service", "list"],
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            ).decode()
+        except Exception:
+            return False
+
+        self.use_ros = "/set_positions" in services
+        return self.use_ros
+
+    def _initialize_ros_node(self):
         if not rclpy.ok():
             rclpy.init()
-        super().__init__('robot_controller')
 
-        # Spin in background
+        super().__init__("robot_controller")
+        self._node_started = True
+
+    def _start_ros_thread(self):
         self.ros_thread = ROSNodeThread(self)
         self.ros_thread.start()
 
-        # SetPositions service
-        self.client = self.create_client(SetPositions, "/set_positions")
-        self.service_ok = self.client.wait_for_service(timeout_sec=0.5)
-        if not self.service_ok:
-            self.get_logger().warning(
-                "SetPositions unavailable – motion commands will be skipped"
-            )
+    def _setup_service_clients(self):
+        self.client, self.service_ok = self._create_client_checked(
+            SetPositions,
+            "/set_positions",
+            "SetPositions unavailable – motion commands will be skipped",
+        )
+        self.send_script_client, self.script_ok = self._create_client_checked(
+            SendScript,
+            "send_script",
+            "SendScript unavailable – script commands will be skipped",
+        )
+        self.event_client, self.event_ok = self._create_client_checked(
+            SetEvent,
+            "/set_event",
+            "SetEvent unavailable – event commands will be skipped",
+        )
 
-        # SendScript service
-        self.send_script_client = self.create_client(SendScript, "send_script")
-        self.script_ok = self.send_script_client.wait_for_service(timeout_sec=0.5)
-        if not self.script_ok:
-            self.get_logger().warning(
-                "SendScript unavailable – script commands will be skipped"
-            )
+    def _create_client_checked(self, srv_type, service_name, warning_text):
+        client = self.create_client(srv_type, service_name)
+        ok = client.wait_for_service(timeout_sec=0.5)
+        if not ok:
+            self.get_logger().warning(warning_text)
+        return client, ok
 
-        # SetEvent service
-        self.event_client = self.create_client(SetEvent, "/set_event")
-        self.event_ok = self.event_client.wait_for_service(timeout_sec=0.5)
-        if not self.event_ok:
-            self.get_logger().warning(
-                "SetEvent unavailable – event commands will be skipped"
-            )
+    def _setup_feedback_subscriptions(self):
+        self.create_subscription(
+            JointState,
+            "/joint_states",
+            self._joint_cb,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            PoseStamped,
+            "/tool_pose",
+            self._tool_cb,
+            qos_profile_sensor_data,
+        )
 
-        # Subscriptions for feedback
-        self.current_positions = None
-        self.create_subscription(JointState, '/joint_states', self._joint_cb, 10)
-        self.current_tool_pose = None
-        self.create_subscription(PoseStamped, '/tool_pose', self._tool_cb, 10)
+    def shutdown(self):
+        """Stop the spin thread and tear down the ROS node cleanly."""
+        if self.ros_thread is not None:
+            try:
+                self.ros_thread.stop()
+            except Exception:
+                pass
+            self.ros_thread = None
 
-    # ---- Motion Commands (guarded) ----
+        if self._node_started:
+            try:
+                self.destroy_node()
+            except Exception:
+                pass
+            self._node_started = False
+
+    def stop(self):
+        """Compatibility alias for callers that expect stop()."""
+        self.shutdown()
+
+    @property
+    def is_available(self):
+        return bool(self.use_ros and self._node_started)
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Motion commands
+    # ------------------------------------------------------------------
     def send_positions_joint_angle(self, positions):
         """Send a joint-space PTP via SetPositions service."""
-        if not (self.use_ros and self.service_ok):
-            return
+        if not (self.use_ros and self.service_ok and self.client):
+            return False
+
         req = SetPositions.Request()
         req.motion_type = 1
         req.positions = positions
@@ -107,59 +205,93 @@ class RobotController(Node if ROSPY_AVAILABLE else object):
         req.blend_percentage = 100
         req.fine_goal = False
         self.client.call_async(req)
+        return True
 
     def send_positions_tool_position(
-        self, positions, quaternion,
-        velocity=3.14, acc_time=0.0, blend_percentage=100, fine_goal=False
+        self,
+        positions,
+        quaternion,
+        velocity=3.14,
+        acc_time=0.0,
+        blend_percentage=100,
+        fine_goal=False,
     ):
         """Send a tool-space PTP via SetPositions service."""
-        if not (self.use_ros and self.service_ok):
-            return
-        euler = transforms3d.euler.quat2euler(quaternion, axes='sxyz')
+        if not (self.use_ros and self.service_ok and self.client):
+            return False
+
+        euler = transforms3d.euler.quat2euler(quaternion, axes="sxyz")
         full = positions + list(euler)
+
         req = SetPositions.Request()
         req.motion_type = 2
         req.positions = full
         req.velocity = float(velocity)
         req.acc_time = float(acc_time)
         req.blend_percentage = int(blend_percentage)
-        req.fine_goal = fine_goal
+        req.fine_goal = bool(fine_goal)
         self.client.call_async(req)
+        return True
 
-    # ---- Script Commands ----
-    def convert_positions_to_script(self, positions):
+    # ------------------------------------------------------------------
+    # Script commands
+    # ------------------------------------------------------------------
+    @staticmethod
+    def convert_positions_to_script(positions):
         """Format joint angles (radians) to a PTP script command."""
         degs = [math.degrees(p) for p in positions]
-        s = ','.join(f"{d:.2f}" for d in degs)
-        return f"PTP(\"JPP\",{s},100,0,100,true)"
+        payload = ",".join(f"{d:.2f}" for d in degs)
+        return f'PTP("JPP",{payload},100,0,100,true)'
 
     def send_request(self, command: str):
         """Send an arbitrary script command via SendScript service."""
-        if not (self.use_ros and self.script_ok):
-            return
+        if not (self.use_ros and self.script_ok and self.send_script_client):
+            return False
+
         req = SendScript.Request()
-        req.id = 'ping'
+        req.id = "ping"
         req.script = command
         self.send_script_client.call_async(req)
+        return True
 
-    # ---- Velocity Mode Helpers (return script strings) ----
-    def enable_joint_velocity_mode(self):       return "ContinueVJog()"
+    # ------------------------------------------------------------------
+    # Velocity mode helpers (return script strings)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def enable_joint_velocity_mode():
+        return "ContinueVJog()"
 
-    def stop_joint_velocity_mode(self):         return "StopContinueVmode()"
+    @staticmethod
+    def stop_joint_velocity_mode():
+        return "StopContinueVmode()"
 
-    def set_joint_velocity(self, v):            return f"SetContinueVJog({','.join(map(str, v))})"
+    @staticmethod
+    def set_joint_velocity(v):
+        return f"SetContinueVJog({','.join(map(str, v))})"
 
-    def enable_end_effector_velocity_mode(self):    return "ContinueVLine(20000,100000)"
+    @staticmethod
+    def enable_end_effector_velocity_mode():
+        return "ContinueVLine(20000,100000)"
 
-    def suspend_end_effector_velocity_mode(self):   return "SuspendContinueVmode()"
+    @staticmethod
+    def suspend_end_effector_velocity_mode():
+        return "SuspendContinueVmode()"
 
-    def stop_end_effector_velocity_mode(self):      return "StopContinueVmode()"
+    @staticmethod
+    def stop_end_effector_velocity_mode():
+        return "StopContinueVmode()"
 
-    def set_end_effector_velocity(self, v):         return f"SetContinueVLine({','.join(map(str, v))})"
+    @staticmethod
+    def set_end_effector_velocity(v):
+        return f"SetContinueVLine({','.join(map(str, v))})"
 
-    def stop_and_clear_buffer(self):               return "StopAndClearBuffer()"
+    @staticmethod
+    def stop_and_clear_buffer():
+        return "StopAndClearBuffer()"
 
-    # ---- Callbacks & getters ----
+    # ------------------------------------------------------------------
+    # Feedback callbacks / getters
+    # ------------------------------------------------------------------
     def _joint_cb(self, msg):
         self.current_positions = msg.position
 
@@ -172,99 +304,110 @@ class RobotController(Node if ROSPY_AVAILABLE else object):
     def get_current_tool_position(self):
         if not self.current_tool_pose:
             return None, None
-        p = self.current_tool_pose.position
-        o = self.current_tool_pose.orientation
-        return (p.x, p.y, p.z), (o.w, o.x, o.y, o.z)
 
+        position = self.current_tool_pose.position
+        orientation = self.current_tool_pose.orientation
+        return (
+            (position.x, position.y, position.z),
+            (orientation.w, orientation.x, orientation.y, orientation.z),
+        )
+
+    # ------------------------------------------------------------------
+    # Frame-aware velocity helpers
+    # ------------------------------------------------------------------
     def set_end_effector_velocity_pre_joint_frame(
-            self,
-            v_lin,
-            v_rot=(0.0, 0.0, 0.0),
-            joint: int = 6,
-            axes_map: dict = None,
+        self,
+        v_lin,
+        v_rot=(0.0, 0.0, 0.0),
+        joint=6,
+        axes_map=None,
     ):
-        """
-        Express v_lin/v_rot in a frame tied to JOINT <joint>:
-          joint=6 → TOOL frame (no removal)
-          joint=5 → remove J6 (pre-roll)
-          joint=4 → remove J6,J5
-          joint=3 → remove J6,J5,J4
-          joint=2 → remove J6..J3
-          joint=1 → (alias to BASE in dispatcher)
-
-        NOTE: Origin remains at TCP; we only change axes.
-        """
-        # Adjust once if TM5-900 joint axes differ
         if axes_map is None:
-            axes_map = {6: 'z', 5: 'y', 4: 'z', 3: 'y', 2: 'z', 1: 'z'}
+            axes_map = {6: "z", 5: "y", 4: "z", 3: "y", 2: "z", 1: "z"}
 
         pos_quat = self.get_current_tool_position()
-        if not pos_quat:
+        if not pos_quat or pos_quat == (None, None):
             return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
 
-        # correct unpack: ((px,py,pz), (qw,qx,qy,qz))
         _, quat = pos_quat
-        R = transforms3d.quaternions.quat2mat(quat)
+        rotation_world_from_tool = transforms3d.quaternions.quat2mat(quat)
 
-        # TOOL frame needs no joint states
         if joint != 6:
             joints = self.get_current_positions()
             if not joints or len(joints) < 6:
                 return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
 
-            # peel off downstream joints J6..J(joint+1)
-            for j in range(6, joint, -1):  # 6,5,4,...,(joint+1)
-                axis = axes_map.get(j, 'z').lower()
-                q = float(joints[j - 1])  # 0-based index
-                c, s = math.cos(-q), math.sin(-q)
-                if axis == 'x':
-                    R = R.dot(np.array([[1, 0, 0], [0, c, -s], [0, s, c]], float))
-                elif axis == 'y':
-                    R = R.dot(np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], float))
-                else:  # 'z'
-                    R = R.dot(np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], float))
+            for j in range(6, joint, -1):
+                axis = axes_map.get(j, "z").lower()
+                angle = float(joints[j - 1])
+                c = math.cos(-angle)
+                s = math.sin(-angle)
 
-        v_lin_world = R.dot(np.asarray(v_lin, dtype=float))
-        v_rot_world = R.dot(np.asarray(v_rot, dtype=float))
+                if axis == "x":
+                    correction = np.array(
+                        [[1, 0, 0], [0, c, -s], [0, s, c]],
+                        dtype=float,
+                    )
+                elif axis == "y":
+                    correction = np.array(
+                        [[c, 0, s], [0, 1, 0], [-s, 0, c]],
+                        dtype=float,
+                    )
+                else:
+                    correction = np.array(
+                        [[c, -s, 0], [s, c, 0], [0, 0, 1]],
+                        dtype=float,
+                    )
+
+                rotation_world_from_tool = rotation_world_from_tool.dot(correction)
+
+        v_lin_world = rotation_world_from_tool.dot(np.asarray(v_lin, dtype=float))
+        v_rot_world = rotation_world_from_tool.dot(np.asarray(v_rot, dtype=float))
         return self.set_end_effector_velocity(list(v_lin_world) + list(v_rot_world))
 
-    def set_end_effector_velocity_in_frame(self, v_lin, v_rot=(0.0, 0.0, 0.0), frame="tool"):
-        """
-        frame accepts:
-          - "base" (world-fixed axes)
-          - "tool", "tcp", or "joint6" (tool axes)
-          - "joint5", "joint4", "joint3", "joint2"
-          - "joint1" (alias to base)
+    @staticmethod
+    def _normalize_frame_name(frame):
+        raw = "tool" if frame is None else str(frame)
+        normalized = raw.strip().lower().replace(" ", "")
 
-        Examples:
-          frame="base"   or "joint1"  -> base axes
-          frame="tool"   or "joint6"  -> tool axes
-          frame="joint5"               -> J5-aligned axes (pre-roll)
-          frame="joint4"/"joint3"/"joint2" -> pre-wrist / pre-forearm / pre-shoulder
-        """
-        # normalize & aliases
-        f = (frame or "tool").strip().lower()
         aliases = {
             "tcp": "joint6",
             "tool": "joint6",
             "world": "base",
-            "j1": "base",
-            "joint1": "base",
+            "base": "base",
+            "j1": "joint1",
+            "j2": "joint2",
+            "j3": "joint3",
+            "j4": "joint4",
+            "j5": "joint5",
             "j6": "joint6",
         }
-        f = aliases.get(f, f)
+        normalized = aliases.get(normalized, normalized)
 
-        if f == "base":
+        if normalized in {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"}:
+            return normalized
+
+        if normalized.isdigit():
+            return f"joint{normalized}"
+
+        match = re.fullmatch(r"joint0*([1-6])", normalized)
+        if match:
+            return f"joint{match.group(1)}"
+
+        return normalized
+
+    def set_end_effector_velocity_in_frame(self, v_lin, v_rot=(0.0, 0.0, 0.0), frame="tool"):
+        normalized = self._normalize_frame_name(frame)
+
+        if normalized == "base":
             return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
 
-        if f.startswith("joint"):
-            n = int(f[5:])
-            if not (1 <= n <= 6):
+        if normalized.startswith("joint"):
+            joint = int(normalized[5:])
+            if not (1 <= joint <= 6):
                 raise ValueError("jointN must be between 1 and 6")
-            if n == 1:
-                # joint1 == base by your requirement
+            if joint == 1:
                 return self.set_end_effector_velocity(list(v_lin) + list(v_rot))
-            return self.set_end_effector_velocity_pre_joint_frame(v_lin, v_rot, joint=n)
+            return self.set_end_effector_velocity_pre_joint_frame(v_lin, v_rot, joint=joint)
 
         raise ValueError(f"Unknown frame '{frame}'")
-

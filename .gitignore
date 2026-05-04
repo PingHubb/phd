@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments / IDE
+venv/
+.env
+.idea/
+.pytest_cache/
+
+# Large ML datasets and checkpoints (clone repo then restore or use LFS)
+phd/resource/ai/data/
+phd/resource/ai/models/

@@ -33,56 +33,63 @@ class MyMeshLab():
         self.camera_pos = self.plotter.camera.position
         self.camera_focal = self.plotter.camera.focal_point
         self.camera_view_angle = self.plotter.camera.view_angle
-    
-    def loadCameraPare(self):
-        self.plotter.camera.position = self.camera_pos
-        self.plotter.camera.focal_point = self.camera_focal
-        self.plotter.camera.view_angle = self.camera_view_angle
 
-        self.plotter_2.camera.position = self.camera_pos
-        self.plotter_2.camera.focal_point = self.camera_focal
-        self.plotter_2.camera.view_angle = self.camera_view_angle
+    def _apply_camera_parameters(self, plotter, camera_pos, camera_focal, camera_view_angle):
+        plotter.camera.position = camera_pos
+        plotter.camera.focal_point = camera_focal
+        plotter.camera.view_angle = camera_view_angle
 
-    def loadCameraPare(self, camera_pos, camera_focal, camera_view_angle):
-        self.plotter.camera.position = camera_pos
-        self.plotter.camera.focal_point = camera_focal
-        self.plotter.camera.view_angle = camera_view_angle
+    def loadCameraPare(self, camera_pos=None, camera_focal=None, camera_view_angle=None):
+        if camera_pos is None:
+            camera_pos = getattr(self, 'camera_pos', None)
+        if camera_focal is None:
+            camera_focal = getattr(self, 'camera_focal', None)
+        if camera_view_angle is None:
+            camera_view_angle = getattr(self, 'camera_view_angle', None)
 
-        self.plotter_2.camera.position = self.camera_pos
-        self.plotter_2.camera.focal_point = self.camera_focal
-        self.plotter_2.camera.view_angle = self.camera_view_angle
+        if camera_pos is None or camera_focal is None or camera_view_angle is None:
+            return
+
+        self._apply_camera_parameters(self.plotter, camera_pos, camera_focal, camera_view_angle)
+        self._apply_camera_parameters(self.plotter_2, camera_pos, camera_focal, camera_view_angle)
 
     def creatPlaneXY(self):
-        self.plotter.camera.position = (1,-1,1)
-        self.plotter_2.camera.position = (1,-1,1)
+        self.plotter.camera.position = (1, -1, 1)
+        self.plotter_2.camera.position = (1, -1, 1)
 
         self.saveCameraPara()
-        line = pv.Line((-50, 0, 0), (50, 0,0 ))
-        
+        line = pv.Line((-50, 0, 0), (50, 0, 0))
+
         # 添加X轴线段，并设置为红色
         self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
         self.plotter_2.add_mesh(line, color='r', line_width=2, label='X Axis')
 
-        line = pv.Line((0, -50, 0), (0,50, 0))
+        line = pv.Line((0, -50, 0), (0, 50, 0))
 
         # 添加Y轴线段，并设置为绿色
         self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
         self.plotter_2.add_mesh(line, color='g', line_width=2, label='Y Axis')
 
-        planeXY = pv.Plane((0,0,0),(0,0,1),100,100,100,100)
+        planeXY = pv.Plane(
+            center=(0, 0, 0),
+            direction=(0, 0, 1),
+            i_size=100,
+            j_size=100,
+            i_resolution=100,
+            j_resolution=100,
+        )
 
-        self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray',style='wireframe')
-        self.actorPlaneXY_2 = self.plotter_2.add_mesh(planeXY, color='gray',style='wireframe')
-
+        self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray', style='wireframe')
+        self.actorPlaneXY_2 = self.plotter_2.add_mesh(planeXY, color='gray', style='wireframe')
 
     def add_sphere(self, showEdge):
         self.saveCameraPara()
         sphere = pv.Sphere()
-        TreeWidgetItem(self.parent.widget_tree,"Sphere",0,0)
+        TreeWidgetItem(self.parent.widget_tree, "Sphere", 0, 0)
         sphere.compute_normals(inplace=True)
         arrows = sphere['Normals']
         centers = sphere.cell_centers().points
-        self.plotter.add_arrows(centers, arrows*0.05, color='white')
+        self.plotter.add_arrows(centers, arrows * 0.05, color='white')
         self.plotter.add_mesh(sphere, show_edges=True)
 
     def addRobot(self):
@@ -96,7 +103,7 @@ class MyMeshLab():
             for obj_file in obj_files:
                 obj_path = os.path.join(folder_path, obj_file)
                 mesh = pv.read(obj_path)
-                
+
                 # Add the transformed mesh to the plotter
                 self.robotModel.append(mesh)
                 self.robotActor.append(self.plotter.add_mesh(mesh, show_edges=False))
@@ -114,9 +121,9 @@ class MyMeshLab():
 
         for i in range(7):
             self.reT.append(np.array([[1, 0, 0, 0],
-                             [0, 1, 0, 0],
-                             [0, 0, 1, 0],
-                             [0, 0, 0, 1]]))
+                                      [0, 1, 0, 0],
+                                      [0, 0, 1, 0],
+                                      [0, 0, 0, 1]]))
 
         self.T01 = np.array([[cos(self.joints[0]), -sin(self.joints[0]), 0, 0],
                              [sin(self.joints[0]), cos(self.joints[0]), 0, 0],
@@ -217,7 +224,7 @@ class MyMeshLab():
 
     def serialConnection(self):
         print("Not implemented yet")
-    
+
     def update_animation(self):
         self.saveCameraPara()
         for i in range(len(self.robotModel)):
@@ -235,12 +242,12 @@ class MyMeshLab():
             self.last_time = current_time
             self.frame_count = 0
 
-    def loadMesh(self,file_paths):
+    def loadMesh(self, file_paths):
         for file_path in file_paths:
             mesh = pv.read(file_path)
             self.plotter.add_mesh(mesh)
 
-    def changeVisibility(self,item):
+    def changeVisibility(self, item):
         if item.level:
             parent = item.parent
             if item._type == 0:
@@ -258,4 +265,3 @@ class MyMeshLab():
         else:
             print("everything for mesh changes")
 
-    
