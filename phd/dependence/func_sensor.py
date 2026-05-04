@@ -6,22 +6,22 @@ import time
 from pyvistaqt import QtInteractor
 from PyQt5.QtCore import QTimer
 from tqdm import tqdm
-from phd.dependence.gesture_logic_direct_finger_motion import (
+from phd.dependence.gesture.gesture_logic_direct_finger_motion import (
     DirectFingerMotion,
     DirectFingerMotionV2,
     ConsoleControl,
     AI_DirectFingerMotion,
     AI_DirectFingerMotion_execution,
 )
-from phd.dependence.gesture_logic_proximity_control import ProximityControl
-from phd.dependence.gesture_logic_recording import RecordGesture
+from phd.dependence.gesture.gesture_logic_proximity_control import ProximityControl
+from phd.dependence.gesture.gesture_logic_recording import RecordGesture
 from phd.dependence.sensor_layout import (
     column_major_idx as _column_major_idx,
     flatten_column_major_view as _flatten_column_major_view,
     reshape_sensor_values_to_row_col_matrix,
     row_major_idx as _row_major_idx,
 )
-from phd.dependence.gesture_logic_three_level import ThreeLevelTransformer
+from phd.dependence.gesture.gesture_logic_three_level import ThreeLevelTransformer
 
 from PyQt5.QtWidgets import QListWidgetItem
 

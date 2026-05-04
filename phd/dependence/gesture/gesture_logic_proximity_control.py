@@ -7,7 +7,7 @@ from PyQt5.QtCore import QTimer
 
 
 class ProximityControl:
-    RESOURCE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "resource"))
+    RESOURCE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "resource"))
     CONFIG_DIR = os.path.join(RESOURCE_ROOT, "config")
     RECORDING_DIR = os.path.join(RESOURCE_ROOT, "proximity_recordings")
     SETTINGS_FILE = os.path.join(CONFIG_DIR, "proximity_control.json")
