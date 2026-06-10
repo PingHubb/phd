@@ -3,10 +3,11 @@ import os
 import re
 import struct
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-import torch
 from PyQt5.QtCore import QTimer
+from phd.dependence.paths import ai_resource_path, resource_path
 
 from phd.dependence.sensor_layout import (
     column_major_coords,
@@ -14,14 +15,13 @@ from phd.dependence.sensor_layout import (
     column_major_matrix_view,
     flatten_column_major_view,
 )
-from phd.dependence.transformer import _AI_DFM_CNNTactileTransformerAux
 
 
 class DirectFingerMotion:
-    RESOURCE_ROOT = "/home/ping2/ros2_ws/src/phd/phd/resource"
-    CONFIG_DIR = os.path.join(RESOURCE_ROOT, "config")
-    AI_DATA_DIR = os.path.join(RESOURCE_ROOT, "ai", "data")
-    AI_MODELS_DIR = os.path.join(RESOURCE_ROOT, "ai", "models")
+    RESOURCE_ROOT = resource_path()
+    CONFIG_DIR = resource_path("config")
+    AI_DATA_DIR = ai_resource_path("data")
+    AI_MODELS_DIR = ai_resource_path("models")
     SETTINGS_FILE = os.path.join(CONFIG_DIR, "direct_finger_motion.json")
 
     def __init__(self, ros_splitter_instance, my_sensor_instance):
@@ -64,6 +64,15 @@ class DirectFingerMotion:
         self.loop_hz = 0.0
         self._loop_tick_count = 0
         self._loop_tick_started_at = time.perf_counter()
+        self._hand_five_finger_close_counter = 0
+        self._hand_five_finger_open_counter = 0
+        self._hand_last_five_finger_spread = None
+        self._hand_last_requested_state = None
+        self._hand_command_inflight = False
+        self._hand_pending_command = None
+        self._hand_executor = None
+        self._single_finger_latched_velocity = None
+        self._two_finger_latched_velocity = None
 
     def _default_settings(self):
         return {
@@ -77,6 +86,7 @@ class DirectFingerMotion:
             "min_speed_ratio": 0.20,
             "max_speed_ratio": 1.50,
             "velocity_smoothing_alpha": 0.4,
+            "push_pinch_enabled": True,
             "push_value_threshold": -12.0,
             "push_hold_deadband": 0.01,
             "push_hold_frames_required": 2,
@@ -91,9 +101,24 @@ class DirectFingerMotion:
             "two_finger_swipe_deadband": 0.06,
             "two_finger_swipe_dominance_ratio": 0.1,
             "two_finger_swipe_axis_lock_frames": 3,
+            "two_finger_swipe_enable_horizontal": True,
+            "two_finger_swipe_enable_vertical": True,
+            "two_finger_swipe_up_add_push": False,
+            "two_finger_swipe_down_add_pull": False,
+            "single_finger_up_as_two_finger_swipe_up": False,
+            "single_finger_vertical_to_y": False,
+            "single_finger_latch_motion": False,
+            "single_finger_magnitude_speed": True,
             "two_finger_release_grace_frames": 3,
             "frame_interval_ms": 0,
             "debug_output": False,
+            "hand_control_enabled": False,
+            "hand_five_finger_min_clusters": 5,
+            "hand_five_finger_min_cells": 5,
+            "hand_five_finger_motion_threshold": 0.02,
+            "hand_five_finger_close_frames": 2,
+            "hand_five_finger_open_frames": 2,
+            "hand_command_timeout_sec": 0.8,
         }
 
     def get_settings(self):
@@ -112,8 +137,24 @@ class DirectFingerMotion:
             "two_finger_swipe_axis_lock_frames",
             "two_finger_release_grace_frames",
             "frame_interval_ms",
+            "hand_five_finger_min_clusters",
+            "hand_five_finger_min_cells",
+            "hand_five_finger_close_frames",
+            "hand_five_finger_open_frames",
         }
-        bool_fields = {"debug_output"}
+        bool_fields = {
+            "debug_output",
+            "hand_control_enabled",
+            "two_finger_swipe_enable_horizontal",
+            "two_finger_swipe_enable_vertical",
+            "two_finger_swipe_up_add_push",
+            "two_finger_swipe_down_add_pull",
+            "single_finger_up_as_two_finger_swipe_up",
+            "single_finger_vertical_to_y",
+            "single_finger_latch_motion",
+            "single_finger_magnitude_speed",
+            "push_pinch_enabled",
+        }
 
         for key, default_value in defaults.items():
             value = merged.get(key, default_value)
@@ -170,6 +211,7 @@ class DirectFingerMotion:
             self.control_timer.stop()
             self._stop_robot_motion(stop_mode=True)
             self._reset_state()
+            self._shutdown_hand_executor()
             print("Direct finger motion STOPPED")
 
     def _reset_state(self):
@@ -195,6 +237,11 @@ class DirectFingerMotion:
         self.current_motion_mode = "stop"
         self._smoothed_velocity = [0.0] * 6
         self._in_push_mode = False
+        self._hand_five_finger_close_counter = 0
+        self._hand_five_finger_open_counter = 0
+        self._hand_last_five_finger_spread = None
+        self._single_finger_latched_velocity = None
+        self._two_finger_latched_velocity = None
 
     def _record_loop_tick(self):
         self._loop_tick_count += 1
@@ -390,6 +437,7 @@ class DirectFingerMotion:
             self.current_two_peak_state = None
             self.last_two_peak_state = None
             self.two_finger_grace_counter = 0
+            self._update_dexterous_hand_from_five_finger(None)
 
             dprint("\nTouch map (single active point):")
             for _ in range(self.my_sensor.n_row):
@@ -462,6 +510,15 @@ class DirectFingerMotion:
                     f"Motion: centroid Δ(col,row)=({delta_col:+.3f}, {delta_row:+.3f})  {arrow}  {direction_name}"
                 )
 
+        if self._update_dexterous_hand_from_five_finger(touched):
+            self._stop_robot_motion()
+            self.last_active_flat_idx = chosen_flat_idx
+            self.last_active_raw_index = current_raw_index
+            self.last_touch_center_row = current_center_row
+            self.last_touch_center_col = current_center_col
+            self.last_two_peak_state = self.current_two_peak_state
+            return
+
         self._update_robot_from_motion(
             previous_center=(previous_center_row, previous_center_col),
             current_center=(current_center_row, current_center_col),
@@ -475,10 +532,18 @@ class DirectFingerMotion:
 
     def _ensure_robot_velocity_mode(self):
         if not self._velocity_mode_enabled:
-            self.ros_splitter.robot_api.send_request(
-                self.ros_splitter.robot_api.enable_end_effector_velocity_mode()
-            )
-            self._velocity_mode_enabled = True
+            robot_api = getattr(self.ros_splitter, "robot_api", None)
+            if robot_api is None:
+                return False
+            if hasattr(robot_api, "enter_end_effector_velocity_mode"):
+                self._velocity_mode_enabled = bool(
+                    robot_api.enter_end_effector_velocity_mode()
+                )
+            else:
+                self._velocity_mode_enabled = bool(
+                    robot_api.send_request(robot_api.enable_end_effector_velocity_mode())
+                )
+        return self._velocity_mode_enabled
 
     def _get_requested_frame(self):
         selected = getattr(self.ros_splitter, "ai_selected_frame", None)
@@ -514,6 +579,159 @@ class DirectFingerMotion:
 
     def _zero_velocity(self):
         return [0.0] * 6
+
+    def _hand_services_available(self):
+        robot_api = getattr(self.ros_splitter, "robot_api", None)
+        return bool(
+            robot_api is not None
+            and hasattr(robot_api, "hand_services_available")
+            and robot_api.hand_services_available()
+            and hasattr(robot_api, "hand_set_angles")
+        )
+
+    def _shutdown_hand_executor(self):
+        executor = getattr(self, "_hand_executor", None)
+        self._hand_executor = None
+        self._hand_command_inflight = False
+        self._hand_pending_command = None
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False)
+            except Exception:
+                pass
+
+    def _ensure_hand_executor(self):
+        if self._hand_executor is None:
+            self._hand_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="dfm-rh56f1-hand",
+            )
+        return self._hand_executor
+
+    def _submit_hand_angles(self, label, angles):
+        if not self._hand_services_available():
+            self._debug_print("[DFM Hand] RH56F1 services unavailable.")
+            return
+
+        payload = [int(v) for v in list(angles or [])[:6]]
+        if len(payload) < 6:
+            payload += [-1] * (6 - len(payload))
+
+        if self._hand_command_inflight:
+            self._hand_pending_command = (str(label), payload)
+            return
+
+        self._hand_command_inflight = True
+        robot_api = self.ros_splitter.robot_api
+        timeout = max(0.1, float(getattr(self, "hand_command_timeout_sec", 0.8)))
+
+        def job():
+            return robot_api.hand_set_angles(payload, timeout_sec=timeout)
+
+        future = self._ensure_hand_executor().submit(job)
+
+        def done_callback(fut):
+            try:
+                result = fut.result()
+                self._debug_print(
+                    f"[DFM Hand] {label}: {'OK' if result is not None else 'FAILED'}"
+                )
+            except Exception as exc:
+                self._debug_print(f"[DFM Hand] {label}: FAILED ({exc})")
+            finally:
+                self._hand_command_inflight = False
+                pending = self._hand_pending_command
+                self._hand_pending_command = None
+                if pending is not None:
+                    pending_label, pending_angles = pending
+                    self._submit_hand_angles(pending_label, pending_angles)
+
+        future.add_done_callback(done_callback)
+
+    def _request_dexterous_hand_state(self, state):
+        if state == self._hand_last_requested_state:
+            return
+
+        if state == "closed":
+            angles = [900, 900, 900, 900, 1100, -1]
+            label = "Five-finger close -> RH56F1 close"
+        elif state == "open":
+            angles = [1720, 1720, 1720, 1720, 1350, -1]
+            label = "Five-finger open -> RH56F1 open"
+        else:
+            return
+
+        self._hand_last_requested_state = state
+        self._submit_hand_angles(label, angles)
+
+    def _five_finger_hand_gesture_active(self, touched):
+        if not bool(getattr(self, "hand_control_enabled", False)):
+            return False
+        if touched is None:
+            return False
+
+        min_clusters = max(1, int(getattr(self, "hand_five_finger_min_clusters", 5)))
+        min_cells = max(1, int(getattr(self, "hand_five_finger_min_cells", 5)))
+        return (
+            len(self.current_touch_clusters) >= min_clusters
+            and int(getattr(touched, "size", 0)) >= min_cells
+        )
+
+    def _five_finger_spread(self):
+        min_clusters = max(1, int(getattr(self, "hand_five_finger_min_clusters", 5)))
+        clusters = list(self.current_touch_clusters[:min_clusters])
+        if len(clusters) < min_clusters:
+            return None
+
+        denom_r, denom_c = self._sensor_axis_denominators()
+        rows = np.asarray([float(c["center_row"]) / denom_r for c in clusters], dtype=float)
+        cols = np.asarray([float(c["center_col"]) / denom_c for c in clusters], dtype=float)
+        row_span = float(np.max(rows) - np.min(rows))
+        col_span = float(np.max(cols) - np.min(cols))
+        return float(np.hypot(row_span, col_span))
+
+    def _update_dexterous_hand_from_five_finger(self, touched):
+        if not bool(getattr(self, "hand_control_enabled", False)):
+            self._hand_five_finger_close_counter = 0
+            self._hand_five_finger_open_counter = 0
+            self._hand_last_five_finger_spread = None
+            return False
+
+        active = self._five_finger_hand_gesture_active(touched)
+        if not active:
+            self._hand_five_finger_close_counter = 0
+            self._hand_five_finger_open_counter = 0
+            self._hand_last_five_finger_spread = None
+            return False
+
+        spread = self._five_finger_spread()
+        previous_spread = self._hand_last_five_finger_spread
+        self._hand_last_five_finger_spread = spread
+        if spread is None or previous_spread is None:
+            return True
+
+        delta = spread - previous_spread
+        threshold = max(0.0, float(getattr(self, "hand_five_finger_motion_threshold", 0.02)))
+        close_frames = max(1, int(getattr(self, "hand_five_finger_close_frames", 2)))
+        open_frames = max(1, int(getattr(self, "hand_five_finger_open_frames", 2)))
+
+        if delta <= -threshold:
+            self._hand_five_finger_close_counter += 1
+            self._hand_five_finger_open_counter = 0
+            if self._hand_five_finger_close_counter >= close_frames:
+                self._request_dexterous_hand_state("closed")
+            return True
+
+        if delta >= threshold:
+            self._hand_five_finger_open_counter += 1
+            self._hand_five_finger_close_counter = 0
+            if self._hand_five_finger_open_counter >= open_frames:
+                self._request_dexterous_hand_state("open")
+            return True
+
+        self._hand_five_finger_close_counter = 0
+        self._hand_five_finger_open_counter = 0
+        return True
 
     def _apply_motion_output(self, mode, velocity):
         smoothed = self._apply_velocity_smoothing(velocity)
@@ -572,21 +790,106 @@ class DirectFingerMotion:
         }
 
     def _centroid_delta_to_robot_velocity(self, delta_col, delta_row):
+        single_as_two_finger_up = self._single_finger_up_as_two_finger_swipe_velocity(
+            delta_col,
+            delta_row,
+        )
+        if single_as_two_finger_up is not None:
+            return single_as_two_finger_up
+
         scaled_col = self._scaled_axis_component(delta_col)
         scaled_row = self._scaled_axis_component(delta_row)
+        if not bool(getattr(self, "single_finger_magnitude_speed", True)):
+            if scaled_col != 0.0:
+                scaled_col = 1.0 if scaled_col > 0.0 else -1.0
+            if scaled_row != 0.0:
+                scaled_row = 1.0 if scaled_row > 0.0 else -1.0
 
         if scaled_col == 0.0 and scaled_row == 0.0:
             return self._zero_velocity()
 
         vx = -self.robot_speed * scaled_col
-        vz = -self.robot_speed * scaled_row
-        return [float(vx), 0.0, float(vz), 0.0, 0.0, 0.0]
+        vertical_velocity = -self.robot_speed * scaled_row
+        if bool(getattr(self, "single_finger_vertical_to_y", False)):
+            return [float(vx), float(vertical_velocity), 0.0, 0.0, 0.0, 0.0]
+        return [float(vx), 0.0, float(vertical_velocity), 0.0, 0.0, 0.0]
+
+    def _single_finger_up_as_two_finger_swipe_velocity(self, delta_col, delta_row):
+        if not bool(getattr(self, "single_finger_up_as_two_finger_swipe_up", False)):
+            return None
+
+        denom_r, _denom_c = self._sensor_axis_denominators()
+        deadband_row = float(self.two_finger_swipe_deadband) / denom_r
+        dominance = max(0.0, float(self.two_finger_swipe_dominance_ratio))
+        abs_col = abs(float(delta_col))
+        abs_row = abs(float(delta_row))
+        is_upward_vertical = (
+            float(delta_row) <= -deadband_row
+            and abs_row >= (abs_col * dominance)
+        )
+        if not is_upward_vertical:
+            return None
+
+        return self._two_finger_vertical_swipe_to_robot_velocity(delta_row)
+
+    def _velocity_with_latch(self, velocity, latch_attr):
+        velocity = [float(v) for v in velocity]
+        has_motion = any(abs(v) > 1e-12 for v in velocity)
+        latch_enabled = bool(getattr(self, "single_finger_latch_motion", False))
+
+        if has_motion:
+            setattr(self, latch_attr, list(velocity))
+            return velocity, "move"
+
+        latched_velocity = getattr(self, latch_attr, None)
+        if latch_enabled and latched_velocity is not None:
+            return list(latched_velocity), "move"
+
+        if not latch_enabled:
+            setattr(self, latch_attr, None)
+        return velocity, "stop"
+
+    def _single_finger_velocity_with_latch(self, velocity):
+        return self._velocity_with_latch(velocity, "_single_finger_latched_velocity")
+
+    def _two_finger_velocity_with_latch(self, velocity):
+        return self._velocity_with_latch(velocity, "_two_finger_latched_velocity")
 
     def _push_velocity(self):
         return [0.0, float(self.push_speed), 0.0, 0.0, 0.0, 0.0]
 
     def _pull_velocity(self):
         return [0.0, -float(self.pull_speed), 0.0, 0.0, 0.0, 0.0]
+
+    def _two_finger_vertical_swipe_to_robot_velocity(self, delta_row):
+        if not bool(getattr(self, "two_finger_swipe_enable_vertical", True)):
+            return self._zero_velocity()
+
+        scaled_row = self._scaled_axis_component(delta_row)
+        if scaled_row == 0.0:
+            return self._zero_velocity()
+
+        rx = self.rotation_speed * scaled_row
+        velocity = [0.0, 0.0, 0.0, float(rx), 0.0, 0.0]
+        if (
+            bool(getattr(self, "two_finger_swipe_up_add_push", False))
+            and delta_row < 0.0
+        ):
+            push_velocity = self._push_velocity()
+            velocity = [
+                float(base + push)
+                for base, push in zip(velocity, push_velocity)
+            ]
+        elif (
+            bool(getattr(self, "two_finger_swipe_down_add_pull", False))
+            and delta_row > 0.0
+        ):
+            pull_velocity = self._pull_velocity()
+            velocity = [
+                float(base + pull)
+                for base, pull in zip(velocity, pull_velocity)
+            ]
+        return velocity
 
     def _two_finger_swipe_to_robot_velocity(self):
         curr = self.current_two_peak_state
@@ -639,26 +942,31 @@ class DirectFingerMotion:
             self._two_finger_swipe_axis_lock = candidate_axis
             self._two_finger_swipe_axis_lock_remaining = lock_frames
 
+        # Optional per-axis disable switches from UI parameters.
+        allow_horizontal = bool(getattr(self, "two_finger_swipe_enable_horizontal", True))
+        allow_vertical = bool(getattr(self, "two_finger_swipe_enable_vertical", True))
+        if candidate_axis == "horizontal" and not allow_horizontal:
+            return self._zero_velocity()
+        if candidate_axis == "vertical" and not allow_vertical:
+            return self._zero_velocity()
+
         scaled_col = 0.0
-        scaled_row = 0.0
         if candidate_axis == "vertical":
-            scaled_row = self._scaled_axis_component(delta_mid_row)
+            return self._two_finger_vertical_swipe_to_robot_velocity(delta_mid_row)
         elif candidate_axis == "horizontal":
             scaled_col = self._scaled_axis_component(delta_mid_col)
 
-        if scaled_col == 0.0 and scaled_row == 0.0:
+        if scaled_col == 0.0:
             return self._zero_velocity()
 
-        rx = self.rotation_speed * scaled_row
         rz = -self.rotation_speed * scaled_col
-        return [0.0, 0.0, 0.0, float(rx), 0.0, float(rz)]
+        return [0.0, 0.0, 0.0, 0.0, 0.0, float(rz)]
 
     def _set_teacher_output(self, mode, velocity):
         self.current_motion_mode = str(mode)
         self.last_teacher_velocity_pre_flip = [float(v) for v in velocity]
 
     def _send_robot_velocity(self, velocity):
-        self._ensure_robot_velocity_mode()
         velocity = [float(v) for v in velocity]
         velocity = [-velocity[0], -velocity[1], -velocity[2], velocity[3], velocity[4], velocity[5]]
 
@@ -668,15 +976,24 @@ class DirectFingerMotion:
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if robot_api is None:
             return
+        if not self._ensure_robot_velocity_mode():
+            return
 
         frame = self._get_requested_frame()
 
-        try:
-            cmd = robot_api.set_end_effector_velocity_in_frame(velocity[:3], velocity[3:], frame=frame)
-        except Exception:
-            cmd = robot_api.set_end_effector_velocity(velocity)
-
-        robot_api.send_request(cmd)
+        if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
+            robot_api.send_end_effector_velocity_in_frame(
+                velocity[:3],
+                velocity[3:],
+                frame=frame,
+                ensure_mode=False,
+            )
+        else:
+            try:
+                cmd = robot_api.set_end_effector_velocity_in_frame(velocity[:3], velocity[3:], frame=frame)
+            except Exception:
+                cmd = robot_api.set_end_effector_velocity(velocity)
+            robot_api.send_request(cmd)
         self.last_robot_velocity_cmd = velocity
         self._debug_print(f"Robot velocity command ({frame}): {velocity}")
 
@@ -718,25 +1035,33 @@ class DirectFingerMotion:
 
     def _update_robot_from_motion(self, previous_center=None, current_center=None):
         if self.current_two_peak_state is not None:
-            if self._two_peak_pinch_is_pull():
+            self._single_finger_latched_velocity = None
+            push_pinch_enabled = bool(getattr(self, "push_pinch_enabled", True))
+            if push_pinch_enabled and self._two_peak_pinch_is_pull():
+                self._two_finger_latched_velocity = None
                 self.push_hold_counter = 0
                 self._in_push_mode = False
                 velocity = self._pull_velocity()
                 self._apply_motion_output("pull", velocity)
                 return
+            if not push_pinch_enabled:
+                self.pinch_hold_counter = 0
 
             self.push_hold_counter = 0
             self._in_push_mode = False
             velocity = self._two_finger_swipe_to_robot_velocity()
-            mode = "move" if any(abs(v) > 1e-12 for v in velocity[3:]) else "stop"
+            velocity, mode = self._two_finger_velocity_with_latch(velocity)
             self._apply_motion_output(mode, velocity)
             return
 
         self.pinch_hold_counter = 0
+        self._two_finger_latched_velocity = None
 
         if self.two_finger_grace_counter > 0:
             self.push_hold_counter = 0
             self._in_push_mode = False
+            self._single_finger_latched_velocity = None
+            self._two_finger_latched_velocity = None
             self._apply_stop_output()
             return
 
@@ -747,6 +1072,7 @@ class DirectFingerMotion:
             if prev_row is None or prev_col is None or curr_row is None or curr_col is None:
                 self.push_hold_counter = 0
                 self._in_push_mode = False
+                self._single_finger_latched_velocity = None
                 self._apply_stop_output()
                 return
 
@@ -755,14 +1081,17 @@ class DirectFingerMotion:
             delta_row = (curr_row - prev_row) / denom_r
             hold_distance = max(abs(delta_col), abs(delta_row))
 
+            push_pinch_enabled = bool(getattr(self, "push_pinch_enabled", True))
             push_enter = (
-                self.current_touch_peak_value is not None
+                push_pinch_enabled
+                and self.current_touch_peak_value is not None
                 and self.current_touch_peak_value <= self.push_value_threshold
                 and hold_distance <= self.push_hold_deadband
             )
             push_exit_threshold = self.push_value_threshold + self.push_exit_value_offset
             push_stay = (
-                self._in_push_mode
+                push_pinch_enabled
+                and self._in_push_mode
                 and self.current_touch_peak_value is not None
                 and self.current_touch_peak_value <= push_exit_threshold
                 and hold_distance <= self.push_hold_deadband * 2.0
@@ -772,6 +1101,7 @@ class DirectFingerMotion:
                 self.push_hold_counter += 1
                 if self.push_hold_counter >= self.push_hold_frames_required:
                     self._in_push_mode = True
+                    self._single_finger_latched_velocity = None
                     velocity = self._push_velocity()
                     self._apply_motion_output("push", velocity)
                     return
@@ -780,7 +1110,7 @@ class DirectFingerMotion:
                 self._in_push_mode = False
 
             velocity = self._centroid_delta_to_robot_velocity(delta_col, delta_row)
-            mode = "move" if any(abs(v) > 1e-12 for v in velocity[:3]) else "stop"
+            velocity, mode = self._single_finger_velocity_with_latch(velocity)
             self._apply_motion_output(mode, velocity)
             return
 
@@ -788,6 +1118,8 @@ class DirectFingerMotion:
         self._in_push_mode = False
         self._two_finger_swipe_axis_lock = None
         self._two_finger_swipe_axis_lock_remaining = 0
+        self._single_finger_latched_velocity = None
+        self._two_finger_latched_velocity = None
         self._apply_stop_output()
 
     def _stop_robot_motion(self, stop_mode=False):
@@ -798,12 +1130,18 @@ class DirectFingerMotion:
         self._two_finger_swipe_axis_lock_remaining = 0
         self.current_two_peak_state = None
         self.last_two_peak_state = None
+        self._single_finger_latched_velocity = None
+        self._two_finger_latched_velocity = None
         if stop_mode:
             self._smoothed_velocity = [0.0] * 6
         self._apply_stop_output()
 
         if stop_mode and self._velocity_mode_enabled:
-            self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
+            robot_api = getattr(self.ros_splitter, "robot_api", None)
+            if robot_api is not None and hasattr(robot_api, "exit_end_effector_velocity_mode"):
+                robot_api.exit_end_effector_velocity_mode(send_zero=False)
+            elif robot_api is not None:
+                robot_api.send_request(robot_api.stop_end_effector_velocity_mode())
             self._velocity_mode_enabled = False
 
 
@@ -1108,457 +1446,6 @@ class DirectFingerMotionV2(DirectFingerMotion):
         self._apply_motion_output(self._v2_latched_mode, self._v2_latched_velocity)
 
 
-class ConsoleControl(DirectFingerMotion):
-    """PS5/DualSense-style joystick control for TCP velocity."""
-
-    SETTINGS_FILE = os.path.join(DirectFingerMotion.CONFIG_DIR, "console_control.json")
-
-    def _default_settings(self):
-        settings = super()._default_settings()
-        settings.update(
-            {
-                "config_version": 4,
-                "motion_threshold": -3.0,
-                "frame_interval_ms": 20,
-                "velocity_smoothing_alpha": 1.0,
-                "console_device_index": 0,
-                "console_deadband": 0.08,
-                "console_linear_speed": 0.05,
-                "console_angular_speed": 0.20,
-                "console_x_speed": 0.05,
-                "console_y_speed": 0.05,
-                "console_z_speed": 0.05,
-                "console_rx_speed": 0.20,
-                "console_ry_speed": 0.20,
-                "console_rz_speed": 0.20,
-                "console_axis_left_x": 0,
-                "console_axis_left_y": 1,
-                "console_axis_right_x": 3,
-                "console_axis_right_y": 4,
-                "console_axis_l2": 2,
-                "console_axis_r2": 5,
-                "console_button_l1": 4,
-                "console_button_r1": 5,
-                "console_x_sign": -1.0,
-                "console_y_sign": 1.0,
-                "console_z_sign": -1.0,
-                "console_rx_sign": 1.0,
-                "console_ry_sign": -1.0,
-                "console_rz_sign": -1.0,
-            }
-        )
-        return settings
-
-    def load_settings_from_file(self):
-        if not os.path.exists(self.settings_path):
-            return
-        try:
-            with open(self.settings_path, "r", encoding="utf-8") as f:
-                settings = json.load(f)
-            config_version = int(settings.get("config_version", 0))
-            migrated = config_version < 4
-            if config_version < 2:
-                settings.update(
-                    {
-                        "config_version": 2,
-                        "console_axis_right_x": 3,
-                        "console_axis_right_y": 4,
-                        "console_axis_l2": 2,
-                        "console_axis_r2": 5,
-                    }
-                )
-                print("[Console Control] Migrated joystick mapping to Linux/Xbox-style axes.")
-            if config_version < 3:
-                settings.update(
-                    {
-                        "config_version": 3,
-                        "console_x_sign": -1.0,
-                        "console_y_sign": 1.0,
-                        "console_z_sign": -1.0,
-                        "console_rx_sign": 1.0,
-                        "console_ry_sign": -1.0,
-                        "console_rz_sign": -1.0,
-                    }
-                )
-                print("[Console Control] Migrated direction signs to reversed defaults.")
-            if config_version < 4:
-                linear_speed = float(settings.get("console_linear_speed", 0.05))
-                angular_speed = float(settings.get("console_angular_speed", 0.20))
-                settings.update(
-                    {
-                        "config_version": 4,
-                        "console_x_speed": linear_speed,
-                        "console_y_speed": linear_speed,
-                        "console_z_speed": linear_speed,
-                        "console_rx_speed": angular_speed,
-                        "console_ry_speed": angular_speed,
-                        "console_rz_speed": angular_speed,
-                    }
-                )
-                print("[Console Control] Migrated shared speeds to per-axis speeds.")
-            self.apply_settings(settings, save_to_file=False)
-            if migrated:
-                self.save_settings_to_file()
-            print(f"Console control settings loaded: {self.settings_path}")
-        except Exception as exc:
-            print(f"Failed to load Console control settings: {exc}")
-
-    def apply_settings(self, settings: dict, save_to_file=False):
-        super().apply_settings(settings, save_to_file=False)
-        int_fields = (
-            "console_device_index",
-            "console_axis_left_x",
-            "console_axis_left_y",
-            "console_axis_right_x",
-            "console_axis_right_y",
-            "console_axis_l2",
-            "console_axis_r2",
-            "console_button_l1",
-            "console_button_r1",
-        )
-        for field in int_fields:
-            setattr(self, field, int(getattr(self, field)))
-        if save_to_file:
-            self.save_settings_to_file()
-
-    def __init__(self, ros_splitter_instance, my_sensor_instance):
-        super().__init__(ros_splitter_instance, my_sensor_instance)
-        self.current_motion_mode = "console_control_idle"
-        self.console_input_source = "ps5"
-        self._console_fd = None
-        self._console_device_path = None
-        self._console_axes = {}
-        self._console_buttons = {}
-        self._console_last_logged_direction = None
-        self._console_last_log_time = 0.0
-        self._console_last_missing_log_time = 0.0
-        self._console_sensor_left_stick_anchor = None
-        self._console_sensor_right_stick_anchor = None
-
-    def toggle_console_control(self):
-        self._toggle_console_control_mode("ps5")
-
-    def toggle_console_control_sensor(self):
-        self._toggle_console_control_mode("sensor")
-
-    def _toggle_console_control_mode(self, source):
-        source = str(source).strip().lower()
-        if source not in {"ps5", "sensor"}:
-            source = "ps5"
-
-        if self.is_running and self.console_input_source == source:
-            self._stop_console_control()
-            return
-
-        if self.is_running and self.console_input_source != source:
-            self.console_input_source = source
-            self._close_console_device()
-            self._reset_state()
-            self._append_console_log(
-                f"[Console Control] switched input source -> {self.console_input_source.upper()} | frame={self._get_requested_frame()}"
-            )
-            return
-
-        self.console_input_source = source
-        self.is_running = True
-        self._reset_state()
-        self.control_timer.start(int(self.frame_interval_ms))
-        if self.console_input_source == "ps5":
-            self._append_console_log(
-                f"[Console Control] STARTED (PS5) | frame={self._get_requested_frame()} | device=/dev/input/js{int(self.console_device_index)}"
-            )
-        else:
-            self._append_console_log(
-                f"[Console Control] STARTED (SENSOR) | frame={self._get_requested_frame()}"
-            )
-
-    def _stop_console_control(self):
-        self.control_timer.stop()
-        self._stop_robot_motion(stop_mode=True)
-        self._close_console_device()
-        self.is_running = False
-        self._reset_state()
-        self._append_console_log("[Console Control] STOPPED")
-
-    def _reset_state(self):
-        super()._reset_state()
-        self.current_motion_mode = "console_control_idle"
-        self._console_axes = {}
-        self._console_buttons = {}
-        self._console_last_logged_direction = None
-        self._console_last_log_time = 0.0
-        self._console_sensor_left_stick_anchor = None
-        self._console_sensor_right_stick_anchor = None
-
-    def _append_console_log(self, message):
-        log_display = getattr(self.ros_splitter, "log_display", None)
-        if log_display is not None:
-            try:
-                log_display.append(message)
-                return
-            except Exception:
-                pass
-        print(message)
-
-    def _find_console_device_path(self):
-        device_index = int(getattr(self, "console_device_index", 0))
-        preferred = f"/dev/input/js{device_index}"
-        if os.path.exists(preferred):
-            return preferred
-
-        input_dir = "/dev/input"
-        try:
-            candidates = sorted(
-                name for name in os.listdir(input_dir)
-                if re.fullmatch(r"js\d+", name)
-            )
-        except Exception:
-            candidates = []
-
-        if candidates:
-            return os.path.join(input_dir, candidates[0])
-        return None
-
-    def _close_console_device(self):
-        if self._console_fd is not None:
-            try:
-                os.close(self._console_fd)
-            except Exception:
-                pass
-        self._console_fd = None
-        self._console_device_path = None
-
-    def _ensure_console_device(self):
-        if self._console_fd is not None:
-            return True
-
-        device_path = self._find_console_device_path()
-        if device_path is None:
-            now = time.perf_counter()
-            if (now - self._console_last_missing_log_time) >= 2.0:
-                self._append_console_log("[Console Control] No joystick found. Connect PS5 controller as /dev/input/js0.")
-                self._console_last_missing_log_time = now
-            return False
-
-        try:
-            self._console_fd = os.open(device_path, os.O_RDONLY | os.O_NONBLOCK)
-            self._console_device_path = device_path
-            self._append_console_log(f"[Console Control] Connected joystick: {device_path}")
-            return True
-        except Exception as exc:
-            now = time.perf_counter()
-            if (now - self._console_last_missing_log_time) >= 2.0:
-                self._append_console_log(f"[Console Control] Failed to open {device_path}: {exc}")
-                self._console_last_missing_log_time = now
-            self._close_console_device()
-            return False
-
-    def _read_console_events(self):
-        if not self._ensure_console_device():
-            return False
-
-        try:
-            while True:
-                event = os.read(self._console_fd, 8)
-                if len(event) < 8:
-                    break
-                _, value, event_type, number = struct.unpack("IhBB", event)
-                event_type = event_type & ~0x80
-                if event_type == 0x02:
-                    self._console_axes[int(number)] = float(value) / 32767.0
-                elif event_type == 0x01:
-                    self._console_buttons[int(number)] = 1.0 if int(value) else 0.0
-        except BlockingIOError:
-            pass
-        except OSError as exc:
-            self._append_console_log(f"[Console Control] Joystick disconnected/read error: {exc}")
-            self._close_console_device()
-            return False
-        return True
-
-    def _axis_value(self, axis_index):
-        value = float(self._console_axes.get(int(axis_index), 0.0))
-        deadband = float(self.console_deadband)
-        if abs(value) < deadband:
-            return 0.0
-        scaled = (abs(value) - deadband) / max(1e-6, 1.0 - deadband)
-        return scaled if value > 0.0 else -scaled
-
-    def _trigger_value(self, axis_index):
-        raw = float(self._console_axes.get(int(axis_index), -1.0))
-        value = (raw + 1.0) * 0.5
-        return 0.0 if value < float(self.console_deadband) else min(1.0, value)
-
-    def _button_value(self, button_index):
-        return float(self._console_buttons.get(int(button_index), 0.0))
-
-    def _apply_console_deadband(self, value):
-        value = float(value)
-        deadband = float(self.console_deadband)
-        if abs(value) < deadband:
-            return 0.0
-        scaled = (abs(value) - deadband) / max(1e-6, 1.0 - deadband)
-        scaled = min(1.0, max(0.0, scaled))
-        return scaled if value > 0.0 else -scaled
-
-    def _sensor_weighted_centroid(self, values, cols, rows, region_mask):
-        if not np.any(region_mask):
-            return None
-        region_values = values[region_mask]
-        region_cols = cols[region_mask].astype(float)
-        region_rows = rows[region_mask].astype(float)
-        weights = np.maximum(float(self.motion_threshold) - region_values, 0.001)
-        center_col = float(np.average(region_cols, weights=weights))
-        center_row = float(np.average(region_rows, weights=weights))
-        return center_col, center_row
-
-    def _sensor_anchored_stick_axes(self, side, values, cols, rows, stick_mask, col_min, col_max, n_row):
-        """First press in region sets neutral; output is delta from anchor (LHS/RHS separate)."""
-        anchor_attr = (
-            "_console_sensor_left_stick_anchor" if side == "left" else "_console_sensor_right_stick_anchor"
-        )
-        if not np.any(stick_mask):
-            setattr(self, anchor_attr, None)
-            return 0.0, 0.0
-
-        centroid = self._sensor_weighted_centroid(values, cols, rows, stick_mask)
-        if centroid is None:
-            setattr(self, anchor_attr, None)
-            return 0.0, 0.0
-
-        anchor = getattr(self, anchor_attr)
-        if anchor is None:
-            setattr(self, anchor_attr, centroid)
-            return 0.0, 0.0
-
-        dc = centroid[0] - anchor[0]
-        dr = centroid[1] - anchor[1]
-        x_half = max(1.0, 0.5 * (float(col_max) - float(col_min)))
-        y_half = max(1.0, 0.5 * max(1.0, float(n_row - 1)))
-        axis_x = float(np.clip(dc / x_half, -1.0, 1.0))
-        axis_y = float(np.clip(dr / y_half, -1.0, 1.0))
-        return self._apply_console_deadband(axis_x), self._apply_console_deadband(axis_y)
-
-    def _read_console_sensor_inputs(self):
-        values = flatten_column_major_view(self.my_sensor._data.diffPerDataAve)
-        indices = np.arange(values.size, dtype=int)
-        cols, rows = column_major_coords(self.my_sensor.n_row, indices)
-        cols = np.asarray(cols)
-        rows = np.asarray(rows)
-
-        n_col = max(2, int(self.my_sensor.n_col))
-        n_row = max(2, int(self.my_sensor.n_row))
-        left_min = 0
-        left_max = max(left_min, n_col // 2 - 1)
-        right_min = min(n_col - 1, left_max + 1)
-        right_max = n_col - 1
-        # Top two sensor rows (0,1): only L1 / R1; virtual sticks never read those rows
-        # so L1/R1 presses cannot be mistaken for stick center.
-        top_button_row_max = 1
-        stick_row_min = min(2, n_row)
-
-        threshold = float(self.motion_threshold)
-        touched = values < threshold
-        top_two = rows <= top_button_row_max
-        l1_mask = top_two & (cols >= left_min) & (cols <= left_max) & touched
-        r1_mask = top_two & (cols >= right_min) & (cols <= right_max) & touched
-        l1 = 1.0 if np.any(l1_mask) else 0.0
-        r1 = 1.0 if np.any(r1_mask) else 0.0
-
-        left_stick_mask = (cols >= left_min) & (cols <= left_max) & (rows >= stick_row_min) & touched
-        right_stick_mask = (cols >= right_min) & (cols <= right_max) & (rows >= stick_row_min) & touched
-
-        lx, ly = self._sensor_anchored_stick_axes(
-            "left", values, cols, rows, left_stick_mask, left_min, left_max, n_row
-        )
-        rx, ry = self._sensor_anchored_stick_axes(
-            "right", values, cols, rows, right_stick_mask, right_min, right_max, n_row
-        )
-        l2 = 0.0
-        r2 = 0.0
-        return lx, ly, rx, ry, l1, r1, l2, r2
-
-    def get_console_sensor_preview_inputs(self):
-        """Public preview API for UI test dialog."""
-        return self._read_console_sensor_inputs()
-
-    def get_console_sensor_stick_center_state(self, lx, ly, rx, ry):
-        """After preview read: each virtual stick is at anchored neutral (press-to-center active)."""
-        eps = 1e-5
-        left_anchor = self._console_sensor_left_stick_anchor is not None
-        right_anchor = self._console_sensor_right_stick_anchor is not None
-        left_center = left_anchor and abs(float(lx)) < eps and abs(float(ly)) < eps
-        right_center = right_anchor and abs(float(rx)) < eps and abs(float(ry)) < eps
-        return {
-            "left_center": left_center,
-            "right_center": right_center,
-            "left_anchor": left_anchor,
-            "right_anchor": right_anchor,
-        }
-
-    def _console_velocity_direction_label(self, velocity):
-        labels = []
-        for axis_name, value in zip(("x", "y", "z", "rx", "ry", "rz"), velocity):
-            value = float(value)
-            if abs(value) < 1e-6:
-                continue
-            labels.append(f"{'+' if value > 0.0 else '-'}{axis_name}")
-        return " ".join(labels) if labels else "stop"
-
-    def _append_console_motion_log(self, velocity):
-        direction = self._console_velocity_direction_label(velocity)
-        now = time.perf_counter()
-        should_log = (
-            direction != self._console_last_logged_direction
-            or (direction != "stop" and (now - self._console_last_log_time) >= 0.5)
-        )
-        if not should_log:
-            return
-
-        self._console_last_logged_direction = direction
-        self._console_last_log_time = now
-        self._append_console_log(
-            f"[Console Control] moving: {direction} | frame={self._get_requested_frame()}"
-        )
-
-    def run_step(self):
-        if not self.is_running:
-            return
-        self._record_loop_tick()
-        if self.console_input_source == "sensor":
-            lx, ly, rx, ry, l1, r1, l2, r2 = self._read_console_sensor_inputs()
-            if (l1 > 0.5) or (r1 > 0.5):
-                # L1/R1 in sensor mode are reserved for pure Z motion.
-                lx, ly, rx, ry = 0.0, 0.0, 0.0, 0.0
-        else:
-            if not self._read_console_events():
-                self._apply_stop_output()
-                return
-            lx = self._axis_value(self.console_axis_left_x)
-            ly = self._axis_value(self.console_axis_left_y)
-            rx = self._axis_value(self.console_axis_right_x)
-            ry = self._axis_value(self.console_axis_right_y)
-            l1 = self._button_value(self.console_button_l1)
-            r1 = self._button_value(self.console_button_r1)
-            l2 = self._trigger_value(self.console_axis_l2)
-            r2 = self._trigger_value(self.console_axis_r2)
-
-        velocity = [
-            float(self.console_x_sign) * float(self.console_x_speed) * lx,
-            float(self.console_y_sign) * float(self.console_y_speed) * ly,
-            float(self.console_z_sign) * float(self.console_z_speed) * (r1 - l1),
-            float(self.console_rx_sign) * float(self.console_rx_speed) * ry,
-            float(self.console_ry_sign) * float(self.console_ry_speed) * rx,
-            float(self.console_rz_sign) * float(self.console_rz_speed) * (r2 - l2),
-        ]
-
-        if any(abs(v) > 1e-6 for v in velocity):
-            self._apply_motion_output("console_control", velocity)
-        else:
-            self._apply_stop_output()
-        self._append_console_motion_log(velocity)
-
-
 class AI_DirectFingerMotion(DirectFingerMotion):
     def __init__(self, ros_splitter_instance, my_sensor_instance):
         super().__init__(ros_splitter_instance, my_sensor_instance)
@@ -1758,7 +1645,8 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
 
     def __init__(self, ros_splitter_instance, my_sensor_instance):
         super().__init__(ros_splitter_instance, my_sensor_instance)
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._torch = None
+        self.device = None
         self.model = None
         self.model_loaded = False
         self.model_checkpoint_path = self.DEFAULT_MODEL_CHECKPOINT
@@ -1794,6 +1682,17 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.zero_keepalive_sec = 0.5
         self.idle_reenable_sec = 1.0
         self._reset_execution_runtime_state()
+
+    def _load_torch_runtime(self):
+        if self._torch is None:
+            import torch
+
+            self._torch = torch
+        if self.device is None:
+            self.device = self._torch.device(
+                "cuda" if self._torch.cuda.is_available() else "cpu"
+            )
+        return self._torch
 
     def _reset_execution_buffers(self):
         self.frame_buffer = []
@@ -1834,6 +1733,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
     def load_model(self, checkpoint_path=None):
         checkpoint_path = checkpoint_path or self.model_checkpoint_path
         try:
+            torch = self._load_torch_runtime()
+            from phd.dependence.transformer import _AI_DFM_CNNTactileTransformerAux
+
             checkpoint = torch.load(checkpoint_path, map_location=self.device)
             config = checkpoint.get("config", {})
             self.seq_len = int(config.get("seq_len", 20))
@@ -1954,6 +1856,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
     def _predict_from_buffer(self):
         if self.model is None or not self.frame_buffer:
             return None
+        torch = self._torch
+        if torch is None:
+            return None
 
         window = np.stack(self.frame_buffer, axis=0)
         aux_window = np.stack(self.aux_buffer, axis=0)
@@ -2033,13 +1938,22 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             if self.last_robot_velocity_cmd == velocity6_sent and (now - self._last_velocity_send_time) < 0.05:
                 return
 
-        self._ensure_robot_velocity_mode()
+        if not self._ensure_robot_velocity_mode():
+            return
         frame = self._get_requested_frame()
-        try:
-            cmd = robot_api.set_end_effector_velocity_in_frame(velocity6_sent[:3], velocity6_sent[3:], frame=frame)
-        except Exception:
-            cmd = robot_api.set_end_effector_velocity(velocity6_sent)
-        robot_api.send_request(cmd)
+        if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
+            robot_api.send_end_effector_velocity_in_frame(
+                velocity6_sent[:3],
+                velocity6_sent[3:],
+                frame=frame,
+                ensure_mode=False,
+            )
+        else:
+            try:
+                cmd = robot_api.set_end_effector_velocity_in_frame(velocity6_sent[:3], velocity6_sent[3:], frame=frame)
+            except Exception:
+                cmd = robot_api.set_end_effector_velocity(velocity6_sent)
+            robot_api.send_request(cmd)
         self.last_robot_velocity_cmd = velocity6_sent
         self._last_velocity_send_time = now
         if not is_zero_cmd:
@@ -2051,14 +1965,20 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self._send_robot_velocity_execution(zero_velocity)
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if stop_mode and robot_api is not None:
-            try:
-                robot_api.send_request(robot_api.suspend_end_effector_velocity_mode())
-            except Exception:
-                pass
-            try:
-                robot_api.send_request(robot_api.stop_end_effector_velocity_mode())
-            except Exception:
-                pass
+            if hasattr(robot_api, "exit_end_effector_velocity_mode"):
+                try:
+                    robot_api.exit_end_effector_velocity_mode(send_zero=False)
+                except Exception:
+                    pass
+            else:
+                try:
+                    robot_api.send_request(robot_api.suspend_end_effector_velocity_mode())
+                except Exception:
+                    pass
+                try:
+                    robot_api.send_request(robot_api.stop_end_effector_velocity_mode())
+                except Exception:
+                    pass
         if stop_mode:
             self._velocity_mode_enabled = False
             self.last_robot_velocity_cmd = None

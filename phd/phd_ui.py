@@ -1,6 +1,14 @@
+import os
 import sys
-from PyQt5 import QtWidgets, QtGui
-from phd.ui.ui_initial import MyMainWindow
+import tempfile
+
+
+_DEFAULT_MPLCONFIGDIR = os.path.join(tempfile.gettempdir(), "pinglab-matplotlib")
+os.makedirs(_DEFAULT_MPLCONFIGDIR, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", _DEFAULT_MPLCONFIGDIR)
+
+from PyQt5 import QtWidgets, QtGui  # noqa: E402
+from phd.ui.ui_initial import MyMainWindow  # noqa: E402
 
 
 def main() -> int:
@@ -12,10 +20,9 @@ def main() -> int:
         app.setFont(QtGui.QFont("Calibri", 12))
 
     window = MyMainWindow()
-    window.show()
+    window.showMaximized()
     return app.exec_()
 
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -27,6 +27,7 @@ class AiControlsMixin:
         self._direct_finger_v2_active = False
         self._console_control_active = False
         self._console_control_sensor_active = False
+        self._console_control_sensor_v2_active = False
         self._ai_direct_finger_active = False
         self._ai_direct_finger_execution_active = False
         self._hier_mode_is_continues = True
@@ -37,6 +38,8 @@ class AiControlsMixin:
         self._set_button_active(self.console_control_button, False)
         if hasattr(self, "console_control_sensor_button"):
             self._set_button_active(self.console_control_sensor_button, False)
+        if hasattr(self, "console_control_sensor_v2_button"):
+            self._set_button_active(self.console_control_sensor_v2_button, False)
         self._set_button_active(self.ai_direct_finger_motion_button, False)
         self._set_button_active(self.ai_direct_finger_motion_execution_button, False)
 

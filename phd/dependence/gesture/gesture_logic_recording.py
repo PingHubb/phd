@@ -4,13 +4,14 @@ import re
 
 import numpy as np
 from PyQt5.QtCore import QTimer
+from phd.dependence.paths import ai_resource_path, resource_path
 
 from phd.dependence.sensor_layout import flatten_column_major_view
 
 
 class RecordGesture:
-    RESOURCE_ROOT = "/home/ping2/ros2_ws/src/phd/phd/resource"
-    OFFSET_DATA_DIR = os.path.join(RESOURCE_ROOT, "ai", "data", "offset")
+    RESOURCE_ROOT = resource_path()
+    OFFSET_DATA_DIR = ai_resource_path("data", "offset")
     TRIGGER_MODES = ("trigger", "no_trigger", "no_trigger_auto", "no_trigger_no_updatecal_auto")
     AUTO_TRIGGER_MODES = ("no_trigger_auto", "no_trigger_no_updatecal_auto")
 

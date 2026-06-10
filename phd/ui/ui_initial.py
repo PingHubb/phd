@@ -1,17 +1,22 @@
 import os
-import time
-from PyQt5.QtCore import Qt, QTimer, QSize
+from typing import Optional
+
+from PyQt5.QtCore import Qt, QTimer, QSize, QEvent
 from PyQt5.QtWidgets import (
     QWidget, QAction, QSplitter, QVBoxLayout, QHBoxLayout, QLabel,
-    QPushButton, QTreeWidget, QTreeWidgetItem, QToolBar, QStatusBar, QComboBox,
+    QPushButton, QToolBar, QStatusBar, QComboBox,
     QFrame, QMessageBox, QStyle, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
-    QGridLayout
+    QGridLayout, QToolButton, QSizePolicy, QMenu, QDoubleSpinBox, QFormLayout, QSpinBox,
+    QCheckBox, QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
 )
-from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath
+from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath, QPixmap, QFont
 import numpy as np
 from pyvistaqt import QtInteractor, MainWindow
+from phd.dependence.paths import icon_path, stylesheet_path
 from phd.ui.ui_ping import UI
+from phd.ui import experiment_tasks
 from phd.dependence.sensor_signal_window import SensorSignalWindow
+from phd.ui.sensor_zero_mask_window import SensorZeroMaskDialog
 
 
 class Resources:
@@ -20,15 +25,14 @@ class Resources:
     This centralizes the hardcoded paths for icons and stylesheets,
     making it easy to update them in one place if they ever change.
     """
-    ICON_DIR = '/home/ping2/ros2_ws/src/phd/phd/resource/icon/'
-    STYLE_FILE = '/home/ping2/ros2_ws/src/phd/phd/resource/stylesheets/ui_style.qss'
+    STYLE_FILE = stylesheet_path("ui_style.qss")
 
     def get_icon(self, name: str) -> QIcon:
         """Loads a QIcon from the predefined icon directory."""
-        icon_path = self.ICON_DIR + name
-        if not os.path.exists(icon_path):
+        path = icon_path(name)
+        if not os.path.exists(path):
             return QIcon()
-        return QIcon(icon_path)
+        return QIcon(path)
 
     def get_stylesheet(self) -> str:
         """Loads the content of the QSS stylesheet."""
@@ -405,10 +409,8 @@ class MyMainWindow(MainWindow):
         self._sidebar_control_timer = None
         self._startup_requested = False
         self._sidebar_active_control_id = None
-        self._sensor_capture_started_at = None
-        self._sensor_capture_series = []
-        self._sensor_capture_duration_sec = 10.0
         self._sensor_capture_result_dialog = None
+        self._sidebar_active_task = None  # experiment_tasks.ExperimentTask, set while running
 
         # --- Initialize Window Properties ---
         self.setWindowTitle("PingLab")
@@ -420,6 +422,15 @@ class MyMainWindow(MainWindow):
         self.ping_mode_entered = False
         self.sensor_window = None
         self.ui_ros = None  # This will hold the main UI widget from ui_ping.py
+
+        # --- Keyboard tool-frame velocity (toolbar toggle) ---
+        # Multiple keys can be active at once (e.g. W+D = +Y and +X combined).
+        # Press adds a direction; release removes it; Space clears all.
+        self._keyboard_tool_velocity_enabled = False
+        self._keyboard_vel_active_tokens: set[str] = set()
+        self._keyboard_vel_timer = QTimer(self)
+        self._keyboard_vel_timer.setInterval(50)
+        self._keyboard_vel_timer.timeout.connect(self._keyboard_vel_timer_tick)
 
         # --- Build the User Interface ---
         self._setup_actions()
@@ -441,17 +452,30 @@ class MyMainWindow(MainWindow):
 
         self.action_sensor_signal = QAction(self.resources.get_icon('logo3.png'), "Sensor Signal", self)
         self.action_ps5_controller_test = QAction(
-            self.style().standardIcon(QStyle.SP_DriveNetIcon),
+            self._emoji_toolbar_icon("🎮"),
             'PS5 Controller Test',
             self,
         )
         self.action_ps5_controller_test.setToolTip('Open the PS5 controller input test window')
         self.action_sensor_controller_test = QAction(
-            self.style().standardIcon(QStyle.SP_DesktopIcon),
+            self._emoji_toolbar_icon("👆"),
             'Sensor Controller Test',
             self,
         )
         self.action_sensor_controller_test.setToolTip('Open the sensor-to-controller mapping test window')
+
+        self.action_keyboard_tool_velocity = QAction(
+            self._emoji_toolbar_icon("⌨"),
+            'Keyboard Tool Velocity',
+            self,
+        )
+        self.action_keyboard_tool_velocity.setCheckable(True)
+        self.action_keyboard_tool_velocity.setToolTip(
+            "Keyboard tool-frame velocity (same panel as Robots → Send Tool Velocity).\n"
+            "W/S = ±Y, A/D = ±X, O/P = ±Z, Q/E = ±Rz, T/Y = ±Rx, G/H = ±Ry.\n"
+            "Hold or press multiple keys to combine (e.g. W+D = +Y and +X). "
+            "Release a key to remove that component. Space stops all."
+        )
 
         self.action_direct_finger_motion_params = QAction(self.style().standardIcon(QStyle.SP_CommandLink), '🖐 DFM Parameters', self)
         self.action_direct_finger_motion_params.setToolTip('Open the Direct Finger Motion parameter editor')
@@ -473,12 +497,41 @@ class MyMainWindow(MainWindow):
             self,
         )
         self.action_console_control_params.setToolTip('Open the Console Control parameter editor')
+        self.action_parameter_settings = QAction(
+            self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
+            'Parameter Settings',
+            self,
+        )
+        self.action_parameter_settings.setToolTip('Open parameter settings menu')
+        self.action_update_sensor = QAction('Update Sensor', self)
+        self.action_update_sensor.setToolTip('Update sensor values (same action used by AI/Sensor tabs before)')
 
-        self.action_toggle_controls = QAction(self.resources.get_icon('logo5.png'), 'Show Controls', self)
-        self.action_toggle_controls.setToolTip('Show the control sidebar')
+        self.action_sensor_zero_mask = QAction(
+            self.style().standardIcon(QStyle.SP_DialogResetButton),
+            'Sensor Zero Mask',
+            self,
+        )
+        self.action_sensor_zero_mask.setToolTip(
+            'Pick sensor cells that should always read 0 (after Build Scene + Update Sensor)'
+        )
+
+        self.action_toggle_controls = QAction(self.resources.get_icon('logo5.png'), 'Show Experiments', self)
+        self.action_toggle_controls.setToolTip('Show the experiments sidebar')
 
         self.action_exit = QAction(self.resources.get_icon('logo4.png'), 'Exit', self)
         self.action_exit.setShortcut('Ctrl+Q')
+
+    def _emoji_toolbar_icon(self, emoji: str, size: int = 28) -> QIcon:
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        try:
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.setFont(QFont("Noto Color Emoji", max(12, int(size * 0.7))))
+            painter.drawText(pixmap.rect(), Qt.AlignCenter, str(emoji))
+        finally:
+            painter.end()
+        return QIcon(pixmap)
 
     def _setup_menu_and_toolbar(self):
         """Initializes the menu bar and the main toolbar using the predefined actions."""
@@ -490,8 +543,10 @@ class MyMainWindow(MainWindow):
         function_menu = menu.addMenu('Menu')
         function_menu.addAction(self.action_log)
         function_menu.addAction(self.action_sensor_signal)
+        function_menu.addAction(self.action_sensor_zero_mask)
         function_menu.addAction(self.action_ps5_controller_test)
         function_menu.addAction(self.action_sensor_controller_test)
+        function_menu.addAction(self.action_keyboard_tool_velocity)
         parameter_menu = function_menu.addMenu('Parameter Settings')
         parameter_menu.addAction(self.action_direct_finger_motion_params)
         parameter_menu.addAction(self.action_direct_finger_motion_v2_params)
@@ -509,15 +564,48 @@ class MyMainWindow(MainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.action_log)
         toolbar.addAction(self.action_sensor_signal)
+        toolbar.addAction(self.action_sensor_zero_mask)
         toolbar.addAction(self.action_ps5_controller_test)
         toolbar.addAction(self.action_sensor_controller_test)
-        toolbar.addAction(self.action_direct_finger_motion_params)
-        toolbar.addAction(self.action_direct_finger_motion_v2_params)
-        toolbar.addAction(self.action_proximity_control_params)
-        toolbar.addAction(self.action_console_control_params)
+        toolbar.addAction(self.action_keyboard_tool_velocity)
+        self.toolbar_parameter_button = QToolButton()
+        self.toolbar_parameter_button.setDefaultAction(self.action_parameter_settings)
+        self.toolbar_parameter_button.setPopupMode(QToolButton.InstantPopup)
+        parameter_popup_menu = QMenu(toolbar)
+        parameter_popup_menu.addAction(self.action_direct_finger_motion_params)
+        parameter_popup_menu.addAction(self.action_direct_finger_motion_v2_params)
+        parameter_popup_menu.addAction(self.action_proximity_control_params)
+        parameter_popup_menu.addAction(self.action_console_control_params)
+        self.toolbar_parameter_button.setMenu(parameter_popup_menu)
+        toolbar.addWidget(self.toolbar_parameter_button)
         toolbar.addAction(self.action_toggle_controls)
         toolbar.addSeparator()
         toolbar.addAction(self.action_exit)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        toolbar.addWidget(spacer)
+        self.toolbar_update_sensor_button = QToolButton()
+        self.toolbar_update_sensor_button.setText("Update Sensor")
+        self.toolbar_update_sensor_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.toolbar_update_sensor_button.setAutoRaise(True)
+        self.toolbar_update_sensor_button.setStyleSheet(
+            "QToolButton {"
+            " border: 1px solid #4fc3f7;"
+            " border-radius: 6px;"
+            " padding: 4px 10px;"
+            " font-weight: 600;"
+            " color: #e8f6ff;"
+            " background-color: rgba(79, 195, 247, 0.14);"
+            "}"
+            "QToolButton:hover {"
+            " background-color: rgba(79, 195, 247, 0.26);"
+            "}"
+            "QToolButton:pressed {"
+            " background-color: rgba(79, 195, 247, 0.38);"
+            "}"
+        )
+        self.toolbar_update_sensor_button.clicked.connect(self.action_update_sensor.trigger)
+        toolbar.addWidget(self.toolbar_update_sensor_button)
         self.addToolBar(toolbar)
 
     def _setup_main_layout(self):
@@ -559,42 +647,26 @@ class MyMainWindow(MainWindow):
         sidebar = QFrame()
         sidebar.setObjectName("sidebar")
         sidebar.setFrameShape(QFrame.StyledPanel)
-        sidebar.setMinimumWidth(250)
+        # Wider than the legacy 250 px so longer task descriptions / labels
+        # (e.g. "Save per-point sensor CSV", "Per-point dwell:", J=[...]° log lines)
+        # are not clipped by the splitter handle.
+        sidebar.setMinimumWidth(330)
 
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(12)
 
-        tree = QTreeWidget()
-        tree.setHeaderHidden(True)
-        root = QTreeWidgetItem(tree, ['Controls'])
-        font = root.font(0)
+        # Available tasks first — this is what the user picks on every run, so keep
+        # it pinned to the top of the sidebar.
+        tasks_header = QLabel("Available Tasks")
+        font = tasks_header.font()
         font.setBold(True)
-        root.setFont(0, font)
-        layout.addWidget(tree)
-
-        layout.addWidget(QLabel("Available Tasks"))
+        tasks_header.setFont(font)
+        layout.addWidget(tasks_header)
 
         self.sidebar_task_list = QListWidget()
         self.sidebar_task_list.setSelectionMode(QListWidget.SingleSelection)
-        task_definitions = [
-            (
-                "Hello World",
-                "hello_world",
-                "Every second, print 'hello world' to the log until you stop it.",
-            ),
-            (
-                "Sensor Peak Change (10s)",
-                "sensor_peak_change",
-                "Capture 10 seconds of sensor data and visualize the strongest diffDataAve change over time.",
-            ),
-            (
-                "Move Robot To Preset Joint",
-                "robot_preset_joint",
-                "Send the robot once to the preset joint-angle target used for quick positioning.",
-            ),
-        ]
-        for label_text, task_id, description in task_definitions:
+        for label_text, task_id, description in experiment_tasks.task_definitions():
             item = QListWidgetItem(label_text)
             item.setData(Qt.UserRole, task_id)
             item.setData(Qt.UserRole + 1, description)
@@ -610,6 +682,13 @@ class MyMainWindow(MainWindow):
         )
         layout.addWidget(self.sidebar_task_info)
         self._update_sidebar_task_info()
+
+        # ─── Task-specific parameter controls ────────────────────────────────
+        # Each task may expose a custom widget under this container; only the
+        # widget that matches the currently-selected task is shown. New tasks
+        # can register their own group by extending ``_task_param_widgets``.
+        self._build_sidebar_task_param_widgets(layout)
+        self._update_sidebar_task_param_visibility()
 
         # Container for Start/Stop buttons
         btn_container = QWidget()
@@ -644,26 +723,100 @@ class MyMainWindow(MainWindow):
         self.action_sensor_signal.triggered.connect(self.open_sensor_signal_window)
         self.action_ps5_controller_test.triggered.connect(self.open_ps5_controller_test_window)
         self.action_sensor_controller_test.triggered.connect(self.open_sensor_controller_test_window)
+        self.action_keyboard_tool_velocity.toggled.connect(self._on_keyboard_tool_velocity_toggled)
         self.action_direct_finger_motion_params.triggered.connect(self.open_direct_finger_motion_params_window)
         self.action_direct_finger_motion_v2_params.triggered.connect(self.open_direct_finger_motion_v2_params_window)
         self.action_proximity_control_params.triggered.connect(self.open_proximity_control_params_window)
         self.action_console_control_params.triggered.connect(self.open_console_control_params_window)
+        self.action_update_sensor.triggered.connect(self._trigger_global_sensor_update)
+        self.action_sensor_zero_mask.triggered.connect(self._open_sensor_zero_mask_window)
         self.sidebar_btn_start.clicked.connect(self._start_sidebar_control)
         self.sidebar_btn_stop.clicked.connect(self._stop_sidebar_control)
         self.sidebar_task_list.currentItemChanged.connect(self._on_sidebar_task_changed)
 
+    def _trigger_global_sensor_update(self):
+        if not self._require_ui_ros(
+            "Please wait for Ping Mode to load before updating the sensor."
+        ):
+            return
+        try:
+            if hasattr(self.ui_ros, "_on_sensor_update"):
+                self.ui_ros._on_sensor_update()
+            elif hasattr(self.ui_ros, "sensor_functions") and hasattr(self.ui_ros.sensor_functions, "updateCal"):
+                self.ui_ros.sensor_functions.updateCal()
+            self.info_process.setText("Sensor updated")
+        except Exception as exc:
+            self.info_process.setText("Sensor update failed")
+            if self.ui_ros is not None and hasattr(self.ui_ros, "log_display"):
+                self.ui_ros.log_display.append(f"Sensor update failed: {exc}")
+
+    def _open_sensor_zero_mask_window(self):
+        """Open the dialog that lets the user zero-out specific sensor cells."""
+        if not self._require_ui_ros(
+            "Please wait for Ping Mode to load before configuring the zero mask."
+        ):
+            return
+
+        sensor_functions = getattr(self.ui_ros, "sensor_functions", None)
+        if sensor_functions is None:
+            QMessageBox.warning(
+                self,
+                "Sensor Zero Mask",
+                "Sensor functions are not available.",
+            )
+            return
+
+        n_row = int(getattr(sensor_functions, "n_row", 0) or 0)
+        n_col = int(getattr(sensor_functions, "n_col", 0) or 0)
+        if n_row <= 0 or n_col <= 0:
+            QMessageBox.information(
+                self,
+                "Sensor Zero Mask",
+                "Build the sensor scene first.\n\n"
+                "Steps: Sensor tab → 'Build Scene' → 'Update Sensor',\n"
+                "then re-open this window to choose cells to force to 0.",
+            )
+            return
+
+        if not getattr(sensor_functions, "is_connected", False):
+            reply = QMessageBox.question(
+                self,
+                "Sensor Zero Mask",
+                "The sensor has not been calibrated yet (Update Sensor was not run).\n"
+                "You can still edit the mask, but it only takes effect once data starts flowing.\n\n"
+                "Continue anyway?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        try:
+            sensor_key = sensor_functions.get_zero_mask_key()
+        except Exception:
+            sensor_key = "(unknown)"
+
+        dialog = SensorZeroMaskDialog(
+            self, sensor_functions=sensor_functions, sensor_key=sensor_key
+        )
+        dialog.exec_()
+
     def _set_sidebar_visible(self, visible: bool):
         """Updates sidebar visibility and keeps the toggle action text in sync."""
+        # Keep this in sync with ``_create_sidebar()``'s setMinimumWidth so
+        # the splitter never starts narrower than the sidebar can render
+        # without text clipping.
+        sidebar_w = max(330, self.sidebar.minimumWidth())
         if visible:
             self.sidebar.show()
-            self.h_splitter.setSizes([self.width() - 250, 250])
-            self.action_toggle_controls.setText('Hide Controls')
-            self.action_toggle_controls.setToolTip('Hide the control sidebar')
+            self.h_splitter.setSizes([max(self.width() - sidebar_w, 0), sidebar_w])
+            self.action_toggle_controls.setText('Hide Experiments')
+            self.action_toggle_controls.setToolTip('Hide the experiments sidebar')
         else:
             self.sidebar.hide()
             self.h_splitter.setSizes([self.width(), 0])
-            self.action_toggle_controls.setText('Show Controls')
-            self.action_toggle_controls.setToolTip('Show the control sidebar')
+            self.action_toggle_controls.setText('Show Experiments')
+            self.action_toggle_controls.setToolTip('Show the experiments sidebar')
 
     def _require_ui_ros(self, message: str) -> bool:
         """Shows a warning when Ping Mode is not ready yet."""
@@ -799,6 +952,7 @@ class MyMainWindow(MainWindow):
             return
 
         iren.render_signal.connect(self._on_frame_rendered)
+        self._fps_render_interactor = iren
 
         if self._fps_timer is None:
             self._fps_timer = QTimer(self)
@@ -859,9 +1013,29 @@ class MyMainWindow(MainWindow):
 
     def _on_sidebar_task_changed(self, _current=None, _previous=None):
         self._update_sidebar_task_info()
+        self._update_sidebar_task_param_visibility()
 
-    def _show_sensor_capture_result(self):
-        if not self._sensor_capture_series:
+    # --- Per-task parameter widgets in the sidebar ----------------------------
+    def _build_sidebar_task_param_widgets(self, parent_layout):
+        """Build the optional per-task parameter editors shown in the sidebar.
+
+        Each entry maps a ``task_id`` to a small QWidget that mutates the task
+        instance directly when the user adjusts a value. Only the widget for
+        the currently-selected task is visible at a time.
+        """
+        self._task_param_widgets: dict = {}
+
+    def _update_sidebar_task_param_visibility(self):
+        widgets = getattr(self, "_task_param_widgets", None)
+        if not widgets:
+            return
+        current_id = self._current_sidebar_control_id()
+        for task_id, widget in widgets.items():
+            widget.setVisible(task_id == current_id)
+
+    def _show_sensor_capture_result(self, series):
+        """Open the capture-result dialog using a series passed in by a task."""
+        if not series:
             self._append_sidebar_control_message("Sensor capture finished, but no samples were collected.")
             return
 
@@ -869,133 +1043,334 @@ class MyMainWindow(MainWindow):
             self._sensor_capture_result_dialog.close()
 
         self._sensor_capture_result_dialog = SensorCaptureResultDialog(
-            self._sensor_capture_series,
+            list(series),
             parent=self,
         )
         self._sensor_capture_result_dialog.show()
 
-    def _read_sensor_peak_change_value(self):
-        if self.ui_ros is None:
-            return None
-
-        sensor_functions = getattr(self.ui_ros, "sensor_functions", None)
-        data_obj = getattr(sensor_functions, "_data", None) if sensor_functions is not None else None
-        diff_data_ave = getattr(data_obj, "diffDataAve", None) if data_obj is not None else None
-        if diff_data_ave is None:
-            return None
-
-        values = np.asarray(diff_data_ave, dtype=float)
-        if values.size == 0:
-            return None
-        return float(np.max(np.abs(values)))
-
-    def _send_sidebar_preset_joint_target(self):
-        if self.ui_ros is None:
-            self._append_sidebar_control_message("Ping UI is not ready yet.")
-            return False
-
-        robot_api = getattr(self.ui_ros, "robot_api", None)
-        if robot_api is None or not hasattr(robot_api, "send_positions_joint_angle"):
-            self._append_sidebar_control_message("Robot API is unavailable.")
-            return False
-
-        target_positions = [
-            -0.743667827275479,
-            -0.2904200138495811,
-            -1.557570536189345,
-            0.2835772211657043,
-            -1.571901671805334,
-            -0.024454002334083434,
-        ]
-
-        try:
-            success = bool(robot_api.send_positions_joint_angle(target_positions))
-        except Exception as exc:
-            self._append_sidebar_control_message(f"Failed to send preset joint target: {exc}")
-            return False
-
-        if success:
-            self._append_sidebar_control_message(
-                "Preset joint target sent: "
-                "[-0.7437, -0.2904, -1.5576, 0.2836, -1.5719, -0.0245]"
-            )
-            return True
-
-        self._append_sidebar_control_message("Robot command was not accepted.")
-        return False
+    # --- Experiments-sidebar lifecycle dispatchers --------------------------------
+    #
+    # Concrete tasks live in ``phd.ui.experiment_tasks``. The methods below only
+    # route events between the QTimer / sidebar buttons and the active task object.
 
     def _run_sidebar_control_action(self):
-        action_id = self._sidebar_active_control_id or self._current_sidebar_control_id()
-        if action_id == "hello_world":
-            self._append_sidebar_control_message("hello world")
+        task = self._sidebar_active_task
+        if task is None:
             return
-
-        if action_id == "sensor_peak_change":
-            peak_value = self._read_sensor_peak_change_value()
-            if peak_value is None:
-                self._append_sidebar_control_message("Sensor data is not ready for capture.")
-                self._stop_sidebar_control(show_result=False, message="Control stopped")
-                return
-
-            elapsed = 0.0
-            if self._sensor_capture_started_at is not None:
-                elapsed = time.time() - self._sensor_capture_started_at
-            self._sensor_capture_series.append((elapsed, peak_value))
-
-            if elapsed >= self._sensor_capture_duration_sec:
-                self._stop_sidebar_control(
-                    show_result=True,
-                    message=f"Sensor capture finished ({len(self._sensor_capture_series)} samples)",
-                )
-            return
+        try:
+            task.on_tick(self)
+        except Exception as exc:
+            self._append_sidebar_control_message(
+                f"Task '{getattr(task, 'label', task.id)}' tick error: {exc}"
+            )
+            self._stop_sidebar_control(show_result=False, message="Control stopped (tick error)")
 
     def _start_sidebar_control(self):
         if self._sidebar_control_timer is None:
             self._sidebar_control_timer = QTimer(self)
             self._sidebar_control_timer.timeout.connect(self._run_sidebar_control_action)
 
-        if self._sidebar_control_timer.isActive():
+        if self._sidebar_control_timer.isActive() or self._sidebar_active_task is not None:
             self._stop_sidebar_control(show_result=False, message="Control restarted")
 
         action_id = self._current_sidebar_control_id()
-        self._sidebar_active_control_id = action_id
-
-        if action_id == "hello_world":
-            self._run_sidebar_control_action()
-            self._sidebar_control_timer.start(1000)
-            self.info_process.setText(
-                f"Control started: {self._current_sidebar_control_label()}"
+        task = experiment_tasks.get_task(action_id)
+        if task is None:
+            self._append_sidebar_control_message(
+                f"No experiment task is registered for id '{action_id}'."
             )
             return
 
-        if action_id == "sensor_peak_change":
-            peak_value = self._read_sensor_peak_change_value()
-            if peak_value is None:
-                self._append_sidebar_control_message("Sensor data is not ready. Please build/update the sensor first.")
-                self._sidebar_active_control_id = None
-                return
+        self._sidebar_active_task = task
+        self._sidebar_active_control_id = action_id
 
-            self._sensor_capture_started_at = time.time()
-            self._sensor_capture_series = [(0.0, peak_value)]
-            self._sidebar_control_timer.start(50)
-            self.info_process.setText("Control started: Sensor Peak Change (10s)")
-            return
-
-        if action_id == "robot_preset_joint":
-            self._send_sidebar_preset_joint_target()
+        try:
+            started = bool(task.on_start(self))
+        except Exception as exc:
+            self._append_sidebar_control_message(
+                f"Task '{task.label}' failed to start: {exc}"
+            )
+            self._sidebar_active_task = None
             self._sidebar_active_control_id = None
             return
+
+        if not started:
+            # One-shot tasks (or tasks that aborted) never engage the timer.
+            self._sidebar_active_task = None
+            self._sidebar_active_control_id = None
+            return
+
+        interval_ms = task.tick_interval_ms
+        if interval_ms is None:
+            self._sidebar_active_task = None
+            self._sidebar_active_control_id = None
+            return
+
+        self._sidebar_control_timer.start(int(interval_ms))
+        self.info_process.setText(f"Control started: {task.label}")
 
     def _stop_sidebar_control(self, show_result=True, message="Control stopped"):
         if self._sidebar_control_timer is not None:
             self._sidebar_control_timer.stop()
-        was_sensor_capture = self._sidebar_active_control_id == "sensor_peak_change"
+        task = self._sidebar_active_task
+        self._sidebar_active_task = None
         self._sidebar_active_control_id = None
-        self._sensor_capture_started_at = None
         self.info_process.setText(message)
 
-        if was_sensor_capture and show_result:
-            self._show_sensor_capture_result()
+        if task is not None:
+            try:
+                task.on_stop(self, show_result=show_result)
+            except Exception as exc:
+                self._append_sidebar_control_message(
+                    f"Task '{getattr(task, 'label', task.id)}' stop error: {exc}"
+                )
+
+    # --- Keyboard tool-frame velocity (WASD + O/P + Q/E + T/Y + G/H) ------
+
+    def _keyboard_velocity_should_capture(self) -> bool:
+        """Return False when the user is typing in a text / numeric field."""
+        w = QApplication.focusWidget()
+        if w is None:
+            return True
+        if isinstance(w, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox)):
+            return False
+        if isinstance(w, QComboBox) and w.isEditable():
+            return False
+        return True
+
+    def _keyboard_vel_key_token(self, key: int) -> Optional[str]:
+        mapping = {
+            Qt.Key_W: "w",
+            Qt.Key_S: "s",
+            Qt.Key_A: "a",
+            Qt.Key_D: "d",
+            Qt.Key_Q: "q",
+            Qt.Key_E: "e",
+            Qt.Key_O: "o",
+            Qt.Key_P: "p",
+            Qt.Key_T: "t",
+            Qt.Key_Y: "y",
+            Qt.Key_G: "g",
+            Qt.Key_H: "h",
+        }
+        return mapping.get(key)
+
+    def _keyboard_vel_widget(self):
+        if self.ui_ros is None:
+            return None
+        return getattr(self.ui_ros, "position_toolframe_widget", None)
+
+    def _keyboard_vel_speeds(self):
+        """Linear (m/s) and angular (rad/s) from the Robots tool-velocity panel."""
+        w = self._keyboard_vel_widget()
+        if w is not None:
+            try:
+                return float(w.linear_speed), float(w.angular_speed)
+            except Exception:
+                pass
+        return 0.02, 0.0005
+
+    def _keyboard_vel_stop_robot(self):
+        """Send zero velocity (keeps velocity mode armed for the next press)."""
+        w = self._keyboard_vel_widget()
+        if w is None:
+            return
+        try:
+            w.stop_all_velocity()
+        except Exception:
+            pass
+
+    def _keyboard_vel_full_stop(self):
+        """Zero velocity AND tear down velocity mode (Suspend → Stop)."""
+        w = self._keyboard_vel_widget()
+        if w is None:
+            return
+        try:
+            w.stop_all_velocity()
+        except Exception:
+            pass
+        try:
+            w.stop_velocity_mode()
+        except Exception:
+            pass
+
+    def _keyboard_vel_vector_for_token(self, token: str):
+        """Return (v_lin, v_rot) contribution for a single key."""
+        lin_spd, ang_spd = self._keyboard_vel_speeds()
+        vx = vy = vz = rx = ry = rz = 0.0
+        if token == "d":
+            vx = lin_spd
+        elif token == "a":
+            vx = -lin_spd
+        elif token == "w":
+            vy = lin_spd
+        elif token == "s":
+            vy = -lin_spd
+        elif token == "o":
+            vz = lin_spd
+        elif token == "p":
+            vz = -lin_spd
+        elif token == "t":
+            rx = -ang_spd
+        elif token == "y":
+            rx = ang_spd
+        elif token == "g":
+            ry = -ang_spd
+        elif token == "h":
+            ry = ang_spd
+        elif token == "q":
+            rz = -ang_spd
+        elif token == "e":
+            rz = ang_spd
+        return [vx, vy, vz], [rx, ry, rz]
+
+    def _keyboard_vel_vector_for_tokens(self, tokens):
+        """Sum velocity contributions from all active keys."""
+        vx = vy = vz = rx = ry = rz = 0.0
+        for token in tokens:
+            v_lin, v_rot = self._keyboard_vel_vector_for_token(token)
+            vx += v_lin[0]
+            vy += v_lin[1]
+            vz += v_lin[2]
+            rx += v_rot[0]
+            ry += v_rot[1]
+            rz += v_rot[2]
+        return [vx, vy, vz], [rx, ry, rz]
+
+    def _keyboard_vel_token_label(self, token: str) -> str:
+        labels = {
+            "w": "+Y", "s": "−Y",
+            "a": "−X", "d": "+X",
+            "o": "+Z", "p": "−Z",
+            "t": "−Rx", "y": "+Rx",
+            "g": "−Ry", "h": "+Ry",
+            "q": "−Rz", "e": "+Rz",
+        }
+        return labels.get(token, token)
+
+    def _keyboard_vel_update_status_text(self):
+        tokens = self._keyboard_vel_active_tokens
+        if not tokens:
+            self.info_process.setText("Keyboard tool velocity: stopped")
+            return
+        parts = [self._keyboard_vel_token_label(t) for t in sorted(tokens)]
+        self.info_process.setText(f"Keyboard tool velocity: {' + '.join(parts)}")
+
+    def _keyboard_vel_timer_tick(self):
+        """Re-send the combined velocity from all active keys.
+
+        TM's ContinueVLine needs periodic refreshes — if no command arrives for
+        a while, the driver will treat it as a watchdog timeout. 50 ms is well
+        below the driver's typical timeout (~200 ms) so the latch feels stable.
+        """
+        if not self._keyboard_tool_velocity_enabled:
+            return
+        if not self._keyboard_vel_active_tokens:
+            return
+        w = self._keyboard_vel_widget()
+        if w is None or not hasattr(w, "_send_velocity"):
+            return
+        v_lin, v_rot = self._keyboard_vel_vector_for_tokens(self._keyboard_vel_active_tokens)
+        try:
+            w._send_velocity(v_lin, v_rot)
+        except Exception:
+            pass
+
+    def _keyboard_vel_apply_active_tokens(self):
+        if not self._keyboard_vel_active_tokens:
+            self._keyboard_vel_stop_robot()
+            self._keyboard_vel_update_status_text()
+            return
+        self._keyboard_vel_timer_tick()
+        self._keyboard_vel_update_status_text()
+
+    def _on_keyboard_tool_velocity_toggled(self, checked: bool):
+        if checked:
+            if not self.ping_mode_entered or self.ui_ros is None:
+                QMessageBox.information(
+                    self,
+                    "Keyboard Tool Velocity",
+                    "Please wait for Ping Mode to finish loading, then try again.",
+                )
+                self.action_keyboard_tool_velocity.blockSignals(True)
+                self.action_keyboard_tool_velocity.setChecked(False)
+                self.action_keyboard_tool_velocity.blockSignals(False)
+                return
+            if self._keyboard_vel_widget() is None:
+                QMessageBox.warning(
+                    self,
+                    "Keyboard Tool Velocity",
+                    "Tool velocity panel is not available on the embedded UI.",
+                )
+                self.action_keyboard_tool_velocity.blockSignals(True)
+                self.action_keyboard_tool_velocity.setChecked(False)
+                self.action_keyboard_tool_velocity.blockSignals(False)
+                return
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+            self._keyboard_tool_velocity_enabled = True
+            self._keyboard_vel_active_tokens = set()
+            self._keyboard_vel_timer.start()
+            self.info_process.setText(
+                "Keyboard tool velocity: ON (W/S=±Y, A/D=±X, O/P=±Z, T/Y=±Rx, G/H=±Ry, Q/E=±Rz, Space=stop, keys combine)"
+            )
+        else:
+            self._disable_keyboard_tool_velocity_internal()
+
+    def _disable_keyboard_tool_velocity_internal(self):
+        self._keyboard_tool_velocity_enabled = False
+        self._keyboard_vel_active_tokens = set()
+        self._keyboard_vel_timer.stop()
+        app = QApplication.instance()
+        if app is not None:
+            try:
+                app.removeEventFilter(self)
+            except Exception:
+                pass
+        self._keyboard_vel_full_stop()
+        if hasattr(self, "action_keyboard_tool_velocity"):
+            self.action_keyboard_tool_velocity.blockSignals(True)
+            self.action_keyboard_tool_velocity.setChecked(False)
+            self.action_keyboard_tool_velocity.blockSignals(False)
+        self.info_process.setText("Keyboard tool velocity: OFF")
+
+    def eventFilter(self, watched, event):
+        if self._keyboard_tool_velocity_enabled:
+            et = event.type()
+            if et == QEvent.ShortcutOverride:
+                # Block other QShortcuts (e.g. Space → AI direct finger motion
+                # toggle in ui_ping_ai_controls) from swallowing our control
+                # keys, so the KeyPress can reach this filter normally.
+                ev = event
+                if not ev.isAutoRepeat() and self._keyboard_velocity_should_capture():
+                    key = ev.key()
+                    if key == Qt.Key_Space or self._keyboard_vel_key_token(key) is not None:
+                        ev.accept()
+                        return True
+            elif et == QEvent.KeyPress:
+                ev = event
+                if not ev.isAutoRepeat() and self._keyboard_velocity_should_capture():
+                    key = ev.key()
+                    if key == Qt.Key_Space:
+                        self._keyboard_vel_active_tokens.clear()
+                        self._keyboard_vel_stop_robot()
+                        self.info_process.setText("Keyboard tool velocity: stopped (Space)")
+                        return True
+                    tok = self._keyboard_vel_key_token(key)
+                    if tok is not None:
+                        self._keyboard_vel_active_tokens.add(tok)
+                        self._keyboard_vel_apply_active_tokens()
+                        return True
+            elif et == QEvent.KeyRelease:
+                ev = event
+                if not ev.isAutoRepeat() and self._keyboard_velocity_should_capture():
+                    tok = self._keyboard_vel_key_token(ev.key())
+                    if tok is not None:
+                        self._keyboard_vel_active_tokens.discard(tok)
+                        self._keyboard_vel_apply_active_tokens()
+                        return True
+        return super().eventFilter(watched, event)
 
     def keyPressEvent(self, event):
         """Handles global key press events."""
@@ -1006,10 +1381,24 @@ class MyMainWindow(MainWindow):
 
     def closeEvent(self, event):
         """Executes when the main window is closed to ensure clean shutdown."""
+        if self._keyboard_tool_velocity_enabled or (
+            hasattr(self, "action_keyboard_tool_velocity")
+            and self.action_keyboard_tool_velocity.isChecked()
+        ):
+            self._disable_keyboard_tool_velocity_internal()
         if self._fps_timer is not None:
             self._fps_timer.stop()
-        if self._sidebar_control_timer is not None:
-            self._sidebar_control_timer.stop()
+        iren = getattr(self, "_fps_render_interactor", None)
+        if iren is not None:
+            try:
+                iren.render_signal.disconnect(self._on_frame_rendered)
+            except Exception:
+                pass
+            self._fps_render_interactor = None
+        self._stop_sidebar_control(
+            show_result=False,
+            message="Control stopped (window closing)",
+        )
 
         # Explicitly close any child windows to avoid orphaned processes
         if self.sensor_window:

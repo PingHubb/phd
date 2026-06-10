@@ -1,8 +1,11 @@
 import os
+from pathlib import Path
 
 gesture_number = 15
+RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "resource"
+
 # Folder path where the text files are stored
-folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/diff/gesture_{gesture_number}"
+folder_path = str(RESOURCE_ROOT / "ai" / "data" / "diff" / f"gesture_{gesture_number}")
 
 # Loop over the original filenames from 181 to 200
 for old_number in range(351, 451):

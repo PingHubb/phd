@@ -1,9 +1,12 @@
 import os
+from pathlib import Path
 
 number = 11
+RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "resource"
+
 # Define your input and output folder paths
-gesture_diff_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{number}"
-output_dir = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/discrete/gesture_{number}"
+gesture_diff_dir = str(RESOURCE_ROOT / "ai" / "data" / "offset" / f"gesture_{number}")
+output_dir = str(RESOURCE_ROOT / "ai" / "data" / "discrete" / f"gesture_{number}")
 
 # Create the output directory if it doesn't exist
 if not os.path.exists(output_dir):

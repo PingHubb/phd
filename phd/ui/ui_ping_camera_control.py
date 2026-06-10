@@ -20,6 +20,12 @@ class CameraControlMixin:
     def _stop_auto_centering(self):
         if self.centering_active or self.auto_center_button.isChecked():
             self.send_velocity_command(0.0, 0.0, 0.0)
+            robot_api = getattr(self, "robot_api", None)
+            if robot_api is not None and hasattr(robot_api, "exit_end_effector_velocity_mode"):
+                try:
+                    robot_api.exit_end_effector_velocity_mode(send_zero=False)
+                except Exception as exc:
+                    print(f"Failed to exit auto-centering velocity mode: {exc}")
         self._set_auto_center_ui_state(False)
 
     def _set_live_camera_ui_state(self, running: bool):
@@ -92,6 +98,72 @@ class CameraControlMixin:
         except Exception as exc:
             self._startup_log(f"⚠️ Failed to stop gesture recording cleanly: {exc}")
 
+    def _shutdown_optional_call(self, method_name, feature_label, *args, **kwargs):
+        method = getattr(self, method_name, None)
+        if not callable(method):
+            return
+        try:
+            method(*args, **kwargs)
+        except Exception as exc:
+            self._startup_log(f"⚠️ Failed to stop {feature_label} cleanly: {exc}")
+
+    def _shutdown_dialog(self, attr_name, feature_label):
+        dialog = getattr(self, attr_name, None)
+        if dialog is None:
+            return
+        try:
+            dialog.close()
+        except Exception as exc:
+            self._startup_log(f"⚠️ Failed to close {feature_label} cleanly: {exc}")
+
+    def _shutdown_proximity_helper(self):
+        helper = self._get_sensor_helper("proximity_control_class")
+        if helper is None:
+            return
+
+        try:
+            if bool(getattr(helper, "is_recording", False)) and hasattr(helper, "toggle_recording"):
+                helper.toggle_recording()
+        except Exception as exc:
+            self._startup_log(f"⚠️ Failed to stop Proximity recording cleanly: {exc}")
+
+        try:
+            if bool(getattr(helper, "is_running", False)) and hasattr(helper, "toggle_proximity_control"):
+                helper.toggle_proximity_control()
+        except Exception as exc:
+            self._startup_log(f"⚠️ Failed to stop Proximity Control cleanly: {exc}")
+
+        if hasattr(self, "_set_button_active"):
+            try:
+                self._set_button_active(self.proximity_control_button, False)
+                self._set_button_active(self.proximity_record_button, False)
+            except Exception:
+                pass
+
+    def _shutdown_console_helper(self):
+        helper = self._get_sensor_helper("console_control_class")
+        if helper is None:
+            return
+        try:
+            if bool(getattr(helper, "is_running", False)) and hasattr(helper, "toggle_console_control"):
+                # Both PS5 and sensor variants share the same running flag; the
+                # helper's toggle method performs the actual stop and closes its
+                # input source cleanly.
+                helper.toggle_console_control()
+        except Exception as exc:
+            self._startup_log(f"⚠️ Failed to stop Console Control cleanly: {exc}")
+
+        self._console_control_active = False
+        self._console_control_sensor_active = False
+        self._console_control_sensor_v2_active = False
+        if hasattr(self, "_set_button_active"):
+            try:
+                self._set_button_active(self.console_control_button, False)
+                self._set_button_active(self.console_control_sensor_button, False)
+                self._set_button_active(self.console_control_sensor_v2_button, False)
+            except Exception:
+                pass
+
     def shutdown(self):
         if self._is_shutting_down:
             return
@@ -129,11 +201,53 @@ class CameraControlMixin:
             "toggle_ai_direct_finger_motion_execution",
             "AI Direct Finger Motion execution",
         )
+        self._shutdown_toggle_helper(
+            "direct_finger_motion_v2_class",
+            "is_running",
+            "toggle_direct_finger_motion_v2",
+            "Direct Finger Motion V2",
+        )
+        self._shutdown_proximity_helper()
+        self._shutdown_console_helper()
         self._shutdown_recording_helper()
+        self._shutdown_optional_call(
+            "_stop_direct_finger_motion_tool_pose_recording",
+            "DFM tool-pose recording",
+        )
+        self._shutdown_optional_call(
+            "_stop_direct_finger_motion_tool_pose_path_animation",
+            "DFM tool-pose path animation",
+            reset_button=False,
+        )
+        self._shutdown_optional_call(
+            "_stop_ps5_controller_test",
+            "PS5 controller test",
+        )
+        self._shutdown_optional_call(
+            "_stop_sensor_controller_test",
+            "Sensor controller test",
+        )
+        self._shutdown_optional_call(
+            "_shutdown_hand_async_worker",
+            "RH56F1 hand command worker",
+        )
+        sensor_functions = getattr(self, "sensor_functions", None)
+        if sensor_functions is not None and hasattr(sensor_functions, "shutdown"):
+            try:
+                sensor_functions.shutdown()
+            except Exception as exc:
+                self._startup_log(f"⚠️ Failed to stop sensor reader cleanly: {exc}")
 
-        dialog = getattr(self, "direct_finger_motion_settings_dialog", None)
-        if dialog is not None:
-            dialog.close()
+        self._shutdown_dialog("direct_finger_motion_settings_dialog", "Direct Finger Motion settings")
+        self._shutdown_dialog("direct_finger_motion_v2_settings_dialog", "Direct Finger Motion V2 settings")
+        self._shutdown_dialog("console_control_settings_dialog", "Console Control settings")
+        self._shutdown_dialog("proximity_settings_dialog", "Proximity Control settings")
+        self._shutdown_dialog("ps5_controller_test_dialog", "PS5 controller test dialog")
+        self._shutdown_dialog("sensor_controller_test_dialog", "Sensor controller test dialog")
+        self._shutdown_dialog(
+            "_direct_finger_motion_tool_pose_plot_dialog",
+            "DFM tool-pose plot dialog",
+        )
 
     def toggle_yolo_camera(self):
         if self._is_shutting_down:
@@ -191,8 +305,11 @@ class CameraControlMixin:
             print("Auto-Centering ACTIVATED. Enabling Robot Velocity Mode...")
 
             try:
-                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
-                self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
+                if hasattr(self.robot_api, "enter_end_effector_velocity_mode"):
+                    self.robot_api.enter_end_effector_velocity_mode(suspend_existing=True)
+                else:
+                    self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+                    self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
             except Exception as exc:
                 print(f"Failed to enable velocity mode: {exc}")
         else:

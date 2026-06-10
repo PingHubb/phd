@@ -1,29 +1,116 @@
+import json
+import os
+from importlib import import_module
+
 import pyvista as pv
 import numpy as np
 import serial
 import serial.tools.list_ports
 import time
 from pyvistaqt import QtInteractor
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
+from PyQt5.QtWidgets import QListWidgetItem
 from tqdm import tqdm
-from phd.dependence.gesture.gesture_logic_direct_finger_motion import (
-    DirectFingerMotion,
-    DirectFingerMotionV2,
-    ConsoleControl,
-    AI_DirectFingerMotion,
-    AI_DirectFingerMotion_execution,
-)
-from phd.dependence.gesture.gesture_logic_proximity_control import ProximityControl
-from phd.dependence.gesture.gesture_logic_recording import RecordGesture
+from phd.dependence.paths import resource_path, sensor_resource_path
 from phd.dependence.sensor_layout import (
     column_major_idx as _column_major_idx,
     flatten_column_major_view as _flatten_column_major_view,
     reshape_sensor_values_to_row_col_matrix,
     row_major_idx as _row_major_idx,
 )
-from phd.dependence.gesture.gesture_logic_three_level import ThreeLevelTransformer
 
-from PyQt5.QtWidgets import QListWidgetItem
+# Persistent storage for per-sensor "always-zero" cell masks. The file holds
+# a mapping of <model>_<n_row>x<n_col> -> 2D 0/1 list, so each sensor layout
+# remembers which cells the user wants forced to zero across runs.
+SENSOR_ZERO_MASK_FILE = os.path.join(
+    resource_path("config"),
+    "sensor_zero_masks.json",
+)
+
+
+class _SensorReadWorker(QObject):
+    """Continuously read raw sensor payloads without blocking Qt rendering."""
+
+    raw_payload_ready = pyqtSignal(int, str, list)
+    error = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, serial_ports, generation=0, response_timeout=0.5, idle_sleep_sec=0.002):
+        super().__init__()
+        self.serial_ports = list(serial_ports or [])
+        self.generation = int(generation)
+        self.response_timeout = max(0.05, float(response_timeout))
+        self.idle_sleep_sec = max(0.0, float(idle_sleep_sec))
+        self._running = False
+
+    def stop(self):
+        self._running = False
+
+    @staticmethod
+    def _parse_ints(text):
+        values = []
+        for token in str(text).split():
+            try:
+                values.append(int(token))
+            except ValueError:
+                continue
+        return values
+
+    def _read_raw_from_port(self, ser):
+        try:
+            ser.write(b"readRaw\n")
+        except Exception as exc:
+            self.error.emit(f"Sensor write failed on {getattr(ser, 'port', 'unknown')}: {exc}")
+            return None
+
+        deadline = time.time() + self.response_timeout
+        while self._running and time.time() < deadline:
+            try:
+                waiting = int(getattr(ser, "in_waiting", 0))
+            except Exception as exc:
+                self.error.emit(f"Sensor read failed on {getattr(ser, 'port', 'unknown')}: {exc}")
+                return None
+
+            if waiting <= 0:
+                time.sleep(self.idle_sleep_sec)
+                continue
+
+            try:
+                line = ser.readline().decode("utf-8", errors="ignore").rstrip()
+            except Exception as exc:
+                self.error.emit(f"Sensor line read failed on {getattr(ser, 'port', 'unknown')}: {exc}")
+                return None
+
+            if not line:
+                continue
+
+            data_list = self._parse_ints(line)
+            if data_list:
+                return data_list[2:-2] if len(data_list) >= 4 else data_list
+
+        return None
+
+    def run(self):
+        self._running = True
+        try:
+            while self._running:
+                emitted = False
+                for ser in self.serial_ports:
+                    if not self._running:
+                        break
+                    data_list = self._read_raw_from_port(ser)
+                    if data_list is None:
+                        continue
+                    self.raw_payload_ready.emit(
+                        self.generation,
+                        str(getattr(ser, "port", "sensor")),
+                        list(data_list),
+                    )
+                    emitted = True
+                if not emitted:
+                    time.sleep(self.idle_sleep_sec)
+        finally:
+            self.finished.emit()
 
 
 class data:
@@ -451,6 +538,39 @@ class _FeatureDisabledProxy:
         return False
 
 
+class _LazyFeatureProxy:
+    """Instantiate an optional feature only when the UI actually uses it."""
+
+    def __init__(self, owner, attr_name, feature_name, factory):
+        self._owner = owner
+        self._attr_name = attr_name
+        self._feature_name = feature_name
+        self._factory = factory
+
+    def _resolve(self):
+        current = getattr(self._owner, self._attr_name, self)
+        if current is not self:
+            return current
+
+        try:
+            helper = self._factory()
+        except Exception as exc:
+            print(f"[{self._feature_name}] Failed to initialize: {exc}")
+            helper = _FeatureDisabledProxy(
+                self._feature_name,
+                f"Unavailable: {exc}",
+            )
+
+        setattr(self._owner, self._attr_name, helper)
+        return helper
+
+    def __getattr__(self, name):
+        return getattr(self._resolve(), name)
+
+    def __bool__(self):
+        return True
+
+
 class MySensor:
     DEFAULT_2D_GRID_SHAPE = (10, 10)
     VISUALIZATION_TARGET_HZ = 30.0
@@ -465,34 +585,68 @@ class MySensor:
         "ai_direct_finger_motion_class": "AI_DirectFingerMotion",
         "ai_direct_finger_motion_execution_class": "AI_DirectFingerMotion_execution",
     }
+    AI_HELPER_IMPORTS = {
+        "record_gesture_class": (
+            "phd.dependence.gesture.gesture_logic_recording",
+            "RecordGesture",
+        ),
+        "threelevel_hierarchical_transformer_class": (
+            "phd.dependence.gesture.gesture_logic_three_level",
+            "ThreeLevelTransformer",
+        ),
+        "proximity_control_class": (
+            "phd.dependence.gesture.gesture_logic_proximity_control",
+            "ProximityControl",
+        ),
+        "direct_finger_motion_class": (
+            "phd.dependence.gesture.gesture_logic_direct_finger_motion",
+            "DirectFingerMotion",
+        ),
+        "direct_finger_motion_v2_class": (
+            "phd.dependence.gesture.gesture_logic_direct_finger_motion",
+            "DirectFingerMotionV2",
+        ),
+        "console_control_class": (
+            "phd.dependence.gesture.gesture_logic_console",
+            "ConsoleControl",
+        ),
+        "ai_direct_finger_motion_class": (
+            "phd.dependence.gesture.gesture_logic_direct_finger_motion",
+            "AI_DirectFingerMotion",
+        ),
+        "ai_direct_finger_motion_execution_class": (
+            "phd.dependence.gesture.gesture_logic_direct_finger_motion",
+            "AI_DirectFingerMotion_execution",
+        ),
+    }
     PREDEFINED_SENSOR_MODELS = {
         "elbow": {
             "n_row": 10,
             "n_col": 13,
-            "mesh_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/mesh.obj",
-            "signal_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/joint_1/signal.txt",
+            "mesh_file": sensor_resource_path("joint_1", "mesh.obj"),
+            "signal_file": sensor_resource_path("joint_1", "signal.txt"),
             "offset_scale": 0.02,
         },
         "kuka": {
             "n_row": 10,
             "n_col": 8,
-            "mesh_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/kuka/knitting_mesh_raw.obj",
-            "signal_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/kuka/signal.txt",
+            "mesh_file": sensor_resource_path("kuka", "knitting_mesh_raw.obj"),
+            "signal_file": sensor_resource_path("kuka", "signal.txt"),
             "reorder_logic": "row_to_col_flipped",
             "offset_scale": 0.2,
         },
         "double_curve": {
             "n_row": 10,
             "n_col": 10,
-            "mesh_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/mesh.obj",
-            "signal_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/dualC/signal.txt",
+            "mesh_file": sensor_resource_path("dualC", "mesh.obj"),
+            "signal_file": sensor_resource_path("dualC", "signal.txt"),
             "offset_scale": 0.2,
         },
         "half_cylinder_surface": {
             "n_row": 10,
             "n_col": 9,
-            "mesh_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/half_cylinder_2.obj",
-            "signal_file": "/home/ping2/ros2_ws/src/phd/phd/resource/sensor/half_cylinder_surface/vertex_groups_2.txt",
+            "mesh_file": sensor_resource_path("half_cylinder_surface", "half_cylinder_2.obj"),
+            "signal_file": sensor_resource_path("half_cylinder_surface", "vertex_groups_2.txt"),
             "reorder_logic": "flip_and_rotate",
             "offset_scale": 0.2,
         },
@@ -524,6 +678,14 @@ class MySensor:
         self._visualization_tick_started_at = time.perf_counter()
         self.initChannel()
         self.ser_list = []
+        self._sensor_read_thread = None
+        self._sensor_read_worker = None
+        self._latest_sensor_payloads = {}
+        self._sensor_reader_generation = 0
+        self._last_sensor_reader_error_log_time = 0.0
+        self._sensor_calibration_in_progress = False
+        self.current_model_name = None
+        self.cell_zero_mask = np.zeros((0, 0), dtype=bool)
 
         # Delay AI helper/model creation until a sensor model is selected in buildScene().
         # This avoids startup warnings/errors caused by initializing model-dependent logic
@@ -598,9 +760,10 @@ class MySensor:
             if attr_name == "console_control_class":
                 continue
             setattr(self, attr_name, _FeatureDisabledProxy(feature_name, reason))
-        self.console_control_class = self._safe_create_helper(
+        self.console_control_class = self._make_lazy_helper(
+            "console_control_class",
             "ConsoleControl",
-            lambda: ConsoleControl(self.parent, self),
+            lambda: self._construct_ai_helper("console_control_class"),
         )
 
     def _safe_create_helper(self, feature_name, factory):
@@ -610,18 +773,28 @@ class MySensor:
             print(f"[{feature_name}] Failed to initialize: {exc}")
             return _FeatureDisabledProxy(feature_name, f"Unavailable: {exc}")
 
+    def _make_lazy_helper(self, attr_name, feature_name, factory):
+        return _LazyFeatureProxy(self, attr_name, feature_name, factory)
+
+    def _load_ai_helper_class(self, attr_name):
+        module_name, symbol_name = self.AI_HELPER_IMPORTS[attr_name]
+        module = import_module(module_name)
+        return getattr(module, symbol_name)
+
+    def _construct_ai_helper(self, attr_name):
+        helper_class = self._load_ai_helper_class(attr_name)
+        if attr_name == "record_gesture_class":
+            return helper_class(self)
+        if attr_name == "threelevel_hierarchical_transformer_class":
+            return helper_class(self.parent, self, self.n_row, self.n_col)
+        return helper_class(self.parent, self)
+
     def _ai_helper_factories(self):
         return {
-            "record_gesture_class": lambda: RecordGesture(self),
-            "threelevel_hierarchical_transformer_class": lambda: ThreeLevelTransformer(
-                self.parent, self, self.n_row, self.n_col
-            ),
-            "proximity_control_class": lambda: ProximityControl(self.parent, self),
-            "direct_finger_motion_class": lambda: DirectFingerMotion(self.parent, self),
-            "direct_finger_motion_v2_class": lambda: DirectFingerMotionV2(self.parent, self),
-            "console_control_class": lambda: ConsoleControl(self.parent, self),
-            "ai_direct_finger_motion_class": lambda: AI_DirectFingerMotion(self.parent, self),
-            "ai_direct_finger_motion_execution_class": lambda: AI_DirectFingerMotion_execution(self.parent, self),
+            attr_name: (
+                lambda attr_name=attr_name: self._construct_ai_helper(attr_name)
+            )
+            for attr_name in self.AI_HELPER_ATTRS
         }
 
     def initialize_ai_helpers(self):
@@ -634,8 +807,8 @@ class MySensor:
             setattr(
                 self,
                 attr_name,
-                self._safe_create_helper(feature_name, factories[attr_name]),
-        )
+                self._make_lazy_helper(attr_name, feature_name, factories[attr_name]),
+            )
 
     def get_ai_direct_finger_motion_execution_default_model_path(self):
         helper = getattr(self, "ai_direct_finger_motion_execution_class", None)
@@ -754,6 +927,11 @@ class MySensor:
         self._2D_map, self.array_positions, self.colors, self.line_poly = \
             model._2D_map, model.array_positions, model.colors, model.line_poly
 
+        # Reset the zero-mask for the new layout, then try to restore a previously
+        # saved one for this exact sensor key (model + grid size).
+        self.cell_zero_mask = np.zeros((self.n_row, self.n_col), dtype=bool)
+        self.load_cell_zero_mask_from_disk()
+
         # Reset connection flags for the new model
         self.is_connected = False
         self.show_2D = False
@@ -775,6 +953,7 @@ class MySensor:
         if n_row is None or n_col is None:
             n_row, n_col = self._get_2d_grid_shape()
 
+        self.current_model_name = "2d"
         self._build_factory_model(
             n_row=n_row,
             n_col=n_col,
@@ -847,23 +1026,110 @@ class MySensor:
         return [item.text() for item in self.parent.serial_channel.selectedItems()]
 
     def _close_serial_ports(self):
+        if not self._stop_sensor_reader_worker():
+            print("Serial ports left open because the sensor reader is still stopping.")
+            return False
         for ser in self.ser_list:
             try:
                 ser.close()
             except Exception:
                 pass
         self.ser_list = []
+        return True
 
     def _open_serial_ports(self, port_names):
         serial_ports = []
         for port_name in port_names:
             try:
-                ser = serial.Serial(port=f"/dev/{port_name}", baudrate=9600, timeout=1)
+                ser = serial.Serial(port=f"/dev/{port_name}", baudrate=9600, timeout=0.1)
                 serial_ports.append(ser)
                 print(f"Opened port: /dev/{port_name}")
             except Exception as exc:
                 print(f"Failed to open /dev/{port_name}: {exc}")
         return serial_ports
+
+    def _sensor_reader_is_running(self):
+        thread = getattr(self, "_sensor_read_thread", None)
+        return bool(thread is not None and thread.isRunning())
+
+    def _start_sensor_reader_worker(self):
+        if not self.ser_list or self._sensor_reader_is_running():
+            return
+
+        self._latest_sensor_payloads = {}
+        self._sensor_reader_generation += 1
+        generation = self._sensor_reader_generation
+        thread_parent = self.parent if isinstance(self.parent, QObject) else None
+        thread = QThread(thread_parent)
+        worker = _SensorReadWorker(self.ser_list, generation=generation)
+        worker.moveToThread(thread)
+
+        thread.started.connect(worker.run)
+        worker.raw_payload_ready.connect(self._on_sensor_reader_payload)
+        worker.error.connect(self._on_sensor_reader_error)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda thread=thread, worker=worker: self._on_sensor_reader_thread_finished(thread, worker)
+        )
+
+        self._sensor_read_thread = thread
+        self._sensor_read_worker = worker
+        thread.start()
+
+    def _stop_sensor_reader_worker(self, wait_timeout_ms=5000):
+        self._sensor_reader_generation += 1
+        worker = getattr(self, "_sensor_read_worker", None)
+        thread = getattr(self, "_sensor_read_thread", None)
+
+        if worker is not None:
+            try:
+                worker.stop()
+            except Exception:
+                pass
+
+        if thread is not None and thread.isRunning():
+            thread.quit()
+            if not thread.wait(max(0, int(wait_timeout_ms))):
+                print("[SensorReader] Stop timed out; keeping reader thread reference alive.")
+                return False
+
+        self._sensor_read_worker = None
+        self._sensor_read_thread = None
+        self._latest_sensor_payloads = {}
+        return True
+
+    def _on_sensor_reader_thread_finished(self, thread=None, worker=None):
+        if thread is not None and self._sensor_read_thread is not thread:
+            return
+        if worker is not None and self._sensor_read_worker is not worker:
+            return
+        self._sensor_read_worker = None
+        self._sensor_read_thread = None
+
+    def _on_sensor_reader_payload(self, generation, port_name, data_list):
+        if int(generation) != int(self._sensor_reader_generation):
+            return
+        if not self.is_connected:
+            return
+        self._latest_sensor_payloads[str(port_name)] = list(data_list or [])
+
+    def _on_sensor_reader_error(self, message):
+        now = time.perf_counter()
+        if (now - self._last_sensor_reader_error_log_time) < 2.0:
+            return
+        self._last_sensor_reader_error_log_time = now
+        print(f"[SensorReader] {message}")
+
+    def _take_latest_sensor_payloads(self):
+        payloads = dict(self._latest_sensor_payloads)
+        self._latest_sensor_payloads.clear()
+        return payloads
+
+    def shutdown(self):
+        self._stop_sensor_reader_worker()
+        self._close_serial_ports()
 
     def _get_2d_grid_shape(self):
         default_n_row, default_n_col = self.DEFAULT_2D_GRID_SHAPE
@@ -878,6 +1144,7 @@ class MySensor:
         self._initialize_from_factory(model)
 
     def _init_predefined_model(self, model_name):
+        self.current_model_name = model_name
         self._build_factory_model(**self.PREDEFINED_SENSOR_MODELS[model_name])
 
     def _initialize_selected_sensor_model(self, sensor_index):
@@ -920,10 +1187,26 @@ class MySensor:
         return reshape_sensor_values_to_row_col_matrix(values, n_row, n_col)
 
     def _update_data_window(self, data_obj, raw_values, n_row, n_col, window_index):
-        data_obj.getRaw(self._reshape_sensor_values(raw_values, n_row, n_col))
+        raw_matrix = self._reshape_sensor_values(raw_values, n_row, n_col)
+        # Force user-selected cells to read exactly the calibration value. That makes
+        # diff/diffPer collapse to 0 for those cells everywhere downstream
+        # (visualization, AI, control logic) without touching each consumer.
+        self._apply_cell_zero_mask_to_raw(raw_matrix, data_obj)
+        data_obj.getRaw(raw_matrix)
         data_obj.calDiff()
         data_obj.calDiffPer()
         data_obj.getWin(window_index)
+
+    def _apply_cell_zero_mask_to_raw(self, raw_matrix, data_obj):
+        mask = getattr(self, "cell_zero_mask", None)
+        if mask is None or mask.size == 0 or not bool(mask.any()):
+            return
+        if raw_matrix.shape != mask.shape:
+            return
+        cal = getattr(data_obj, "calData", None)
+        if cal is None or cal.shape != raw_matrix.shape:
+            return
+        raw_matrix[mask] = cal[mask]
 
     def _apply_live_raw_overrides(self, raw_values):
         """Patch known bad channels for specific live sensor layouts."""
@@ -940,6 +1223,103 @@ class MySensor:
             raw_values[77] = flat_cal_data[77]
             raw_values[78] = flat_cal_data[78]
             raw_values[79] = flat_cal_data[79]
+
+    # ------------------------------------------------------------------
+    # Cell zero-mask: force a chosen subset of cells to always read 0.
+    # ------------------------------------------------------------------
+    def get_zero_mask_key(self):
+        """Stable identifier used as the JSON key for the current sensor layout."""
+        model = self.current_model_name or "sensor"
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        return f"{model}_{n_row}x{n_col}"
+
+    def get_cell_zero_mask(self):
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        mask = getattr(self, "cell_zero_mask", None)
+        if (
+            not isinstance(mask, np.ndarray)
+            or mask.dtype != bool
+            or mask.shape != (n_row, n_col)
+        ):
+            mask = np.zeros((n_row, n_col), dtype=bool)
+            self.cell_zero_mask = mask
+        return mask
+
+    def set_cell_zero_mask(self, mask):
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        if n_row <= 0 or n_col <= 0:
+            return False
+        try:
+            arr = np.asarray(mask, dtype=bool)
+        except Exception:
+            return False
+        if arr.shape != (n_row, n_col):
+            return False
+        self.cell_zero_mask = arr.copy()
+        return True
+
+    def clear_cell_zero_mask(self):
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        self.cell_zero_mask = np.zeros((n_row, n_col), dtype=bool)
+
+    def _read_zero_mask_file(self):
+        try:
+            with open(SENSOR_ZERO_MASK_FILE, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                payload.setdefault("version", 1)
+                masks = payload.get("masks")
+                if not isinstance(masks, dict):
+                    payload["masks"] = {}
+                return payload
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"[ZeroMask] Failed to read {SENSOR_ZERO_MASK_FILE}: {exc}")
+        return {"version": 1, "masks": {}}
+
+    def _write_zero_mask_file(self, payload):
+        try:
+            os.makedirs(os.path.dirname(SENSOR_ZERO_MASK_FILE), exist_ok=True)
+            with open(SENSOR_ZERO_MASK_FILE, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            return True
+        except Exception as exc:
+            print(f"[ZeroMask] Failed to write {SENSOR_ZERO_MASK_FILE}: {exc}")
+            return False
+
+    def save_cell_zero_mask_to_disk(self):
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        if n_row <= 0 or n_col <= 0:
+            return False
+        payload = self._read_zero_mask_file()
+        masks = payload.setdefault("masks", {})
+        masks[self.get_zero_mask_key()] = self.get_cell_zero_mask().astype(int).tolist()
+        return self._write_zero_mask_file(payload)
+
+    def load_cell_zero_mask_from_disk(self):
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        if n_row <= 0 or n_col <= 0:
+            return False
+        payload = self._read_zero_mask_file()
+        masks = payload.get("masks", {}) if isinstance(payload, dict) else {}
+        raw = masks.get(self.get_zero_mask_key())
+        if raw is None:
+            return False
+        try:
+            arr = np.asarray(raw, dtype=bool)
+        except Exception:
+            return False
+        if arr.shape != (n_row, n_col):
+            return False
+        self.cell_zero_mask = arr.copy()
+        return True
 
     def _read_port_sensor_values(self, ser, read_operation, error_prefix):
         try:
@@ -969,48 +1349,70 @@ class MySensor:
         return True
 
     def updateCal(self):
+        if self._sensor_calibration_in_progress:
+            print("Sensor calibration is already running.")
+            return
+
+        self._sensor_calibration_in_progress = True
+        self._set_sensor_update_button_enabled(False)
+        self.is_connected = False
         calibration_succeeded = False
-        for ser in self.ser_list:
-            sensor_api, cal_data_list = self._read_port_sensor_values(
-                ser,
-                lambda api: api.update_cal(),
-                "Error during calibration",
-            )
-            if cal_data_list is None:
-                continue
+        try:
+            if not self._stop_sensor_reader_worker():
+                print("Sensor calibration aborted: live reader did not stop in time.")
+                return
 
-            self.cal_data = cal_data_list
-            self._data.getCal(self._reshape_sensor_values(cal_data_list, self.n_row, self.n_col))
-            if self._warm_sensor_window(sensor_api, ser):
-                calibration_succeeded = True
+            for ser in self.ser_list:
+                sensor_api, cal_data_list = self._read_port_sensor_values(
+                    ser,
+                    lambda api: api.update_cal(),
+                    "Error during calibration",
+                )
+                if cal_data_list is None:
+                    continue
 
-        self.is_connected = calibration_succeeded
-        self._set_sensor_update_button_enabled(True)
+                self.cal_data = cal_data_list
+                self._data.getCal(self._reshape_sensor_values(cal_data_list, self.n_row, self.n_col))
+                if self._warm_sensor_window(sensor_api, ser):
+                    calibration_succeeded = True
+        finally:
+            self.is_connected = calibration_succeeded
+            if calibration_succeeded:
+                try:
+                    self._start_sensor_reader_worker()
+                except Exception as exc:
+                    self.is_connected = False
+                    print(f"Failed to restart sensor reader after calibration: {exc}")
+            self._sensor_calibration_in_progress = False
+            self._set_sensor_update_button_enabled(True)
 
     def update_animation(self):
-        if self.is_connected:
-            for ser in self.ser_list:
-                _, raw_data_list = self._read_port_sensor_values(
-                    ser,
-                    lambda api: api.read_raw(),
-                    "Error reading from",
+        if not self.is_connected:
+            return
+
+        for port_name, data_list in self._take_latest_sensor_payloads().items():
+            raw_data_list = self._extract_sensor_values(
+                data_list,
+                self.n_row,
+                self.n_col,
+                port_name,
+            )
+            if raw_data_list is None:
+                continue
+
+            try:
+                self._apply_live_raw_overrides(raw_data_list)
+                self._update_data_window(
+                    self._data, raw_data_list, self.n_row, self.n_col, self._data.windowSize
                 )
-                if raw_data_list is None:
-                    continue
+                self._record_sensor_update_tick()
+            except Exception as exc:
+                print(f"Error processing data from port {port_name}: {exc}")
+                continue
 
-                try:
-                    self._apply_live_raw_overrides(raw_data_list)
-                    self._update_data_window(
-                        self._data, raw_data_list, self.n_row, self.n_col, self._data.windowSize
-                    )
-                    self._record_sensor_update_tick()
-                except Exception as exc:
-                    print(f"Error processing data from port {ser.port}: {exc}")
-                    continue
-
-                if self._should_refresh_visualization():
-                    self.saveCameraPara()
-                    self.update_visualization(self._data.diffPerDataAve)
+            if self._should_refresh_visualization():
+                self.saveCameraPara()
+                self.update_visualization(self._data.diffPerDataAve)
 
     def update_visualization(self, sensor_matrix):
         self._record_visualization_tick()
@@ -1108,13 +1510,19 @@ class MySensor:
         return self._format_data_for_display(column_major_flat_raw_ave)
 
     def read_raw_all_ports(self):
-        for ser in self.ser_list:
-            _, raw_data_list = self._read_port_sensor_values(
-                ser,
-                lambda api: api.read_raw(),
-                "Error reading raw data",
-            )
-            if raw_data_list is not None:
-                print(f"Port {ser.port} raw data: {raw_data_list}")
+        restart_reader = bool(self.is_connected)
+        self._stop_sensor_reader_worker()
+        try:
+            for ser in self.ser_list:
+                _, raw_data_list = self._read_port_sensor_values(
+                    ser,
+                    lambda api: api.read_raw(),
+                    "Error reading raw data",
+                )
+                if raw_data_list is not None:
+                    print(f"Port {ser.port} raw data: {raw_data_list}")
+        finally:
+            if restart_reader:
+                self._start_sensor_reader_worker()
 
     # Geneva demo support has been archived to `backup/func_sensor_geneva_archive.py`.

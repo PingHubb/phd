@@ -5,9 +5,11 @@ import time
 import numpy as np
 from PyQt5.QtCore import QTimer
 
+from phd.dependence.paths import RESOURCE_ROOT as _PROJECT_RESOURCE_ROOT
+
 
 class ProximityControl:
-    RESOURCE_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "resource"))
+    RESOURCE_ROOT = str(_PROJECT_RESOURCE_ROOT)
     CONFIG_DIR = os.path.join(RESOURCE_ROOT, "config")
     RECORDING_DIR = os.path.join(RESOURCE_ROOT, "proximity_recordings")
     SETTINGS_FILE = os.path.join(CONFIG_DIR, "proximity_control.json")
@@ -410,13 +412,20 @@ class ProximityControl:
 
     def _ensure_robot_velocity_mode(self):
         if not self._velocity_mode_enabled:
-            self.ros_splitter.robot_api.send_request(
-                self.ros_splitter.robot_api.enable_end_effector_velocity_mode()
-            )
-            self._velocity_mode_enabled = True
+            robot_api = getattr(self.ros_splitter, "robot_api", None)
+            if robot_api is None:
+                return False
+            if hasattr(robot_api, "enter_end_effector_velocity_mode"):
+                self._velocity_mode_enabled = bool(
+                    robot_api.enter_end_effector_velocity_mode()
+                )
+            else:
+                self._velocity_mode_enabled = bool(
+                    robot_api.send_request(robot_api.enable_end_effector_velocity_mode())
+                )
+        return self._velocity_mode_enabled
 
     def _send_robot_velocity(self, velocity):
-        self._ensure_robot_velocity_mode()
         velocity = [float(v) for v in velocity]
         velocity = [-velocity[0], -velocity[1], -velocity[2], velocity[3], velocity[4], velocity[5]]
 
@@ -426,14 +435,22 @@ class ProximityControl:
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if robot_api is None:
             return
+        if not self._ensure_robot_velocity_mode():
+            return
 
         frame = self._get_requested_frame()
-        try:
-            cmd = robot_api.set_end_effector_velocity_in_frame(velocity[:3], velocity[3:], frame=frame)
-        except Exception:
-            cmd = robot_api.set_end_effector_velocity(velocity)
-
-        robot_api.send_request(cmd)
+        if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
+            robot_api.send_end_effector_velocity_in_frame(
+                velocity[:3],
+                velocity[3:],
+                frame=frame,
+            )
+        else:
+            try:
+                cmd = robot_api.set_end_effector_velocity_in_frame(velocity[:3], velocity[3:], frame=frame)
+            except Exception:
+                cmd = robot_api.set_end_effector_velocity(velocity)
+            robot_api.send_request(cmd)
         self.last_robot_velocity_cmd = velocity
 
     def _zero_velocity(self):
@@ -443,9 +460,11 @@ class ProximityControl:
         self.last_robot_velocity_cmd = None
         self._send_robot_velocity(self._zero_velocity())
         if stop_mode and self._velocity_mode_enabled:
-            self.ros_splitter.robot_api.send_request(
-                self.ros_splitter.robot_api.stop_end_effector_velocity_mode()
-            )
+            robot_api = getattr(self.ros_splitter, "robot_api", None)
+            if robot_api is not None and hasattr(robot_api, "exit_end_effector_velocity_mode"):
+                robot_api.exit_end_effector_velocity_mode(send_zero=False)
+            elif robot_api is not None:
+                robot_api.send_request(robot_api.stop_end_effector_velocity_mode())
             self._velocity_mode_enabled = False
 
     def _get_signal_matrix(self):

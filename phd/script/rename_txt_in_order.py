@@ -1,7 +1,9 @@
 import os
 import re
+from pathlib import Path
 
 gesture_number = 1
+RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "resource"
 
 def rename_files_in_folder(folder_path):
     # List all .txt files in the folder
@@ -31,7 +33,7 @@ def rename_files_in_folder(folder_path):
 
 if __name__ == "__main__":
     # Define the folder path using your provided format
-    folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{gesture_number}"
+    folder_path = str(RESOURCE_ROOT / "ai" / "data" / "offset" / f"gesture_{gesture_number}")
 
     if os.path.isdir(folder_path):
         rename_files_in_folder(folder_path)

@@ -12,7 +12,6 @@ class RobotSensorControlsMixin:
                 self.position_script_widget,
                 self.send_script_button,
                 self.show_robot_button,
-                self.continuous_read_button,
             ],
             enabled,
         )

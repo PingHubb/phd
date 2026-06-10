@@ -1,9 +1,11 @@
 import os
+from pathlib import Path
 
 gesture_number = "cylinder_1"
+RESOURCE_ROOT = Path(__file__).resolve().parents[1] / "resource"
 
 # Define the folder path
-folder_path = f"/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/offset/gesture_{gesture_number}"  # Replace with your folder path
+folder_path = str(RESOURCE_ROOT / "ai" / "data" / "offset" / f"gesture_{gesture_number}")
 
 
 # Function to find .txt files with fewer than 10 lines

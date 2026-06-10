@@ -2,10 +2,9 @@ import os
 import time
 
 import numpy as np
-import torch
 from PyQt5.QtCore import QTimer
+from phd.dependence.paths import ai_resource_path
 from phd.dependence.sensor_layout import flatten_column_major_view
-from phd.dependence.transformer import GestureBackbone, ThreeLevelHierarchicalModel
 
 
 class ThreeLevelTransformer:
@@ -15,9 +14,16 @@ class ThreeLevelTransformer:
     SHAPE_9X10 = (9, 10)
     SHAPE_10X10 = (10, 10)
     MODEL_DIR_BY_SHAPE = {
-        JOINT_CONTROL_SHAPE: "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/eblow/eblow_0123_threelevel_v6(30frames)/",
-        SHAPE_9X10: "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_finger012_gesture123456_100good/",
-        SHAPE_10X10: "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/NEW_CHIP/on_robot/transformer/cylinder/cylinder_10x10_01234_threelevel(3frames)/",
+        JOINT_CONTROL_SHAPE: ai_resource_path(
+            "models",
+            "NEW_CHIP",
+            "on_robot",
+            "transformer",
+            "elbow",
+            "eblow_0123_threelevel_v6(30frames)",
+        ),
+        SHAPE_9X10: ai_resource_path("models", "NEW_CHIP", "on_robot", "transformer", "cylinder", "cylinder_finger012_gesture123456_100good"),
+        SHAPE_10X10: ai_resource_path("models", "NEW_CHIP", "on_robot", "transformer", "cylinder", "cylinder_10x10_01234_threelevel(3frames)"),
     }
 
     def __init__(self, ros_splitter_instance, my_sensor_instance, n_row, n_col):
@@ -56,8 +62,11 @@ class ThreeLevelTransformer:
         self.activation_threshold = 10
         self.potential_gesture_to_activate = None
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self._torch = None
+        self.device = None
         self.model = None
+        self.model_loaded = False
+        self.model_load_error = None
         self.global_mean, self.global_std = 0.0, 1.0
         self.movement_x, self.movement_y, self.movement_z = 0.0, 0.0, 0.0
         self.rotation_x, self.rotation_y, self.rotation_z = 0.0, 0.0, 0.0
@@ -67,19 +76,25 @@ class ThreeLevelTransformer:
         self.config_path = os.path.join(model_dir, "backbone_3level_config.txt")
         self.scaler_path = os.path.join(model_dir, "scaler_3level.npz")
         self.three_level_config_path = os.path.join(model_dir, "3level_config.txt")
-        self.load_model_and_scaler()
 
     def load_model_and_scaler(self):
+        if self.model is not None:
+            self.model_loaded = True
+            return True
+
         print("--- Loading 3-Level Transformer Model for Real-Time Recognition ---")
+        self.model_loaded = False
+        self.model_load_error = None
         try:
             for path in [self.model_path, self.config_path, self.scaler_path, self.three_level_config_path]:
                 if not os.path.exists(path):
-                    print(f"Error: Required file not found at {path}. Cannot load model.")
+                    self.model_load_error = f"Required file not found at {path}"
+                    print(f"Error: {self.model_load_error}. Cannot load model.")
                     self.model = None
-                    return
+                    return False
 
-            scaler_data = np.load(self.scaler_path)
-            self.global_mean, self.global_std = scaler_data["mean"], scaler_data["std"]
+            with np.load(self.scaler_path) as scaler_data:
+                self.global_mean, self.global_std = scaler_data["mean"], scaler_data["std"]
             print(f"Row: {self.n_row}, Col: {self.n_col}")
             print(f"Loaded standardization scaler: Mean={self.global_mean:.4f}, Std={self.global_std:.4f}")
 
@@ -94,14 +109,33 @@ class ThreeLevelTransformer:
             num_g = int(config_3level["NUM_GESTURE_CLASSES"])
             num_q = int(config_3level["NUM_QUALITY_CLASSES"])
 
+            import torch
+            from phd.dependence.transformer import (
+                GestureBackbone,
+                ThreeLevelHierarchicalModel,
+            )
+
+            self._torch = torch
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             backbone = GestureBackbone(d_model, n_head, num_enc_layers, d_model * 4, dropout, self.n_row, self.n_col)
             self.model = ThreeLevelHierarchicalModel(backbone, d_model, num_f, num_g, num_q).to(self.device)
             self.model.load_state_dict(torch.load(self.model_path, map_location=self.device))
             self.model.eval()
+            self.model_loaded = True
             print("Successfully loaded 3-Level Transformer model.")
+            return True
         except Exception as exc:
+            self.model_load_error = str(exc)
             print(f"An error occurred while loading the model: {exc}")
             self.model = None
+            self.model_loaded = False
+            return False
+
+    def _ensure_model_loaded(self):
+        if self.model is not None:
+            self.model_loaded = True
+            return True
+        return self.load_model_and_scaler()
 
     def _parse_config(self, path):
         config = {}
@@ -152,14 +186,22 @@ class ThreeLevelTransformer:
 
     def _start_frame_control_recognition(self):
         self.recognition_timer.start()
-        self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
-        self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.enable_end_effector_velocity_mode())
+        robot_api = self.ros_splitter.robot_api
+        if hasattr(robot_api, "enter_end_effector_velocity_mode"):
+            robot_api.enter_end_effector_velocity_mode(suspend_existing=True)
+        else:
+            robot_api.send_request(robot_api.suspend_end_effector_velocity_mode())
+            robot_api.send_request(robot_api.enable_end_effector_velocity_mode())
         print("3-Level Transformer Recognition STARTED (Frame Control).")
 
     def _stop_frame_control_recognition(self):
         self.recognition_timer.stop()
-        self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.suspend_end_effector_velocity_mode())
-        self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.stop_end_effector_velocity_mode())
+        robot_api = self.ros_splitter.robot_api
+        if hasattr(robot_api, "exit_end_effector_velocity_mode"):
+            robot_api.exit_end_effector_velocity_mode(send_zero=True)
+        else:
+            robot_api.send_request(robot_api.suspend_end_effector_velocity_mode())
+            robot_api.send_request(robot_api.stop_end_effector_velocity_mode())
         print("3-Level Transformer Recognition STOPPED (Frame Control).")
 
     def _apply_logged_assignment(self, message, attr_name, value):
@@ -247,7 +289,7 @@ class ThreeLevelTransformer:
         )
 
     def toggle_gesture_recognition(self):
-        if self.model is None:
+        if not self.is_recognizing_gesture and not self._ensure_model_loaded():
             print("Cannot start recognition: Model is not loaded properly.")
             return
 
@@ -369,6 +411,10 @@ class ThreeLevelTransformer:
             return
 
         gesture_array = np.array(gesture_data_list, dtype=np.float32)
+        torch = self._torch
+        if torch is None:
+            return None, None, None, 0.0, 0.0, 0.0
+
         data_tensor = torch.tensor(gesture_array, dtype=torch.float32).unsqueeze(0).to(self.device)
         padding_mask = torch.zeros(1, self.window_size, dtype=torch.bool).to(self.device)
 
@@ -555,25 +601,40 @@ class ThreeLevelTransformer:
         v_rot = np.array([self.rotation_x, self.rotation_y, self.rotation_z], float)
 
         if self._sensor_shape() == self.SHAPE_9X10:
+            robot_api = self.ros_splitter.robot_api
             if self.anchor_enabled and self.current_state == self.STATE_PERFORMING and self._anchor_R is not None:
                 v_lin_w = self._anchor_R.dot(v_lin)
                 v_rot_w = self._anchor_R.dot(v_rot)
-                self.ros_splitter.robot_api.send_request(
-                    self.ros_splitter.robot_api.set_end_effector_velocity_in_frame(
+                if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
+                    robot_api.send_end_effector_velocity_in_frame(
                         v_lin_w.tolist(),
                         v_rot_w.tolist(),
                         frame="base",
                     )
-                )
+                else:
+                    robot_api.send_request(
+                        robot_api.set_end_effector_velocity_in_frame(
+                            v_lin_w.tolist(),
+                            v_rot_w.tolist(),
+                            frame="base",
+                        )
+                    )
             else:
                 frame = self._get_requested_frame() or "tool"
-                self.ros_splitter.robot_api.send_request(
-                    self.ros_splitter.robot_api.set_end_effector_velocity_in_frame(
+                if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
+                    robot_api.send_end_effector_velocity_in_frame(
                         v_lin.tolist(),
                         v_rot.tolist(),
                         frame=frame,
                     )
-                )
+                else:
+                    robot_api.send_request(
+                        robot_api.set_end_effector_velocity_in_frame(
+                            v_lin.tolist(),
+                            v_rot.tolist(),
+                            frame=frame,
+                        )
+                    )
 
         if self._is_joint_control_shape():
             if not getattr(self, "_joint_vel_mode_enabled", False):

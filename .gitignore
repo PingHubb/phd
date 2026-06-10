@@ -13,3 +13,13 @@ venv/
 # Large ML datasets and checkpoints (clone repo then restore or use LFS)
 phd/resource/ai/data/
 phd/resource/ai/models/
+
+# Runtime output
+phd/resource/robot/tool_pose_logs/*.csv
+phd/resource/robot/task2_sensor_logs/*.csv
+phd/resource/robot/task2_saved_points_backups/*.json
+phd/resource/sensor_screenshots/*
+
+# Local caches / generated previews
+phd/resource/dexterous_scan/*.png
+phd/resource/geneva/*.blend1

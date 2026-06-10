@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import math
+import json
+import os
 from typing import Any, Optional
 
 import numpy as np
@@ -8,6 +10,7 @@ from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QDialog,
     QFileDialog,
     QGroupBox,
@@ -19,15 +22,19 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QPlainTextEdit,
     QPushButton,
+    QHeaderView,
     QSlider,
     QSpinBox,
     QSplitter,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 from pyvistaqt import QtInteractor
+from phd.dependence.paths import ai_resource_path, resource_path
 from phd.ui.ui_ping_ai_controls import AiControlsMixin
 from phd.ui.ui_ping_camera_control import CameraControlMixin
 from phd.ui.ui_ping_direct_finger_motion import DirectFingerMotionMixin
@@ -97,6 +104,21 @@ class NullRobotApi:
 
     def send_positions_tool_position(self, *args, **kwargs):
         raise RuntimeError('Robot API unavailable')
+
+    def hand_services_available(self):
+        return False
+
+    def hand_tactile_available(self):
+        return False
+
+    def enable_hand_tactile_subscription(self, enabled=True):
+        return False
+
+    def get_latest_hand_tactile(self):
+        return None
+
+    def hand_tactile_publisher_count(self):
+        return 0
 
 
 class NullGripper:
@@ -186,8 +208,8 @@ class _NoOpToggle:
 
 
 class DisabledSensorFunctions:
-    DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH = (
-        "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/ai_direct_finger_motion/best_model.pt"
+    DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH = ai_resource_path(
+        "models", "ai_direct_finger_motion", "best_model.pt"
     )
     DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE = 3
     DEFAULT_VISUALIZATION_TARGET_HZ = 30.0
@@ -255,6 +277,12 @@ class NullMeshLab:
         self.parent = parent
 
     def addRobot(self):
+        return None
+
+    def addRobotInDialog(self):
+        return None
+
+    def addDexterousHandInDialog(self):
         return None
 
 
@@ -378,6 +406,8 @@ class RobotScriptSendWidget(QWidget):
 
 
 class RobotPositionWidget(QWidget):
+    PRESET_CONFIG_PATH = resource_path("config", "robot_position_presets.json")
+
     def __init__(self, robot_api=None, parent=None):
         super().__init__(parent)
         self.robot_api = robot_api
@@ -386,10 +416,16 @@ class RobotPositionWidget(QWidget):
         self.labels = []
         # --- MODIFICATION: Removed inline stylesheet ---
 
+        # Preset 1 (deg): [-45, 0, -90, 0, -90, 0]
         self.presets = {
-            1: [-0.7242335, 0.28315391, -1.523286731370, -0.32650261753, -1.5700302685, 0.0],
-            2: [-1.1, -0.43900, -1.005029724, -0.143107, -1.57, 0.0]
+            1: [math.radians(d) for d in (-45.0, 0.0, -90.0, 0.0, -90.0, 0.0)],
+            2: [-1.1, -0.43900, -1.005029724, -0.143107, -1.57, 0.0],
+            3: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            4: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            5: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         }
+        self._load_presets_from_disk()
+        self.current_preset_number = 1
 
         # --- MODIFICATION: Use QGroupBox for title and layout ---
         self.angle_group_box = QGroupBox("Angle")
@@ -438,11 +474,16 @@ class RobotPositionWidget(QWidget):
         action_layout.setContentsMargins(0, 10, 0, 0)
 
         self.preset_buttons = []
-        for i in range(1, 3):
-            btn = QPushButton(f"Preset {i}")
+        for i in range(1, 6):
+            btn = QPushButton(str(i))
             btn.clicked.connect(lambda checked, p=i: self.apply_preset(p))
             action_layout.addWidget(btn)
             self.preset_buttons.append(btn)
+
+        self.load_current_angle_button = QPushButton("Load Current Robot Angle")
+        self.load_current_angle_button.clicked.connect(self.load_current_robot_angle_into_current_preset)
+        action_layout.addWidget(self.load_current_angle_button)
+        self._update_load_current_angle_button_state()
 
         action_layout.addStretch()
 
@@ -457,8 +498,95 @@ class RobotPositionWidget(QWidget):
     def apply_preset(self, preset_number):
         preset_values = self.presets.get(preset_number)
         if preset_values:
+            self.current_preset_number = int(preset_number)
             for i, value in enumerate(preset_values):
                 self.position_edits[i].setText(f"{value:.4f}")
+            self._update_load_current_angle_button_state()
+
+    def _update_load_current_angle_button_state(self):
+        btn = getattr(self, "load_current_angle_button", None)
+        if btn is None:
+            return
+        preset_number = int(getattr(self, "current_preset_number", 1))
+        allow = preset_number >= 3
+        btn.setEnabled(allow)
+        if allow:
+            btn.setToolTip(
+                f"Load current robot joint angles and save into Preset {preset_number}."
+            )
+        else:
+            btn.setToolTip(
+                "Disabled for Preset 1/2 to avoid accidental overwrite. "
+                "Switch to Preset 3 or 4 to enable."
+            )
+
+    def load_current_robot_angle_into_current_preset(self):
+        api = self.robot_api
+        if api is None or not hasattr(api, 'get_current_positions'):
+            print("Robot API unavailable: cannot load current joint angle.")
+            return
+
+        try:
+            current_positions = list(api.get_current_positions() or [])
+        except Exception as e:
+            print(f"Failed to read current robot joint angles: {e}")
+            return
+
+        if len(current_positions) < 6:
+            print("Current robot joint angles unavailable or incomplete.")
+            return
+
+        current_positions = [float(v) for v in current_positions[:6]]
+        preset_number = int(getattr(self, "current_preset_number", 1))
+        if preset_number not in self.presets:
+            preset_number = 1
+            self.current_preset_number = 1
+
+        self.presets[preset_number] = current_positions
+        for i, value in enumerate(current_positions):
+            self.position_edits[i].setText(f"{value:.4f}")
+        self._save_presets_to_disk()
+
+        print(
+            f"Loaded current robot joint angles into Preset {preset_number}: "
+            f"{[round(v, 4) for v in current_positions]}"
+        )
+
+    def _save_presets_to_disk(self):
+        payload = {
+            "version": 1,
+            "presets": {
+                str(k): [float(v) for v in values]
+                for k, values in sorted(self.presets.items())
+                if isinstance(k, int) and len(values) >= 6
+            },
+        }
+        try:
+            os.makedirs(os.path.dirname(self.PRESET_CONFIG_PATH), exist_ok=True)
+            with open(self.PRESET_CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception as e:
+            print(f"Failed to save robot position presets: {e}")
+
+    def _load_presets_from_disk(self):
+        try:
+            if not os.path.isfile(self.PRESET_CONFIG_PATH):
+                return
+            with open(self.PRESET_CONFIG_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            loaded = payload.get("presets", {}) if isinstance(payload, dict) else {}
+            if not isinstance(loaded, dict):
+                return
+            for key, values in loaded.items():
+                try:
+                    preset_number = int(key)
+                    if not isinstance(values, list) or len(values) < 6:
+                        continue
+                    self.presets[preset_number] = [float(v) for v in values[:6]]
+                except Exception:
+                    continue
+        except Exception as e:
+            print(f"Failed to load robot position presets: {e}")
 
     def _nudge_joint_rad(self, index: int, delta_rad: float):
         edit = self.position_edits[index]
@@ -482,7 +610,9 @@ class RobotPositionWidget(QWidget):
 
         try:
             print("Sending positions:", positions)
-            api.send_positions_joint_angle(positions)
+            ok = api.send_positions_joint_angle(positions)
+            if not ok:
+                print("Failed to queue joint positions: robot API returned False.")
         except Exception as e:
             print(f"Failed to send joint positions: {e}")
 
@@ -607,6 +737,7 @@ class RobotToolFramePositionWidget(QWidget):
     Improved layout:
       - speed sliders at top
       - 2 sub-tabs: Linear / Angular
+      - direct 6D (x y z rx ry rz) send row
       - compact stop buttons at bottom
     """
 
@@ -616,7 +747,10 @@ class RobotToolFramePositionWidget(QWidget):
         self.log_display = log_display
 
         self.linear_speed = 0.02   # m/s
-        self.angular_speed = 0.01  # rad/s
+        # Angular velocity for Rx/Ry/Rz buttons (rad/s). Slider maps 1..10 →
+        # 0.0001 .. 0.001 (fine control for slow tool-frame rotation).
+        self.angular_speed = 0.0001
+        self._velocity_mode_active = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(6, 6, 6, 6)
@@ -652,11 +786,17 @@ class RobotToolFramePositionWidget(QWidget):
         angular_row = QHBoxLayout()
         angular_row.addWidget(QLabel("RXYZ speed:"))
         self.angular_slider = QSlider(Qt.Horizontal)
-        self.angular_slider.setRange(1, 200)  # 0.001 -> 0.200 rad/s
-        self.angular_slider.setValue(int(self.angular_speed * 1000))
+        # Integer 1..10 → 0.0001 .. 0.001 rad/s (step 0.0001)
+        self.angular_slider.setRange(1, 10)
+        self.angular_slider.setSingleStep(1)
+        self.angular_slider.setPageStep(1)
+        self.angular_slider.setValue(max(1, int(round(self.angular_speed / 1e-4))))
+        self.angular_slider.setToolTip(
+            "Angular velocity for Rx/Ry/Rz buttons: 0.0001 to 0.001 rad/s (step 0.0001)."
+        )
         self.angular_slider.valueChanged.connect(self._on_angular_slider)
         self.angular_label = QLabel()
-        self.angular_label.setFixedWidth(90)
+        self.angular_label.setFixedWidth(130)
         angular_row.addWidget(self.angular_slider)
         angular_row.addWidget(self.angular_label)
         main_layout.addLayout(angular_row)
@@ -725,6 +865,33 @@ class RobotToolFramePositionWidget(QWidget):
 
         self.motion_tabs.addTab(angular_tab, "Angular")
 
+        # Direct 6D tab
+        direct_tab = QWidget()
+        direct_tab_layout = QGridLayout(direct_tab)
+        direct_tab_layout.setContentsMargins(8, 8, 8, 8)
+        direct_tab_layout.setHorizontalSpacing(8)
+        direct_tab_layout.setVerticalSpacing(6)
+
+        self.direct_vel_inputs = {}
+        axes = ("x", "y", "z", "rx", "ry", "rz")
+        for idx, axis in enumerate(axes):
+            row = idx // 3
+            col = (idx % 3) * 2
+            label = QLabel(f"{axis}:")
+            entry = QLineEdit("0.0")
+            entry.setMaximumWidth(90)
+            entry.setToolTip("Velocity in tool frame (m/s for x,y,z; rad/s for rx,ry,rz).")
+            direct_tab_layout.addWidget(label, row, col)
+            direct_tab_layout.addWidget(entry, row, col + 1)
+            self.direct_vel_inputs[axis] = entry
+
+        self.send_direct_6d_button = QPushButton("Send 6D Velocity")
+        self.send_direct_6d_button.setMinimumHeight(32)
+        self.send_direct_6d_button.clicked.connect(self._send_direct_6d_velocity)
+        direct_tab_layout.addWidget(self.send_direct_6d_button, 2, 0, 1, 6)
+
+        self.motion_tabs.addTab(direct_tab, "Direct 6D")
+
         # -------------------------
         # Stop buttons
         # -------------------------
@@ -755,12 +922,12 @@ class RobotToolFramePositionWidget(QWidget):
         self._refresh_speed_labels()
 
     def _on_angular_slider(self, value: int):
-        self.angular_speed = value / 1000.0
+        self.angular_speed = max(1, min(10, int(value))) * 1e-4
         self._refresh_speed_labels()
 
     def _refresh_speed_labels(self):
         self.linear_label.setText(f"{self.linear_speed:.3f} m/s")
-        self.angular_label.setText(f"{self.angular_speed:.3f} rad/s")
+        self.angular_label.setText(f"{self.angular_speed:.4f} rad/s")
 
     def _append_log(self, message: str):
         if self.log_display is not None:
@@ -768,6 +935,35 @@ class RobotToolFramePositionWidget(QWidget):
                 self.log_display.append(message)
             except Exception:
                 pass
+
+    def _robot_velocity_mode_active(self):
+        return bool(
+            self._velocity_mode_active
+            or getattr(self.robot_api, "_end_effector_velocity_mode_active", False)
+        )
+
+    @staticmethod
+    def _velocity_is_zero(v_lin, v_rot):
+        values = list(v_lin or []) + list(v_rot or [])
+        return all(abs(float(value)) < 1e-12 for value in values)
+
+    def _ensure_velocity_mode(self):
+        if self._robot_velocity_mode_active():
+            self._velocity_mode_active = True
+            return True
+        if hasattr(self.robot_api, "enter_end_effector_velocity_mode"):
+            ok = self.robot_api.enter_end_effector_velocity_mode(suspend_existing=True)
+            self._velocity_mode_active = bool(ok)
+            return bool(ok)
+        if not hasattr(self.robot_api, "send_request"):
+            return False
+        if hasattr(self.robot_api, "suspend_end_effector_velocity_mode"):
+            self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+        if hasattr(self.robot_api, "enable_end_effector_velocity_mode"):
+            ok = self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
+            self._velocity_mode_active = bool(ok)
+            return bool(ok)
+        return False
 
     def _send_linear(self, x, y, z):
         self._send_velocity([float(x), float(y), float(z)], [0.0, 0.0, 0.0])
@@ -781,11 +977,23 @@ class RobotToolFramePositionWidget(QWidget):
                 print("[RobotToolFramePositionWidget] robot_api has no send_request()")
                 return
 
-            if hasattr(self.robot_api, "suspend_end_effector_velocity_mode"):
-                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+            v_lin = [float(v_lin[0]), float(v_lin[1]), float(v_lin[2])]
+            v_rot = [float(v_rot[0]), float(v_rot[1]), float(v_rot[2])]
+            is_zero = self._velocity_is_zero(v_lin, v_rot)
+            if not is_zero and not self._ensure_velocity_mode():
+                self._append_log("❌ [VelocityControl] Could not enter tool velocity mode.")
+                return
+            if is_zero and not self._robot_velocity_mode_active():
+                return
 
-            if hasattr(self.robot_api, "enable_end_effector_velocity_mode"):
-                self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
+            if hasattr(self.robot_api, "send_end_effector_velocity_in_frame"):
+                self.robot_api.send_end_effector_velocity_in_frame(
+                    v_lin,
+                    v_rot,
+                    frame="tool",
+                    ensure_mode=not is_zero,
+                )
+                return
 
             if hasattr(self.robot_api, "set_end_effector_velocity_in_frame"):
                 self.robot_api.send_request(
@@ -803,23 +1011,42 @@ class RobotToolFramePositionWidget(QWidget):
             print(msg)
             self._append_log(f"❌ {msg}")
 
+    def _send_direct_6d_velocity(self):
+        try:
+            x = float(self.direct_vel_inputs["x"].text())
+            y = float(self.direct_vel_inputs["y"].text())
+            z = float(self.direct_vel_inputs["z"].text())
+            rx = float(self.direct_vel_inputs["rx"].text())
+            ry = float(self.direct_vel_inputs["ry"].text())
+            rz = float(self.direct_vel_inputs["rz"].text())
+        except Exception:
+            self._append_log("❌ [VelocityControl] Invalid 6D input. Please enter numeric x/y/z/rx/ry/rz.")
+            return
+        self._send_velocity([x, y, z], [rx, ry, rz])
+
     def stop_all_velocity(self):
         self._send_velocity([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
 
     def stop_velocity_mode(self):
-        """Safely exit velocity mode: Suspend -> Stop."""
+        """Safely exit velocity mode: zero velocity, then Suspend -> Stop."""
         try:
             if not hasattr(self.robot_api, "send_request"):
                 print("[RobotToolFramePositionWidget] robot_api has no send_request()")
                 return
 
-            if hasattr(self.robot_api, "suspend_end_effector_velocity_mode"):
-                self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
-
-            if hasattr(self.robot_api, "stop_end_effector_velocity_mode"):
-                self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
+            if hasattr(self.robot_api, "exit_end_effector_velocity_mode"):
+                self.robot_api.exit_end_effector_velocity_mode(send_zero=True)
+            else:
+                if hasattr(self.robot_api, "set_end_effector_velocity"):
+                    self.robot_api.send_request(self.robot_api.set_end_effector_velocity([0.0] * 6))
+                if hasattr(self.robot_api, "suspend_end_effector_velocity_mode"):
+                    self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
+                if hasattr(self.robot_api, "stop_end_effector_velocity_mode"):
+                    self.robot_api.send_request(self.robot_api.stop_end_effector_velocity_mode())
+            self._velocity_mode_active = False
 
         except Exception as e:
+            self._velocity_mode_active = False
             msg = f"[VelocityControl] Failed to stop velocity mode: {e}"
             print(msg)
             self._append_log(f"❌ {msg}")
@@ -921,7 +1148,21 @@ class UI(
         self.robot_api = self._safe_create(RobotController, NullRobotApi(), 'robot_driver', 'Robot API')
         self.gripper = self._safe_create(GripperHelper, NullGripper(), 'gripper_driver', 'Gripper API')
 
-        self.features['robot_ready'] = bool(getattr(self.robot_api, 'use_ros', False))
+        self.features['robot_ready'] = bool(
+            getattr(self.robot_api, 'service_ok', False)
+            or getattr(self.robot_api, 'script_ok', False)
+        )
+        hand_services_ready = False
+        hand_tactile_ready = False
+        try:
+            hand_services_ready = bool(self.robot_api.hand_services_available())
+        except Exception:
+            hand_services_ready = False
+        try:
+            hand_tactile_ready = bool(self.robot_api.hand_tactile_available())
+        except Exception:
+            hand_tactile_ready = False
+        self.features['hand_ready'] = bool(hand_services_ready or hand_tactile_ready)
         self.features['sensor_ready'] = bool(self.features['sensor_module'])
         self.features['gripper_ready'] = bool(self.features['gripper_driver'])
         self.features['camera_ready'] = bool(self.features['camera_driver'])
@@ -1006,6 +1247,10 @@ class UI(
         if not self.features.get('robot_ready', False):
             self.set_robot_subtab_enabled(False)
             self.auto_center_button.setEnabled(False)
+
+        if not self.features.get('hand_ready', False):
+            if hasattr(self, "hand_tab_index"):
+                self.tab_widget.setTabEnabled(int(self.hand_tab_index), False)
 
         if not self.features.get('camera_ready', False):
             self.live_yolo_button.setEnabled(False)
@@ -1109,6 +1354,12 @@ class UI(
         self.setup_tab4(tab4_layout)
         self.tab_widget.addTab(tab4, "Extra")
 
+        # Tab 5: Dexterous Hand
+        tab5 = QWidget()
+        tab5_layout = QVBoxLayout(tab5)
+        self.setup_tab5(tab5_layout)
+        self.hand_tab_index = self.tab_widget.addTab(tab5, "Dexterous Hand")
+
     def setup_tab1(self, layout):
         self.sensor_sub_tabs = QTabWidget()
         self.sensor_sub_tabs.setUsesScrollButtons(False)
@@ -1139,8 +1390,10 @@ class UI(
         self.buildScene = QPushButton("Build Scene", self.widget_func)
         send_layout.addWidget(self.buildScene)
 
+        # Keep a single backend update trigger object for compatibility with existing
+        # enable/disable hooks; the visible Update Sensor control is now in top toolbar.
         self.sensor_update = QPushButton("Update Sensor", self.widget_func)
-        send_layout.addWidget(self.sensor_update)
+        self.sensor_update.setVisible(False)
 
         send_group.setLayout(send_layout)
 
@@ -1261,12 +1514,10 @@ class UI(
 
         self.send_script_button = QPushButton("Send Script")
         self.show_robot_button = QPushButton("Import 3D Robot Model")
-        self.continuous_read_button = QPushButton("Real-time Live 3D Robot Model", self.widget_func)
 
         read_layout.addWidget(self.read_joint_angle_button)
         read_layout.addWidget(self.read_tool_position_button)
         read_layout.addWidget(self.show_robot_button)
-        read_layout.addWidget(self.continuous_read_button)
         send_layout.addWidget(self.send_position_PTP_J_button)
         send_layout.addWidget(self.send_position_PTP_T_button)
         send_layout.addWidget(self.send_position_PTP_T_toolframe_button)
@@ -1490,11 +1741,11 @@ class UI(
         ha.addStretch()
         ai_model_layout.addWidget(row_anchor)
 
-        self.update_sensor_button = QPushButton("Update Sensor")
         self.direct_finger_motion_button = QPushButton("Direct Finger Motion")
         self.direct_finger_motion_v2_button = QPushButton("Direct Finger Motion (Version 2)")
         self.console_control_button = QPushButton("Console Control (PS5)")
         self.console_control_sensor_button = QPushButton("Console Control (Sensor)")
+        self.console_control_sensor_v2_button = QPushButton("Console Control (Sensor V2)")
         self.direct_finger_motion_tool_pose_record_menu_button = QPushButton("Tool Pose Recording")
         self.load_tool_pose_path_button = QPushButton("Load Tool Pose Path")
         self.clear_tool_pose_path_button = QPushButton("Clear Tool Pose Path")
@@ -1507,7 +1758,7 @@ class UI(
         model_row_layout.addWidget(QLabel("Model Path:"))
         self.ai_direct_execution_model_path_input = QLineEdit()
         self.ai_direct_execution_model_path_input.setPlaceholderText(
-            "/home/ping2/ros2_ws/src/phd/phd/resource/ai/models/ai_direct_finger_motion/best_model.pt"
+            DisabledSensorFunctions.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
         )
         default_ai_model_path = self._get_default_ai_execution_model_path()
         self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
@@ -1525,9 +1776,15 @@ class UI(
         )
         threelevel_row_layout.addWidget(self.btn_toggle_3lvl_latch, 1)
         ai_model_layout.addWidget(threelevel_row)
-        ai_model_layout.addWidget(self.proximity_control_button)
-        ai_model_layout.addWidget(self.proximity_record_button)
-        ai_model_layout.addWidget(self.update_sensor_button)
+        proximity_row = QWidget()
+        proximity_row_layout = QHBoxLayout(proximity_row)
+        proximity_row_layout.setContentsMargins(0, 0, 0, 0)
+        proximity_row_layout.setSpacing(6)
+        self.proximity_control_button.setMinimumWidth(0)
+        self.proximity_record_button.setMinimumWidth(0)
+        proximity_row_layout.addWidget(self.proximity_control_button, 1)
+        proximity_row_layout.addWidget(self.proximity_record_button, 1)
+        ai_model_layout.addWidget(proximity_row)
         ai_model_layout.addWidget(self.direct_finger_motion_button)
         ai_model_layout.addWidget(self.direct_finger_motion_v2_button)
         console_row = QWidget()
@@ -1536,16 +1793,22 @@ class UI(
         console_row_layout.setSpacing(6)
         self.console_control_button.setMinimumWidth(0)
         self.console_control_sensor_button.setMinimumWidth(0)
+        self.console_control_sensor_v2_button.setMinimumWidth(0)
         console_row_layout.addWidget(self.console_control_button, 1)
         console_row_layout.addWidget(self.console_control_sensor_button, 1)
+        console_row_layout.addWidget(self.console_control_sensor_v2_button, 1)
         ai_model_layout.addWidget(console_row)
-        ai_model_layout.addWidget(self.direct_finger_motion_tool_pose_record_menu_button)
-        tool_pose_path_row = QWidget()
-        tool_pose_path_row_layout = QHBoxLayout(tool_pose_path_row)
-        tool_pose_path_row_layout.setContentsMargins(0, 0, 0, 0)
-        tool_pose_path_row_layout.addWidget(self.load_tool_pose_path_button)
-        tool_pose_path_row_layout.addWidget(self.clear_tool_pose_path_button)
-        ai_model_layout.addWidget(tool_pose_path_row)
+        tool_pose_row = QWidget()
+        tool_pose_row_layout = QHBoxLayout(tool_pose_row)
+        tool_pose_row_layout.setContentsMargins(0, 0, 0, 0)
+        tool_pose_row_layout.setSpacing(6)
+        self.direct_finger_motion_tool_pose_record_menu_button.setMinimumWidth(0)
+        self.load_tool_pose_path_button.setMinimumWidth(0)
+        self.clear_tool_pose_path_button.setMinimumWidth(0)
+        tool_pose_row_layout.addWidget(self.direct_finger_motion_tool_pose_record_menu_button, 1)
+        tool_pose_row_layout.addWidget(self.load_tool_pose_path_button, 1)
+        tool_pose_row_layout.addWidget(self.clear_tool_pose_path_button, 1)
+        ai_model_layout.addWidget(tool_pose_row)
         self._build_direct_finger_motion_settings_dialog()
         self._build_direct_finger_motion_v2_settings_dialog()
         self._build_console_control_settings_dialog()
@@ -1634,6 +1897,220 @@ class UI(
         camera_layout.addWidget(self.auto_center_button)
         camera_group.setLayout(camera_layout)
         layout.addWidget(camera_group)
+
+    def setup_tab5(self, layout):
+        self.hand_state_label = QLabel("RH56F1 status: idle")
+        layout.addWidget(self.hand_state_label)
+
+        model_group = QGroupBox("3D Hand Model")
+        model_layout = QHBoxLayout(model_group)
+        self.hand_model_show_button = QPushButton("Import 3D Hand Model")
+        model_layout.addWidget(self.hand_model_show_button)
+        self.hand_model_status_label = QLabel("resource/dexterous_hand")
+        self.hand_model_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        model_layout.addWidget(self.hand_model_status_label, stretch=1)
+        layout.addWidget(model_group)
+
+        tactile_group = QGroupBox("Tactile Sensor Readout")
+        tactile_layout = QVBoxLayout(tactile_group)
+
+        tactile_control_row = QHBoxLayout()
+        self.hand_tactile_live_button = QPushButton("Start Live Tactile")
+        self.hand_tactile_live_button.setCheckable(True)
+        tactile_control_row.addWidget(self.hand_tactile_live_button)
+
+        self.hand_tactile_refresh_button = QPushButton("Refresh Display")
+        tactile_control_row.addWidget(self.hand_tactile_refresh_button)
+
+        self.hand_tactile_status_label = QLabel("No tactile data")
+        self.hand_tactile_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        tactile_control_row.addWidget(self.hand_tactile_status_label, stretch=1)
+        tactile_layout.addLayout(tactile_control_row)
+
+        self.hand_tactile_table = QTableWidget(8, 5)
+        self.hand_tactile_table.setHorizontalHeaderLabels(
+            ["Region", "Normal (N)", "Tangential (N)", "Direction", "Proximity"]
+        )
+        self.hand_tactile_table.verticalHeader().hide()
+        self.hand_tactile_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.hand_tactile_table.setSelectionMode(QTableWidget.NoSelection)
+        self.hand_tactile_table.setMinimumHeight(245)
+        header = self.hand_tactile_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        for col in range(1, 5):
+            header.setSectionResizeMode(col, QHeaderView.Stretch)
+
+        self._hand_tactile_region_names = [
+            "Little finger",
+            "Ring finger",
+            "Middle finger",
+            "Index finger",
+            "Thumb",
+            "Palm left",
+            "Palm middle",
+            "Palm right",
+        ]
+        for row, name in enumerate(self._hand_tactile_region_names):
+            self.hand_tactile_table.setItem(row, 0, QTableWidgetItem(name))
+            for col in range(1, 5):
+                item = QTableWidgetItem("--")
+                item.setTextAlignment(Qt.AlignCenter)
+                self.hand_tactile_table.setItem(row, col, item)
+
+        tactile_layout.addWidget(self.hand_tactile_table)
+        layout.addWidget(tactile_group)
+
+        self.hand_tactile_timer = QTimer(self)
+        self.hand_tactile_timer.setInterval(100)
+        self.hand_tactile_timer.timeout.connect(self._refresh_hand_tactile_display)
+
+        speed_force_group = QGroupBox("Global Speed / Force")
+        sf_layout = QGridLayout(speed_force_group)
+        sf_layout.addWidget(QLabel("Speed (all):"), 0, 0)
+        self.hand_speed_spin = QSpinBox()
+        self.hand_speed_spin.setRange(0, 3000)
+        self.hand_speed_spin.setValue(300)
+        sf_layout.addWidget(self.hand_speed_spin, 0, 1)
+        self.hand_apply_speed_button = QPushButton("Apply Speed")
+        sf_layout.addWidget(self.hand_apply_speed_button, 0, 2)
+        sf_layout.addWidget(QLabel("Force (all):"), 1, 0)
+        self.hand_force_spin = QSpinBox()
+        self.hand_force_spin.setRange(0, 12000)
+        self.hand_force_spin.setValue(2000)
+        sf_layout.addWidget(self.hand_force_spin, 1, 1)
+        self.hand_apply_force_button = QPushButton("Apply Force")
+        sf_layout.addWidget(self.hand_apply_force_button, 1, 2)
+        layout.addWidget(speed_force_group)
+
+        open_close_group = QGroupBox("Quick Actions")
+        oc_layout = QHBoxLayout(open_close_group)
+        self.hand_open_all_button = QPushButton("Open All")
+        self.hand_close_all_button = QPushButton("Close All")
+        self.hand_read_angles_button = QPushButton("Read Actual Angles")
+        oc_layout.addWidget(self.hand_open_all_button)
+        oc_layout.addWidget(self.hand_close_all_button)
+        oc_layout.addWidget(self.hand_read_angles_button)
+        layout.addWidget(open_close_group)
+
+        thumb_group = QGroupBox("Thumb Rotation Presets")
+        thumb_layout = QHBoxLayout(thumb_group)
+        self.hand_thumb_left_button = QPushButton("Thumb Left")
+        self.hand_thumb_center_button = QPushButton("Thumb Center")
+        self.hand_thumb_right_button = QPushButton("Thumb Right")
+        thumb_layout.addWidget(self.hand_thumb_left_button)
+        thumb_layout.addWidget(self.hand_thumb_center_button)
+        thumb_layout.addWidget(self.hand_thumb_right_button)
+        layout.addWidget(thumb_group)
+
+        # Per-finger sliders. Drag a slider to set the target angle; the
+        # right-most "Send" button sends just that finger (others left
+        # untouched). Range is tuned per actuator so the usable open/close
+        # range falls in the middle of the slider.
+        slider_group = QGroupBox("Finger Position Sliders")
+        slider_outer = QVBoxLayout(slider_group)
+
+        # name, angle index, slider min, slider max, default open/close hints
+        self._hand_slider_specs = [
+            ("Little finger", 0, 800, 1900, 1720, 900),
+            ("Ring finger", 1, 800, 1900, 1720, 900),
+            ("Middle finger", 2, 800, 1900, 1720, 900),
+            ("Index finger", 3, 800, 1900, 1720, 900),
+            ("Thumb bending", 4, 1000, 1500, 1350, 1100),
+            ("Thumb rotation", 5, 500, 2000, 1000, 1000),
+        ]
+        # Public list reused by the interaction layer (replaces the old
+        # ``hand_angle_spins``). Each entry is a ``QSlider``.
+        self.hand_angle_sliders = []
+        self._hand_angle_value_labels = []
+        self._hand_angle_send_buttons = []
+        self._hand_angle_open_values = []
+        self._hand_angle_close_values = []
+
+        sliders_grid = QGridLayout()
+        sliders_grid.setHorizontalSpacing(8)
+        sliders_grid.setVerticalSpacing(4)
+        for row, (name, idx, lo, hi, open_v, close_v) in enumerate(
+            self._hand_slider_specs
+        ):
+            name_label = QLabel(f"{name}\n(angle{idx})")
+            name_label.setMinimumWidth(110)
+
+            slider = QSlider(Qt.Horizontal)
+            slider.setRange(int(lo), int(hi))
+            slider.setSingleStep(1)
+            slider.setPageStep(max(10, (hi - lo) // 20))
+            slider.setValue(int(open_v))
+            slider.setTracking(True)
+
+            value_label = QLabel(str(int(open_v)))
+            value_label.setMinimumWidth(48)
+            value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+            send_btn = QPushButton("Send")
+            send_btn.setFixedWidth(56)
+            send_btn.setToolTip(
+                f"Send angle{idx}={slider.value()} only; the other five\n"
+                f"actuators stay where they are."
+            )
+
+            sliders_grid.addWidget(name_label, row, 0)
+            sliders_grid.addWidget(slider, row, 1)
+            sliders_grid.addWidget(value_label, row, 2)
+            sliders_grid.addWidget(send_btn, row, 3)
+
+            self.hand_angle_sliders.append(slider)
+            self._hand_angle_value_labels.append(value_label)
+            self._hand_angle_send_buttons.append(send_btn)
+            self._hand_angle_open_values.append(int(open_v))
+            self._hand_angle_close_values.append(int(close_v))
+
+        slider_outer.addLayout(sliders_grid)
+
+        # Action / quick preset row.
+        bottom_row = QHBoxLayout()
+        self.hand_sliders_live_check = QCheckBox("Live update (drag to send)")
+        self.hand_sliders_live_check.setToolTip(
+            "When ticked, dragging a slider continuously streams the new\n"
+            "angle to the hand (throttled). Turn off if you prefer to dial\n"
+            "in the value first and press 'Send' yourself."
+        )
+        bottom_row.addWidget(self.hand_sliders_live_check)
+
+        self.hand_sliders_load_open_button = QPushButton("Load Open")
+        self.hand_sliders_load_open_button.setToolTip(
+            "Snap all six sliders to their suggested OPEN position. Does not\n"
+            "send anything until you press 'Send All'."
+        )
+        bottom_row.addWidget(self.hand_sliders_load_open_button)
+
+        self.hand_sliders_load_close_button = QPushButton("Load Close")
+        self.hand_sliders_load_close_button.setToolTip(
+            "Snap all six sliders to their suggested CLOSE position. Does\n"
+            "not send anything until you press 'Send All'."
+        )
+        bottom_row.addWidget(self.hand_sliders_load_close_button)
+
+        self.hand_sliders_sync_button = QPushButton("Sync From Actual")
+        self.hand_sliders_sync_button.setToolTip(
+            "Read /Getangleact and set every slider to the live actual\n"
+            "angle. Useful when starting from an unknown pose."
+        )
+        bottom_row.addWidget(self.hand_sliders_sync_button)
+
+        bottom_row.addStretch(1)
+
+        self.hand_send_custom_angles_button = QPushButton("Send All")
+        self.hand_send_custom_angles_button.setStyleSheet(
+            "QPushButton { font-weight: bold; padding: 4px 12px; }"
+        )
+        self.hand_send_custom_angles_button.setToolTip(
+            "Send the current value of all six sliders in one go."
+        )
+        bottom_row.addWidget(self.hand_send_custom_angles_button)
+
+        slider_outer.addLayout(bottom_row)
+        layout.addWidget(slider_group)
+        layout.addStretch()
 
     def _set_button_active(self, btn: QPushButton, active: bool):
         """Green when active; when inactive, revert to the default theme."""
@@ -1745,11 +2222,13 @@ class UI(
         v_rot = [0.0, 0.0, 0.0]  # We don't want to rotate, just move
 
         try:
-            # We assume velocity mode is already enabled by the toggle button
-            self.robot_api.send_request(
-                self.robot_api.set_end_effector_velocity_in_frame(
+            if hasattr(self.robot_api, "send_end_effector_velocity_in_frame"):
+                self.robot_api.send_end_effector_velocity_in_frame(
                     v_lin, v_rot, frame="tool"
                 )
+                return
+            self.robot_api.send_request(
+                self.robot_api.set_end_effector_velocity_in_frame(v_lin, v_rot, frame="tool")
             )
         except Exception as e:
             print(f"Error sending velocity: {e}")
