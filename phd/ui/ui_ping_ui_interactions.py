@@ -612,7 +612,9 @@ class UiInteractionsMixin:
 
     def _submit_hand_worker(self, kind: str, label: str, call_fn, *, live: bool = False):
         if not self._hand_api_available():
-            self._hand_log("RH56F1 service unavailable. Check ROS2 /Setangle /Setspeed /Setforce /Getangleact.")
+            self._hand_log(
+                "RH56F1 command interface unavailable. Check /set_angle_data or /Setangle."
+            )
             return
         self._ensure_hand_async_worker()
 
@@ -814,6 +816,9 @@ class UiInteractionsMixin:
                     status.setText("No /touch_data publisher")
                 else:
                     status.setText("Waiting for /touch_data")
+            helper = getattr(self, "mesh_functions", None)
+            if helper is not None and hasattr(helper, "updateDexterousHandTactile"):
+                helper.updateDexterousHandTactile(None)
             return
 
         finger_forces = list(data.get("finger_forces") or [])
@@ -870,6 +875,10 @@ class UiInteractionsMixin:
                 status.setText(f"/touch_data age {age:.2f}s")
             else:
                 status.setText("/touch_data received")
+
+        helper = getattr(self, "mesh_functions", None)
+        if helper is not None and hasattr(helper, "updateDexterousHandTactile"):
+            helper.updateDexterousHandTactile(data)
 
     def _on_hand_open_all(self):
         self._send_hand_angles([1720, 1720, 1720, 1720, 1350, -1], label="Open all")

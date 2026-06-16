@@ -285,6 +285,9 @@ class NullMeshLab:
     def addDexterousHandInDialog(self):
         return None
 
+    def updateDexterousHandTactile(self, *_args, **_kwargs):
+        return None
+
 
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
@@ -1348,17 +1351,17 @@ class UI(
         self.setup_tab3(tab3_layout)
         self.tab_widget.addTab(tab3, "AI")
 
-        # Tab 4: Extra
+        # Tab 4: Dexterous Hand
         tab4 = QWidget()
         tab4_layout = QVBoxLayout(tab4)
-        self.setup_tab4(tab4_layout)
-        self.tab_widget.addTab(tab4, "Extra")
+        self.setup_tab5(tab4_layout)
+        self.hand_tab_index = self.tab_widget.addTab(tab4, "Dexterous Hand")
 
-        # Tab 5: Dexterous Hand
+        # Tab 5: Extra (last)
         tab5 = QWidget()
         tab5_layout = QVBoxLayout(tab5)
-        self.setup_tab5(tab5_layout)
-        self.hand_tab_index = self.tab_widget.addTab(tab5, "Dexterous Hand")
+        self.setup_tab4(tab5_layout)
+        self.tab_widget.addTab(tab5, "Extra")
 
     def setup_tab1(self, layout):
         self.sensor_sub_tabs = QTabWidget()

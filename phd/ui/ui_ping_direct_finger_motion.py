@@ -578,11 +578,6 @@ class DirectFingerMotionMixin:
             "0.0 = maximum smoothing (very slow). 1.0 = no smoothing (raw).\n"
             "Single-finger swipe relevance: very high."
         ),
-        "push_pinch_enabled": (
-            "Enable hard-press push and two-finger pinch pull gestures.\n"
-            "Off: hard press and pinch are ignored.\n"
-            "On: hard press can push, and two-finger pinch can pull."
-        ),
         "push_value_threshold": (
             "Touch strength threshold for push detection.\n"
             "More negative → requires a deeper press.\n"
@@ -631,114 +626,60 @@ class DirectFingerMotionMixin:
             "Larger → more stable but slower."
         ),
         "pull_speed": (
-            "Robot speed used for pull after pinch detection.\n"
+            "Robot speed used for two-finger pull after pinch-in detection.\n"
             "Larger → faster pull.\n"
             "Smaller → gentler pull."
         ),
+        "push_pinch_enabled": (
+            "Enable hard-press push and two-finger pinch pull.\n"
+            "Turn off to use only swipe gestures."
+        ),
         "rotation_speed": (
             "Robot angular speed used for two-finger swipe rotation.\n"
-            "Larger → stronger rotation.\n"
-            "Smaller → gentler rotation."
+            "Vertical swipe → Rx. Horizontal swipe → Rz.\n"
+            "Larger → stronger rotation. Smaller → gentler rotation."
         ),
         "two_finger_swipe_deadband": (
-            "Minimum two-finger midpoint motion needed before rotation begins.\n"
-            "Smaller → more sensitive.\n"
-            "Larger → steadier but slower to react."
+            "Minimum two-finger midpoint motion before rotation begins.\n"
+            "Smaller → more sensitive. Larger → steadier but slower to react."
         ),
         "two_finger_swipe_dominance_ratio": (
-            "How much one axis must dominate before classifying a two-finger swipe direction.\n"
-            "Larger → more selective direction locking.\n"
+            "How much one axis must dominate before classifying swipe direction.\n"
+            "Larger → more selective axis locking.\n"
             "Smaller → easier to trigger either axis."
         ),
         "two_finger_swipe_axis_lock_frames": (
-            "How many frames the chosen two-finger swipe axis stays locked before switching is allowed.\n"
-            "Larger → horizontal/vertical is steadier and less likely to flip.\n"
-            "Smaller → direction can switch more quickly."
+            "Frames the chosen swipe axis stays locked before switching is allowed.\n"
+            "Larger → steadier horizontal/vertical. Smaller → quicker axis changes."
         ),
         "two_finger_swipe_enable_horizontal": (
-            "Enable horizontal two-finger swipe rotation.\n"
+            "Enable horizontal two-finger swipe (Rz rotation).\n"
             "Turn off to ignore left/right midpoint swipes."
         ),
         "two_finger_swipe_enable_vertical": (
-            "Enable vertical two-finger swipe rotation.\n"
+            "Enable vertical two-finger swipe (Rx rotation).\n"
             "Turn off to ignore up/down midpoint swipes."
         ),
-        "two_finger_swipe_up_add_push": (
-            "Add push motion during a two-finger upward swipe.\n"
-            "Off: two-finger vertical swipe only rotates as usual.\n"
-            "On: two-finger upward swipe combines rotation with Push Speed."
-        ),
-        "two_finger_swipe_down_add_pull": (
-            "Add pull motion during a two-finger downward swipe.\n"
-            "Off: two-finger vertical swipe only rotates as usual.\n"
-            "On: two-finger downward swipe combines rotation with Pull Speed."
-        ),
-        "single_finger_up_as_two_finger_swipe_up": (
-            "Treat a one-finger upward swipe as a two-finger upward swipe.\n"
-            "If 2-Finger Up Swipe + Push is enabled, this one-finger upward swipe\n"
-            "also performs the same rotation plus push combination."
-        ),
-        "single_finger_vertical_to_y": (
-            "Single-finger vertical swipe axis.\n"
-            "Off: finger down/up controls +Z/-Z.\n"
-            "On: finger down/up controls +Y/-Y."
-        ),
-        "single_finger_latch_motion": (
-            "Keep the last one- or two-finger swipe velocity while touch remains.\n"
-            "Off: robot stops when the finger stops moving.\n"
-            "On: robot keeps moving in the previous direction until no touch is detected."
-        ),
-        "single_finger_magnitude_speed": (
-            "Allow finger movement distance to change single-finger robot speed.\n"
-            "On: larger finger movement commands faster robot motion.\n"
-            "Off: finger movement only selects direction; speed stays at Robot Speed."
-        ),
         "two_finger_release_grace_frames": (
-            "How many frames the controller waits after losing a two-finger contact.\n"
-            "Smaller → stops faster.\n"
-            "Larger → smoother transitions, but more delay."
+            "Frames to wait after losing two-finger contact before single-finger resumes.\n"
+            "Smaller → stops faster. Larger → smoother transitions."
         ),
         "frame_interval_ms": (
             "Timer interval for the DFM loop.\n"
             "0 means run as fast as the event loop allows.\n"
             "Larger values reduce CPU usage but increase control latency."
         ),
-        "hand_control_enabled": (
-            "Enable five-finger control for the RH56F1 dexterous hand.\n"
-            "When enabled, five-finger motion controls only the hand:\n"
-            "fingers moving inward closes; moving outward opens."
-        ),
-        "hand_five_finger_min_clusters": (
-            "Minimum number of separated touch clusters required to treat the\n"
-            "sensor input as a five-finger hand gesture."
-        ),
-        "hand_five_finger_min_cells": (
-            "Minimum total active sensor cells required before sending a hand\n"
-            "command. Increase this if accidental single contacts trigger it."
-        ),
-        "hand_five_finger_motion_threshold": (
-            "Minimum normalized change in the five-finger spread per frame.\n"
-            "Spread shrinking below this threshold closes the hand; growing\n"
-            "above this threshold opens it."
-        ),
-        "hand_five_finger_close_frames": (
-            "How many consecutive inward five-finger motion frames are\n"
-            "required before RH56F1 closes."
-        ),
-        "hand_five_finger_open_frames": (
-            "How many consecutive outward five-finger motion frames are\n"
-            "required before RH56F1 opens."
-        ),
-        "hand_command_timeout_sec": (
-            "Maximum wait time for each RH56F1 Setangle service call.\n"
-            "Shorter values keep the DFM loop responsive if the service stalls."
+        "sensor_frame_timeout_sec": (
+            "Safety timeout when no fresh sensor frame arrives.\n"
+            "If the robot is moving and the sensor stream stalls longer than this,\n"
+            "DFM sends an immediate zero velocity command."
         ),
     }
 
     def _build_direct_finger_motion_settings_dialog(self):
         self.direct_finger_motion_settings_dialog = QDialog(self)
         self.direct_finger_motion_settings_dialog.setWindowTitle("Direct Finger Motion Parameters")
-        self.direct_finger_motion_settings_dialog.resize(780, 660)
+        self.direct_finger_motion_settings_dialog.resize(780, 620)
         self.direct_finger_motion_settings_dialog.setStyleSheet(
             "QToolTip {"
             " color: #111111;"
@@ -762,7 +703,7 @@ class DirectFingerMotionMixin:
         self.direct_finger_motion_title_label = QLabel("Direct Finger Motion Control Panel")
         self.direct_finger_motion_title_label.setStyleSheet("font-size: 16px; font-weight: 600;")
         self.direct_finger_motion_subtitle_label = QLabel(
-            "Tune and save DFM parameters without editing the script."
+            "Single-finger swipe, hard-press push, two-finger pull, and two-finger swipe."
         )
         self.direct_finger_motion_subtitle_label.setStyleSheet("color: #b0b0b0;")
         header_text_layout.addWidget(self.direct_finger_motion_title_label)
@@ -844,23 +785,11 @@ class DirectFingerMotionMixin:
         add_double("two_finger_swipe_dominance_ratio", "2-Finger Swipe Dominance", 10, 2, 0.0, 100.0, 0.01, 3)
         add_int("two_finger_release_grace_frames", "2-Finger Release Grace", 11, 0, 0, 999)
         add_int("two_finger_swipe_axis_lock_frames", "2-Finger Axis Lock Frames", 11, 2, 0, 999)
-        add_bool("two_finger_swipe_enable_horizontal", "Enable 2-Finger Horizontal Swipe", 12, 0)
-        add_bool("two_finger_swipe_enable_vertical", "Enable 2-Finger Vertical Swipe", 12, 2)
-        add_bool("two_finger_swipe_up_add_push", "2-Finger Up Swipe + Push", 13, 0)
-        add_bool("two_finger_swipe_down_add_pull", "2-Finger Down Swipe + Pull", 13, 2)
-        add_bool("single_finger_vertical_to_y", "Single-Finger Vertical → Y", 14, 0)
-        add_bool("single_finger_latch_motion", "Hold Last Finger Motion", 14, 2)
-        add_bool("single_finger_magnitude_speed", "Finger Magnitude Controls Speed", 15, 0)
-        add_bool("push_pinch_enabled", "Enable Push/Pinch", 15, 2)
-        add_bool("single_finger_up_as_two_finger_swipe_up", "1-Finger Up = 2-Finger Up", 16, 0)
-        add_int("frame_interval_ms", "Timer Interval (ms)", 20, 0, 0, 10000)
-        add_bool("hand_control_enabled", "RH56F1 5-Finger Control", 17, 0)
-        add_int("hand_five_finger_min_clusters", "5-Finger Min Clusters", 18, 0, 1, 20)
-        add_int("hand_five_finger_min_cells", "5-Finger Min Cells", 19, 0, 1, 999)
-        add_double("hand_five_finger_motion_threshold", "5-Finger Motion Threshold", 17, 2, 0.0, 1.0, 0.005, 3)
-        add_int("hand_five_finger_close_frames", "5-Finger Close Frames", 18, 2, 1, 999)
-        add_int("hand_five_finger_open_frames", "5-Finger Open Frames", 19, 2, 1, 999)
-        add_double("hand_command_timeout_sec", "Hand Command Timeout (s)", 20, 2, 0.1, 5.0, 0.1, 2)
+        add_double("sensor_frame_timeout_sec", "Sensor Timeout (s)", 12, 0, 0.0, 5.0, 0.01, 2)
+        add_int("frame_interval_ms", "Timer Interval (ms)", 12, 2, 0, 10000)
+        add_bool("two_finger_swipe_enable_horizontal", "Enable 2-Finger Horizontal Swipe", 13, 0)
+        add_bool("two_finger_swipe_enable_vertical", "Enable 2-Finger Vertical Swipe", 13, 2)
+        add_bool("push_pinch_enabled", "Enable Push/Pinch", 14, 0)
 
         panel_layout.addLayout(grid)
 

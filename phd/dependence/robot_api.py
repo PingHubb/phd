@@ -2,6 +2,7 @@ import math
 import subprocess
 import time
 import re
+from types import SimpleNamespace
 
 import numpy as np
 import transforms3d
@@ -35,9 +36,17 @@ if ROS_AVAILABLE:
         HAND_TOUCH_AVAILABLE = True
     except Exception:
         HAND_TOUCH_AVAILABLE = False
+
+    try:
+        from service_interfaces.msg import GetAngleAct1, SetAngle1, SetForce1, SetSpeed1
+
+        HAND_TOPIC_CMDS_AVAILABLE = True
+    except Exception:
+        HAND_TOPIC_CMDS_AVAILABLE = False
 else:
     HAND_SRVS_AVAILABLE = False
     HAND_TOUCH_AVAILABLE = False
+    HAND_TOPIC_CMDS_AVAILABLE = False
 
 
 class ROSNodeThread(QThread if ROS_AVAILABLE else object):
@@ -116,6 +125,15 @@ class RobotController(Node if ROS_AVAILABLE else object):
         self.hand_set_speed_client = None
         self.hand_set_force_client = None
         self.hand_get_angle_client = None
+        self.hand_topic_ok = False
+        self.hand_topic_commands_detected = False
+        self.hand_set_angle_pub = None
+        self.hand_set_speed_pub = None
+        self.hand_set_force_pub = None
+        self.hand_angle_subscription = None
+        self.latest_hand_angle_data = None
+        self.latest_hand_angle_time = None
+        self._hand_angle_target_cache = [1720, 1720, 1720, 1720, 1350, 1000]
         self.hand_touch_subscription = None
         self.latest_hand_touch_data = None
         self.latest_hand_touch_time = None
@@ -145,10 +163,15 @@ class RobotController(Node if ROS_AVAILABLE else object):
             topics = ""
 
         robot_ready = "/set_positions" in services
-        hand_ready = any(
+        hand_service_ready = any(
             name in services
             for name in ("/Setangle", "/Setspeed", "/Setforce", "/Getangleact")
-        ) or "/touch_data" in topics
+        )
+        self.hand_topic_commands_detected = any(
+            name in topics
+            for name in ("/set_angle_data", "/set_speed_data", "/set_force_data", "/angle_data")
+        )
+        hand_ready = hand_service_ready or self.hand_topic_commands_detected or "/touch_data" in topics
         self.use_ros = bool(robot_ready or hand_ready)
         return self.use_ros
 
@@ -180,6 +203,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
             "SetEvent unavailable – event commands will be skipped",
         )
         self._setup_hand_service_clients()
+        self._setup_hand_topic_interfaces()
 
     def _setup_hand_service_clients(self):
         if not HAND_SRVS_AVAILABLE:
@@ -197,7 +221,25 @@ class RobotController(Node if ROS_AVAILABLE else object):
         ok_get = self.hand_get_angle_client.wait_for_service(timeout_sec=0.3)
         self.hand_srv_ok = bool(ok_angle and ok_speed and ok_force and ok_get)
         if not self.hand_srv_ok:
-            self.get_logger().warning("RH56F1 services unavailable – Dexterous Hand tab will run in limited mode.")
+            self.get_logger().warning("RH56F1 service API unavailable; checking topic command interface.")
+
+    def _setup_hand_topic_interfaces(self):
+        if not HAND_TOPIC_CMDS_AVAILABLE:
+            self.hand_topic_ok = False
+            return
+
+        try:
+            qos = QoSProfile(depth=10)
+            self.hand_set_angle_pub = self.create_publisher(SetAngle1, "/set_angle_data", qos)
+            self.hand_set_speed_pub = self.create_publisher(SetSpeed1, "/set_speed_data", qos)
+            self.hand_set_force_pub = self.create_publisher(SetForce1, "/set_force_data", qos)
+            self.hand_topic_ok = True
+        except Exception as exc:
+            self.hand_topic_ok = False
+            try:
+                self.get_logger().warning(f"RH56F1 topic interface unavailable: {exc}")
+            except Exception:
+                pass
 
     def _create_client_checked(self, srv_type, service_name, warning_text):
         client = self.create_client(srv_type, service_name)
@@ -223,6 +265,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
     def shutdown(self):
         """Stop the spin thread and tear down the ROS node cleanly."""
         self.enable_hand_tactile_subscription(False)
+        self._set_hand_angle_subscription_enabled(False)
         if self.ros_thread is not None:
             try:
                 self.ros_thread.stop()
@@ -392,8 +435,14 @@ class RobotController(Node if ROS_AVAILABLE else object):
     # ------------------------------------------------------------------
     # Dexterous hand helpers (RH56F1 via service_interfaces)
     # ------------------------------------------------------------------
-    def hand_services_available(self):
+    def _hand_service_commands_available(self):
         return bool(self.use_ros and self.hand_srv_ok and HAND_SRVS_AVAILABLE)
+
+    def _hand_topic_commands_available(self):
+        return bool(self.use_ros and self._node_started and self.hand_topic_ok and HAND_TOPIC_CMDS_AVAILABLE)
+
+    def hand_services_available(self):
+        return bool(self._hand_service_commands_available() or self._hand_topic_commands_available())
 
     def hand_tactile_available(self):
         return bool(self.use_ros and self._node_started and HAND_TOUCH_AVAILABLE)
@@ -420,6 +469,28 @@ class RobotController(Node if ROS_AVAILABLE else object):
             self.hand_touch_subscription = None
         return True
 
+    def _set_hand_angle_subscription_enabled(self, enabled=True):
+        if not (self.use_ros and self._node_started and HAND_TOPIC_CMDS_AVAILABLE):
+            return False
+
+        if enabled:
+            if self.hand_angle_subscription is None:
+                self.hand_angle_subscription = self.create_subscription(
+                    GetAngleAct1,
+                    "/angle_data",
+                    self._hand_angle_cb,
+                    QoSProfile(depth=10),
+                )
+            return True
+
+        if self.hand_angle_subscription is not None:
+            try:
+                self.destroy_subscription(self.hand_angle_subscription)
+            except Exception:
+                pass
+            self.hand_angle_subscription = None
+        return True
+
     @staticmethod
     def _msg_sequence(value):
         if value is None:
@@ -443,6 +514,24 @@ class RobotController(Node if ROS_AVAILABLE else object):
         }
         self.latest_hand_touch_time = time.time()
 
+    def _hand_angle_cb(self, msg):
+        data = {
+            "finger_ids": self._msg_sequence(getattr(msg, "finger_ids", None)),
+            "angle_values": self._msg_sequence(getattr(msg, "angle_values", None)),
+            "finger_names": self._msg_sequence(getattr(msg, "finger_names", None)),
+        }
+        self.latest_hand_angle_data = data
+        self.latest_hand_angle_time = time.time()
+
+        for finger_id, angle in zip(data["finger_ids"], data["angle_values"]):
+            try:
+                idx = int(finger_id) - 1
+                value = int(angle)
+            except Exception:
+                continue
+            if 0 <= idx < len(self._hand_angle_target_cache) and value >= 0:
+                self._hand_angle_target_cache[idx] = value
+
     def get_latest_hand_tactile(self):
         if self.latest_hand_touch_data is None:
             return None
@@ -459,6 +548,80 @@ class RobotController(Node if ROS_AVAILABLE else object):
             return 0
 
     @staticmethod
+    def _hand_full_command_values(values, count, fill_value):
+        output = list(values or [])
+        if len(output) < count:
+            output += [fill_value] * (count - len(output))
+        return [int(v) for v in output[:count]]
+
+    def _hand_angle_topic_values(self, angles):
+        incoming = self._hand_full_command_values(angles, 6, -1)
+        output = list(self._hand_angle_target_cache)
+        for idx, value in enumerate(incoming):
+            if value >= 0:
+                output[idx] = int(value)
+        self._hand_angle_target_cache = list(output)
+        return output
+
+    def _publish_hand_angles_topic(self, angles):
+        if not self._hand_topic_commands_available() or self.hand_set_angle_pub is None:
+            return None
+        msg = SetAngle1()
+        msg.finger_ids = [1, 2, 3, 4, 5, 6]
+        msg.angles = self._hand_angle_topic_values(angles)
+        self.hand_set_angle_pub.publish(msg)
+        return {"mode": "topic", "topic": "/set_angle_data", "angles": list(msg.angles)}
+
+    def _publish_hand_speed_topic(self, speed):
+        if not self._hand_topic_commands_available() or self.hand_set_speed_pub is None:
+            return None
+        msg = SetSpeed1()
+        msg.finger_ids = [1, 2, 3, 4, 5, 6]
+        msg.speeds = [int(speed)] * 6
+        self.hand_set_speed_pub.publish(msg)
+        return {"mode": "topic", "topic": "/set_speed_data", "speeds": list(msg.speeds)}
+
+    def _publish_hand_force_topic(self, forces):
+        if not self._hand_topic_commands_available() or self.hand_set_force_pub is None:
+            return None
+        msg = SetForce1()
+        msg.finger_ids = [1, 2, 3, 4, 5, 6]
+        msg.forces = self._hand_full_command_values(forces, 6, 2000)
+        self.hand_set_force_pub.publish(msg)
+        return {"mode": "topic", "topic": "/set_force_data", "forces": list(msg.forces)}
+
+    def _latest_hand_angles_as_result(self):
+        data = self.latest_hand_angle_data
+        if not data:
+            return None
+
+        values = [None] * 6
+        for finger_id, angle in zip(data.get("finger_ids") or [], data.get("angle_values") or []):
+            try:
+                fid = int(finger_id)
+                value = int(angle)
+            except Exception:
+                continue
+            one_based_idx = fid - 1
+            if 0 <= one_based_idx < 6:
+                values[one_based_idx] = value
+            elif 0 <= fid < 6:
+                values[fid] = value
+
+        for idx, value in enumerate(values):
+            if value is None:
+                values[idx] = self._hand_angle_target_cache[idx]
+
+        return SimpleNamespace(
+            angle0=int(values[0]),
+            angle1=int(values[1]),
+            angle2=int(values[2]),
+            angle3=int(values[3]),
+            angle4=int(values[4]),
+            angle5=int(values[5]),
+        )
+
+    @staticmethod
     def _wait_future(future, timeout_sec=1.5):
         started = time.time()
         while not future.done():
@@ -471,55 +634,71 @@ class RobotController(Node if ROS_AVAILABLE else object):
             return None
 
     def hand_set_angles(self, angles, hand_id=1, timeout_sec=1.5):
-        if not self.hand_services_available():
-            return None
-        req = Setangle.Request()
-        req.status = "set_angle"
-        req.hand_id = int(hand_id)
-        values = list(angles or [])
-        if len(values) < 6:
-            values = values + ([-1] * (6 - len(values)))
-        req.angle0, req.angle1, req.angle2, req.angle3, req.angle4, req.angle5 = [int(v) for v in values[:6]]
-        fut = self.hand_set_angle_client.call_async(req)
-        return self._wait_future(fut, timeout_sec=timeout_sec)
+        if self._hand_service_commands_available():
+            req = Setangle.Request()
+            req.status = "set_angle"
+            req.hand_id = int(hand_id)
+            values = list(angles or [])
+            if len(values) < 6:
+                values = values + ([-1] * (6 - len(values)))
+            req.angle0, req.angle1, req.angle2, req.angle3, req.angle4, req.angle5 = [int(v) for v in values[:6]]
+            fut = self.hand_set_angle_client.call_async(req)
+            return self._wait_future(fut, timeout_sec=timeout_sec)
+        return self._publish_hand_angles_topic(angles)
 
     def hand_set_speed_all(self, speed, hand_id=1, timeout_sec=1.5):
-        if not self.hand_services_available():
-            return None
-        req = Setspeed.Request()
-        req.status = "set_speed"
-        req.hand_id = int(hand_id)
-        s = int(speed)
-        req.speed0 = s
-        req.speed1 = s
-        req.speed2 = s
-        req.speed3 = s
-        req.speed4 = s
-        req.speed5 = s
-        fut = self.hand_set_speed_client.call_async(req)
-        return self._wait_future(fut, timeout_sec=timeout_sec)
+        if self._hand_service_commands_available():
+            req = Setspeed.Request()
+            req.status = "set_speed"
+            req.hand_id = int(hand_id)
+            s = int(speed)
+            req.speed0 = s
+            req.speed1 = s
+            req.speed2 = s
+            req.speed3 = s
+            req.speed4 = s
+            req.speed5 = s
+            fut = self.hand_set_speed_client.call_async(req)
+            return self._wait_future(fut, timeout_sec=timeout_sec)
+        return self._publish_hand_speed_topic(speed)
 
     def hand_set_force_all(self, forces, hand_id=1, timeout_sec=1.5):
-        if not self.hand_services_available():
-            return None
-        req = Setforce.Request()
-        req.status = "set_force"
-        req.hand_id = int(hand_id)
-        values = list(forces or [])
-        if len(values) < 6:
-            values = values + ([2000] * (6 - len(values)))
-        req.force0, req.force1, req.force2, req.force3, req.force4, req.force5 = [int(v) for v in values[:6]]
-        fut = self.hand_set_force_client.call_async(req)
-        return self._wait_future(fut, timeout_sec=timeout_sec)
+        if self._hand_service_commands_available():
+            req = Setforce.Request()
+            req.status = "set_force"
+            req.hand_id = int(hand_id)
+            values = list(forces or [])
+            if len(values) < 6:
+                values = values + ([2000] * (6 - len(values)))
+            req.force0, req.force1, req.force2, req.force3, req.force4, req.force5 = [int(v) for v in values[:6]]
+            fut = self.hand_set_force_client.call_async(req)
+            return self._wait_future(fut, timeout_sec=timeout_sec)
+        return self._publish_hand_force_topic(forces)
 
     def hand_get_actual_angles(self, hand_id=1, timeout_sec=1.5):
-        if not self.hand_services_available():
+        if self._hand_service_commands_available():
+            req = Getangleact.Request()
+            req.status = "get_angleact"
+            req.hand_id = int(hand_id)
+            fut = self.hand_get_angle_client.call_async(req)
+            return self._wait_future(fut, timeout_sec=timeout_sec)
+
+        if not self._hand_topic_commands_available():
             return None
-        req = Getangleact.Request()
-        req.status = "get_angleact"
-        req.hand_id = int(hand_id)
-        fut = self.hand_get_angle_client.call_async(req)
-        return self._wait_future(fut, timeout_sec=timeout_sec)
+
+        self.latest_hand_angle_data = None
+        if not self._set_hand_angle_subscription_enabled(True):
+            return None
+
+        started = time.time()
+        try:
+            while self.latest_hand_angle_data is None:
+                if (time.time() - started) >= float(timeout_sec):
+                    return None
+                time.sleep(0.02)
+            return self._latest_hand_angles_as_result()
+        finally:
+            self._set_hand_angle_subscription_enabled(False)
 
     # ------------------------------------------------------------------
     # Velocity mode helpers (return script strings)

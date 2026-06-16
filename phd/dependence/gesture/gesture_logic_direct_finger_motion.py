@@ -3,7 +3,6 @@ import os
 import re
 import struct
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from PyQt5.QtCore import QTimer
@@ -64,15 +63,8 @@ class DirectFingerMotion:
         self.loop_hz = 0.0
         self._loop_tick_count = 0
         self._loop_tick_started_at = time.perf_counter()
-        self._hand_five_finger_close_counter = 0
-        self._hand_five_finger_open_counter = 0
-        self._hand_last_five_finger_spread = None
-        self._hand_last_requested_state = None
-        self._hand_command_inflight = False
-        self._hand_pending_command = None
-        self._hand_executor = None
-        self._single_finger_latched_velocity = None
-        self._two_finger_latched_velocity = None
+        self._last_processed_sensor_frame = None
+        self._last_sensor_frame_seen_at = 0.0
 
     def _default_settings(self):
         return {
@@ -83,10 +75,9 @@ class DirectFingerMotion:
             "robot_speed": 0.05,
             "centroid_deadband": 0.005,
             "centroid_gain": 20.0,
-            "min_speed_ratio": 0.20,
-            "max_speed_ratio": 1.50,
-            "velocity_smoothing_alpha": 0.4,
-            "push_pinch_enabled": True,
+            "min_speed_ratio": 1.0,
+            "max_speed_ratio": 1.0,
+            "velocity_smoothing_alpha": 1.0,
             "push_value_threshold": -12.0,
             "push_hold_deadband": 0.01,
             "push_hold_frames_required": 2,
@@ -97,28 +88,17 @@ class DirectFingerMotion:
             "pinch_midpoint_deadband": 0.5,
             "pinch_frames_required": 1,
             "pull_speed": 0.08,
-            "rotation_speed": 0.005,
+            "push_pinch_enabled": True,
+            "rotation_speed": 0.002,
             "two_finger_swipe_deadband": 0.06,
-            "two_finger_swipe_dominance_ratio": 0.1,
-            "two_finger_swipe_axis_lock_frames": 3,
+            "two_finger_swipe_dominance_ratio": 1.0,
+            "two_finger_swipe_axis_lock_frames": 5,
             "two_finger_swipe_enable_horizontal": True,
             "two_finger_swipe_enable_vertical": True,
-            "two_finger_swipe_up_add_push": False,
-            "two_finger_swipe_down_add_pull": False,
-            "single_finger_up_as_two_finger_swipe_up": False,
-            "single_finger_vertical_to_y": False,
-            "single_finger_latch_motion": False,
-            "single_finger_magnitude_speed": True,
             "two_finger_release_grace_frames": 3,
+            "sensor_frame_timeout_sec": 0.2,
             "frame_interval_ms": 0,
             "debug_output": False,
-            "hand_control_enabled": False,
-            "hand_five_finger_min_clusters": 5,
-            "hand_five_finger_min_cells": 5,
-            "hand_five_finger_motion_threshold": 0.02,
-            "hand_five_finger_close_frames": 2,
-            "hand_five_finger_open_frames": 2,
-            "hand_command_timeout_sec": 0.8,
         }
 
     def get_settings(self):
@@ -137,23 +117,12 @@ class DirectFingerMotion:
             "two_finger_swipe_axis_lock_frames",
             "two_finger_release_grace_frames",
             "frame_interval_ms",
-            "hand_five_finger_min_clusters",
-            "hand_five_finger_min_cells",
-            "hand_five_finger_close_frames",
-            "hand_five_finger_open_frames",
         }
         bool_fields = {
             "debug_output",
-            "hand_control_enabled",
+            "push_pinch_enabled",
             "two_finger_swipe_enable_horizontal",
             "two_finger_swipe_enable_vertical",
-            "two_finger_swipe_up_add_push",
-            "two_finger_swipe_down_add_pull",
-            "single_finger_up_as_two_finger_swipe_up",
-            "single_finger_vertical_to_y",
-            "single_finger_latch_motion",
-            "single_finger_magnitude_speed",
-            "push_pinch_enabled",
         }
 
         for key, default_value in defaults.items():
@@ -211,7 +180,6 @@ class DirectFingerMotion:
             self.control_timer.stop()
             self._stop_robot_motion(stop_mode=True)
             self._reset_state()
-            self._shutdown_hand_executor()
             print("Direct finger motion STOPPED")
 
     def _reset_state(self):
@@ -237,11 +205,8 @@ class DirectFingerMotion:
         self.current_motion_mode = "stop"
         self._smoothed_velocity = [0.0] * 6
         self._in_push_mode = False
-        self._hand_five_finger_close_counter = 0
-        self._hand_five_finger_open_counter = 0
-        self._hand_last_five_finger_spread = None
-        self._single_finger_latched_velocity = None
-        self._two_finger_latched_velocity = None
+        self._last_processed_sensor_frame = None
+        self._last_sensor_frame_seen_at = 0.0
 
     def _record_loop_tick(self):
         self._loop_tick_count += 1
@@ -259,6 +224,21 @@ class DirectFingerMotion:
             return
 
         self._record_loop_tick()
+        data_obj = getattr(self.my_sensor, "_data", None)
+        sensor_frame = getattr(data_obj, "frame_sequence", None)
+        now = time.perf_counter()
+        if sensor_frame is not None:
+            if sensor_frame == self._last_processed_sensor_frame:
+                timeout = max(0.0, float(getattr(self, "sensor_frame_timeout_sec", 0.2)))
+                if (
+                    timeout > 0.0
+                    and self.last_robot_velocity_cmd != self._zero_velocity()
+                    and (now - self._last_sensor_frame_seen_at) >= timeout
+                ):
+                    self._apply_stop_output()
+                return
+            self._last_processed_sensor_frame = sensor_frame
+            self._last_sensor_frame_seen_at = now
         self.print_single_touch_map_with_motion(threshold=self.motion_threshold)
 
     def _flat_idx_to_raw_index(self, flat_idx):
@@ -437,7 +417,6 @@ class DirectFingerMotion:
             self.current_two_peak_state = None
             self.last_two_peak_state = None
             self.two_finger_grace_counter = 0
-            self._update_dexterous_hand_from_five_finger(None)
 
             dprint("\nTouch map (single active point):")
             for _ in range(self.my_sensor.n_row):
@@ -460,7 +439,7 @@ class DirectFingerMotion:
         self.no_touch_frames = 0
 
         if len(self.current_touch_clusters) >= 2:
-            self.two_finger_grace_counter = self.two_finger_release_grace_frames
+            self.two_finger_grace_counter = int(self.two_finger_release_grace_frames)
         elif self.two_finger_grace_counter > 0:
             self.two_finger_grace_counter -= 1
 
@@ -509,15 +488,6 @@ class DirectFingerMotion:
                 dprint(
                     f"Motion: centroid Δ(col,row)=({delta_col:+.3f}, {delta_row:+.3f})  {arrow}  {direction_name}"
                 )
-
-        if self._update_dexterous_hand_from_five_finger(touched):
-            self._stop_robot_motion()
-            self.last_active_flat_idx = chosen_flat_idx
-            self.last_active_raw_index = current_raw_index
-            self.last_touch_center_row = current_center_row
-            self.last_touch_center_col = current_center_col
-            self.last_two_peak_state = self.current_two_peak_state
-            return
 
         self._update_robot_from_motion(
             previous_center=(previous_center_row, previous_center_col),
@@ -580,166 +550,16 @@ class DirectFingerMotion:
     def _zero_velocity(self):
         return [0.0] * 6
 
-    def _hand_services_available(self):
-        robot_api = getattr(self.ros_splitter, "robot_api", None)
-        return bool(
-            robot_api is not None
-            and hasattr(robot_api, "hand_services_available")
-            and robot_api.hand_services_available()
-            and hasattr(robot_api, "hand_set_angles")
-        )
-
-    def _shutdown_hand_executor(self):
-        executor = getattr(self, "_hand_executor", None)
-        self._hand_executor = None
-        self._hand_command_inflight = False
-        self._hand_pending_command = None
-        if executor is not None:
-            try:
-                executor.shutdown(wait=False)
-            except Exception:
-                pass
-
-    def _ensure_hand_executor(self):
-        if self._hand_executor is None:
-            self._hand_executor = ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix="dfm-rh56f1-hand",
-            )
-        return self._hand_executor
-
-    def _submit_hand_angles(self, label, angles):
-        if not self._hand_services_available():
-            self._debug_print("[DFM Hand] RH56F1 services unavailable.")
-            return
-
-        payload = [int(v) for v in list(angles or [])[:6]]
-        if len(payload) < 6:
-            payload += [-1] * (6 - len(payload))
-
-        if self._hand_command_inflight:
-            self._hand_pending_command = (str(label), payload)
-            return
-
-        self._hand_command_inflight = True
-        robot_api = self.ros_splitter.robot_api
-        timeout = max(0.1, float(getattr(self, "hand_command_timeout_sec", 0.8)))
-
-        def job():
-            return robot_api.hand_set_angles(payload, timeout_sec=timeout)
-
-        future = self._ensure_hand_executor().submit(job)
-
-        def done_callback(fut):
-            try:
-                result = fut.result()
-                self._debug_print(
-                    f"[DFM Hand] {label}: {'OK' if result is not None else 'FAILED'}"
-                )
-            except Exception as exc:
-                self._debug_print(f"[DFM Hand] {label}: FAILED ({exc})")
-            finally:
-                self._hand_command_inflight = False
-                pending = self._hand_pending_command
-                self._hand_pending_command = None
-                if pending is not None:
-                    pending_label, pending_angles = pending
-                    self._submit_hand_angles(pending_label, pending_angles)
-
-        future.add_done_callback(done_callback)
-
-    def _request_dexterous_hand_state(self, state):
-        if state == self._hand_last_requested_state:
-            return
-
-        if state == "closed":
-            angles = [900, 900, 900, 900, 1100, -1]
-            label = "Five-finger close -> RH56F1 close"
-        elif state == "open":
-            angles = [1720, 1720, 1720, 1720, 1350, -1]
-            label = "Five-finger open -> RH56F1 open"
-        else:
-            return
-
-        self._hand_last_requested_state = state
-        self._submit_hand_angles(label, angles)
-
-    def _five_finger_hand_gesture_active(self, touched):
-        if not bool(getattr(self, "hand_control_enabled", False)):
-            return False
-        if touched is None:
-            return False
-
-        min_clusters = max(1, int(getattr(self, "hand_five_finger_min_clusters", 5)))
-        min_cells = max(1, int(getattr(self, "hand_five_finger_min_cells", 5)))
-        return (
-            len(self.current_touch_clusters) >= min_clusters
-            and int(getattr(touched, "size", 0)) >= min_cells
-        )
-
-    def _five_finger_spread(self):
-        min_clusters = max(1, int(getattr(self, "hand_five_finger_min_clusters", 5)))
-        clusters = list(self.current_touch_clusters[:min_clusters])
-        if len(clusters) < min_clusters:
-            return None
-
-        denom_r, denom_c = self._sensor_axis_denominators()
-        rows = np.asarray([float(c["center_row"]) / denom_r for c in clusters], dtype=float)
-        cols = np.asarray([float(c["center_col"]) / denom_c for c in clusters], dtype=float)
-        row_span = float(np.max(rows) - np.min(rows))
-        col_span = float(np.max(cols) - np.min(cols))
-        return float(np.hypot(row_span, col_span))
-
-    def _update_dexterous_hand_from_five_finger(self, touched):
-        if not bool(getattr(self, "hand_control_enabled", False)):
-            self._hand_five_finger_close_counter = 0
-            self._hand_five_finger_open_counter = 0
-            self._hand_last_five_finger_spread = None
-            return False
-
-        active = self._five_finger_hand_gesture_active(touched)
-        if not active:
-            self._hand_five_finger_close_counter = 0
-            self._hand_five_finger_open_counter = 0
-            self._hand_last_five_finger_spread = None
-            return False
-
-        spread = self._five_finger_spread()
-        previous_spread = self._hand_last_five_finger_spread
-        self._hand_last_five_finger_spread = spread
-        if spread is None or previous_spread is None:
-            return True
-
-        delta = spread - previous_spread
-        threshold = max(0.0, float(getattr(self, "hand_five_finger_motion_threshold", 0.02)))
-        close_frames = max(1, int(getattr(self, "hand_five_finger_close_frames", 2)))
-        open_frames = max(1, int(getattr(self, "hand_five_finger_open_frames", 2)))
-
-        if delta <= -threshold:
-            self._hand_five_finger_close_counter += 1
-            self._hand_five_finger_open_counter = 0
-            if self._hand_five_finger_close_counter >= close_frames:
-                self._request_dexterous_hand_state("closed")
-            return True
-
-        if delta >= threshold:
-            self._hand_five_finger_open_counter += 1
-            self._hand_five_finger_close_counter = 0
-            if self._hand_five_finger_open_counter >= open_frames:
-                self._request_dexterous_hand_state("open")
-            return True
-
-        self._hand_five_finger_close_counter = 0
-        self._hand_five_finger_open_counter = 0
-        return True
-
     def _apply_motion_output(self, mode, velocity):
         smoothed = self._apply_velocity_smoothing(velocity)
         self._set_teacher_output(mode, smoothed)
         self._send_robot_velocity(smoothed)
 
     def _apply_stop_output(self):
-        self._apply_motion_output("stop", self._zero_velocity())
+        zero = self._zero_velocity()
+        self._smoothed_velocity = list(zero)
+        self._set_teacher_output("stop", zero)
+        self._send_robot_velocity(zero)
 
     def _apply_velocity_smoothing(self, target_velocity):
         alpha = max(0.0, min(1.0, self.velocity_smoothing_alpha))
@@ -790,70 +610,15 @@ class DirectFingerMotion:
         }
 
     def _centroid_delta_to_robot_velocity(self, delta_col, delta_row):
-        single_as_two_finger_up = self._single_finger_up_as_two_finger_swipe_velocity(
-            delta_col,
-            delta_row,
-        )
-        if single_as_two_finger_up is not None:
-            return single_as_two_finger_up
-
         scaled_col = self._scaled_axis_component(delta_col)
         scaled_row = self._scaled_axis_component(delta_row)
-        if not bool(getattr(self, "single_finger_magnitude_speed", True)):
-            if scaled_col != 0.0:
-                scaled_col = 1.0 if scaled_col > 0.0 else -1.0
-            if scaled_row != 0.0:
-                scaled_row = 1.0 if scaled_row > 0.0 else -1.0
 
         if scaled_col == 0.0 and scaled_row == 0.0:
             return self._zero_velocity()
 
         vx = -self.robot_speed * scaled_col
-        vertical_velocity = -self.robot_speed * scaled_row
-        if bool(getattr(self, "single_finger_vertical_to_y", False)):
-            return [float(vx), float(vertical_velocity), 0.0, 0.0, 0.0, 0.0]
-        return [float(vx), 0.0, float(vertical_velocity), 0.0, 0.0, 0.0]
-
-    def _single_finger_up_as_two_finger_swipe_velocity(self, delta_col, delta_row):
-        if not bool(getattr(self, "single_finger_up_as_two_finger_swipe_up", False)):
-            return None
-
-        denom_r, _denom_c = self._sensor_axis_denominators()
-        deadband_row = float(self.two_finger_swipe_deadband) / denom_r
-        dominance = max(0.0, float(self.two_finger_swipe_dominance_ratio))
-        abs_col = abs(float(delta_col))
-        abs_row = abs(float(delta_row))
-        is_upward_vertical = (
-            float(delta_row) <= -deadband_row
-            and abs_row >= (abs_col * dominance)
-        )
-        if not is_upward_vertical:
-            return None
-
-        return self._two_finger_vertical_swipe_to_robot_velocity(delta_row)
-
-    def _velocity_with_latch(self, velocity, latch_attr):
-        velocity = [float(v) for v in velocity]
-        has_motion = any(abs(v) > 1e-12 for v in velocity)
-        latch_enabled = bool(getattr(self, "single_finger_latch_motion", False))
-
-        if has_motion:
-            setattr(self, latch_attr, list(velocity))
-            return velocity, "move"
-
-        latched_velocity = getattr(self, latch_attr, None)
-        if latch_enabled and latched_velocity is not None:
-            return list(latched_velocity), "move"
-
-        if not latch_enabled:
-            setattr(self, latch_attr, None)
-        return velocity, "stop"
-
-    def _single_finger_velocity_with_latch(self, velocity):
-        return self._velocity_with_latch(velocity, "_single_finger_latched_velocity")
-
-    def _two_finger_velocity_with_latch(self, velocity):
-        return self._velocity_with_latch(velocity, "_two_finger_latched_velocity")
+        vz = -self.robot_speed * scaled_row
+        return [float(vx), 0.0, float(vz), 0.0, 0.0, 0.0]
 
     def _push_velocity(self):
         return [0.0, float(self.push_speed), 0.0, 0.0, 0.0, 0.0]
@@ -870,26 +635,7 @@ class DirectFingerMotion:
             return self._zero_velocity()
 
         rx = self.rotation_speed * scaled_row
-        velocity = [0.0, 0.0, 0.0, float(rx), 0.0, 0.0]
-        if (
-            bool(getattr(self, "two_finger_swipe_up_add_push", False))
-            and delta_row < 0.0
-        ):
-            push_velocity = self._push_velocity()
-            velocity = [
-                float(base + push)
-                for base, push in zip(velocity, push_velocity)
-            ]
-        elif (
-            bool(getattr(self, "two_finger_swipe_down_add_pull", False))
-            and delta_row > 0.0
-        ):
-            pull_velocity = self._pull_velocity()
-            velocity = [
-                float(base + pull)
-                for base, pull in zip(velocity, pull_velocity)
-            ]
-        return velocity
+        return [0.0, 0.0, 0.0, float(rx), 0.0, 0.0]
 
     def _two_finger_swipe_to_robot_velocity(self):
         curr = self.current_two_peak_state
@@ -942,7 +688,6 @@ class DirectFingerMotion:
             self._two_finger_swipe_axis_lock = candidate_axis
             self._two_finger_swipe_axis_lock_remaining = lock_frames
 
-        # Optional per-axis disable switches from UI parameters.
         allow_horizontal = bool(getattr(self, "two_finger_swipe_enable_horizontal", True))
         allow_vertical = bool(getattr(self, "two_finger_swipe_enable_vertical", True))
         if candidate_axis == "horizontal" and not allow_horizontal:
@@ -950,12 +695,10 @@ class DirectFingerMotion:
         if candidate_axis == "vertical" and not allow_vertical:
             return self._zero_velocity()
 
-        scaled_col = 0.0
         if candidate_axis == "vertical":
             return self._two_finger_vertical_swipe_to_robot_velocity(delta_mid_row)
-        elif candidate_axis == "horizontal":
-            scaled_col = self._scaled_axis_component(delta_mid_col)
 
+        scaled_col = self._scaled_axis_component(delta_mid_col)
         if scaled_col == 0.0:
             return self._zero_velocity()
 
@@ -1035,14 +778,12 @@ class DirectFingerMotion:
 
     def _update_robot_from_motion(self, previous_center=None, current_center=None):
         if self.current_two_peak_state is not None:
-            self._single_finger_latched_velocity = None
             push_pinch_enabled = bool(getattr(self, "push_pinch_enabled", True))
             if push_pinch_enabled and self._two_peak_pinch_is_pull():
-                self._two_finger_latched_velocity = None
                 self.push_hold_counter = 0
                 self._in_push_mode = False
                 velocity = self._pull_velocity()
-                self._apply_motion_output("pull", velocity)
+                self._apply_motion_output("two_finger_pull", velocity)
                 return
             if not push_pinch_enabled:
                 self.pinch_hold_counter = 0
@@ -1050,18 +791,15 @@ class DirectFingerMotion:
             self.push_hold_counter = 0
             self._in_push_mode = False
             velocity = self._two_finger_swipe_to_robot_velocity()
-            velocity, mode = self._two_finger_velocity_with_latch(velocity)
+            mode = "two_finger_swipe" if any(abs(v) > 1e-12 for v in velocity) else "stop"
             self._apply_motion_output(mode, velocity)
             return
 
         self.pinch_hold_counter = 0
-        self._two_finger_latched_velocity = None
 
         if self.two_finger_grace_counter > 0:
             self.push_hold_counter = 0
             self._in_push_mode = False
-            self._single_finger_latched_velocity = None
-            self._two_finger_latched_velocity = None
             self._apply_stop_output()
             return
 
@@ -1072,7 +810,6 @@ class DirectFingerMotion:
             if prev_row is None or prev_col is None or curr_row is None or curr_col is None:
                 self.push_hold_counter = 0
                 self._in_push_mode = False
-                self._single_finger_latched_velocity = None
                 self._apply_stop_output()
                 return
 
@@ -1101,7 +838,6 @@ class DirectFingerMotion:
                 self.push_hold_counter += 1
                 if self.push_hold_counter >= self.push_hold_frames_required:
                     self._in_push_mode = True
-                    self._single_finger_latched_velocity = None
                     velocity = self._push_velocity()
                     self._apply_motion_output("push", velocity)
                     return
@@ -1110,28 +846,23 @@ class DirectFingerMotion:
                 self._in_push_mode = False
 
             velocity = self._centroid_delta_to_robot_velocity(delta_col, delta_row)
-            velocity, mode = self._single_finger_velocity_with_latch(velocity)
+            mode = "single_finger_swipe" if any(abs(v) > 1e-12 for v in velocity) else "stop"
             self._apply_motion_output(mode, velocity)
             return
 
         self.push_hold_counter = 0
         self._in_push_mode = False
-        self._two_finger_swipe_axis_lock = None
-        self._two_finger_swipe_axis_lock_remaining = 0
-        self._single_finger_latched_velocity = None
-        self._two_finger_latched_velocity = None
         self._apply_stop_output()
 
     def _stop_robot_motion(self, stop_mode=False):
         self.push_hold_counter = 0
         self.pinch_hold_counter = 0
-        self._in_push_mode = False
+        self.two_finger_grace_counter = 0
         self._two_finger_swipe_axis_lock = None
         self._two_finger_swipe_axis_lock_remaining = 0
+        self._in_push_mode = False
         self.current_two_peak_state = None
         self.last_two_peak_state = None
-        self._single_finger_latched_velocity = None
-        self._two_finger_latched_velocity = None
         if stop_mode:
             self._smoothed_velocity = [0.0] * 6
         self._apply_stop_output()

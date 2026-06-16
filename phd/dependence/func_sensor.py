@@ -128,6 +128,7 @@ class data:
         self.rawDataAve = np.zeros((self.n_row, self.n_col))
         self.diffDataAve = np.zeros((self.n_row, self.n_col))
         self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
+        self.frame_sequence = 0
 
     def _recompute_averages(self):
         self.rawDataAve = np.flipud(np.mean(self.rawDataWin, axis=0))
@@ -167,6 +168,7 @@ class data:
         self.rawDataAve = np.zeros((self.n_row, self.n_col))
         self.diffDataAve = np.zeros((self.n_row, self.n_col))
         self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
+        self.frame_sequence = 0
 
     def getWin(self, i):
         # This index logic seems to be 1-based. Using i-1 to be safe.
@@ -190,6 +192,7 @@ class data:
 
         if i >= self.windowSize:  # Calculate average once the window is full
             self._recompute_averages()
+            self.frame_sequence += 1
 
 
 class SensorModelFactory:
@@ -875,6 +878,13 @@ class MySensor:
             if data_obj is not None
             else int(self.sensor_average_window_size)
         )
+        hand_report = ""
+        mesh_functions = getattr(getattr(self, "parent", None), "mesh_functions", None)
+        if mesh_functions is not None and hasattr(mesh_functions, "hand_tactile_runtime_report"):
+            try:
+                hand_report = "\n" + mesh_functions.hand_tactile_runtime_report()
+            except Exception as exc:
+                hand_report = f"\nhand_3d_runtime_report_error: {exc}"
 
         return (
             f"sensor_update_hz: {self._sensor_update_hz:.2f}\n"
@@ -883,6 +893,7 @@ class MySensor:
             f"visualization_actual_hz: {self._visualization_hz:.2f}\n"
             f"sensor_average_window_size: {window_size}\n"
             f"visualization_target_hz: {self.visualization_target_hz:.2f}"
+            f"{hand_report}"
         )
 
     def toggle_ai_direct_finger_motion_execution(self, model_checkpoint_path=None):

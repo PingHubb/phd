@@ -3,6 +3,7 @@ import numpy as np
 from pyvistaqt import QtInteractor
 import os
 import re
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtWidgets import (
@@ -27,6 +28,22 @@ class MyMeshLab():
         r"([-+]?\d+(?:\.\d*)?(?:[Ee][-+]?\d+)?)\s*,\s*"
         r"([-+]?\d+(?:\.\d*)?(?:[Ee][-+]?\d+)?)\s*\)\s*\)"
     )
+    _RH56F1_FINGER_SENSOR_LINKS = (
+        ("little", "little_force_sensor"),
+        ("ring", "ring_force_sensor"),
+        ("middle", "middle_force_sensor"),
+        ("index", "index_force_sensor"),
+        ("thumb", "thumb_force_sensor"),
+    )
+    _RH56F1_SENSOR_LINKS = {link for _, link in _RH56F1_FINGER_SENSOR_LINKS}
+    _RH56F1_SENSOR_LINKS.add("plam_force_sensor")
+    # Palm data arrives as three groups of (normal force, tangential force,
+    # tangential direction). Hardware testing showed the visual left/right
+    # order is mirrored from the manual register wording, so map the incoming
+    # groups to left -> middle -> right.
+    _RH56F1_PALM_DATA_REGIONS = ("palm_left", "palm_middle", "palm_right")
+    # Full-scale raw force for colour mapping: manual states raw 1024 = 10.24 N.
+    _RH56F1_FORCE_FULL_SCALE = 1024.0
 
     def __init__(self, parent) -> None:
         self.parent = parent
@@ -39,7 +56,14 @@ class MyMeshLab():
         self.creatPlaneXY()
         self.timer = QTimer()
         # self.timer.timeout.connect(self.update_animation)
-        self.timer.start(0)
+        # Keep this timer stopped unless update_animation is explicitly wired.
+        # A 0-ms timer with no connected slot still adds avoidable Qt traffic.
+        self._hand_tactile_update_count = 0
+        self._hand_tactile_render_count = 0
+        self._hand_tactile_render_skip_count = 0
+        self._hand_tactile_render_total_sec = 0.0
+        self._hand_tactile_last_render_sec = 0.0
+        self._hand_tactile_report_started_at = time.perf_counter()
         self.frame_count = 0
         self.last_time = time.time()
         self.is_connected = False
@@ -1270,7 +1294,615 @@ class MyMeshLab():
             return step_path
 
         return None
-        return None
+
+    def _default_rh56f1_urdf_path(self):
+        urdf_path = Path(resource_path("dexterous_hand", "rh56f1_right", "urdf", "RH56F1_R.urdf"))
+        return urdf_path if urdf_path.exists() else None
+
+    @staticmethod
+    def _matrix_from_xyz_rpy(xyz, rpy):
+        x, y, z = xyz
+        roll, pitch, yaw = rpy
+        cr, sr = math.cos(roll), math.sin(roll)
+        cp, sp = math.cos(pitch), math.sin(pitch)
+        cy, sy = math.cos(yaw), math.sin(yaw)
+
+        rx = np.array(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, cr, -sr],
+                [0.0, sr, cr],
+            ],
+            dtype=float,
+        )
+        ry = np.array(
+            [
+                [cp, 0.0, sp],
+                [0.0, 1.0, 0.0],
+                [-sp, 0.0, cp],
+            ],
+            dtype=float,
+        )
+        rz = np.array(
+            [
+                [cy, -sy, 0.0],
+                [sy, cy, 0.0],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+        mat = np.eye(4, dtype=float)
+        mat[:3, :3] = rz @ ry @ rx
+        mat[:3, 3] = [x, y, z]
+        return mat
+
+    @staticmethod
+    def _parse_urdf_origin(node):
+        if node is None:
+            return np.eye(4, dtype=float)
+        try:
+            xyz = [float(v) for v in node.attrib.get("xyz", "0 0 0").split()]
+            rpy = [float(v) for v in node.attrib.get("rpy", "0 0 0").split()]
+        except Exception:
+            xyz = [0.0, 0.0, 0.0]
+            rpy = [0.0, 0.0, 0.0]
+        if len(xyz) != 3:
+            xyz = [0.0, 0.0, 0.0]
+        if len(rpy) != 3:
+            rpy = [0.0, 0.0, 0.0]
+        return MyMeshLab._matrix_from_xyz_rpy(xyz, rpy)
+
+    @staticmethod
+    def _resolve_rh56f1_mesh_uri(urdf_path, uri):
+        mesh_name = str(uri or "").strip()
+        if not mesh_name:
+            return None
+        if mesh_name.startswith("package://RH56F1_R/meshes/"):
+            mesh_name = mesh_name.split("package://RH56F1_R/meshes/", 1)[1]
+            return Path(urdf_path).parent.parent / "meshes" / mesh_name
+        if mesh_name.startswith("package://"):
+            mesh_name = mesh_name.rsplit("/", 1)[-1]
+            return Path(urdf_path).parent.parent / "meshes" / mesh_name
+        path = Path(mesh_name)
+        if path.is_absolute():
+            return path
+        return Path(urdf_path).parent / path
+
+    def _load_rh56f1_urdf_visual_meshes(self, urdf_path):
+        root = ET.parse(str(urdf_path)).getroot()
+        child_joints = {}
+        for joint in root.findall("joint"):
+            parent_node = joint.find("parent")
+            child_node = joint.find("child")
+            if parent_node is None or child_node is None:
+                continue
+            parent_name = parent_node.attrib.get("link", "")
+            child_name = child_node.attrib.get("link", "")
+            if not parent_name or not child_name:
+                continue
+            child_joints.setdefault(parent_name, []).append(
+                (child_name, self._parse_urdf_origin(joint.find("origin")))
+            )
+
+        link_transforms = {"base_link": np.eye(4, dtype=float)}
+        stack = ["base_link"]
+        while stack:
+            parent_name = stack.pop()
+            parent_transform = link_transforms[parent_name]
+            for child_name, joint_transform in child_joints.get(parent_name, []):
+                link_transforms[child_name] = parent_transform @ joint_transform
+                stack.append(child_name)
+
+        visual_meshes = []
+        bounds_min = []
+        bounds_max = []
+        for link in root.findall("link"):
+            link_name = link.attrib.get("name", "")
+            link_transform = link_transforms.get(link_name)
+            if not link_name or link_transform is None:
+                continue
+            visual = link.find("visual")
+            if visual is None:
+                continue
+            mesh_node = visual.find("./geometry/mesh")
+            if mesh_node is None:
+                continue
+            mesh_path = self._resolve_rh56f1_mesh_uri(
+                urdf_path,
+                mesh_node.attrib.get("filename", ""),
+            )
+            if mesh_path is None or not mesh_path.exists():
+                continue
+
+            try:
+                mesh = pv.read(str(mesh_path)).triangulate()
+            except Exception as exc:
+                print(f"[DexterousHandModel] Failed to load URDF mesh {mesh_path}: {exc}")
+                continue
+            if mesh.n_points <= 0:
+                continue
+
+            visual_transform = self._parse_urdf_origin(visual.find("origin"))
+            transform = link_transform @ visual_transform
+            points = np.asarray(mesh.points, dtype=float)
+            homogeneous = np.c_[points, np.ones(mesh.n_points, dtype=float)]
+            mesh.points = (transform @ homogeneous.T).T[:, :3] * 1000.0
+
+            color = (0.86, 0.88, 0.91, 1.0)
+            color_node = visual.find("./material/color")
+            if color_node is not None:
+                try:
+                    rgba = [float(v) for v in color_node.attrib.get("rgba", "").split()]
+                    if len(rgba) == 4:
+                        color = tuple(rgba)
+                except Exception:
+                    pass
+
+            bounds = mesh.bounds
+            bounds_min.append([bounds[0], bounds[2], bounds[4]])
+            bounds_max.append([bounds[1], bounds[3], bounds[5]])
+            visual_meshes.append(
+                {
+                    "link": link_name,
+                    "mesh": mesh,
+                    "color": color,
+                    "is_sensor": link_name in self._RH56F1_SENSOR_LINKS,
+                }
+            )
+
+        if not visual_meshes:
+            raise RuntimeError(f"No visual meshes could be loaded from {urdf_path}")
+
+        bounds_min = np.asarray(bounds_min, dtype=float).min(axis=0)
+        bounds_max = np.asarray(bounds_max, dtype=float).max(axis=0)
+        center = (bounds_min + bounds_max) * 0.5
+        for item in visual_meshes:
+            item["mesh"].translate(-center, inplace=True)
+
+        span = float(max(bounds_max - bounds_min))
+        return visual_meshes, center, span
+
+    @staticmethod
+    def _blend_color(color_a, color_b, t):
+        t = max(0.0, min(1.0, float(t)))
+        a = np.asarray(color_a, dtype=float)
+        b = np.asarray(color_b, dtype=float)
+        return tuple((a + (b - a) * t).tolist())
+
+    def _tactile_level_color(self, level):
+        level = max(0.0, min(1.0, float(level)))
+        idle = (0.10, 0.38, 0.95)
+        mid = (1.00, 0.78, 0.18)
+        hot = (1.00, 0.12, 0.05)
+        if level < 0.5:
+            return self._blend_color(idle, mid, level * 2.0)
+        return self._blend_color(mid, hot, (level - 0.5) * 2.0)
+
+    @staticmethod
+    def _set_actor_visual(actor, color, opacity):
+        if actor is None:
+            return
+        try:
+            prop = actor.GetProperty()
+            prop.SetColor(*color)
+            prop.SetOpacity(float(opacity))
+            return
+        except Exception:
+            pass
+        try:
+            actor.prop.color = color
+            actor.prop.opacity = float(opacity)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _valid_tactile_raw(value):
+        try:
+            raw = int(value)
+        except Exception:
+            return None
+        if raw < 0 or raw in {65535, 0xFFFF}:
+            return None
+        return raw
+
+    def _force_raw_to_level(self, raw):
+        if raw is None:
+            return 0.0
+        return max(0.0, min(1.0, raw / self._RH56F1_FORCE_FULL_SCALE))
+
+    def _extract_tactile_readings(self, data):
+        """Map tactile data to {region: {"level", "force_n"}}.
+
+        Each fingertip reports one capacitive sensor (normal force, raw 1024 =
+        10.24 N). The palm module reports three regions, each as a
+        (normal, tangential, direction) triple; only the normal force is used
+        for the heat colour - the direction angle (0-359) must never be
+        interpreted as a force.
+        """
+        readings = {}
+        if not data:
+            return readings
+
+        finger_forces = list(data.get("finger_forces") or [])
+        for index, (region, _link_name) in enumerate(self._RH56F1_FINGER_SENSOR_LINKS):
+            if index < len(finger_forces):
+                raw = self._valid_tactile_raw(finger_forces[index])
+                readings[region] = {
+                    "level": self._force_raw_to_level(raw),
+                    "force_n": (raw / 100.0) if raw is not None else None,
+                }
+
+        palm_data = list(data.get("palm_data") or [])
+        for index, region in enumerate(self._RH56F1_PALM_DATA_REGIONS):
+            start = index * 3
+            group = palm_data[start:start + 3]
+            if not group:
+                continue
+            raw = self._valid_tactile_raw(group[0])  # normal force only
+            readings[region] = {
+                "level": self._force_raw_to_level(raw),
+                "force_n": (raw / 100.0) if raw is not None else None,
+            }
+        return readings
+
+    def _split_palm_sensor_mesh(self, palm_mesh):
+        """Split the palm sensor pad into its three reported regions.
+
+        Verified against the official URDF (RH56F1_R): in the display frame the
+        palm pad's long axis is Y (span ~61 mm) and the fingertip sensors sit
+        at thumb y=+0.092 ... little y=-0.034, i.e. +Y is the thumb side.
+        Looking at the right palm from the sensor (palm) side, the thumb side
+        is the viewer's right, so +Y -> palm_right, -Y -> palm_left.
+        """
+        if palm_mesh is None or palm_mesh.n_cells <= 0:
+            return []
+        try:
+            centers = np.asarray(palm_mesh.cell_centers().points, dtype=float)
+        except Exception:
+            return [("palm_middle", palm_mesh)]
+        if len(centers) != palm_mesh.n_cells:
+            return [("palm_middle", palm_mesh)]
+
+        y_values = centers[:, 1]
+        y_min = float(np.min(y_values))
+        y_max = float(np.max(y_values))
+        if not np.isfinite(y_min) or not np.isfinite(y_max) or abs(y_max - y_min) < 1e-9:
+            return [("palm_middle", palm_mesh)]
+
+        cut_1 = y_min + (y_max - y_min) / 3.0
+        cut_2 = y_min + (y_max - y_min) * 2.0 / 3.0
+        masks = (
+            ("palm_left", y_values < cut_1),
+            ("palm_middle", (y_values >= cut_1) & (y_values < cut_2)),
+            ("palm_right", y_values >= cut_2),
+        )
+        parts = []
+        for region, mask in masks:
+            cell_ids = np.flatnonzero(mask)
+            if len(cell_ids) == 0:
+                continue
+            try:
+                parts.append((region, palm_mesh.extract_cells(cell_ids)))
+            except Exception:
+                pass
+        return parts or [("palm_middle", palm_mesh)]
+
+    def _make_estimated_fingertip_pad_patch(self, region, sensor_mesh):
+        """Create a smaller visual pad from the vendor fingertip sensor mesh.
+
+        The RH56F1 URDF provides fingertip ``*_force_sensor`` meshes, but those
+        meshes are effectively the full fingertip shell. For visualization we
+        display only a trimmed front patch to represent the likely sensitive
+        pad area. This is an estimate, not an official CAD boundary.
+        """
+        if sensor_mesh is None or sensor_mesh.n_cells <= 0:
+            return sensor_mesh
+
+        try:
+            centers = np.asarray(sensor_mesh.cell_centers().points, dtype=float)
+        except Exception:
+            return sensor_mesh
+        if len(centers) != sensor_mesh.n_cells:
+            return sensor_mesh
+
+        # In the RH56F1 display frame the palm/front contact side is the +X
+        # side. Keep only that face, then trim the patch along the fingertip.
+        x_values = centers[:, 0]
+        front_cut = float(np.quantile(x_values, 0.58))
+        front_mask = x_values >= front_cut
+
+        spans = np.ptp(centers, axis=0)
+        length_axis = 2 if spans[2] >= spans[1] else 1
+        width_axis = 1 if length_axis == 2 else 2
+
+        length_values = centers[:, length_axis]
+        width_values = centers[:, width_axis]
+        length_lo, length_hi = np.quantile(length_values, [0.22, 0.88])
+        width_lo, width_hi = np.quantile(width_values, [0.18, 0.82])
+        patch_mask = (
+            front_mask
+            & (length_values >= length_lo)
+            & (length_values <= length_hi)
+            & (width_values >= width_lo)
+            & (width_values <= width_hi)
+        )
+
+        cell_ids = np.flatnonzero(patch_mask)
+        min_cells = max(80, int(sensor_mesh.n_cells * 0.015))
+        if len(cell_ids) < min_cells:
+            # Relax the cut if a specific fingertip geometry is more curved
+            # than expected.
+            front_cut = float(np.quantile(x_values, 0.50))
+            length_lo, length_hi = np.quantile(length_values, [0.16, 0.94])
+            width_lo, width_hi = np.quantile(width_values, [0.12, 0.88])
+            patch_mask = (
+                (x_values >= front_cut)
+                & (length_values >= length_lo)
+                & (length_values <= length_hi)
+                & (width_values >= width_lo)
+                & (width_values <= width_hi)
+            )
+            cell_ids = np.flatnonzero(patch_mask)
+
+        if len(cell_ids) < min_cells:
+            print(
+                f"[DexterousHandModel] Estimated {region} pad too small; "
+                "using full fingertip sensor mesh."
+            )
+            return sensor_mesh
+
+        try:
+            patch = sensor_mesh.extract_cells(cell_ids).extract_surface().triangulate()
+        except Exception:
+            return sensor_mesh
+
+        try:
+            # Lift the patch slightly above the hand body to prevent z-fighting
+            # with the fingertip shell mesh.
+            patch.points = np.asarray(patch.points, dtype=float) + np.array([0.8, 0.0, 0.0])
+        except Exception:
+            pass
+        return patch
+
+    def _add_rh56f1_urdf_hand_to_plotter(self, plotter, urdf_path):
+        visual_meshes, _center, span = self._load_rh56f1_urdf_visual_meshes(urdf_path)
+        tactile_actors = {}
+        body_count = 0
+
+        for item in visual_meshes:
+            link_name = item["link"]
+            mesh = item["mesh"]
+            if item["is_sensor"]:
+                continue
+            rgba = item["color"]
+            color = tuple(rgba[:3])
+            opacity = float(rgba[3]) if len(rgba) >= 4 else 1.0
+            try:
+                plotter.add_mesh(
+                    mesh,
+                    color=color,
+                    opacity=opacity,
+                    show_edges=False,
+                    specular=0.28,
+                    specular_power=14,
+                    smooth_shading=True,
+                )
+                body_count += 1
+            except Exception as exc:
+                print(f"[DexterousHandModel] Failed to display {link_name}: {exc}")
+
+        idle_color = self._tactile_level_color(0.0)
+        value_text_actors = {}
+        for item in visual_meshes:
+            link_name = item["link"]
+            if not item["is_sensor"]:
+                continue
+            sensor_regions = []
+            if link_name == "plam_force_sensor":
+                sensor_regions = self._split_palm_sensor_mesh(item["mesh"])
+            else:
+                region = link_name.replace("_force_sensor", "")
+                sensor_regions = [
+                    (region, self._make_estimated_fingertip_pad_patch(region, item["mesh"]))
+                ]
+
+            for region, mesh in sensor_regions:
+                try:
+                    actor = plotter.add_mesh(
+                        mesh,
+                        color=idle_color,
+                        opacity=0.45,
+                        show_edges=False,
+                        specular=0.55,
+                        specular_power=20,
+                        smooth_shading=True,
+                    )
+                    tactile_actors[region] = actor
+                except Exception as exc:
+                    print(f"[DexterousHandModel] Failed to display tactile pad {region}: {exc}")
+                    continue
+
+                # Sensor centre marker + live value label, anchored on the
+                # official URDF sensor pad geometry (mm display space).
+                try:
+                    points = np.asarray(mesh.points, dtype=float)
+                    center = points.mean(axis=0)
+                    normal = self._estimate_sensor_outward_normal(mesh, center)
+                    plotter.add_mesh(
+                        pv.Sphere(radius=1.1, center=center),
+                        color="#ffffff",
+                        opacity=0.9,
+                        smooth_shading=True,
+                    )
+                    text_actor = self._make_sensor_value_text_actor(
+                        center + normal * 7.0
+                    )
+                    plotter.renderer.AddActor(text_actor)
+                    value_text_actors[region] = text_actor
+                except Exception as exc:
+                    print(f"[DexterousHandModel] Failed to add sensor marker {region}: {exc}")
+
+        self._hand_tactile_pad_actors = tactile_actors
+        self._hand_tactile_value_text_actors = value_text_actors
+        return body_count, len(tactile_actors), span
+
+    @staticmethod
+    def _estimate_sensor_outward_normal(mesh, center):
+        """Average the pad's face normals to find its outward direction."""
+        try:
+            normals = np.asarray(
+                mesh.compute_normals(
+                    cell_normals=True,
+                    point_normals=False,
+                    auto_orient_normals=True,
+                )["Normals"],
+                dtype=float,
+            )
+            mean_normal = normals.mean(axis=0)
+            norm = float(np.linalg.norm(mean_normal))
+            if norm > 1e-9:
+                direction = mean_normal / norm
+                # Pads face away from the hand interior (origin side).
+                if float(np.dot(direction, center)) < 0.0:
+                    direction = -direction
+                return direction
+        except Exception:
+            pass
+        norm = float(np.linalg.norm(center))
+        if norm > 1e-9:
+            return np.asarray(center, dtype=float) / norm
+        return np.array([0.0, 0.0, 1.0])
+
+    @staticmethod
+    def _make_sensor_value_text_actor(position):
+        import vtk
+
+        actor = vtk.vtkBillboardTextActor3D()
+        actor.SetInput("--")
+        actor.SetPosition(*[float(v) for v in position])
+        prop = actor.GetTextProperty()
+        prop.SetFontSize(15)
+        prop.SetColor(1.0, 1.0, 1.0)
+        prop.SetBackgroundColor(0.08, 0.08, 0.10)
+        prop.SetBackgroundOpacity(0.55)
+        prop.SetJustificationToCentered()
+        return actor
+
+    def _direct_finger_motion_active(self):
+        parent = getattr(self, "parent", None)
+        if parent is not None and bool(getattr(parent, "_direct_finger_active", False)):
+            return True
+
+        sensor_functions = getattr(parent, "sensor_functions", None)
+        direct_helper = getattr(sensor_functions, "direct_finger_motion_class", None)
+        return bool(getattr(direct_helper, "is_running", False))
+
+    def _render_hand_tactile_plotter(self, plotter):
+        if plotter is None:
+            return
+
+        self._hand_tactile_update_count = int(getattr(self, "_hand_tactile_update_count", 0)) + 1
+
+        # DFM v1 is driven by a Qt timer on the same process. VTK renders from
+        # the hand model window can steal enough event-loop time to make robot
+        # control feel slow/stuttery, so render the tactile overlay less often
+        # while DFM is active.
+        min_interval = 0.35 if self._direct_finger_motion_active() else 0.08
+        now = time.perf_counter()
+        last_render = float(getattr(self, "_hand_tactile_last_render_at", 0.0))
+        if now - last_render < min_interval:
+            self._hand_tactile_render_skip_count = (
+                int(getattr(self, "_hand_tactile_render_skip_count", 0)) + 1
+            )
+            return
+
+        self._hand_tactile_last_render_at = now
+        started = time.perf_counter()
+        try:
+            plotter.render()
+        except Exception:
+            pass
+        elapsed = time.perf_counter() - started
+        self._hand_tactile_render_count = int(getattr(self, "_hand_tactile_render_count", 0)) + 1
+        self._hand_tactile_last_render_sec = float(elapsed)
+        self._hand_tactile_render_total_sec = (
+            float(getattr(self, "_hand_tactile_render_total_sec", 0.0)) + float(elapsed)
+        )
+
+    def hand_tactile_runtime_report(self):
+        plotter_open = getattr(self, "_hand_model_dialog_plotter", None) is not None
+        actors = getattr(self, "_hand_tactile_pad_actors", None) or {}
+        updates = int(getattr(self, "_hand_tactile_update_count", 0))
+        renders = int(getattr(self, "_hand_tactile_render_count", 0))
+        skips = int(getattr(self, "_hand_tactile_render_skip_count", 0))
+        total_render_sec = float(getattr(self, "_hand_tactile_render_total_sec", 0.0))
+        last_render_ms = float(getattr(self, "_hand_tactile_last_render_sec", 0.0)) * 1000.0
+        started_at = float(getattr(self, "_hand_tactile_report_started_at", time.perf_counter()))
+        elapsed = max(1e-6, time.perf_counter() - started_at)
+        avg_render_ms = (total_render_sec / renders * 1000.0) if renders else 0.0
+        return (
+            f"hand_3d_open: {plotter_open}\n"
+            f"hand_3d_tactile_regions: {len(actors)}\n"
+            f"hand_3d_tactile_update_hz: {updates / elapsed:.2f}\n"
+            f"hand_3d_render_hz: {renders / elapsed:.2f}\n"
+            f"hand_3d_render_skipped: {skips}\n"
+            f"hand_3d_last_render_ms: {last_render_ms:.2f}\n"
+            f"hand_3d_avg_render_ms: {avg_render_ms:.2f}"
+        )
+
+    def updateDexterousHandTactile(self, data=None):
+        actors = getattr(self, "_hand_tactile_pad_actors", None)
+        if not actors:
+            return False
+
+        readings = self._extract_tactile_readings(data)
+        text_actors = getattr(self, "_hand_tactile_value_text_actors", None) or {}
+        max_force = None
+        max_level = 0.0
+        for region, actor in actors.items():
+            reading = readings.get(region) or {}
+            level = float(reading.get("level") or 0.0)
+            force_n = reading.get("force_n")
+            max_level = max(max_level, level)
+            if force_n is not None and (max_force is None or force_n > max_force):
+                max_force = force_n
+            color = self._tactile_level_color(level)
+            opacity = 0.40 + 0.55 * max(0.0, min(1.0, level))
+            self._set_actor_visual(actor, color, opacity)
+
+            text_actor = text_actors.get(region)
+            if text_actor is not None:
+                try:
+                    if force_n is None:
+                        text_actor.SetInput("--")
+                    else:
+                        text_actor.SetInput(f"{force_n:.2f}N")
+                except Exception:
+                    pass
+
+        label = getattr(self, "_hand_tactile_overlay_label", None)
+        if label is not None:
+            if data and max_force is not None:
+                label.setText(f"Tactile overlay: peak {max_force:.2f} N")
+            elif data:
+                label.setText("Tactile overlay: no contact")
+            else:
+                label.setText("Tactile overlay: idle")
+
+        plotter = getattr(self, "_hand_model_dialog_plotter", None)
+        self._render_hand_tactile_plotter(plotter)
+        return True
+
+    def _apply_latest_dexterous_hand_tactile(self):
+        api = getattr(getattr(self, "parent", None), "robot_api", None)
+        if api is None or not hasattr(api, "get_latest_hand_tactile"):
+            return self.updateDexterousHandTactile(None)
+        try:
+            data = api.get_latest_hand_tactile()
+        except Exception:
+            data = None
+        return self.updateDexterousHandTactile(data)
 
     def _load_step_point_cloud(self, step_path, max_points=220000):
         """Create a visual preview from STEP CARTESIAN_POINT entries.
@@ -1330,13 +1962,15 @@ class MyMeshLab():
                     existing.show()
                     existing.raise_()
                     existing.activateWindow()
+                    self._apply_latest_dexterous_hand_tactile()
                     self._poke_main_plotters()
                     return True
             except Exception:
                 pass
 
-        model_path = self._default_dexterous_hand_model_path()
-        if model_path is None:
+        urdf_path = self._default_rh56f1_urdf_path()
+        model_path = None if urdf_path is not None else self._default_dexterous_hand_model_path()
+        if urdf_path is None and model_path is None:
             QMessageBox.warning(
                 self.parent,
                 "Dexterous Hand Model",
@@ -1351,7 +1985,8 @@ class MyMeshLab():
         self._poke_main_plotters()
 
         dialog = QDialog(getattr(self, "parent", None))
-        dialog.setWindowTitle(f"Dexterous Hand Model - {model_path.name}")
+        source_name = urdf_path.name if urdf_path is not None else model_path.name
+        dialog.setWindowTitle(f"Dexterous Hand Model - {source_name}")
         dialog.setWindowFlags(dialog.windowFlags() | Qt.Window)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         dialog.resize(900, 760)
@@ -1364,6 +1999,9 @@ class MyMeshLab():
         toolbar.setContentsMargins(8, 6, 8, 6)
         status_label = QLabel("Loading hand model...")
         toolbar.addWidget(status_label)
+        tactile_status_label = QLabel("Tactile overlay: idle")
+        tactile_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        toolbar.addWidget(tactile_status_label)
         toolbar.addStretch(1)
 
         reset_button = QPushButton("Reset View")
@@ -1378,9 +2016,22 @@ class MyMeshLab():
             pass
 
         loaded_actor = None
-        suffix = model_path.suffix.lower()
         try:
-            if suffix in {".step", ".stp"}:
+            self._hand_tactile_pad_actors = {}
+            self._hand_tactile_value_text_actors = {}
+            self._hand_tactile_overlay_label = tactile_status_label
+
+            if urdf_path is not None:
+                body_count, pad_count, span = self._add_rh56f1_urdf_hand_to_plotter(
+                    plotter,
+                    urdf_path,
+                )
+                self._add_hand_dialog_axes(plotter, span * 0.6)
+                status_label.setText(
+                    f"{urdf_path.name} | {body_count} hand parts | {pad_count} tactile pads"
+                )
+                loaded_actor = True
+            elif model_path.suffix.lower() in {".step", ".stp"}:
                 cloud, original_count, shown_count = self._load_step_point_cloud(model_path)
                 loaded_actor = plotter.add_mesh(
                     cloud,
@@ -1427,7 +2078,7 @@ class MyMeshLab():
             QMessageBox.warning(
                 self.parent,
                 "Dexterous Hand Model",
-                f"Failed to load {model_path}:\n{exc}",
+                f"Failed to load {source_name}:\n{exc}",
             )
             try:
                 dialog.close()
@@ -1463,6 +2114,9 @@ class MyMeshLab():
             self._hand_model_dialog = None
             self._hand_model_dialog_plotter = None
             self._hand_model_actor = None
+            self._hand_tactile_pad_actors = {}
+            self._hand_tactile_value_text_actors = {}
+            self._hand_tactile_overlay_label = None
             self._poke_main_plotters()
 
         dialog.finished.connect(_on_finished)
@@ -1470,7 +2124,9 @@ class MyMeshLab():
         self._hand_model_dialog = dialog
         self._hand_model_dialog_plotter = plotter
         self._hand_model_actor = loaded_actor
+        self._hand_tactile_overlay_label = tactile_status_label
         dialog.show()
+        self._apply_latest_dexterous_hand_tactile()
         try:
             plotter.render()
         except Exception:
