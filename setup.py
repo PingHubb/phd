@@ -21,6 +21,8 @@ setup(
     entry_points={
         'console_scripts': [
             'phd_ui = phd.phd_ui:main',
+            'check_ai_dfm_dataset = phd.script.check_ai_direct_finger_motion_dataset:main',
+            'train_ai_dfm_model = phd.script.train_ai_direct_finger_motion:main',
         ],
     },
 )

@@ -55,6 +55,7 @@ class DirectFingerMotion:
         self._two_finger_swipe_axis_lock_remaining = 0
 
         self._velocity_mode_enabled = False
+        self.robot_command_output_enabled = True
         self.last_robot_velocity_cmd = None
         self.last_teacher_velocity_pre_flip = self._zero_velocity()
         self.current_motion_mode = "stop"
@@ -65,6 +66,8 @@ class DirectFingerMotion:
         self._loop_tick_started_at = time.perf_counter()
         self._last_processed_sensor_frame = None
         self._last_sensor_frame_seen_at = 0.0
+        self._last_motion_ratio_log_at = 0.0
+        self._last_motion_ratio_log_signature = None
 
     def _default_settings(self):
         return {
@@ -83,6 +86,7 @@ class DirectFingerMotion:
             "push_hold_frames_required": 2,
             "push_speed": 0.08,
             "push_exit_value_offset": 4.0,
+            "pull_value_threshold": -12.0,
             "pinch_axis_deadband": 0.003,
             "pinch_distance_threshold": 0.02,
             "pinch_midpoint_deadband": 0.5,
@@ -99,6 +103,7 @@ class DirectFingerMotion:
             "sensor_frame_timeout_sec": 0.2,
             "frame_interval_ms": 0,
             "debug_output": False,
+            "motion_ratio_log_enabled": False,
         }
 
     def get_settings(self):
@@ -108,6 +113,8 @@ class DirectFingerMotion:
     def apply_settings(self, settings: dict, save_to_file=False):
         defaults = self._default_settings()
         merged = {**defaults, **(settings or {})}
+        if settings is not None and "pull_value_threshold" not in settings:
+            merged["pull_value_threshold"] = merged.get("push_value_threshold", defaults["pull_value_threshold"])
 
         int_fields = {
             "config_version",
@@ -120,6 +127,7 @@ class DirectFingerMotion:
         }
         bool_fields = {
             "debug_output",
+            "motion_ratio_log_enabled",
             "push_pinch_enabled",
             "two_finger_swipe_enable_horizontal",
             "two_finger_swipe_enable_vertical",
@@ -207,6 +215,8 @@ class DirectFingerMotion:
         self._in_push_mode = False
         self._last_processed_sensor_frame = None
         self._last_sensor_frame_seen_at = 0.0
+        self._last_motion_ratio_log_at = 0.0
+        self._last_motion_ratio_log_signature = None
 
     def _record_loop_tick(self):
         self._loop_tick_count += 1
@@ -402,7 +412,7 @@ class DirectFingerMotion:
         self.current_touch_peak_value = float(np.min(values[touched]))
         return chosen, values, touched
 
-    def print_single_touch_map_with_motion(self, threshold=-3):
+    def print_single_touch_map_with_motion(self, threshold=-3, update_robot=True):
         dprint = self._debug_print
         red = "\033[91m"
         green = "\033[92m"
@@ -425,14 +435,16 @@ class DirectFingerMotion:
             if self.no_touch_frames >= self.no_touch_reset_limit:
                 if self.last_active_raw_index is not None:
                     dprint("Motion: RELEASED")
-                self._stop_robot_motion()
+                if update_robot:
+                    self._stop_robot_motion()
                 self.last_active_flat_idx = None
                 self.last_active_raw_index = None
                 self.last_touch_center_row = None
                 self.last_touch_center_col = None
             else:
                 dprint("Motion: no touch")
-                self._stop_robot_motion()
+                if update_robot:
+                    self._stop_robot_motion()
 
             return
 
@@ -489,10 +501,11 @@ class DirectFingerMotion:
                     f"Motion: centroid Δ(col,row)=({delta_col:+.3f}, {delta_row:+.3f})  {arrow}  {direction_name}"
                 )
 
-        self._update_robot_from_motion(
-            previous_center=(previous_center_row, previous_center_col),
-            current_center=(current_center_row, current_center_col),
-        )
+        if update_robot:
+            self._update_robot_from_motion(
+                previous_center=(previous_center_row, previous_center_col),
+                current_center=(current_center_row, current_center_col),
+            )
 
         self.last_active_flat_idx = chosen_flat_idx
         self.last_active_raw_index = current_raw_index
@@ -536,10 +549,67 @@ class DirectFingerMotion:
         if abs_delta < self.centroid_deadband:
             return 0.0
 
+        min_ratio, max_ratio = self._speed_ratio_bounds()
         scaled = abs_delta * self.centroid_gain
-        scaled = max(self.min_speed_ratio, scaled)
-        scaled = min(self.max_speed_ratio, scaled)
+        scaled = max(min_ratio, scaled)
+        scaled = min(max_ratio, scaled)
         return scaled if delta_value > 0 else -scaled
+
+    def _speed_ratio_bounds(self):
+        min_ratio = max(0.0, float(getattr(self, "min_speed_ratio", 1.0)))
+        max_ratio = max(0.0, float(getattr(self, "max_speed_ratio", min_ratio)))
+        if max_ratio < min_ratio:
+            min_ratio, max_ratio = max_ratio, min_ratio
+        return min_ratio, max_ratio
+
+    def _pressure_speed_span(self, value_threshold=None):
+        if value_threshold is None:
+            value_threshold = self.push_value_threshold
+        threshold_gap = abs(float(self.motion_threshold) - float(value_threshold))
+        hysteresis_gap = abs(float(getattr(self, "push_exit_value_offset", 0.0)))
+        return max(1e-6, hysteresis_gap, threshold_gap * 0.5)
+
+    def _ratio_from_pressure_delta(self, pressure_delta, value_threshold=None):
+        min_ratio, max_ratio = self._speed_ratio_bounds()
+        if max_ratio <= min_ratio:
+            return min_ratio
+        normalized = max(0.0, min(1.0, float(pressure_delta) / self._pressure_speed_span(value_threshold)))
+        return min_ratio + (max_ratio - min_ratio) * normalized
+
+    def _push_pressure_speed_ratio(self):
+        if self.current_touch_peak_value is None:
+            return self._speed_ratio_bounds()[0]
+        pressure_beyond_push = float(self.push_value_threshold) - float(self.current_touch_peak_value)
+        return self._ratio_from_pressure_delta(max(0.0, pressure_beyond_push), self.push_value_threshold)
+
+    def _two_finger_pull_pressure_delta(self, state=None):
+        state = self.current_two_peak_state if state is None else state
+        if state is None:
+            return 0.0
+        left_force = max(0.0, float(state.get("left_force", 0.0)))
+        right_force = max(0.0, float(state.get("right_force", 0.0)))
+        pull_entry_force = max(0.0, float(self.motion_threshold) - float(self.pull_value_threshold))
+        average_force = 0.5 * (left_force + right_force)
+        return max(0.0, average_force - pull_entry_force)
+
+    def _two_finger_pull_pressure_ready(self, state=None):
+        state = self.current_two_peak_state if state is None else state
+        if state is None:
+            return False
+        left_force = max(0.0, float(state.get("left_force", 0.0)))
+        right_force = max(0.0, float(state.get("right_force", 0.0)))
+        average_force = 0.5 * (left_force + right_force)
+        pull_entry_force = max(0.0, float(self.motion_threshold) - float(self.pull_value_threshold))
+        return average_force >= pull_entry_force
+
+    def _two_finger_pressure_speed_ratio(self):
+        state = self.current_two_peak_state
+        if state is None:
+            return self._speed_ratio_bounds()[0]
+        return self._ratio_from_pressure_delta(
+            self._two_finger_pull_pressure_delta(state),
+            self.pull_value_threshold,
+        )
 
     def _sensor_axis_denominators(self):
         return (
@@ -554,12 +624,14 @@ class DirectFingerMotion:
         smoothed = self._apply_velocity_smoothing(velocity)
         self._set_teacher_output(mode, smoothed)
         self._send_robot_velocity(smoothed)
+        self._log_motion_ratio(mode, smoothed)
 
     def _apply_stop_output(self):
         zero = self._zero_velocity()
         self._smoothed_velocity = list(zero)
         self._set_teacher_output("stop", zero)
         self._send_robot_velocity(zero)
+        self._log_motion_ratio("stop", zero)
 
     def _apply_velocity_smoothing(self, target_velocity):
         alpha = max(0.0, min(1.0, self.velocity_smoothing_alpha))
@@ -570,6 +642,63 @@ class DirectFingerMotion:
         if all(abs(v) < 1e-6 for v in self._smoothed_velocity):
             self._smoothed_velocity = [0.0] * 6
         return list(self._smoothed_velocity)
+
+    def _motion_ratio_from_velocity(self, mode, velocity):
+        mode = str(mode or "")
+        values = [float(v) for v in velocity]
+        if mode == "single_finger_swipe":
+            base = max(1e-9, abs(float(self.robot_speed)))
+            return max(abs(values[0]), abs(values[2])) / base
+        if mode == "push":
+            base = max(1e-9, abs(float(self.push_speed)))
+            return abs(values[1]) / base
+        if mode == "two_finger_pull":
+            base = max(1e-9, abs(float(self.pull_speed)))
+            return abs(values[1]) / base
+        if mode == "two_finger_swipe":
+            base = max(1e-9, abs(float(self.rotation_speed)))
+            return max(abs(values[3]), abs(values[5])) / base
+        return 0.0
+
+    def _sent_velocity_from_pre_flip(self, velocity):
+        values = [float(v) for v in velocity]
+        return [-values[0], -values[1], -values[2], values[3], values[4], values[5]]
+
+    def _motion_ratio_detail_text(self, mode, ratio, velocity):
+        display_mode = "pull" if str(mode) == "two_finger_pull" else str(mode)
+        return f"[DFM Ratio] mode={display_mode} | ratio={ratio:.3f}"
+
+    def _log_motion_ratio(self, mode, velocity):
+        if not bool(getattr(self, "motion_ratio_log_enabled", False)):
+            return
+
+        mode = str(mode or "stop")
+        ratio = self._motion_ratio_from_velocity(mode, velocity)
+        ratio = max(0.0, ratio)
+        if mode == "stop":
+            signature = (mode, 0.0)
+        else:
+            signature = (mode, round(ratio, 2))
+
+        now = time.perf_counter()
+        is_changed = signature != self._last_motion_ratio_log_signature
+        if mode != "stop" and not is_changed and (now - self._last_motion_ratio_log_at) < 0.25:
+            return
+        if mode == "stop" and not is_changed:
+            return
+
+        message = self._motion_ratio_detail_text(mode, ratio, velocity)
+        log_display = getattr(self.ros_splitter, "log_display", None)
+        if log_display is not None:
+            try:
+                log_display.append(message)
+            except Exception:
+                print(message)
+        else:
+            print(message)
+
+        self._last_motion_ratio_log_signature = signature
+        self._last_motion_ratio_log_at = now
 
     def _compute_touch_motion_features(self, values, prev_row, prev_col):
         touch_mask = values < float(self.motion_threshold)
@@ -621,10 +750,12 @@ class DirectFingerMotion:
         return [float(vx), 0.0, float(vz), 0.0, 0.0, 0.0]
 
     def _push_velocity(self):
-        return [0.0, float(self.push_speed), 0.0, 0.0, 0.0, 0.0]
+        speed = float(self.push_speed) * self._push_pressure_speed_ratio()
+        return [0.0, speed, 0.0, 0.0, 0.0, 0.0]
 
     def _pull_velocity(self):
-        return [0.0, -float(self.pull_speed), 0.0, 0.0, 0.0, 0.0]
+        speed = float(self.pull_speed) * self._two_finger_pressure_speed_ratio()
+        return [0.0, -speed, 0.0, 0.0, 0.0, 0.0]
 
     def _two_finger_vertical_swipe_to_robot_velocity(self, delta_row):
         if not bool(getattr(self, "two_finger_swipe_enable_vertical", True)):
@@ -716,6 +847,11 @@ class DirectFingerMotion:
         if self.last_robot_velocity_cmd == velocity:
             return
 
+        if not bool(getattr(self, "robot_command_output_enabled", True)):
+            self.last_robot_velocity_cmd = velocity
+            self._debug_print(f"Virtual robot velocity command ({self._get_requested_frame()}): {velocity}")
+            return
+
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if robot_api is None:
             return
@@ -770,6 +906,9 @@ class DirectFingerMotion:
         )
 
         if pinch_detected:
+            if not self._two_finger_pull_pressure_ready(curr):
+                self.pinch_hold_counter = 0
+                return False
             self.pinch_hold_counter += 1
             return self.pinch_hold_counter >= self.pinch_frames_required
 
@@ -876,308 +1015,31 @@ class DirectFingerMotion:
             self._velocity_mode_enabled = False
 
 
-class DirectFingerMotionV2(DirectFingerMotion):
-    """
-    Two-finger span control.
-
-    Place one finger on the left side and one on the right side of the sensor:
-    - both fingers move toward the center (span shrinks) -> pull robot toward user
-    - both fingers move away from center (span grows) -> move robot away from user
-
-    For this first version, magnitude is ignored; it sends fixed pull/push speeds.
-    """
-    SETTINGS_FILE = os.path.join(DirectFingerMotion.CONFIG_DIR, "direct_finger_motion_v2.json")
-    PROFILE_DIR = os.path.join(DirectFingerMotion.CONFIG_DIR, "direct_finger_motion_v2_profiles")
-    DEFAULT_PROFILE_NAME = "default"
-
-    def __init__(self, ros_splitter_instance, my_sensor_instance):
-        self.current_profile_name = self.DEFAULT_PROFILE_NAME
-        super().__init__(ros_splitter_instance, my_sensor_instance)
-        self.current_motion_mode = "v2_stop"
-        self._v2_latched_mode = "v2_stop"
-        self._v2_latched_velocity = self._zero_velocity()
-        self._v2_last_logged_direction = None
-        self._v2_last_log_time = 0.0
-
-    def _profile_slug(self, profile_name):
-        name = str(profile_name or self.DEFAULT_PROFILE_NAME).strip().lower()
-        name = re.sub(r"[^a-z0-9_-]+", "_", name)
-        name = name.strip("_")
-        return name or self.DEFAULT_PROFILE_NAME
-
-    def _profile_path(self, profile_name=None):
-        profile = self._profile_slug(profile_name or self.current_profile_name)
-        return os.path.join(self.PROFILE_DIR, f"{profile}.json")
-
-    def get_current_profile_name(self):
-        return self.current_profile_name
-
-    def list_profiles(self):
-        profiles = {self.DEFAULT_PROFILE_NAME}
-        try:
-            if os.path.isdir(self.PROFILE_DIR):
-                for filename in os.listdir(self.PROFILE_DIR):
-                    if filename.endswith(".json"):
-                        profiles.add(os.path.splitext(filename)[0])
-        except Exception as exc:
-            print(f"Failed to list DFM v2 profiles: {exc}")
-        return sorted(profiles)
-
-    def set_profile(self, profile_name, load=True):
-        self.current_profile_name = self._profile_slug(profile_name)
-        self.settings_path = self._profile_path(self.current_profile_name)
-        if load:
-            self.apply_settings(self._default_settings(), save_to_file=False)
-            self.load_settings_from_file()
-        return self.current_profile_name
-
-    def save_settings_to_file(self):
-        self.settings_path = self._profile_path(self.current_profile_name)
-        super().save_settings_to_file()
-
-    def load_settings_from_file(self):
-        self.settings_path = self._profile_path(self.current_profile_name)
-        if not os.path.exists(self.settings_path) and self.current_profile_name == self.DEFAULT_PROFILE_NAME:
-            # Migrate the previous single-file DFM v2 settings into the default profile.
-            self.settings_path = self.SETTINGS_FILE
-        super().load_settings_from_file()
-        self.settings_path = self._profile_path(self.current_profile_name)
-
-    def _default_settings(self):
-        settings = super()._default_settings()
-        settings.update(
-            {
-                "config_version": 2,
-                "motion_threshold": -3.0,
-                "frame_interval_ms": 0,
-                "velocity_smoothing_alpha": 1.0,
-                "robot_speed": 0.05,
-                "centroid_deadband": 0.003,
-                "centroid_gain": 20.0,
-                "min_speed_ratio": 0.20,
-                "max_speed_ratio": 1.50,
-                "pull_speed": 0.12,
-                "push_speed": 0.12,
-                "pinch_axis_deadband": 0.003,
-                "pinch_distance_threshold": 0.02,
-                "pinch_midpoint_deadband": 0.5,
-                "v2_span_deadband": 0.006,
-                "v2_midpoint_deadband": 0.08,
-                "v2_planar_span_tolerance": 0.04,
-                "v2_planar_dominance_ratio": 1.0,
-                "v2_up_down_direction_sign": 1.0,
-                "v2_forward_backward_direction_sign": 1.0,
-                "v2_rotation_speed": 0.08,
-                "v2_rotation_deadband": 0.01,
-                "v2_rotation_direction_sign": 1.0,
-                "v2_force_lateral_speed": 0.05,
-                "v2_force_lateral_deadband": 1.0,
-                "v2_force_lateral_center_deadband": 0.08,
-                "v2_force_lateral_direction_sign": 1.0,
-            }
-        )
-        return settings
-
-    def toggle_direct_finger_motion_v2(self):
-        self.toggle_direct_finger_motion()
-
-    def _reset_state(self):
-        super()._reset_state()
-        self._v2_latched_mode = "v2_stop"
-        self._v2_latched_velocity = self._zero_velocity()
-        self._v2_last_logged_direction = None
-        self._v2_last_log_time = 0.0
-
-    def _v2_velocity_direction_label(self, velocity):
-        labels = []
-        axis_names = ("x", "y", "z", "rx", "ry", "rz")
-        for axis_name, value in zip(axis_names, velocity):
-            value = float(value)
-            if abs(value) < 1e-6:
-                continue
-            sign = "+" if value > 0.0 else "-"
-            labels.append(f"{sign}{axis_name}")
-        return " ".join(labels) if labels else "stop"
-
-    def _v2_append_motion_log(self, mode, velocity):
-        direction = self._v2_velocity_direction_label(velocity)
-        now = time.perf_counter()
-        should_log = (
-            direction != self._v2_last_logged_direction
-            or (direction != "stop" and (now - self._v2_last_log_time) >= 0.5)
-        )
-        if not should_log:
-            return
-
-        self._v2_last_logged_direction = direction
-        self._v2_last_log_time = now
-        frame = self._get_requested_frame()
-        message = f"[DFM V2] moving: {direction} | mode={mode} | frame={frame}"
-
-        log_display = getattr(self.ros_splitter, "log_display", None)
-        if log_display is not None:
-            try:
-                log_display.append(message)
-                return
-            except Exception:
-                pass
-        print(message)
-
-    def _apply_motion_output(self, mode, velocity):
-        super()._apply_motion_output(mode, velocity)
-        self._v2_append_motion_log(mode, velocity)
-
-    def _v2_side_press_velocity(self, two_peak_state=None, held_side=None):
-        velocity = self._zero_velocity()
-
-        if two_peak_state is not None:
-            if held_side not in {"left", "right"}:
-                return velocity
-            force_key = "left_force" if held_side == "left" else "right_force"
-            force = float(two_peak_state.get(force_key, 0.0))
-            if force < float(self.v2_force_lateral_deadband):
-                return velocity
-            side_sign = -1.0 if held_side == "left" else 1.0
-        else:
-            if not self.current_touch_clusters:
-                return velocity
-            strongest = self.current_touch_clusters[0]
-            force = max(0.0, float(self.motion_threshold) - float(strongest["peak_value"]))
-            if force < float(self.v2_force_lateral_deadband):
-                return velocity
-
-            denom_c = max(1.0, float(self.my_sensor.n_col - 1))
-            side_delta = (float(strongest["center_col"]) / denom_c) - 0.5
-            if abs(side_delta) < float(self.v2_force_lateral_center_deadband):
-                return velocity
-            side_sign = -1.0 if side_delta < 0.0 else 1.0
-
-        velocity[0] = (
-            float(self.v2_force_lateral_direction_sign)
-            * float(self.v2_force_lateral_speed)
-            * side_sign
-        )
-        return velocity
-
-    def _update_robot_from_motion(self, previous_center=None, current_center=None):
-        curr = self.current_two_peak_state
-        prev = self.last_two_peak_state
-
-        self.push_hold_counter = 0
-        self.pinch_hold_counter = 0
-        self._in_push_mode = False
-        self._two_finger_swipe_axis_lock = None
-        self._two_finger_swipe_axis_lock_remaining = 0
-
-        if curr is None:
-            force_lateral_velocity = self._v2_side_press_velocity()
-            if any(abs(v) > 1e-6 for v in force_lateral_velocity):
-                self._v2_latched_mode = "v2_single_side_press_move"
-                self._v2_latched_velocity = force_lateral_velocity
-                self._apply_motion_output(self._v2_latched_mode, self._v2_latched_velocity)
-            else:
-                self._v2_latched_mode = "v2_stop"
-                self._v2_latched_velocity = self._zero_velocity()
-                self._apply_stop_output()
-            return
-
-        if prev is None:
-            self._apply_motion_output(self._v2_latched_mode, self._v2_latched_velocity)
-            return
-
-        left_move = curr["left_col"] - prev["left_col"]
-        right_move = curr["right_col"] - prev["right_col"]
-        left_row_move = curr["left_row"] - prev["left_row"]
-        right_row_move = curr["right_row"] - prev["right_row"]
-        span_delta = curr["span"] - prev["span"]
-        mid_col_delta = curr["mid_col"] - prev["mid_col"]
-        mid_row_delta = curr["mid_row"] - prev["mid_row"]
-        midpoint_shift_col = abs(curr["mid_col"] - prev["mid_col"])
-        midpoint_shift_row = abs(curr["mid_row"] - prev["mid_row"])
-
-        midpoint_stable = (
-            midpoint_shift_col <= float(self.v2_midpoint_deadband)
-            and midpoint_shift_row <= float(self.v2_midpoint_deadband)
-        )
-        span_deadband = float(self.v2_span_deadband)
-        span_abs = abs(float(span_delta))
-        planar_axis_delta = max(abs(float(mid_col_delta)), abs(float(mid_row_delta)))
-        planar_requested = (
-            planar_axis_delta >= float(self.centroid_deadband)
-            and (
-                span_abs <= float(self.v2_planar_span_tolerance)
-                or planar_axis_delta >= span_abs * float(self.v2_planar_dominance_ratio)
-            )
-        )
-
-        edge_swipe_y_positive = span_delta >= span_deadband
-        edge_swipe_y_negative = span_delta <= -span_deadband
-
-        planar_velocity = self._zero_velocity()
-        # Temporarily disable center-motion planar control for DFM v2 testing.
-        # X is controlled by side press/hold; Y is controlled by edge swipe.
-
-        normal_velocity = self._zero_velocity()
-        if edge_swipe_y_positive:
-            normal_velocity = self._push_velocity()
-        elif edge_swipe_y_negative:
-            normal_velocity = self._pull_velocity()
-        normal_velocity[1] *= float(self.v2_forward_backward_direction_sign)
-
-        rotation_velocity = self._zero_velocity()
-        # Temporarily disable cylinder rotation for DFM v2 testing.
-
-        side_hold_deadband = max(float(self.v2_span_deadband), float(self.centroid_deadband))
-        swipe_active_deadband = float(self.v2_span_deadband)
-        left_holding = abs(float(left_move)) <= side_hold_deadband
-        right_holding = abs(float(right_move)) <= side_hold_deadband
-        left_swiping_left = left_move <= -swipe_active_deadband
-        left_swiping_right = left_move >= swipe_active_deadband
-        right_swiping_left = right_move <= -swipe_active_deadband
-        right_swiping_right = right_move >= swipe_active_deadband
-        pure_y_gesture = (
-            (left_swiping_left and right_swiping_right)
-            or (left_swiping_right and right_swiping_left)
-        )
-        held_side = None
-        if (edge_swipe_y_positive or edge_swipe_y_negative) and not pure_y_gesture:
-            if left_holding and not right_holding:
-                held_side = "left"
-            elif right_holding and not left_holding:
-                held_side = "right"
-
-        force_lateral_velocity = self._v2_side_press_velocity(curr, held_side=held_side)
-
-        mixed_velocity = [
-            float(planar_velocity[i] + normal_velocity[i] + rotation_velocity[i] + force_lateral_velocity[i])
-            for i in range(6)
-        ]
-
-        if any(abs(v) > 1e-6 for v in mixed_velocity):
-            has_planar = any(abs(v) > 1e-6 for v in planar_velocity)
-            has_normal = any(abs(v) > 1e-6 for v in normal_velocity)
-            has_rotation = any(abs(v) > 1e-6 for v in rotation_velocity)
-            has_force_lateral = any(abs(v) > 1e-6 for v in force_lateral_velocity)
-            if sum([has_planar, has_normal, has_rotation, has_force_lateral]) > 1:
-                self._v2_latched_mode = "v2_mixed_motion"
-            elif has_planar:
-                self._v2_latched_mode = "v2_two_finger_planar_move"
-            elif has_rotation:
-                self._v2_latched_mode = "v2_cylinder_rotation"
-            elif has_force_lateral:
-                self._v2_latched_mode = "v2_force_lateral_move"
-            elif edge_swipe_y_negative:
-                self._v2_latched_mode = "v2_pull_toward_user"
-            else:
-                self._v2_latched_mode = "v2_move_away_user"
-            self._v2_latched_velocity = mixed_velocity
-            self._apply_motion_output(self._v2_latched_mode, self._v2_latched_velocity)
-            return
-
-        self._apply_motion_output(self._v2_latched_mode, self._v2_latched_velocity)
-
-
 class AI_DirectFingerMotion(DirectFingerMotion):
+    RECORD_TARGET_HZ = 60.0
+    RECORD_TIMER_INTERVAL_MS = 16
+    TARGET_SEQ_LEN = 16
+    TEACHING_AUTO_LABEL = "auto"
+    TEACHING_LABELS = (
+        "auto",
+        "stop",
+        "normal_swipe",
+        "push",
+        "pull",
+        "x_pos",
+        "x_neg",
+        "y_pos",
+        "y_neg",
+        "z_pos",
+        "z_neg",
+        "rx_pos",
+        "rx_neg",
+        "ry_pos",
+        "ry_neg",
+        "rz_pos",
+        "rz_neg",
+    )
+
     def __init__(self, ros_splitter_instance, my_sensor_instance):
         super().__init__(ros_splitter_instance, my_sensor_instance)
 
@@ -1186,11 +1048,18 @@ class AI_DirectFingerMotion(DirectFingerMotion):
         self.session_tag = "default"
         self.trial_number = None
         self.episode_started_at = None
+        self.episode_started_perf_at = None
+        self._last_episode_perf_timestamp = None
+        self.teaching_override_label = self.TEACHING_AUTO_LABEL
+        self.send_robot_commands = False
         self.current_episode = self._create_empty_episode()
 
     def _create_empty_episode(self):
         return {
             "timestamps": [],
+            "elapsed_sec": [],
+            "dt_sec": [],
+            "sensor_frame_sequence": [],
             "rawData": [],
             "diffData": [],
             "diffPerData": [],
@@ -1209,8 +1078,163 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             "mode": [],
             "teacher_velocity_pre_flip": [],
             "teacher_velocity_sent": [],
+            "teacher_velocity_target": [],
+            "intended_velocity_target": [],
+            "intended_mode": [],
+            "teaching_label": [],
+            "teaching_source": [],
+            "manual_override_active": [],
+            "robot_tool_pose": [],
+            "robot_joint_positions": [],
+            "robot_feedback_valid": [],
+            "control_frame_idx": [],
+            "two_peak_state": [],
             "selected_frame": [],
         }
+
+    @staticmethod
+    def _safe_sequence(value, length):
+        if value is None:
+            return [float("nan")] * int(length)
+        try:
+            seq = list(value)
+        except Exception:
+            return [float("nan")] * int(length)
+
+        out = []
+        for idx in range(int(length)):
+            try:
+                out.append(float(seq[idx]))
+            except Exception:
+                out.append(float("nan"))
+        return out
+
+    def _safe_tool_pose(self):
+        robot_api = getattr(self.ros_splitter, "robot_api", None)
+        if robot_api is None or not hasattr(robot_api, "get_current_tool_position"):
+            return [float("nan")] * 7
+        try:
+            pos, quat = robot_api.get_current_tool_position()
+            return self._safe_sequence(pos, 3) + self._safe_sequence(quat, 4)
+        except Exception:
+            return [float("nan")] * 7
+
+    def _safe_joint_positions(self):
+        robot_api = getattr(self.ros_splitter, "robot_api", None)
+        if robot_api is None or not hasattr(robot_api, "get_current_positions"):
+            return [float("nan")] * 6
+        try:
+            return self._safe_sequence(robot_api.get_current_positions(), 6)
+        except Exception:
+            return [float("nan")] * 6
+
+    @staticmethod
+    def _selected_frame_index(frame_name):
+        frame_name = str(frame_name or "").lower()
+        if frame_name in {"tool", "tcp", "joint6", "j6"}:
+            return 6.0
+        if frame_name in {"base", "world", "joint1", "j1"}:
+            return 1.0
+        match = re.fullmatch(r"(?:joint|j)([1-6])", frame_name)
+        if match:
+            return float(match.group(1))
+        return 0.0
+
+    def _two_peak_state_vector(self):
+        state = self.current_two_peak_state
+        if state is None:
+            return [float("nan")] * 9
+        return [
+            float(state.get("left_col", np.nan)),
+            float(state.get("left_row", np.nan)),
+            float(state.get("right_col", np.nan)),
+            float(state.get("right_row", np.nan)),
+            float(state.get("left_force", np.nan)),
+            float(state.get("right_force", np.nan)),
+            float(state.get("span", np.nan)),
+            float(state.get("mid_col", np.nan)),
+            float(state.get("mid_row", np.nan)),
+        ]
+
+    def set_teaching_override(self, label=None):
+        label = str(label or self.TEACHING_AUTO_LABEL).strip().lower()
+        if label in {"dfm", "auto_dfm", "auto/dfm", "none"}:
+            label = self.TEACHING_AUTO_LABEL
+        if label not in self.TEACHING_LABELS:
+            label = self.TEACHING_AUTO_LABEL
+        self.teaching_override_label = label
+        return self.teaching_override_label
+
+    def get_teaching_override_label(self):
+        return str(getattr(self, "teaching_override_label", self.TEACHING_AUTO_LABEL))
+
+    def _manual_teaching_velocity_target(self, label):
+        label = str(label or self.TEACHING_AUTO_LABEL)
+        linear_speed = float(
+            max(
+                abs(float(getattr(self, "robot_speed", 0.0))),
+                abs(float(getattr(self, "push_speed", 0.0))),
+                abs(float(getattr(self, "pull_speed", 0.0))),
+            )
+        )
+        push_speed = abs(float(getattr(self, "push_speed", linear_speed)))
+        pull_speed = abs(float(getattr(self, "pull_speed", linear_speed)))
+        rotation_speed = abs(float(getattr(self, "rotation_speed", 0.0)))
+
+        velocity = [0.0] * 6
+        if label == "stop":
+            return velocity
+        if label == "push":
+            velocity[1] = -push_speed * self._push_pressure_speed_ratio()
+            return velocity
+        if label == "pull":
+            velocity[1] = pull_speed * self._two_finger_pressure_speed_ratio()
+            return velocity
+
+        axis_map = {
+            "x_pos": (0, 1.0, linear_speed),
+            "x_neg": (0, -1.0, linear_speed),
+            "y_pos": (1, 1.0, linear_speed),
+            "y_neg": (1, -1.0, linear_speed),
+            "z_pos": (2, 1.0, linear_speed),
+            "z_neg": (2, -1.0, linear_speed),
+            "rx_pos": (3, 1.0, rotation_speed),
+            "rx_neg": (3, -1.0, rotation_speed),
+            "ry_pos": (4, 1.0, rotation_speed),
+            "ry_neg": (4, -1.0, rotation_speed),
+            "rz_pos": (5, 1.0, rotation_speed),
+            "rz_neg": (5, -1.0, rotation_speed),
+        }
+        spec = axis_map.get(label)
+        if spec is None:
+            return None
+        axis, sign, speed = spec
+        velocity[axis] = float(sign * speed)
+        return velocity
+
+    def _normal_swipe_teaching_target(self, feature):
+        if feature is None or not bool(feature.get("touch_present", 0.0)):
+            return self._zero_velocity(), "stop"
+
+        delta_col = float(feature.get("delta_col_norm", 0.0))
+        delta_row = float(feature.get("delta_row_norm", 0.0))
+        pre_flip_velocity = self._centroid_delta_to_robot_velocity(delta_col, delta_row)
+        if not any(abs(value) > 1e-12 for value in pre_flip_velocity):
+            return self._zero_velocity(), "stop"
+        return self._sent_velocity_from_pre_flip(pre_flip_velocity), "single_finger_swipe"
+
+    def _intended_teaching_target(self, dfm_target, dfm_mode, feature=None):
+        label = self.get_teaching_override_label()
+        if label == self.TEACHING_AUTO_LABEL:
+            return list(dfm_target), str(dfm_mode), label, "dfm", 0
+        if label == "normal_swipe":
+            velocity, mode = self._normal_swipe_teaching_target(feature)
+            return list(velocity), mode, label, "manual", 1
+
+        velocity = self._manual_teaching_velocity_target(label)
+        if velocity is None:
+            return list(dfm_target), str(dfm_mode), self.TEACHING_AUTO_LABEL, "dfm", 0
+        return list(velocity), str(label), label, "manual", 1
 
     def sanitize_session_tag(self, session_tag):
         session_tag = (session_tag or "default").strip()
@@ -1231,24 +1255,34 @@ class AI_DirectFingerMotion(DirectFingerMotion):
                     existing.append(int(match.group(1)))
         return max(existing, default=0) + 1
 
-    def toggle_ai_direct_finger_motion(self, session_tag=None):
+    def toggle_ai_direct_finger_motion(self, session_tag=None, send_robot_commands=False):
         self.is_running = not self.is_running
 
         if self.is_running:
             self.session_tag = self.sanitize_session_tag(session_tag)
+            self.send_robot_commands = bool(send_robot_commands)
+            self.robot_command_output_enabled = bool(send_robot_commands)
             self.trial_number = self._get_next_trial_number()
             self.episode_started_at = time.time()
+            self.episode_started_perf_at = time.perf_counter()
+            self._last_episode_perf_timestamp = None
             self.current_episode = self._create_empty_episode()
             self._reset_state()
-            self.control_timer.start(int(self.frame_interval_ms))
+            self.control_timer.start(int(self.RECORD_TIMER_INTERVAL_MS))
+            record_mode = "with_robot" if self.send_robot_commands else "no_robot"
             print(
-                f"AI direct finger motion STARTED | session='{self.session_tag}' | trial={self.trial_number}"
+                f"AI direct finger motion STARTED ({record_mode}) | session='{self.session_tag}' | "
+                f"trial={self.trial_number} | target={self.RECORD_TARGET_HZ:.0f} Hz"
             )
         else:
             self.control_timer.stop()
             self._stop_robot_motion(stop_mode=True)
             self._save_episode()
+            self.robot_command_output_enabled = True
+            self.send_robot_commands = False
             self._reset_state()
+            self.episode_started_perf_at = None
+            self._last_episode_perf_timestamp = None
             print("AI direct finger motion STOPPED")
 
     def run_step(self):
@@ -1257,13 +1291,36 @@ class AI_DirectFingerMotion(DirectFingerMotion):
         if self.my_sensor.n_row < 2 or self.my_sensor.n_col < 2:
             return
 
+        data_obj = getattr(self.my_sensor, "_data", None)
+        sensor_frame_sequence = getattr(data_obj, "frame_sequence", None)
+        perf_timestamp = time.perf_counter()
+        if sensor_frame_sequence is not None:
+            if sensor_frame_sequence == self._last_processed_sensor_frame:
+                timeout = max(0.0, float(getattr(self, "sensor_frame_timeout_sec", 0.2)))
+                if (
+                    timeout > 0.0
+                    and self.last_robot_velocity_cmd != self._zero_velocity()
+                    and (perf_timestamp - self._last_sensor_frame_seen_at) >= timeout
+                ):
+                    self._apply_stop_output()
+                return
+            self._last_processed_sensor_frame = sensor_frame_sequence
+            self._last_sensor_frame_seen_at = perf_timestamp
+
         prev_row = self.last_touch_center_row
         prev_col = self.last_touch_center_col
         timestamp = time.time()
         sensor_snapshot = self._snapshot_sensor_frame()
 
         self.print_single_touch_map_with_motion(threshold=self.motion_threshold)
-        self._append_teacher_frame(timestamp, sensor_snapshot, prev_row, prev_col)
+        self._append_teacher_frame(
+            timestamp,
+            perf_timestamp,
+            sensor_frame_sequence,
+            sensor_snapshot,
+            prev_row,
+            prev_col,
+        )
 
     def _snapshot_sensor_frame(self):
         data = self.my_sensor._data
@@ -1275,12 +1332,50 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             "diffPerDataAve": column_major_matrix_view(data.diffPerDataAve, dtype=np.float32, copy=True),
         }
 
-    def _append_teacher_frame(self, timestamp, sensor_snapshot, prev_row, prev_col):
+    def _append_teacher_frame(
+        self,
+        timestamp,
+        perf_timestamp,
+        sensor_frame_sequence,
+        sensor_snapshot,
+        prev_row,
+        prev_col,
+    ):
         episode = self.current_episode
         values = sensor_snapshot["diffPerDataAve"]
         feature = self._compute_touch_motion_features(values, prev_row, prev_col)
 
+        if self.episode_started_perf_at is None:
+            self.episode_started_perf_at = float(perf_timestamp)
+        elapsed_sec = float(perf_timestamp - self.episode_started_perf_at)
+        if self._last_episode_perf_timestamp is None:
+            dt_sec = 0.0
+        else:
+            dt_sec = float(perf_timestamp - self._last_episode_perf_timestamp)
+        self._last_episode_perf_timestamp = float(perf_timestamp)
+
+        teacher_pre_flip = self._safe_sequence(self.last_teacher_velocity_pre_flip, 6)
+        teacher_sent = self._safe_sequence(self.last_robot_velocity_cmd or self._zero_velocity(), 6)
+        (
+            intended_velocity,
+            intended_mode,
+            teaching_label,
+            teaching_source,
+            manual_override_active,
+        ) = self._intended_teaching_target(teacher_sent, self.current_motion_mode, feature)
+        tool_pose = self._safe_tool_pose()
+        joint_positions = self._safe_joint_positions()
+        robot_feedback_valid = int(
+            any(np.isfinite(tool_pose)) or any(np.isfinite(joint_positions))
+        )
+        selected_frame = feature["selected_frame"]
+
         episode["timestamps"].append(float(timestamp))
+        episode["elapsed_sec"].append(np.float32(elapsed_sec))
+        episode["dt_sec"].append(np.float32(dt_sec))
+        episode["sensor_frame_sequence"].append(
+            np.int64(-1 if sensor_frame_sequence is None else int(sensor_frame_sequence))
+        )
         for key, value in sensor_snapshot.items():
             episode[key].append(value)
         episode["touch_mask"].append(feature["touch_mask"].astype(np.uint8))
@@ -1302,11 +1397,20 @@ class AI_DirectFingerMotion(DirectFingerMotion):
         episode["peak_value"].append(np.float32(feature["peak_value"]))
         episode["mean_active_value"].append(np.float32(feature["mean_active_value"]))
         episode["mode"].append(str(self.current_motion_mode))
-        episode["teacher_velocity_pre_flip"].append(np.array(self.last_teacher_velocity_pre_flip, dtype=np.float32))
-        episode["teacher_velocity_sent"].append(
-            np.array(self.last_robot_velocity_cmd or self._zero_velocity(), dtype=np.float32)
-        )
-        episode["selected_frame"].append(feature["selected_frame"])
+        episode["teacher_velocity_pre_flip"].append(np.asarray(teacher_pre_flip, dtype=np.float32))
+        episode["teacher_velocity_sent"].append(np.asarray(teacher_sent, dtype=np.float32))
+        episode["teacher_velocity_target"].append(np.asarray(teacher_sent, dtype=np.float32))
+        episode["intended_velocity_target"].append(np.asarray(intended_velocity, dtype=np.float32))
+        episode["intended_mode"].append(str(intended_mode))
+        episode["teaching_label"].append(str(teaching_label))
+        episode["teaching_source"].append(str(teaching_source))
+        episode["manual_override_active"].append(np.uint8(manual_override_active))
+        episode["robot_tool_pose"].append(np.asarray(tool_pose, dtype=np.float32))
+        episode["robot_joint_positions"].append(np.asarray(joint_positions, dtype=np.float32))
+        episode["robot_feedback_valid"].append(np.uint8(robot_feedback_valid))
+        episode["control_frame_idx"].append(np.float32(self._selected_frame_index(selected_frame)))
+        episode["two_peak_state"].append(np.asarray(self._two_peak_state_vector(), dtype=np.float32))
+        episode["selected_frame"].append(selected_frame)
 
     def _save_episode(self):
         frame_count = len(self.current_episode["timestamps"])
@@ -1322,6 +1426,8 @@ class AI_DirectFingerMotion(DirectFingerMotion):
         filename = os.path.join(session_dir, f"trial_{int(self.trial_number):04d}_{started_stamp}.npz")
 
         metadata = {
+            "dataset_version": 3,
+            "dataset_role": "ai_direct_finger_motion_stage2_teaching_recording",
             "session_tag": self.session_tag,
             "trial_number": int(self.trial_number or 0),
             "frame_count": int(frame_count),
@@ -1329,8 +1435,40 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             "saved_at": float(time.time()),
             "sensor_rows": int(self.my_sensor.n_row),
             "sensor_cols": int(self.my_sensor.n_col),
+            "sensor_model": str(getattr(self.my_sensor, "current_model_name", "")),
+            "sensor_reorder_mode": str(getattr(self.my_sensor, "current_reorder_mode", "")),
+            "sensor_average_window_size": int(getattr(self.my_sensor, "sensor_average_window_size", 0) or 0),
             "motion_threshold": float(self.motion_threshold),
+            "teacher": "direct_finger_motion_v1_rule_based",
             "teacher_layout": "column_major_matrix_view",
+            "record_mode": "with_robot" if bool(getattr(self, "send_robot_commands", False)) else "no_robot",
+            "send_robot_commands": bool(getattr(self, "send_robot_commands", False)),
+            "record_target_hz": float(self.RECORD_TARGET_HZ),
+            "record_timer_interval_ms": int(self.RECORD_TIMER_INTERVAL_MS),
+            "target_sequence_length": int(self.TARGET_SEQ_LEN),
+            "target_window_sec_estimate": float(self.TARGET_SEQ_LEN / self.RECORD_TARGET_HZ),
+            "fresh_sensor_frame_gated": True,
+            "model_input_intent": "recent tactile sequence + robot state",
+            "model_output_intent": "6d velocity [vx, vy, vz, rx, ry, rz] in selected EE frame",
+            "training_target_key": "intended_velocity_target",
+            "dfm_training_target_key": "teacher_velocity_target",
+            "intended_training_target_key": "intended_velocity_target",
+            "teaching_labels": list(self.TEACHING_LABELS),
+            "teaching_auto_label": self.TEACHING_AUTO_LABEL,
+            "two_peak_state_layout": [
+                "left_col",
+                "left_row",
+                "right_col",
+                "right_row",
+                "left_force",
+                "right_force",
+                "span",
+                "mid_col",
+                "mid_row",
+            ],
+            "robot_tool_pose_layout": ["x", "y", "z", "qw", "qx", "qy", "qz"],
+            "robot_joint_positions_layout": ["j1", "j2", "j3", "j4", "j5", "j6"],
+            "dfm_settings": self.get_settings(),
         }
 
         episode = self.current_episode
@@ -1338,6 +1476,9 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             filename,
             metadata_json=np.array(json.dumps(metadata)),
             timestamps=np.asarray(episode["timestamps"], dtype=np.float64),
+            elapsed_sec=np.asarray(episode["elapsed_sec"], dtype=np.float32),
+            dt_sec=np.asarray(episode["dt_sec"], dtype=np.float32),
+            sensor_frame_sequence=np.asarray(episode["sensor_frame_sequence"], dtype=np.int64),
             rawData=np.stack(episode["rawData"], axis=0),
             diffData=np.stack(episode["diffData"], axis=0),
             diffPerData=np.stack(episode["diffPerData"], axis=0),
@@ -1353,10 +1494,21 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             speed=np.asarray(episode["speed"], dtype=np.float32),
             peak_value=np.asarray(episode["peak_value"], dtype=np.float32),
             mean_active_value=np.asarray(episode["mean_active_value"], dtype=np.float32),
-            mode=np.asarray(episode["mode"], dtype="U16"),
+            mode=np.asarray(episode["mode"], dtype="U32"),
             teacher_velocity_pre_flip=np.stack(episode["teacher_velocity_pre_flip"], axis=0),
             teacher_velocity_sent=np.stack(episode["teacher_velocity_sent"], axis=0),
-            selected_frame=np.asarray(episode["selected_frame"], dtype="U16"),
+            teacher_velocity_target=np.stack(episode["teacher_velocity_target"], axis=0),
+            intended_velocity_target=np.stack(episode["intended_velocity_target"], axis=0),
+            intended_mode=np.asarray(episode["intended_mode"], dtype="U32"),
+            teaching_label=np.asarray(episode["teaching_label"], dtype="U32"),
+            teaching_source=np.asarray(episode["teaching_source"], dtype="U16"),
+            manual_override_active=np.asarray(episode["manual_override_active"], dtype=np.uint8),
+            robot_tool_pose=np.stack(episode["robot_tool_pose"], axis=0),
+            robot_joint_positions=np.stack(episode["robot_joint_positions"], axis=0),
+            robot_feedback_valid=np.asarray(episode["robot_feedback_valid"], dtype=np.uint8),
+            control_frame_idx=np.asarray(episode["control_frame_idx"], dtype=np.float32),
+            two_peak_state=np.stack(episode["two_peak_state"], axis=0),
+            selected_frame=np.asarray(episode["selected_frame"], dtype="U32"),
         )
 
         print(f"AI direct finger motion episode saved: {filename}")
@@ -1371,7 +1523,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
     DEFAULT_MODEL_CHECKPOINT = os.path.join(
         DirectFingerMotion.AI_MODELS_DIR,
         "ai_direct_finger_motion",
-        "best_model.pt",
+        "latest_cnn_gru_model.pt",
     )
 
     def __init__(self, ros_splitter_instance, my_sensor_instance):
@@ -1380,12 +1532,14 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.device = None
         self.model = None
         self.model_loaded = False
+        self.model_kind = "unknown"
         self.model_checkpoint_path = self.DEFAULT_MODEL_CHECKPOINT
         self.model_conf_threshold = 0.55
         self.velocity_scale = 1.0
-        self.max_linear_speed = 0.20
-        self.prediction_interval_ms = 30
-        self.seq_len = 20
+        self.max_linear_speed = 0.05
+        self.max_angular_speed = 0.0
+        self.prediction_interval_ms = 16
+        self.seq_len = 16
         self.input_channels = ["diffPerData", "diffPerDataAve", "frameDiff", "touchMask"]
         self.use_aux_features = True
         self.aux_feature_names = [
@@ -1399,12 +1553,15 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             "peak_value",
             "mean_active_value",
             "touch_present",
-            "selected_frame_idx",
+            "control_frame_idx",
         ]
         self.scaler_mean = np.zeros(len(self.input_channels), dtype=np.float32)
         self.scaler_std = np.ones(len(self.input_channels), dtype=np.float32)
         self.aux_mean = np.zeros(len(self.aux_feature_names), dtype=np.float32)
         self.aux_std = np.ones(len(self.aux_feature_names), dtype=np.float32)
+        self.target_scale = np.ones(6, dtype=np.float32)
+        self.lock_rotation_axes = True
+        self.dry_run_predictions_only = True
         self.frame_buffer = []
         self.aux_buffer = []
         self.last_prediction = None
@@ -1424,6 +1581,10 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
                 "cuda" if self._torch.cuda.is_available() else "cpu"
             )
         return self._torch
+
+    def set_dry_run_predictions_only(self, enabled=True):
+        self.dry_run_predictions_only = bool(enabled)
+        return self.dry_run_predictions_only
 
     def _reset_execution_buffers(self):
         self.frame_buffer = []
@@ -1450,12 +1611,20 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             self._reset_state()
             self._reset_execution_buffers()
             self._reset_execution_runtime_state()
-            self._ensure_robot_velocity_mode()
+            if not self.dry_run_predictions_only:
+                self._ensure_robot_velocity_mode()
             self.control_timer.start(self.prediction_interval_ms)
-            print(f"AI direct finger motion execution STARTED | model={self.model_checkpoint_path}")
+            mode_text = "DRY RUN" if self.dry_run_predictions_only else "ROBOT MOTION ENABLED"
+            print(
+                f"AI direct finger motion execution STARTED ({mode_text}) | "
+                f"model={self.model_checkpoint_path}"
+            )
         else:
             self.control_timer.stop()
-            self._stop_robot_motion_execution(stop_mode=True)
+            if self.dry_run_predictions_only:
+                self._set_teacher_output("stop", self._zero_velocity())
+            else:
+                self._stop_robot_motion_execution(stop_mode=True)
             self._reset_state()
             self._reset_execution_buffers()
             self._reset_execution_runtime_state()
@@ -1465,45 +1634,102 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         checkpoint_path = checkpoint_path or self.model_checkpoint_path
         try:
             torch = self._load_torch_runtime()
-            from phd.dependence.transformer import _AI_DFM_CNNTactileTransformerAux
 
-            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
             config = checkpoint.get("config", {})
-            self.seq_len = int(config.get("seq_len", 20))
-            self.input_channels = list(config.get("input_channels", config.get("channels", self.input_channels)))
-            self.use_aux_features = bool(config.get("use_aux_features", True))
-            self.aux_feature_names = list(config.get("aux_feature_names", self.aux_feature_names))
-            self.scaler_mean = np.asarray(config.get("scaler_mean", [0.0] * len(self.input_channels)), dtype=np.float32)
-            self.scaler_std = np.asarray(config.get("scaler_std", [1.0] * len(self.input_channels)), dtype=np.float32)
-            self.scaler_std[self.scaler_std < 1e-6] = 1.0
-            self.aux_mean = np.asarray(config.get("aux_mean", [0.0] * len(self.aux_feature_names)), dtype=np.float32)
-            self.aux_std = np.asarray(config.get("aux_std", [1.0] * len(self.aux_feature_names)), dtype=np.float32)
-            self.aux_std[self.aux_std < 1e-6] = 1.0
-            self.model = _AI_DFM_CNNTactileTransformerAux(
-                in_channels=len(self.input_channels),
-                aux_dim=len(self.aux_feature_names),
-                seq_len=self.seq_len,
-                d_model=int(config.get("d_model", 128)),
-                nhead=int(config.get("nhead", 4)),
-                num_layers=int(config.get("num_layers", 3)),
-                dim_feedforward=int(config.get("dim_feedforward", 256)),
-                dropout=float(config.get("dropout", 0.1)),
-                num_mode_classes=len(self.MODE_TO_INDEX),
-                num_finger_classes=4,
-                use_aux_features=self.use_aux_features,
-            ).to(self.device)
+            model_class = str(checkpoint.get("model_class", ""))
+            model_family = str(config.get("model_family", ""))
+            if model_class == "TactileCNNGRUPolicy" or model_family == "tactile_cnn_gru_policy":
+                self._load_cnn_gru_checkpoint(checkpoint, config)
+            else:
+                self._load_legacy_transformer_checkpoint(checkpoint, config)
             state = checkpoint.get("model_state", checkpoint)
             self.model.load_state_dict(state)
             self.model.eval()
             self.model_loaded = True
             print(
-                f"AI_DirectFingerMotion_execution model loaded | seq_len={self.seq_len} | "
-                f"channels={self.input_channels} | aux={self.aux_feature_names} | device={self.device}"
+                f"AI_DirectFingerMotion_execution model loaded | kind={self.model_kind} | "
+                f"seq_len={self.seq_len} | channels={self.input_channels} | "
+                f"aux={self.aux_feature_names} | device={self.device}"
             )
         except Exception as exc:
             self.model_loaded = False
             self.model = None
             print(f"Failed to load AI direct finger motion model: {exc}")
+
+    def _load_cnn_gru_checkpoint(self, _checkpoint, config):
+        from phd.dependence.transformer import TactileCNNGRUPolicy
+
+        self.model_kind = "cnn_gru"
+        self.seq_len = int(config.get("seq_len", 16))
+        self.input_channels = list(config.get("channels", self.input_channels))
+        self.aux_feature_names = list(config.get("aux_feature_names", self.aux_feature_names))
+        self.use_aux_features = True
+        self.scaler_mean = np.asarray(
+            config.get("channel_mean", [0.0] * len(self.input_channels)),
+            dtype=np.float32,
+        )
+        self.scaler_std = np.asarray(
+            config.get("channel_std", [1.0] * len(self.input_channels)),
+            dtype=np.float32,
+        )
+        self.scaler_std[self.scaler_std < 1e-6] = 1.0
+        self.aux_mean = np.asarray(
+            config.get("aux_mean", [0.0] * len(self.aux_feature_names)),
+            dtype=np.float32,
+        )
+        self.aux_std = np.asarray(
+            config.get("aux_std", [1.0] * len(self.aux_feature_names)),
+            dtype=np.float32,
+        )
+        self.aux_std[self.aux_std < 1e-6] = 1.0
+        self.target_scale = np.asarray(config.get("target_scale", [1.0] * 6), dtype=np.float32)
+        if self.target_scale.shape[0] < 6:
+            self.target_scale = np.pad(self.target_scale, (0, 6 - self.target_scale.shape[0]), constant_values=1.0)
+        self.target_scale[self.target_scale < 1e-6] = 1.0
+        self.lock_rotation_axes = bool(config.get("lock_rotation_axes", True))
+        if self.lock_rotation_axes:
+            self.max_angular_speed = 0.0
+        self.model = TactileCNNGRUPolicy(
+            in_channels=len(self.input_channels),
+            aux_dim=len(self.aux_feature_names),
+            d_model=int(config.get("d_model", 96)),
+            gru_hidden=int(config.get("gru_hidden", 128)),
+            gru_layers=int(config.get("gru_layers", 1)),
+            dropout=float(config.get("dropout", 0.12)),
+            velocity_dim=int(config.get("velocity_dim", 6)),
+            mode_classes=int(config.get("mode_classes", len(self.MODE_TO_INDEX))),
+        ).to(self.device)
+
+    def _load_legacy_transformer_checkpoint(self, _checkpoint, config):
+        from phd.dependence.transformer import _AI_DFM_CNNTactileTransformerAux
+
+        self.model_kind = "legacy_transformer"
+        self.seq_len = int(config.get("seq_len", 20))
+        self.input_channels = list(config.get("input_channels", config.get("channels", self.input_channels)))
+        self.use_aux_features = bool(config.get("use_aux_features", True))
+        self.aux_feature_names = list(config.get("aux_feature_names", self.aux_feature_names))
+        self.scaler_mean = np.asarray(config.get("scaler_mean", [0.0] * len(self.input_channels)), dtype=np.float32)
+        self.scaler_std = np.asarray(config.get("scaler_std", [1.0] * len(self.input_channels)), dtype=np.float32)
+        self.scaler_std[self.scaler_std < 1e-6] = 1.0
+        self.aux_mean = np.asarray(config.get("aux_mean", [0.0] * len(self.aux_feature_names)), dtype=np.float32)
+        self.aux_std = np.asarray(config.get("aux_std", [1.0] * len(self.aux_feature_names)), dtype=np.float32)
+        self.aux_std[self.aux_std < 1e-6] = 1.0
+        self.target_scale = np.ones(6, dtype=np.float32)
+        self.lock_rotation_axes = True
+        self.model = _AI_DFM_CNNTactileTransformerAux(
+            in_channels=len(self.input_channels),
+            aux_dim=len(self.aux_feature_names),
+            seq_len=self.seq_len,
+            d_model=int(config.get("d_model", 128)),
+            nhead=int(config.get("nhead", 4)),
+            num_layers=int(config.get("num_layers", 3)),
+            dim_feedforward=int(config.get("dim_feedforward", 256)),
+            dropout=float(config.get("dropout", 0.1)),
+            num_mode_classes=len(self.MODE_TO_INDEX),
+            num_finger_classes=4,
+            use_aux_features=self.use_aux_features,
+        ).to(self.device)
 
     def _reset_state(self):
         super()._reset_state()
@@ -1516,10 +1742,37 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         if self.my_sensor.n_row < 2 or self.my_sensor.n_col < 2:
             return
 
+        data_obj = getattr(self.my_sensor, "_data", None)
+        sensor_frame_sequence = getattr(data_obj, "frame_sequence", None)
+        perf_timestamp = time.perf_counter()
+        if sensor_frame_sequence is not None:
+            if sensor_frame_sequence == self._last_processed_sensor_frame:
+                timeout = max(0.0, float(getattr(self, "sensor_frame_timeout_sec", 0.2)))
+                if (
+                    timeout > 0.0
+                    and self.last_robot_velocity_cmd != self._zero_velocity()
+                    and (perf_timestamp - self._last_sensor_frame_seen_at) >= timeout
+                ):
+                    self._apply_prediction(
+                        {
+                            "mode": "stop",
+                            "mode_conf": 1.0,
+                            "finger_idx": 0,
+                            "finger_conf": 1.0,
+                            "velocity_sent": np.zeros(6, dtype=np.float32),
+                        }
+                    )
+                return
+            self._last_processed_sensor_frame = sensor_frame_sequence
+            self._last_sensor_frame_seen_at = perf_timestamp
+
         prev_row = self.last_touch_center_row
         prev_col = self.last_touch_center_col
         sensor_snapshot = self._snapshot_sensor_frame()
-        self.print_single_touch_map_with_motion(threshold=self.motion_threshold)
+        self.print_single_touch_map_with_motion(
+            threshold=self.motion_threshold,
+            update_robot=False,
+        )
         frame_tensor, aux_vec = self._build_live_features(sensor_snapshot, prev_row, prev_col)
         self.frame_buffer.append(frame_tensor)
         self.aux_buffer.append(aux_vec)
@@ -1527,6 +1780,17 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             self.frame_buffer.pop(0)
         if len(self.aux_buffer) > self.seq_len:
             self.aux_buffer.pop(0)
+        if not bool(getattr(self, "_last_live_touch_present", False)):
+            self._apply_prediction(
+                {
+                    "mode": "stop",
+                    "mode_conf": 1.0,
+                    "finger_idx": 0,
+                    "finger_conf": 1.0,
+                    "velocity_sent": np.zeros(6, dtype=np.float32),
+                }
+            )
+            return
         prediction = self._predict_from_buffer()
         if prediction is not None:
             self._apply_prediction(prediction)
@@ -1540,10 +1804,13 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
 
     def _selected_frame_index(self, frame_name):
         frame_name = str(frame_name).lower()
-        if "tool" in frame_name:
+        if frame_name in {"tool", "tcp", "joint6", "j6"}:
+            return 6.0
+        if frame_name in {"base", "world", "joint1", "j1"}:
             return 1.0
-        if "base" in frame_name:
-            return 2.0
+        match = re.fullmatch(r"(?:joint|j)([1-6])", frame_name)
+        if match:
+            return float(match.group(1))
         return 0.0
 
     def _build_live_features(self, sensor_snapshot, prev_row, prev_col):
@@ -1568,6 +1835,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         frame_tensor = np.stack(channel_tensors, axis=0).astype(np.float32)
         feature = self._compute_touch_motion_features(diff_ave, prev_row, prev_col)
         selected_frame_idx = self._selected_frame_index(feature["selected_frame"])
+        self._last_live_touch_present = bool(feature["touch_present"] > 0.0)
         aux_map = {
             "center_row": feature["center_row_norm"],
             "center_col": feature["center_col_norm"],
@@ -1580,9 +1848,23 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             "mean_active_value": feature["mean_active_value"],
             "touch_present": feature["touch_present"],
             "selected_frame_idx": selected_frame_idx,
+            "control_frame_idx": selected_frame_idx,
         }
         aux_vec = np.asarray([aux_map.get(name, 0.0) for name in self.aux_feature_names], dtype=np.float32)
         return frame_tensor, aux_vec
+
+    def _clip_velocity6(self, velocity):
+        velocity = np.asarray(velocity, dtype=np.float32).reshape(-1)
+        if velocity.shape[0] < 6:
+            velocity = np.pad(velocity, (0, 6 - velocity.shape[0]), constant_values=0.0)
+        velocity = velocity[:6].astype(np.float32)
+        if bool(getattr(self, "lock_rotation_axes", True)):
+            velocity[3:] = 0.0
+        linear_limit = abs(float(getattr(self, "max_linear_speed", 0.02)))
+        angular_limit = abs(float(getattr(self, "max_angular_speed", 0.0)))
+        velocity[:3] = np.clip(velocity[:3], -linear_limit, linear_limit)
+        velocity[3:] = np.clip(velocity[3:], -angular_limit, angular_limit)
+        return velocity
 
     def _predict_from_buffer(self):
         if self.model is None or not self.frame_buffer:
@@ -1605,18 +1887,21 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         with torch.no_grad():
             out = self.model(x, aux)
             mode_probs = torch.softmax(out["mode_logits"], dim=1)
-            finger_probs = torch.softmax(out["finger_logits"], dim=1)
             mode_idx = int(torch.argmax(mode_probs, dim=1).item())
-            finger_idx = int(torch.argmax(finger_probs, dim=1).item())
             mode_conf = float(torch.max(mode_probs).item())
-            finger_conf = float(torch.max(finger_probs).item())
-            velocity_sent = out["velocity"][0].detach().cpu().numpy().astype(np.float32)
+            if self.model_kind == "cnn_gru":
+                velocity_norm = out["velocity_norm"][0].detach().cpu().numpy().astype(np.float32)
+                target_scale = np.asarray(self.target_scale[: velocity_norm.shape[0]], dtype=np.float32)
+                velocity_sent = velocity_norm * target_scale
+                finger_idx = 0
+                finger_conf = 1.0
+            else:
+                finger_probs = torch.softmax(out["finger_logits"], dim=1)
+                finger_idx = int(torch.argmax(finger_probs, dim=1).item())
+                finger_conf = float(torch.max(finger_probs).item())
+                velocity_sent = out["velocity"][0].detach().cpu().numpy().astype(np.float32)
 
-        velocity_sent = np.clip(
-            velocity_sent * float(self.velocity_scale),
-            -float(self.max_linear_speed),
-            float(self.max_linear_speed),
-        )
+        velocity_sent = self._clip_velocity6(velocity_sent * float(self.velocity_scale))
         return {
             "mode": self.INDEX_TO_MODE.get(mode_idx, "stop"),
             "mode_conf": mode_conf,
@@ -1629,28 +1914,40 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         mode = prediction["mode"]
         mode_conf = float(prediction["mode_conf"])
         finger_idx = int(prediction["finger_idx"])
-        velocity_sent = prediction["velocity_sent"]
+        velocity_sent = self._clip_velocity6(prediction["velocity_sent"])
         if mode_conf < self.model_conf_threshold or mode == "stop":
             mode = "stop"
-            velocity_sent = np.zeros(3, dtype=np.float32)
+            velocity_sent = np.zeros(6, dtype=np.float32)
 
-        velocity6_sent = [float(velocity_sent[0]), float(velocity_sent[1]), float(velocity_sent[2]), 0.0, 0.0, 0.0]
-        velocity6_pre_flip = [-velocity6_sent[0], -velocity6_sent[1], -velocity6_sent[2], 0.0, 0.0, 0.0]
+        velocity6_sent = [float(v) for v in velocity_sent[:6]]
+        velocity6_pre_flip = [
+            -velocity6_sent[0],
+            -velocity6_sent[1],
+            -velocity6_sent[2],
+            -velocity6_sent[3],
+            -velocity6_sent[4],
+            -velocity6_sent[5],
+        ]
         self._set_teacher_output(mode, velocity6_pre_flip)
-        self._send_robot_velocity_execution(velocity6_sent)
+        if not self.dry_run_predictions_only:
+            self._send_robot_velocity_execution(velocity6_sent)
         self.last_prediction = {
             "mode": mode,
             "mode_conf": mode_conf,
             "finger_idx": finger_idx,
             "velocity_sent": velocity6_sent,
+            "dry_run": bool(self.dry_run_predictions_only),
         }
         self.last_prediction_time = time.time()
         self._debug_print(
-            f"[AI_EXEC] mode={mode} ({mode_conf:.3f}) | fingers={finger_idx} | "
-            f"velocity_sent={[round(v, 4) for v in velocity6_sent[:3]]}"
+            f"[AI_EXEC{' DRY' if self.dry_run_predictions_only else ''}] "
+            f"mode={mode} ({mode_conf:.3f}) | fingers={finger_idx} | "
+            f"velocity_sent={[round(v, 4) for v in velocity6_sent]}"
         )
 
     def _send_robot_velocity_execution(self, velocity6_sent):
+        if self.dry_run_predictions_only:
+            return
         velocity6_sent = [float(v) for v in velocity6_sent]
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if robot_api is None:

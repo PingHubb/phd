@@ -24,23 +24,24 @@ class AiControlsMixin:
         self._hier_active = False
         self._three_active = False
         self._direct_finger_active = False
-        self._direct_finger_v2_active = False
         self._console_control_active = False
         self._console_control_sensor_active = False
         self._console_control_sensor_v2_active = False
         self._ai_direct_finger_active = False
+        self._ai_direct_finger_robot_active = False
         self._ai_direct_finger_execution_active = False
         self._hier_mode_is_continues = True
 
         self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, False)
         self._set_button_active(self.direct_finger_motion_button, False)
-        self._set_button_active(self.direct_finger_motion_v2_button, False)
         self._set_button_active(self.console_control_button, False)
         if hasattr(self, "console_control_sensor_button"):
             self._set_button_active(self.console_control_sensor_button, False)
         if hasattr(self, "console_control_sensor_v2_button"):
             self._set_button_active(self.console_control_sensor_v2_button, False)
         self._set_button_active(self.ai_direct_finger_motion_button, False)
+        if hasattr(self, "ai_direct_finger_motion_robot_button"):
+            self._set_button_active(self.ai_direct_finger_motion_robot_button, False)
         self._set_button_active(self.ai_direct_finger_motion_execution_button, False)
 
         if all(
@@ -79,7 +80,11 @@ class AiControlsMixin:
 
         if hasattr(self, "ai_direct_finger_motion_button"):
             self.ai_direct_finger_motion_button.setToolTip(
-                "Start/stop AI Direct Finger Motion recording. Shortcut: Space. Emergency stop: Esc."
+                "Start/stop AI Direct Finger Motion recording without sending robot commands. Shortcut: Space. Stop: Esc."
+            )
+        if hasattr(self, "ai_direct_finger_motion_robot_button"):
+            self.ai_direct_finger_motion_robot_button.setToolTip(
+                "Start/stop AI Direct Finger Motion recording while sending the rule-based robot commands."
             )
         if hasattr(self, "ai_direct_finger_motion_execution_button"):
             self.ai_direct_finger_motion_execution_button.setToolTip(
@@ -105,7 +110,10 @@ class AiControlsMixin:
     def _shortcut_stop_ai_direct_finger_motion(self):
         if self._focus_on_text_input():
             return
-        if not getattr(self, "_ai_direct_finger_active", False):
+        if not (
+            getattr(self, "_ai_direct_finger_active", False)
+            or getattr(self, "_ai_direct_finger_robot_active", False)
+        ):
             return
         if not self.ai_direct_finger_motion_button.isEnabled():
             return

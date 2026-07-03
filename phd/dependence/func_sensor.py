@@ -26,6 +26,29 @@ SENSOR_ZERO_MASK_FILE = os.path.join(
     resource_path("config"),
     "sensor_zero_masks.json",
 )
+SENSOR_REORDER_LOGIC_FILE = os.path.join(
+    resource_path("config"),
+    "sensor_reorder_logic.json",
+)
+
+REORDER_FACTORY_DEFAULT = "factory"
+REORDER_NONE = "none"
+REORDER_LOGIC_OPTIONS = (
+    REORDER_FACTORY_DEFAULT,
+    REORDER_NONE,
+    "row_to_col",
+    "row_to_col_flipped",
+    "row_to_col_c_flip_only",
+    "row_to_col_r_flip_only",
+    "col_to_row",
+    "col_to_row_flipped",
+    "col_to_row_c_flip_only",
+    "col_to_row_r_flip_only",
+    "vertical_flip",
+    "horizontal_flip",
+    "flip_and_rotate",
+    "rotate_180",
+)
 
 
 class _SensorReadWorker(QObject):
@@ -249,7 +272,7 @@ class SensorModelFactory:
 
     def build(self):
         """Executes the full build pipeline and returns the completed instance."""
-        is_row_major_input = self.reorder_logic in ['row_to_col', 'row_to_col_flipped']
+        is_row_major_input = str(self.reorder_logic or "").startswith("row_to_col")
         major_order = 'row' if is_row_major_input else 'column'
 
         self._build_edges(major_order=major_order)
@@ -576,14 +599,13 @@ class _LazyFeatureProxy:
 
 class MySensor:
     DEFAULT_2D_GRID_SHAPE = (10, 10)
-    VISUALIZATION_TARGET_HZ = 30.0
+    VISUALIZATION_TARGET_HZ = 60.0
     SENSOR_AVERAGE_WINDOW_SIZE = 3
     AI_HELPER_ATTRS = {
         "record_gesture_class": "RecordGesture",
         "threelevel_hierarchical_transformer_class": "ThreeLevelTransformer",
         "proximity_control_class": "ProximityControl",
         "direct_finger_motion_class": "DirectFingerMotion",
-        "direct_finger_motion_v2_class": "DirectFingerMotionV2",
         "console_control_class": "ConsoleControl",
         "ai_direct_finger_motion_class": "AI_DirectFingerMotion",
         "ai_direct_finger_motion_execution_class": "AI_DirectFingerMotion_execution",
@@ -604,10 +626,6 @@ class MySensor:
         "direct_finger_motion_class": (
             "phd.dependence.gesture.gesture_logic_direct_finger_motion",
             "DirectFingerMotion",
-        ),
-        "direct_finger_motion_v2_class": (
-            "phd.dependence.gesture.gesture_logic_direct_finger_motion",
-            "DirectFingerMotionV2",
         ),
         "console_control_class": (
             "phd.dependence.gesture.gesture_logic_console",
@@ -654,15 +672,81 @@ class MySensor:
             "offset_scale": 0.2,
         },
     }
+    SENSOR_MODEL_NAMES_BY_INDEX = {
+        0: "2d",
+        1: "elbow",
+        2: "kuka",
+        3: "double_curve",
+        4: "half_cylinder_surface",
+    }
+    SENSOR_MODEL_LABELS = {
+        "elbow": "Elbow",
+        "kuka": "Kuka",
+        "double_curve": "Double Curve",
+        "2d": "2D",
+        "half_cylinder_surface": "Half Cylinder Surface",
+    }
+    SENSOR_VISUALIZATION_MODE_OPTIONS = (
+        ("point_grid", "Point Grid"),
+        ("stereo_field", "Stereo Field"),
+    )
 
     def __init__(self, parent) -> None:
         self.parent = parent
         self.plotter: QtInteractor = self.parent.plotter_2
         self.actionMesh = None  # no mesh yet
         self.objActor = None
+        self.matrixLineActor = None
+        self.matrixLinePoly = None
+        self.matrixLineColors = None
+        self._matrix_visual_actor_mode = None
+        self._matrix_line_dense_shape = (0, 0)
+        self._matrix_line_base_points = None
+        self._matrix_line_normals = None
+        self._matrix_line_top_indices = None
+        self._matrix_line_base_indices = None
+        self._matrix_line_field_height = 0.0
+        self._matrix_line_height_variation = None
+        self._stereo_field_smoothed_visibility = None
+        self._stereo_field_smoothed_color_response = None
+        self.stereo_field_ignore_noise_enabled = True
+        self.stereo_field_deadband_pct = 0.35
+        self.stereo_field_response_scale_pct = 2.0
+        self.stereo_field_length_scale = 0.35
+        self.stereo_field_smoothing_alpha = 0.82
+        self.contactNormalActor = None
+        self.contactNormalMesh = None
+        self._contact_normal_smoothed_start = None
+        self._contact_normal_smoothed_direction = None
+        self._contact_motion_previous_center = None
+        self._contact_anchor_center = None
+        self._contact_motion_smoothed_delta = None
+        self._sensor_geometry_base_points_origin = None
+        self._sensor_geometry_base_normals = None
+        self._sensor_geometry_base_fine_points = None
+        self.current_sensor_geometry_config = None
+        self.sensor_visual_offset_scale = 0.0
+        self._contact_normal_missing_frames = 0
+        self.sensorPointLabelActor = None
         self.n_col = 0
         self.n_row = 0
         self.touch_sensitivity_scale = 0.05
+        self.sensor_visualization_mode = "point_grid"
+        self.show_contact_normal_vector = True
+        self.show_sensor_point_labels = False
+        self.contact_normal_estimator_mode = "touch_anchor_v4"
+        self.contact_normal_threshold_pct = 3.0
+        self.contact_normal_cluster_floor_pct = 0.8
+        self.contact_normal_tilt_gain = 0.85
+        self.contact_normal_residual_gain = 1.2
+        self.contact_normal_residual_deadband = 0.06
+        self.contact_normal_smoothing_alpha = 0.65
+        self.contact_normal_missing_grace_frames = 4
+        self.contact_motion_deadband_cells = 0.008
+        self.contact_motion_smoothing_alpha = 0.68
+        self.contact_motion_tilt_gain = 6.0
+        self.contact_motion_max_tilt_deg = 90.0
+        self.contact_force_scale_n_per_signal = 0.0
         self.cal_data = []
         self.sensor_average_window_size = self.SENSOR_AVERAGE_WINDOW_SIZE
         self.visualization_target_hz = self.VISUALIZATION_TARGET_HZ
@@ -688,6 +772,9 @@ class MySensor:
         self._last_sensor_reader_error_log_time = 0.0
         self._sensor_calibration_in_progress = False
         self.current_model_name = None
+        self.current_reorder_mode = REORDER_FACTORY_DEFAULT
+        self.current_effective_reorder_logic = None
+        self.current_sensor_reorder_key = None
         self.cell_zero_mask = np.zeros((0, 0), dtype=bool)
 
         # Delay AI helper/model creation until a sensor model is selected in buildScene().
@@ -754,6 +841,10 @@ class MySensor:
                 # Selection mode is already handled in ui_ping.py.
                 item = QListWidgetItem(port.name)
                 self.parent.serial_channel.addItem(item)
+            if self.parent.serial_channel.count() > 0:
+                first_item = self.parent.serial_channel.item(0)
+                self.parent.serial_channel.setCurrentRow(0)
+                first_item.setSelected(True)
         else:
             print("No serial ports found. Please connect the device and retry.")
             return
@@ -864,6 +955,375 @@ class MySensor:
         self.visualization_target_hz = max(1.0, float(hz))
         self.visualization_min_interval_sec = 1.0 / self.visualization_target_hz
 
+    def get_sensor_visualization_modes(self):
+        return list(self.SENSOR_VISUALIZATION_MODE_OPTIONS)
+
+    def set_sensor_visualization_mode(self, mode):
+        valid_modes = {key for key, _label in self.SENSOR_VISUALIZATION_MODE_OPTIONS}
+        if mode not in valid_modes:
+            mode = "point_grid"
+        previous_mode = str(getattr(self, "sensor_visualization_mode", "point_grid"))
+        self.sensor_visualization_mode = mode
+        if mode != previous_mode:
+            self._stereo_field_smoothed_visibility = None
+            self._stereo_field_smoothed_color_response = None
+        if (
+            self._is_matrix_visualization_mode(mode)
+            and (
+                self.matrixLineActor is None
+                or getattr(self, "_matrix_visual_actor_mode", None) != mode
+            )
+        ):
+            self._rebuild_matrix_visualization_actor(render=False)
+        self._refresh_sensor_visualization_mode_actors()
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_matrix_visualization_mode(mode):
+        return str(mode) == "stereo_field"
+
+    @staticmethod
+    def _set_actor_visible(actor, visible):
+        if actor is None:
+            return
+        try:
+            actor.SetVisibility(1 if visible else 0)
+            return
+        except Exception:
+            pass
+        try:
+            actor.visibility = bool(visible)
+        except Exception:
+            pass
+
+    def _refresh_sensor_visualization_mode_actors(self):
+        matrix_mode = self._is_matrix_visualization_mode(
+            getattr(self, "sensor_visualization_mode", "point_grid")
+        )
+        self._set_actor_visible(getattr(self, "objActor", None), not matrix_mode)
+        self._set_actor_visible(getattr(self, "actionMesh", None), not matrix_mode)
+        self._set_actor_visible(getattr(self, "matrixLineActor", None), matrix_mode)
+
+    def _coarse_grid_vectors(self, vectors):
+        if vectors is None or self.n_row <= 0 or self.n_col <= 0:
+            return None
+        arr = np.asarray(vectors, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] < self.n_row * self.n_col or arr.shape[1] != 3:
+            return None
+        grid = np.zeros((self.n_row, self.n_col, 3), dtype=float)
+        for row in range(self.n_row):
+            for col in range(self.n_col):
+                grid[row, col] = arr[_column_major_idx(self.n_row, col, row)]
+        return grid
+
+    @staticmethod
+    def _bilinear_grid_sample(grid, dense_rows, dense_cols):
+        grid = np.asarray(grid, dtype=float)
+        rows, cols = grid.shape[:2]
+        if rows <= 0 or cols <= 0:
+            return np.zeros((0, 0) + grid.shape[2:], dtype=float)
+        row_pos = np.linspace(0.0, max(rows - 1, 0), int(dense_rows))
+        col_pos = np.linspace(0.0, max(cols - 1, 0), int(dense_cols))
+        row0 = np.floor(row_pos).astype(int)
+        col0 = np.floor(col_pos).astype(int)
+        row1 = np.clip(row0 + 1, 0, rows - 1)
+        col1 = np.clip(col0 + 1, 0, cols - 1)
+        row_weight = (row_pos - row0)[:, None]
+        col_weight = (col_pos - col0)[None, :]
+
+        top = (
+            grid[row0[:, None], col0[None, :]] * (1.0 - col_weight)[..., None]
+            + grid[row0[:, None], col1[None, :]] * col_weight[..., None]
+        )
+        bottom = (
+            grid[row1[:, None], col0[None, :]] * (1.0 - col_weight)[..., None]
+            + grid[row1[:, None], col1[None, :]] * col_weight[..., None]
+        )
+        return top * (1.0 - row_weight)[..., None] + bottom * row_weight[..., None]
+
+    def _normal_visualization_dense_grid(self, dense_scale=4, dense_cap=96):
+        point_grid = self._coarse_grid_vectors(getattr(self, "points_origin", None))
+        normal_grid = self._coarse_grid_vectors(getattr(self, "normals", None))
+        if point_grid is None or normal_grid is None:
+            return None, None, (0, 0)
+
+        dense_rows = min(max(int(self.n_row) * int(dense_scale), int(self.n_row), 2), int(dense_cap))
+        dense_cols = min(max(int(self.n_col) * int(dense_scale), int(self.n_col), 2), int(dense_cap))
+        dense_points = self._bilinear_grid_sample(point_grid, dense_rows, dense_cols)
+        dense_normals = self._bilinear_grid_sample(normal_grid, dense_rows, dense_cols)
+        normal_norm = np.linalg.norm(dense_normals, axis=2)
+        valid_normals = normal_norm > 1e-9
+        dense_normals[valid_normals] = (
+            dense_normals[valid_normals] / normal_norm[valid_normals][:, None]
+        )
+        dense_normals[~valid_normals] = [0.0, 0.0, 1.0]
+        return dense_points, dense_normals, (dense_rows, dense_cols)
+
+    def _build_matrix_line_polydata(self, mode=None):
+        mode = str(mode or getattr(self, "sensor_visualization_mode", "stereo_field"))
+        dense_scale = 6 if mode == "stereo_field" else 4
+        dense_cap = 120 if mode == "stereo_field" else 96
+        dense_points, dense_normals, dense_shape = self._normal_visualization_dense_grid(
+            dense_scale=dense_scale,
+            dense_cap=dense_cap,
+        )
+        if dense_points is None or dense_normals is None:
+            return None, None, (0, 0)
+
+        dense_rows, dense_cols = dense_shape
+
+        lift = max(0.0008, abs(float(getattr(self, "sensor_visual_offset_scale", 0.0))) * 2.5)
+        base_points = dense_points + dense_normals * lift
+
+        if mode == "stereo_field":
+            flat_base_points = base_points.reshape((-1, 3))
+            flat_normals = dense_normals.reshape((-1, 3))
+            finite = flat_base_points[np.all(np.isfinite(flat_base_points), axis=1)]
+            if finite.size:
+                span = float(np.linalg.norm(np.max(finite, axis=0) - np.min(finite, axis=0)))
+            else:
+                span = 0.05
+            length_scale = float(getattr(self, "stereo_field_length_scale", 0.35) or 0.35)
+            field_height = max(0.015, span * max(0.05, length_scale))
+            height_variation = np.ones(flat_base_points.shape[0], dtype=float)
+
+            points = np.empty((flat_base_points.shape[0] * 2, 3), dtype=float)
+            base_indices = np.arange(flat_base_points.shape[0]) * 2
+            top_indices = base_indices + 1
+            points[base_indices] = flat_base_points
+            points[top_indices] = flat_base_points + flat_normals * (
+                field_height * height_variation[:, None]
+            )
+
+            lines = []
+            for point_idx in range(flat_base_points.shape[0]):
+                lines.append([2, int(base_indices[point_idx]), int(top_indices[point_idx])])
+
+            poly = pv.PolyData(points)
+            poly.lines = np.asarray(lines, dtype=np.int_)
+            colors = np.empty((points.shape[0], 3), dtype=np.uint8)
+            colors[base_indices] = [8, 70, 55]
+            colors[top_indices] = [55, 255, 185]
+            poly.point_data["matrix_colors"] = colors
+            poly.set_active_scalars("matrix_colors")
+
+            self._matrix_line_base_points = flat_base_points
+            self._matrix_line_normals = flat_normals
+            self._matrix_line_base_indices = base_indices
+            self._matrix_line_top_indices = top_indices
+            self._matrix_line_field_height = field_height
+            self._matrix_line_height_variation = height_variation
+            return poly, colors, dense_shape
+
+        points = base_points.reshape((-1, 3))
+
+        lines = []
+        for row in range(dense_rows):
+            row_start = row * dense_cols
+            for col in range(dense_cols - 1):
+                lines.append([2, row_start + col, row_start + col + 1])
+        for col in range(dense_cols):
+            for row in range(dense_rows - 1):
+                lines.append([2, row * dense_cols + col, (row + 1) * dense_cols + col])
+
+        poly = pv.PolyData(points)
+        poly.lines = np.asarray(lines, dtype=np.int_)
+        colors = np.empty((points.shape[0], 3), dtype=np.uint8)
+        colors[:, 0] = 30
+        colors[:, 1] = 235
+        colors[:, 2] = 160
+        poly.point_data["matrix_colors"] = colors
+        poly.set_active_scalars("matrix_colors")
+        self._matrix_line_base_points = None
+        self._matrix_line_normals = None
+        self._matrix_line_base_indices = None
+        self._matrix_line_top_indices = None
+        self._matrix_line_field_height = 0.0
+        self._matrix_line_height_variation = None
+        self._stereo_field_smoothed_visibility = None
+        self._stereo_field_smoothed_color_response = None
+        return poly, colors, (dense_rows, dense_cols)
+
+    def _rebuild_matrix_visualization_actor(self, render=False):
+        self.matrixLineActor = self._remove_actor_safely(
+            getattr(self, "matrixLineActor", None)
+        )
+        self.matrixLinePoly = None
+        self.matrixLineColors = None
+        self._matrix_visual_actor_mode = None
+        self._matrix_line_dense_shape = (0, 0)
+        self._matrix_line_base_points = None
+        self._matrix_line_normals = None
+        self._matrix_line_base_indices = None
+        self._matrix_line_top_indices = None
+        self._matrix_line_field_height = 0.0
+        self._matrix_line_height_variation = None
+        self._stereo_field_smoothed_visibility = None
+        self._stereo_field_smoothed_color_response = None
+
+        mode = str(getattr(self, "sensor_visualization_mode", "stereo_field"))
+        if not self._is_matrix_visualization_mode(mode):
+            mode = "stereo_field"
+
+        poly, colors, dense_shape = self._build_matrix_line_polydata(mode=mode)
+        if poly is None:
+            return
+        self.matrixLinePoly = poly
+        self.matrixLineColors = colors
+        self._matrix_visual_actor_mode = mode
+        self._matrix_line_dense_shape = dense_shape
+        try:
+            self.matrixLineActor = self.plotter.add_mesh(
+                self.matrixLinePoly,
+                scalars="matrix_colors",
+                line_width=1 if mode == "stereo_field" else 3,
+                rgb=True,
+                render_lines_as_tubes=False if mode == "stereo_field" else True,
+                lighting=False,
+                ambient=1.0,
+                name=f"sensor_{mode}",
+                render=render,
+            )
+        except Exception as exc:
+            self.matrixLineActor = None
+            self.matrixLinePoly = None
+            self.matrixLineColors = None
+            self._matrix_visual_actor_mode = None
+            self._matrix_line_dense_shape = (0, 0)
+            self._stereo_field_smoothed_visibility = None
+            self._stereo_field_smoothed_color_response = None
+            print(f"[SensorVisualization] Failed to build matrix silhouette: {exc}")
+
+    def _update_matrix_silhouette_visualization(self, sensor_matrix):
+        mode = str(getattr(self, "sensor_visualization_mode", "stereo_field"))
+        if (
+            self.matrixLinePoly is None
+            or self.matrixLineColors is None
+            or getattr(self, "_matrix_visual_actor_mode", None) != mode
+        ):
+            self._rebuild_matrix_visualization_actor(render=False)
+        if self.matrixLinePoly is None or self.matrixLineColors is None:
+            return
+
+        dense_rows, dense_cols = getattr(self, "_matrix_line_dense_shape", (0, 0))
+        if dense_rows <= 0 or dense_cols <= 0:
+            return
+        values = np.asarray(sensor_matrix, dtype=float)
+        if values.ndim != 2:
+            return
+        pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
+        dense_pressure = self._bilinear_grid_sample(pressure[..., None], dense_rows, dense_cols)[..., 0]
+        if mode == "stereo_field":
+            ignore_noise = bool(getattr(self, "stereo_field_ignore_noise_enabled", True))
+            deadband = max(0.0, float(getattr(self, "stereo_field_deadband_pct", 0.35)))
+            response_scale = max(0.05, float(getattr(self, "stereo_field_response_scale_pct", 2.0)))
+            if ignore_noise:
+                contact = np.clip((dense_pressure - deadband) / response_scale, 0.0, 1.0)
+                color_contact = np.clip(
+                    (dense_pressure - deadband * 0.35) / (response_scale * 1.25),
+                    0.0,
+                    1.0,
+                )
+            else:
+                contact = np.clip(dense_pressure * 150.0 / 255.0, 0.0, 1.0)
+                color_contact = contact
+            erased = np.power(contact, 0.65 if ignore_noise else 0.45)
+            raw_visibility = np.clip(1.0 - erased, 0.08, 1.0).reshape(-1)
+            raw_color_response = np.clip(np.power(color_contact, 0.72), 0.0, 1.0).reshape(-1)
+            previous_visibility = getattr(self, "_stereo_field_smoothed_visibility", None)
+            previous_color_response = getattr(self, "_stereo_field_smoothed_color_response", None)
+            alpha = np.clip(
+                float(getattr(self, "stereo_field_smoothing_alpha", 0.82)) if ignore_noise else 0.0,
+                0.0,
+                0.98,
+            )
+            if (
+                previous_visibility is None
+                or np.asarray(previous_visibility).shape != raw_visibility.shape
+            ):
+                visibility = raw_visibility
+            else:
+                visibility = alpha * np.asarray(previous_visibility) + (1.0 - alpha) * raw_visibility
+            if (
+                previous_color_response is None
+                or np.asarray(previous_color_response).shape != raw_color_response.shape
+            ):
+                color_response = raw_color_response
+            else:
+                color_response = (
+                    alpha * np.asarray(previous_color_response)
+                    + (1.0 - alpha) * raw_color_response
+                )
+            self._stereo_field_smoothed_visibility = np.array(visibility, dtype=float, copy=True)
+            self._stereo_field_smoothed_color_response = np.array(
+                color_response,
+                dtype=float,
+                copy=True,
+            )
+        else:
+            contact = np.clip(dense_pressure * 150.0 / 255.0, 0.0, 1.0)
+            erased = np.power(contact, 0.45)
+            visibility = np.clip(1.0 - erased, 0.02, 1.0).reshape(-1)
+            color_response = 1.0 - visibility
+
+        colors = self.matrixLineColors
+        if mode == "stereo_field":
+            base_points = getattr(self, "_matrix_line_base_points", None)
+            normals = getattr(self, "_matrix_line_normals", None)
+            top_indices = getattr(self, "_matrix_line_top_indices", None)
+            base_indices = getattr(self, "_matrix_line_base_indices", None)
+            field_height = float(getattr(self, "_matrix_line_field_height", 0.0) or 0.0)
+            height_variation = getattr(self, "_matrix_line_height_variation", None)
+            if (
+                base_points is not None
+                and normals is not None
+                and top_indices is not None
+                and base_indices is not None
+                and height_variation is not None
+                and field_height > 0.0
+            ):
+                height_variation = np.asarray(height_variation, dtype=float).reshape(-1)
+                if height_variation.shape[0] != visibility.shape[0]:
+                    height_variation = np.ones_like(visibility)
+                height_scale = np.clip(0.12 + 0.88 * visibility, 0.12, 1.0)
+                points = np.array(self.matrixLinePoly.points, dtype=float, copy=True)
+                points[top_indices] = base_points + normals * (
+                    field_height * height_variation[:, None] * height_scale[:, None]
+                )
+                self.matrixLinePoly.points = points
+                colors[base_indices, 0] = np.clip(4 + visibility * 12, 0, 255).astype(np.uint8)
+                colors[base_indices, 1] = np.clip(25 + visibility * 70, 0, 255).astype(np.uint8)
+                colors[base_indices, 2] = np.clip(20 + visibility * 55, 0, 255).astype(np.uint8)
+                response = np.clip(np.asarray(color_response, dtype=float), 0.0, 1.0)
+                cool = np.array([25.0, 185.0, 255.0])
+                warm = np.array([255.0, 96.0, 42.0])
+                top_rgb = cool[None, :] * (1.0 - response[:, None]) + warm[None, :] * response[:, None]
+                brightness = np.clip(0.62 + 0.38 * visibility, 0.35, 1.0)
+                top_rgb = np.clip(top_rgb * brightness[:, None], 0, 255)
+                base_rgb = np.clip(top_rgb * 0.32, 0, 255)
+                colors[base_indices] = base_rgb.astype(np.uint8)
+                colors[top_indices] = top_rgb.astype(np.uint8)
+                self.matrixLinePoly.point_data["matrix_colors"] = colors
+                self.matrixLinePoly.set_active_scalars("matrix_colors")
+                try:
+                    self.matrixLinePoly.Modified()
+                except Exception:
+                    pass
+                return
+
+        colors[:, 0] = np.clip(5 + visibility * 25, 0, 255).astype(np.uint8)
+        colors[:, 1] = np.clip(5 + visibility * 230, 0, 255).astype(np.uint8)
+        colors[:, 2] = np.clip(5 + visibility * 155, 0, 255).astype(np.uint8)
+        self.matrixLinePoly.point_data["matrix_colors"] = colors
+        self.matrixLinePoly.set_active_scalars("matrix_colors")
+        try:
+            self.matrixLinePoly.Modified()
+        except Exception:
+            pass
+
     def read_runtime_hz_report(self):
         direct_helper = getattr(self, "direct_finger_motion_class", None)
         direct_hz = 0.0
@@ -896,10 +1356,12 @@ class MySensor:
             f"{hand_report}"
         )
 
-    def toggle_ai_direct_finger_motion_execution(self, model_checkpoint_path=None):
+    def toggle_ai_direct_finger_motion_execution(self, model_checkpoint_path=None, dry_run_predictions_only=None):
         helper = getattr(self, "ai_direct_finger_motion_execution_class", None)
         if helper is None:
             raise RuntimeError("AI_DirectFingerMotion_execution helper is not initialized.")
+        if dry_run_predictions_only is not None and hasattr(helper, "set_dry_run_predictions_only"):
+            helper.set_dry_run_predictions_only(dry_run_predictions_only)
         return helper.toggle_ai_direct_finger_motion_execution(
             model_checkpoint_path=model_checkpoint_path
         )
@@ -937,6 +1399,17 @@ class MySensor:
         self.edges, self.colors_3d = model.edges, model.colors_3d
         self._2D_map, self.array_positions, self.colors, self.line_poly = \
             model._2D_map, model.array_positions, model.colors, model.line_poly
+        self.sensor_visual_offset_scale = float(getattr(model, "offset_scale", 0.0) or 0.0)
+        self._capture_sensor_geometry_base()
+        self.set_sensor_geometry_config(
+            self.get_saved_sensor_geometry_config(
+                self.current_model_name,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            ),
+            save_current_sensor=False,
+            render=False,
+        )
 
         # Reset the zero-mask for the new layout, then try to restore a previously
         # saved one for this exact sensor key (model + grid size).
@@ -959,6 +1432,10 @@ class MySensor:
             self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
             render_points_as_spheres=True, rgb=True
         )
+        if self.actionMesh is not None or self.matrixLineActor is not None:
+            self._rebuild_matrix_visualization_actor(render=False)
+            self._refresh_sensor_visualization_mode_actors()
+        self._refresh_sensor_point_label_actor()
 
     def init_2d_model(self, n_row=None, n_col=None):
         if n_row is None or n_col is None:
@@ -1001,6 +1478,13 @@ class MySensor:
         self.array_positions = None
         self.n_node = None
         self._2D_map = None
+        self._sensor_geometry_base_points_origin = None
+        self._sensor_geometry_base_normals = None
+        self._sensor_geometry_base_fine_points = None
+        self.current_sensor_geometry_config = None
+        self.sensor_visual_offset_scale = 0.0
+        self._clear_contact_normal_actor()
+        self._clear_sensor_point_label_actor()
 
     def update_ui_elements(self):
         self.parent.buildScene.setText("Scene Built")
@@ -1032,6 +1516,23 @@ class MySensor:
     def _clear_scene_actors(self):
         self.objActor = self._remove_actor_safely(self.objActor)
         self.actionMesh = self._remove_actor_safely(self.actionMesh)
+        self.matrixLineActor = self._remove_actor_safely(
+            getattr(self, "matrixLineActor", None)
+        )
+        self.matrixLinePoly = None
+        self.matrixLineColors = None
+        self._matrix_visual_actor_mode = None
+        self._matrix_line_dense_shape = (0, 0)
+        self._matrix_line_base_points = None
+        self._matrix_line_normals = None
+        self._matrix_line_base_indices = None
+        self._matrix_line_top_indices = None
+        self._matrix_line_field_height = 0.0
+        self._matrix_line_height_variation = None
+        self._stereo_field_smoothed_visibility = None
+        self._stereo_field_smoothed_color_response = None
+        self._clear_contact_normal_actor()
+        self._clear_sensor_point_label_actor()
 
     def _get_selected_port_names(self):
         return [item.text() for item in self.parent.serial_channel.selectedItems()]
@@ -1151,6 +1652,7 @@ class MySensor:
 
     def _build_factory_model(self, **model_kwargs):
         model_kwargs.setdefault("window_size", self.sensor_average_window_size)
+        model_kwargs = self._apply_saved_reorder_logic(model_kwargs)
         model = SensorModelFactory(**model_kwargs).build()
         self._initialize_from_factory(model)
 
@@ -1160,17 +1662,663 @@ class MySensor:
 
     def _initialize_selected_sensor_model(self, sensor_index):
         model_initializers = {
-            0: self.init_elbow_model,
-            1: self.init_kuka_model,
-            2: self.init_double_curve_model,
-            3: self.init_2d_model,
-            4: self.init_half_cylinder_surface_model,
+            "elbow": self.init_elbow_model,
+            "kuka": self.init_kuka_model,
+            "double_curve": self.init_double_curve_model,
+            "2d": self.init_2d_model,
+            "half_cylinder_surface": self.init_half_cylinder_surface_model,
         }
-        initializer = model_initializers.get(sensor_index)
+        model_name = self.SENSOR_MODEL_NAMES_BY_INDEX.get(sensor_index)
+        initializer = model_initializers.get(model_name)
         if initializer is None:
             return False
         initializer()
         return True
+
+    # ------------------------------------------------------------------
+    # Sensor reorder logic: per-sensor persistent geometry/channel remapping.
+    # ------------------------------------------------------------------
+    def get_reorder_logic_options(self):
+        return list(REORDER_LOGIC_OPTIONS)
+
+    def get_sensor_model_choices(self):
+        return [
+            (model_name, self.SENSOR_MODEL_LABELS.get(model_name, model_name))
+            for _, model_name in sorted(self.SENSOR_MODEL_NAMES_BY_INDEX.items())
+        ]
+
+    def get_sensor_model_name_for_index(self, sensor_index):
+        return self.SENSOR_MODEL_NAMES_BY_INDEX.get(int(sensor_index), "sensor")
+
+    def _sensor_shape_for_model(self, model_name):
+        if model_name == "2d":
+            return self._get_2d_grid_shape()
+        config = self.PREDEFINED_SENSOR_MODELS.get(str(model_name), {})
+        return int(config.get("n_row", 0) or 0), int(config.get("n_col", 0) or 0)
+
+    def get_sensor_reorder_key(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        return f"{model}_{int(n_row)}x{int(n_col)}"
+
+    def _default_reorder_logic_for_model(self, model_name):
+        if model_name == "2d":
+            return None
+        config = self.PREDEFINED_SENSOR_MODELS.get(str(model_name), {})
+        return config.get("reorder_logic", None)
+
+    def _normalize_reorder_mode(self, mode):
+        if mode is None:
+            return REORDER_FACTORY_DEFAULT
+        text = str(mode).strip()
+        if text == "":
+            return REORDER_FACTORY_DEFAULT
+        if text not in REORDER_LOGIC_OPTIONS:
+            return REORDER_FACTORY_DEFAULT
+        return text
+
+    def _reorder_mode_to_logic(self, model_name, mode):
+        mode = self._normalize_reorder_mode(mode)
+        if mode == REORDER_FACTORY_DEFAULT:
+            return self._default_reorder_logic_for_model(model_name)
+        if mode == REORDER_NONE:
+            return None
+        return mode
+
+    def _read_reorder_logic_file(self):
+        try:
+            with open(SENSOR_REORDER_LOGIC_FILE, "r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+            if isinstance(payload, dict):
+                payload.setdefault("version", 1)
+                settings = payload.get("settings")
+                if not isinstance(settings, dict):
+                    payload["settings"] = {}
+                return payload
+        except FileNotFoundError:
+            pass
+        except Exception as exc:
+            print(f"[SensorReorder] Failed to read {SENSOR_REORDER_LOGIC_FILE}: {exc}")
+        return {"version": 1, "settings": {}}
+
+    def _write_reorder_logic_file(self, payload):
+        try:
+            os.makedirs(os.path.dirname(SENSOR_REORDER_LOGIC_FILE), exist_ok=True)
+            with open(SENSOR_REORDER_LOGIC_FILE, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, indent=2)
+            return True
+        except Exception as exc:
+            print(f"[SensorReorder] Failed to write {SENSOR_REORDER_LOGIC_FILE}: {exc}")
+            return False
+
+    def get_saved_sensor_reorder_mode(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        if isinstance(item, dict):
+            return self._normalize_reorder_mode(item.get("reorder_mode"))
+        return self._normalize_reorder_mode(item)
+
+    def set_saved_sensor_reorder_mode(self, model_name, mode, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        mode = self._normalize_reorder_mode(mode)
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "reorder_mode": mode,
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    def get_saved_sensor_point_labels_enabled(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        if isinstance(item, dict):
+            return bool(item.get("point_labels_enabled", False))
+        return False
+
+    def set_saved_sensor_point_labels_enabled(self, model_name, enabled, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "point_labels_enabled": bool(enabled),
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    def get_saved_sensor_contact_force_scale(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        if not isinstance(item, dict):
+            return 0.0
+        try:
+            return max(0.0, float(item.get("force_scale_n_per_signal", 0.0)))
+        except Exception:
+            return 0.0
+
+    def set_saved_sensor_contact_force_scale(self, model_name, scale, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        try:
+            scale_value = max(0.0, float(scale))
+        except Exception:
+            scale_value = 0.0
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "force_scale_n_per_signal": scale_value,
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    @staticmethod
+    def _default_sensor_geometry_config():
+        return {
+            "use_selected_shape": False,
+            "shape": "flat",
+            "bend_axis": "columns",
+            "arc_deg": 0.0,
+            "normal_flip": False,
+        }
+
+    def _normalize_sensor_geometry_config(self, config):
+        default = self._default_sensor_geometry_config()
+        if not isinstance(config, dict):
+            return dict(default)
+
+        shape = str(config.get("shape", default["shape"]) or default["shape"]).strip().lower()
+        if shape not in ("flat", "cylinder"):
+            shape = "flat"
+
+        bend_axis = str(config.get("bend_axis", default["bend_axis"]) or default["bend_axis"]).strip().lower()
+        if bend_axis not in ("columns", "rows"):
+            bend_axis = "columns"
+
+        try:
+            arc_deg = float(config.get("arc_deg", default["arc_deg"]))
+        except Exception:
+            arc_deg = 0.0
+        arc_deg = float(np.clip(arc_deg, -180.0, 180.0))
+
+        if "use_selected_shape" in config:
+            use_selected_shape = bool(config.get("use_selected_shape"))
+        else:
+            use_selected_shape = shape != "flat" or abs(arc_deg) > 1e-6
+
+        return {
+            "use_selected_shape": use_selected_shape,
+            "shape": shape,
+            "bend_axis": bend_axis,
+            "arc_deg": arc_deg,
+            "normal_flip": bool(config.get("normal_flip", default["normal_flip"])),
+        }
+
+    def _effective_sensor_geometry_config(self, config):
+        geometry = self._normalize_sensor_geometry_config(config)
+        if not bool(geometry.get("use_selected_shape", False)):
+            effective = dict(geometry)
+            effective["shape"] = "flat"
+            effective["arc_deg"] = 0.0
+            effective["normal_flip"] = False
+            return effective
+        return geometry
+
+    def get_saved_sensor_geometry_config(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        geometry = item.get("geometry", {}) if isinstance(item, dict) else {}
+        return self._normalize_sensor_geometry_config(geometry)
+
+    def set_saved_sensor_geometry_config(self, model_name, config, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "geometry": self._normalize_sensor_geometry_config(config),
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    @staticmethod
+    def _default_stereo_field_config():
+        return {
+            "ignore_noise_enabled": True,
+            "deadband_pct": 0.35,
+            "response_scale_pct": 2.0,
+            "length_scale": 0.35,
+        }
+
+    def _normalize_stereo_field_config(self, config):
+        default = self._default_stereo_field_config()
+        if not isinstance(config, dict):
+            return dict(default)
+
+        try:
+            deadband_pct = float(config.get("deadband_pct", default["deadband_pct"]))
+        except Exception:
+            deadband_pct = default["deadband_pct"]
+        try:
+            response_scale_pct = float(config.get("response_scale_pct", default["response_scale_pct"]))
+        except Exception:
+            response_scale_pct = default["response_scale_pct"]
+        try:
+            length_scale = float(config.get("length_scale", default["length_scale"]))
+        except Exception:
+            length_scale = default["length_scale"]
+
+        return {
+            "ignore_noise_enabled": bool(
+                config.get("ignore_noise_enabled", default["ignore_noise_enabled"])
+            ),
+            "deadband_pct": float(np.clip(deadband_pct, 0.0, 20.0)),
+            "response_scale_pct": float(np.clip(response_scale_pct, 0.05, 50.0)),
+            "length_scale": float(np.clip(length_scale, 0.05, 2.0)),
+        }
+
+    def get_saved_sensor_stereo_field_config(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        config = item.get("stereo_field", {}) if isinstance(item, dict) else {}
+        return self._normalize_stereo_field_config(config)
+
+    def set_saved_sensor_stereo_field_config(self, model_name, config, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "stereo_field": self._normalize_stereo_field_config(config),
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    def get_stereo_field_settings(self):
+        return self._normalize_stereo_field_config({
+            "ignore_noise_enabled": getattr(self, "stereo_field_ignore_noise_enabled", True),
+            "deadband_pct": getattr(self, "stereo_field_deadband_pct", 0.35),
+            "response_scale_pct": getattr(self, "stereo_field_response_scale_pct", 2.0),
+            "length_scale": getattr(self, "stereo_field_length_scale", 0.35),
+        })
+
+    def set_stereo_field_settings(self, config, save_current_sensor: bool = False):
+        settings = self._normalize_stereo_field_config(config)
+        self.stereo_field_ignore_noise_enabled = bool(settings["ignore_noise_enabled"])
+        self.stereo_field_deadband_pct = float(settings["deadband_pct"])
+        self.stereo_field_response_scale_pct = float(settings["response_scale_pct"])
+        previous_length_scale = float(getattr(self, "stereo_field_length_scale", 0.35) or 0.35)
+        self.stereo_field_length_scale = float(settings["length_scale"])
+        self._stereo_field_smoothed_visibility = None
+        self._stereo_field_smoothed_color_response = None
+        if abs(previous_length_scale - self.stereo_field_length_scale) > 1e-9:
+            self._rebuild_matrix_visualization_actor(render=False)
+            self._refresh_sensor_visualization_mode_actors()
+        if save_current_sensor and self.current_model_name:
+            self.set_saved_sensor_stereo_field_config(
+                self.current_model_name,
+                settings,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            )
+        return True
+
+    def get_sensor_reorder_context(self, model_name=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        n_row, n_col = self._sensor_shape_for_model(model)
+        saved_mode = self.get_saved_sensor_reorder_mode(model, n_row=n_row, n_col=n_col)
+        default_logic = self._default_reorder_logic_for_model(model)
+        effective_logic = self._reorder_mode_to_logic(model, saved_mode)
+        point_labels_enabled = self.get_saved_sensor_point_labels_enabled(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        force_scale = self.get_saved_sensor_contact_force_scale(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        geometry = self.get_saved_sensor_geometry_config(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        stereo_field = self.get_saved_sensor_stereo_field_config(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        return {
+            "model": model,
+            "label": self.SENSOR_MODEL_LABELS.get(model, model),
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "key": self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col),
+            "saved_mode": saved_mode,
+            "default_logic": default_logic,
+            "effective_logic": effective_logic,
+            "point_labels_enabled": point_labels_enabled,
+            "force_scale_n_per_signal": force_scale,
+            "geometry": geometry,
+            "stereo_field": stereo_field,
+        }
+
+    def _apply_saved_reorder_logic(self, model_kwargs):
+        model = str(self.current_model_name or "sensor")
+        n_row = int(model_kwargs.get("n_row", 0) or 0)
+        n_col = int(model_kwargs.get("n_col", 0) or 0)
+        mode = self.get_saved_sensor_reorder_mode(model, n_row=n_row, n_col=n_col)
+        effective_logic = self._reorder_mode_to_logic(model, mode)
+        updated = dict(model_kwargs)
+        if effective_logic is None:
+            updated.pop("reorder_logic", None)
+        else:
+            updated["reorder_logic"] = effective_logic
+        self.current_reorder_mode = mode
+        self.current_effective_reorder_logic = effective_logic
+        self.current_sensor_reorder_key = self.get_sensor_reorder_key(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        self.show_sensor_point_labels = self.get_saved_sensor_point_labels_enabled(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        self.contact_force_scale_n_per_signal = self.get_saved_sensor_contact_force_scale(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        self.set_stereo_field_settings(
+            self.get_saved_sensor_stereo_field_config(
+                model,
+                n_row=n_row,
+                n_col=n_col,
+            ),
+            save_current_sensor=False,
+        )
+        print(
+            "[SensorReorder] "
+            f"{self.current_sensor_reorder_key} "
+            f"mode={mode}, effective={effective_logic or 'none'}"
+        )
+        return updated
+
+    def set_sensor_point_labels_enabled(self, enabled: bool, save_current_sensor: bool = False):
+        self.show_sensor_point_labels = bool(enabled)
+        if save_current_sensor and self.current_model_name:
+            self.set_saved_sensor_point_labels_enabled(
+                self.current_model_name,
+                self.show_sensor_point_labels,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            )
+        self._refresh_sensor_point_label_actor()
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def set_sensor_contact_force_scale(self, scale, save_current_sensor: bool = False):
+        try:
+            self.contact_force_scale_n_per_signal = max(0.0, float(scale))
+        except Exception:
+            self.contact_force_scale_n_per_signal = 0.0
+        if save_current_sensor and self.current_model_name:
+            self.set_saved_sensor_contact_force_scale(
+                self.current_model_name,
+                self.contact_force_scale_n_per_signal,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            )
+
+    def _capture_sensor_geometry_base(self):
+        self._sensor_geometry_base_points_origin = (
+            np.array(self.points_origin, dtype=float, copy=True)
+            if self.points_origin is not None
+            else None
+        )
+        self._sensor_geometry_base_normals = (
+            np.array(self.normals, dtype=float, copy=True)
+            if self.normals is not None
+            else None
+        )
+        self._sensor_geometry_base_fine_points = (
+            np.array(self._2D_map.points, dtype=float, copy=True)
+            if self._2D_map is not None and getattr(self._2D_map, "n_points", 0) > 0
+            else None
+        )
+
+    @staticmethod
+    def _bend_points_to_cylinder(points, config, return_normals=False, base_normals=None):
+        points_np = np.array(points, dtype=float, copy=True)
+        if points_np.ndim != 2 or points_np.shape[1] != 3:
+            if return_normals:
+                return points_np, base_normals
+            return points_np
+
+        normalized = {
+            "use_selected_shape": bool(config.get("use_selected_shape", True)),
+            "shape": str(config.get("shape", "flat")),
+            "bend_axis": str(config.get("bend_axis", "columns")),
+            "arc_deg": float(config.get("arc_deg", 0.0) or 0.0),
+            "normal_flip": bool(config.get("normal_flip", False)),
+        }
+
+        normals = None
+        if return_normals:
+            if base_normals is None:
+                normals = np.tile([0.0, 0.0, 1.0], (len(points_np), 1))
+            else:
+                normals = np.array(base_normals, dtype=float, copy=True)
+
+        if (
+            not normalized["use_selected_shape"]
+            or normalized["shape"] != "cylinder"
+            or abs(normalized["arc_deg"]) < 1e-6
+        ):
+            if normals is not None and normalized["normal_flip"]:
+                normals *= -1.0
+            return (points_np, normals) if return_normals else points_np
+
+        axis_idx = 0 if normalized["bend_axis"] == "columns" else 1
+        values = points_np[:, axis_idx]
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            if normals is not None and normalized["normal_flip"]:
+                normals *= -1.0
+            return (points_np, normals) if return_normals else points_np
+
+        width = float(np.max(finite) - np.min(finite))
+        if width <= 1e-9:
+            if normals is not None and normalized["normal_flip"]:
+                normals *= -1.0
+            return (points_np, normals) if return_normals else points_np
+
+        center = float((np.max(finite) + np.min(finite)) * 0.5)
+        arc_rad = float(np.radians(abs(normalized["arc_deg"])))
+        if arc_rad <= 1e-9:
+            if normals is not None and normalized["normal_flip"]:
+                normals *= -1.0
+            return (points_np, normals) if return_normals else points_np
+
+        curve_sign = 1.0 if normalized["arc_deg"] >= 0.0 else -1.0
+        radius = width / arc_rad
+        u = values - center
+        theta = u / max(radius, 1e-9)
+        points_np[:, axis_idx] = center + radius * np.sin(theta)
+        points_np[:, 2] = points_np[:, 2] + curve_sign * radius * (np.cos(theta) - 1.0)
+
+        if normals is not None:
+            normals = np.zeros_like(points_np)
+            normals[:, axis_idx] = curve_sign * np.sin(theta)
+            normals[:, 2] = np.cos(theta)
+            norm = np.linalg.norm(normals, axis=1)
+            valid = norm > 1e-9
+            normals[valid] = normals[valid] / norm[valid, None]
+            normals[~valid] = [0.0, 0.0, 1.0]
+            if normalized["normal_flip"]:
+                normals *= -1.0
+            return points_np, normals
+
+        return points_np
+
+    def set_sensor_geometry_config(self, config, save_current_sensor: bool = False, render: bool = True):
+        geometry = self._normalize_sensor_geometry_config(config)
+        self.current_sensor_geometry_config = geometry
+        effective_geometry = self._effective_sensor_geometry_config(geometry)
+
+        if save_current_sensor and self.current_model_name:
+            self.set_saved_sensor_geometry_config(
+                self.current_model_name,
+                geometry,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            )
+
+        if str(self.current_model_name or "") != "2d":
+            return False
+
+        base_points = getattr(self, "_sensor_geometry_base_points_origin", None)
+        base_normals = getattr(self, "_sensor_geometry_base_normals", None)
+        if base_points is None or base_normals is None:
+            return False
+
+        self.points_origin, self.normals = self._bend_points_to_cylinder(
+            base_points,
+            effective_geometry,
+            return_normals=True,
+            base_normals=base_normals,
+        )
+        self.points = self.points_origin + self.normals * float(
+            getattr(self, "sensor_visual_offset_scale", 0.0)
+        )
+
+        base_fine_points = getattr(self, "_sensor_geometry_base_fine_points", None)
+        if self._2D_map is not None and base_fine_points is not None:
+            self._2D_map.points = self._bend_points_to_cylinder(
+                base_fine_points,
+                effective_geometry,
+                return_normals=False,
+            )
+            try:
+                self._2D_map.Modified()
+            except Exception:
+                pass
+
+        if self.line_poly is not None:
+            self.line_poly.points = self.points
+            try:
+                self.line_poly.Modified()
+            except Exception:
+                pass
+
+        if self.actionMesh is not None or self.matrixLineActor is not None:
+            self._rebuild_matrix_visualization_actor(render=False)
+            self._refresh_sensor_visualization_mode_actors()
+        self._clear_contact_normal_actor()
+        self._refresh_sensor_point_label_actor()
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+        return True
+
+    def _sensor_point_labels(self):
+        labels = []
+        for col in range(int(self.n_col)):
+            for row in range(int(self.n_row)):
+                idx = _column_major_idx(self.n_row, col, row)
+                labels.append(f"P{idx} r{row} c{col}")
+        return labels
+
+    def _clear_sensor_point_label_actor(self):
+        self.sensorPointLabelActor = self._remove_actor_safely(
+            getattr(self, "sensorPointLabelActor", None)
+        )
+
+    def _refresh_sensor_point_label_actor(self):
+        self._clear_sensor_point_label_actor()
+        if not bool(getattr(self, "show_sensor_point_labels", False)):
+            return
+        if self.line_poly is None or self.n_row <= 0 or self.n_col <= 0:
+            return
+        try:
+            self.sensorPointLabelActor = self.plotter.add_point_labels(
+                self.line_poly,
+                self._sensor_point_labels(),
+                font_size=12,
+                text_color="#111111",
+                point_color="#00e5ff",
+                point_size=7,
+                show_points=True,
+                shape="rounded_rect",
+                shape_color="#ffd34d",
+                shape_opacity=0.92,
+                margin=4,
+                always_visible=True,
+                name="sensor_point_labels",
+                render=False,
+            )
+        except Exception as exc:
+            self.sensorPointLabelActor = None
+            print(f"[SensorPointLabels] Failed to show point labels: {exc}")
 
     def _bind_sensor_api_to_port(self, ser):
         """Reuse the shared sensor API object while switching its active serial port."""
@@ -1444,7 +2592,693 @@ class MySensor:
 
         self.line_poly.points = self.points
         self.line_poly.point_data.set_scalars(self.colors_3d)
+        if self._is_matrix_visualization_mode(
+            getattr(self, "sensor_visualization_mode", "point_grid")
+        ):
+            self._update_matrix_silhouette_visualization(sensor_matrix)
+        self._update_contact_force_status(sensor_matrix)
+        self._update_contact_normal_visualization(sensor_matrix)
         self.plotter.render()
+
+    @staticmethod
+    def _normalize_vector(vector, fallback=None):
+        arr = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(arr))
+        if norm > 1e-9:
+            return arr / norm
+        if fallback is None:
+            fallback = (0.0, 0.0, 1.0)
+        fallback_arr = np.asarray(fallback, dtype=float)
+        fallback_norm = float(np.linalg.norm(fallback_arr))
+        if fallback_norm > 1e-9:
+            return fallback_arr / fallback_norm
+        return np.array([0.0, 0.0, 1.0], dtype=float)
+
+    def _set_contact_normal_status(self, text):
+        label = getattr(self.parent, "contact_normal_status_label", None)
+        if label is not None:
+            try:
+                label.setText(str(text))
+            except Exception:
+                pass
+
+    def _set_contact_force_status(self, text):
+        label = getattr(self.parent, "contact_force_status_label", None)
+        if label is not None:
+            try:
+                label.setText(str(text))
+            except Exception:
+                pass
+
+    def set_contact_normal_visualization_enabled(self, enabled: bool):
+        self.show_contact_normal_vector = bool(enabled)
+        if not self.show_contact_normal_vector:
+            self._clear_contact_normal_actor()
+            self._set_contact_normal_status("Normal vector: off")
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+        else:
+            self._set_contact_normal_status("Normal vector: waiting for contact")
+
+    def get_contact_normal_estimator_modes(self):
+        return [
+            ("motion_direction_v3", "Motion Direction (V3)"),
+            ("touch_anchor_v4", "Touch Anchor Direction (V4)"),
+        ]
+
+    def set_contact_normal_estimator_mode(self, mode):
+        valid_modes = {key for key, _label in self.get_contact_normal_estimator_modes()}
+        mode = str(mode or "touch_anchor_v4")
+        if mode not in valid_modes:
+            mode = "touch_anchor_v4"
+        self.contact_normal_estimator_mode = mode
+        if mode == "motion_direction_v3":
+            self._set_contact_normal_status("Contact vector mode: Motion Direction (V3)")
+        else:
+            self._set_contact_normal_status("Contact vector mode: Touch Anchor Direction (V4)")
+        self._reset_contact_motion_tracker()
+        self._contact_normal_smoothed_start = None
+        self._contact_normal_smoothed_direction = None
+
+    def _reset_contact_motion_tracker(self):
+        self._contact_motion_previous_center = None
+        self._contact_anchor_center = None
+        self._contact_motion_smoothed_delta = None
+
+    def _clear_contact_normal_actor(self):
+        self.contactNormalActor = self._remove_actor_safely(
+            getattr(self, "contactNormalActor", None)
+        )
+        self.contactNormalMesh = None
+        self._contact_normal_smoothed_start = None
+        self._contact_normal_smoothed_direction = None
+        self._reset_contact_motion_tracker()
+
+    def _sensor_scene_span(self):
+        points = np.asarray(getattr(self, "points_origin", None), dtype=float)
+        if points.size == 0:
+            return 1.0
+        finite = points[np.all(np.isfinite(points), axis=1)]
+        if finite.size == 0:
+            return 1.0
+        span = np.ptp(finite, axis=0)
+        return max(float(np.linalg.norm(span)), 1e-3)
+
+    def _grid_point_index(self, col, row):
+        col = int(np.clip(int(col), 0, max(0, self.n_col - 1)))
+        row = int(np.clip(int(row), 0, max(0, self.n_row - 1)))
+        return _column_major_idx(self.n_row, col, row)
+
+    def _point_at_cell(self, col, row):
+        return np.asarray(self.points_origin[self._grid_point_index(col, row)], dtype=float)
+
+    def _local_contact_tangent_axes(self, peak_col, peak_row, surface_normal):
+        normal = self._normalize_vector(surface_normal)
+
+        left_col = max(0, int(peak_col) - 1)
+        right_col = min(self.n_col - 1, int(peak_col) + 1)
+        down_row = max(0, int(peak_row) - 1)
+        up_row = min(self.n_row - 1, int(peak_row) + 1)
+
+        tangent_col = self._point_at_cell(right_col, peak_row) - self._point_at_cell(left_col, peak_row)
+        tangent_row = self._point_at_cell(peak_col, up_row) - self._point_at_cell(peak_col, down_row)
+
+        tangent_col = tangent_col - normal * float(np.dot(tangent_col, normal))
+        tangent_col = self._normalize_vector(tangent_col, fallback=np.cross(normal, [0.0, 0.0, 1.0]))
+        if float(np.linalg.norm(tangent_col)) <= 1e-9:
+            tangent_col = self._normalize_vector(np.cross(normal, [1.0, 0.0, 0.0]))
+
+        tangent_row = tangent_row - normal * float(np.dot(tangent_row, normal))
+        tangent_row = tangent_row - tangent_col * float(np.dot(tangent_row, tangent_col))
+        tangent_row = self._normalize_vector(tangent_row, fallback=np.cross(normal, tangent_col))
+        return tangent_col, tangent_row
+
+    def _contact_cluster_mask(self, pressure, peak_row, peak_col, threshold):
+        touched = np.asarray(pressure >= float(threshold), dtype=bool)
+        if touched.size == 0 or not bool(touched[peak_row, peak_col]):
+            return np.zeros_like(touched, dtype=bool)
+
+        cluster = np.zeros_like(touched, dtype=bool)
+        stack = [(int(peak_row), int(peak_col))]
+        cluster[peak_row, peak_col] = True
+        while stack:
+            row, col = stack.pop()
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr = row + dr
+                    nc = col + dc
+                    if not (0 <= nr < self.n_row and 0 <= nc < self.n_col):
+                        continue
+                    if cluster[nr, nc] or not touched[nr, nc]:
+                        continue
+                    cluster[nr, nc] = True
+                    stack.append((nr, nc))
+        return cluster
+
+    def _estimate_contact_force_signal(self, sensor_matrix):
+        values = np.asarray(sensor_matrix, dtype=float)
+        if values.shape != (self.n_row, self.n_col):
+            return None
+
+        pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
+        peak_threshold = max(0.0, float(getattr(self, "contact_normal_threshold_pct", 3.0)))
+        peak_flat = int(np.argmax(pressure))
+        peak_row, peak_col = np.unravel_index(peak_flat, pressure.shape)
+        peak_pressure = float(pressure[peak_row, peak_col])
+        if peak_pressure < peak_threshold:
+            return None
+
+        cluster_floor = max(0.0, float(getattr(self, "contact_normal_cluster_floor_pct", 0.8)))
+        cluster_threshold = min(
+            peak_threshold,
+            max(cluster_floor, peak_pressure * 0.08),
+        )
+        cluster = self._contact_cluster_mask(pressure, peak_row, peak_col, cluster_threshold)
+        if not bool(cluster.any()):
+            return None
+
+        weights = np.where(cluster, np.maximum(pressure - cluster_threshold, 0.0), 0.0)
+        signal_sum = float(np.sum(weights))
+        if signal_sum <= 1e-9:
+            weights = np.where(cluster, pressure, 0.0)
+            signal_sum = float(np.sum(weights))
+        if signal_sum <= 1e-9:
+            return None
+
+        rows, cols = np.indices((self.n_row, self.n_col))
+        center_row = float(np.sum(rows * weights) / signal_sum)
+        center_col = float(np.sum(cols * weights) / signal_sum)
+        scale = max(0.0, float(getattr(self, "contact_force_scale_n_per_signal", 0.0)))
+        force_n = signal_sum * scale if scale > 0.0 else None
+        return {
+            "signal_sum": signal_sum,
+            "force_n": force_n,
+            "scale": scale,
+            "active_nodes": int(np.count_nonzero(cluster)),
+            "center_row": center_row,
+            "center_col": center_col,
+            "peak_pressure": peak_pressure,
+        }
+
+    def _update_contact_force_status(self, sensor_matrix):
+        estimate = self._estimate_contact_force_signal(sensor_matrix)
+        if estimate is None:
+            self._set_contact_force_status("Contact force: no contact")
+            return
+
+        force_n = estimate.get("force_n")
+        if force_n is None:
+            self._set_contact_force_status(
+                "Contact force: uncalibrated | "
+                f"signal {estimate['signal_sum']:.2f}, "
+                f"nodes {estimate['active_nodes']}, "
+                f"center r{estimate['center_row']:.2f} c{estimate['center_col']:.2f}"
+            )
+        else:
+            self._set_contact_force_status(
+                f"Contact force: {force_n:.3f} N | "
+                f"signal {estimate['signal_sum']:.2f}, "
+                f"scale {estimate['scale']:.6f} N/signal"
+            )
+
+    @staticmethod
+    def _bilinear_sample_matrix(matrix, row, col):
+        data = np.asarray(matrix, dtype=float)
+        n_row, n_col = data.shape
+        if row < 0.0 or col < 0.0 or row > (n_row - 1) or col > (n_col - 1):
+            return None
+
+        r0 = int(np.floor(row))
+        c0 = int(np.floor(col))
+        r1 = min(r0 + 1, n_row - 1)
+        c1 = min(c0 + 1, n_col - 1)
+        fr = float(row - r0)
+        fc = float(col - c0)
+
+        return float(
+            data[r0, c0] * (1.0 - fr) * (1.0 - fc)
+            + data[r1, c0] * fr * (1.0 - fc)
+            + data[r0, c1] * (1.0 - fr) * fc
+            + data[r1, c1] * fr * fc
+        )
+
+    def _pressure_residual_tilt_components(self, weights, center_row, center_col):
+        weights = np.asarray(weights, dtype=float)
+        if weights.shape != (self.n_row, self.n_col):
+            return 0.0, 0.0, 0.0
+
+        rows, cols = np.indices((self.n_row, self.n_col))
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-9:
+            return 0.0, 0.0, 0.0
+
+        d_rows = rows - float(center_row)
+        d_cols = cols - float(center_col)
+        spread = float(np.sqrt(np.sum(weights * (d_rows ** 2 + d_cols ** 2)) / weight_sum))
+        spread = max(spread, 0.5)
+
+        residual_row = 0.0
+        residual_col = 0.0
+        residual_abs = 0.0
+        sample_count = 0
+
+        active_indices = np.argwhere(weights > 0.0)
+        for row, col in active_indices:
+            mirror_row = 2.0 * float(center_row) - float(row)
+            mirror_col = 2.0 * float(center_col) - float(col)
+            mirror_value = self._bilinear_sample_matrix(weights, mirror_row, mirror_col)
+            if mirror_value is None:
+                continue
+
+            residual = float(weights[row, col] - mirror_value)
+            residual_row += residual * float(row - center_row)
+            residual_col += residual * float(col - center_col)
+            residual_abs += abs(residual)
+            sample_count += 1
+
+        if sample_count <= 0:
+            return 0.0, 0.0, 0.0
+
+        norm = max(weight_sum * spread, 1e-9)
+        tilt_row = residual_row / norm
+        tilt_col = residual_col / norm
+        residual_strength = residual_abs / max(weight_sum, 1e-9)
+
+        deadband = max(0.0, float(getattr(self, "contact_normal_residual_deadband", 0.06)))
+        magnitude = float(np.hypot(tilt_row, tilt_col))
+        if magnitude <= deadband:
+            return 0.0, 0.0, residual_strength
+
+        scale = (magnitude - deadband) / magnitude
+        gain = float(getattr(self, "contact_normal_residual_gain", 1.2))
+        return tilt_row * scale * gain, tilt_col * scale * gain, residual_strength
+
+    def _contact_motion_delta(self, center_row, center_col):
+        current_center = np.array([float(center_row), float(center_col)], dtype=float)
+        previous_center = getattr(self, "_contact_motion_previous_center", None)
+        self._contact_motion_previous_center = current_center
+
+        if previous_center is None:
+            raw_delta = np.zeros(2, dtype=float)
+        else:
+            previous_center = np.asarray(previous_center, dtype=float)
+            if previous_center.shape != (2,) or not np.all(np.isfinite(previous_center)):
+                raw_delta = np.zeros(2, dtype=float)
+            else:
+                raw_delta = current_center - previous_center
+
+        alpha = float(getattr(self, "contact_motion_smoothing_alpha", 0.55))
+        alpha = max(0.0, min(1.0, alpha))
+        previous_delta = getattr(self, "_contact_motion_smoothed_delta", None)
+        if previous_delta is None:
+            smoothed_delta = raw_delta
+        else:
+            previous_delta = np.asarray(previous_delta, dtype=float)
+            if previous_delta.shape != (2,) or not np.all(np.isfinite(previous_delta)):
+                smoothed_delta = raw_delta
+            else:
+                smoothed_delta = alpha * raw_delta + (1.0 - alpha) * previous_delta
+
+        self._contact_motion_smoothed_delta = smoothed_delta
+        return raw_delta, smoothed_delta
+
+    def _contact_anchor_delta(self, center_row, center_col):
+        current_center = np.array([float(center_row), float(center_col)], dtype=float)
+        anchor_center = getattr(self, "_contact_anchor_center", None)
+        if anchor_center is None:
+            self._contact_anchor_center = current_center
+            raw_delta = np.zeros(2, dtype=float)
+        else:
+            anchor_center = np.asarray(anchor_center, dtype=float)
+            if anchor_center.shape != (2,) or not np.all(np.isfinite(anchor_center)):
+                self._contact_anchor_center = current_center
+                raw_delta = np.zeros(2, dtype=float)
+            else:
+                raw_delta = current_center - anchor_center
+
+        alpha = float(getattr(self, "contact_motion_smoothing_alpha", 0.55))
+        alpha = max(0.0, min(1.0, alpha))
+        previous_delta = getattr(self, "_contact_motion_smoothed_delta", None)
+        if previous_delta is None:
+            smoothed_delta = raw_delta
+        else:
+            previous_delta = np.asarray(previous_delta, dtype=float)
+            if previous_delta.shape != (2,) or not np.all(np.isfinite(previous_delta)):
+                smoothed_delta = raw_delta
+            else:
+                smoothed_delta = alpha * raw_delta + (1.0 - alpha) * previous_delta
+
+        self._contact_motion_smoothed_delta = smoothed_delta
+        return raw_delta, smoothed_delta
+
+    @staticmethod
+    def _angle_between_vectors_deg(vector_a, vector_b):
+        a = np.asarray(vector_a, dtype=float)
+        b = np.asarray(vector_b, dtype=float)
+        a_norm = float(np.linalg.norm(a))
+        b_norm = float(np.linalg.norm(b))
+        if a_norm <= 1e-9 or b_norm <= 1e-9:
+            return 0.0
+        return float(
+            np.degrees(
+                np.arccos(
+                    np.clip(float(np.dot(a / a_norm, b / b_norm)), -1.0, 1.0)
+                )
+            )
+        )
+
+    def _smooth_contact_normal_pose(self, start, direction, preserve_direction_sign=False):
+        alpha = float(getattr(self, "contact_normal_smoothing_alpha", 0.65))
+        alpha = max(0.0, min(1.0, alpha))
+        start = np.asarray(start, dtype=float)
+        direction = self._normalize_vector(direction)
+
+        previous_start = getattr(self, "_contact_normal_smoothed_start", None)
+        previous_direction = getattr(self, "_contact_normal_smoothed_direction", None)
+        if previous_start is None or previous_direction is None:
+            self._contact_normal_smoothed_start = start
+            self._contact_normal_smoothed_direction = direction
+            return start, direction
+
+        previous_start = np.asarray(previous_start, dtype=float)
+        previous_direction = self._normalize_vector(previous_direction, fallback=direction)
+        if not preserve_direction_sign and float(np.dot(previous_direction, direction)) < 0.0:
+            previous_direction = -previous_direction
+
+        smoothed_start = alpha * start + (1.0 - alpha) * previous_start
+        smoothed_direction = self._normalize_vector(
+            alpha * direction + (1.0 - alpha) * previous_direction,
+            fallback=direction,
+        )
+
+        self._contact_normal_smoothed_start = smoothed_start
+        self._contact_normal_smoothed_direction = smoothed_direction
+        return smoothed_start, smoothed_direction
+
+    @staticmethod
+    def _make_contact_normal_arrow_mesh(start, direction, arrow_length):
+        direction = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9:
+            direction = np.array([0.0, 0.0, 1.0], dtype=float)
+        else:
+            direction = direction / norm
+        length = max(float(arrow_length), 1e-6)
+        return pv.Arrow(
+            start=np.asarray(start, dtype=float),
+            direction=direction,
+            scale=length,
+            tip_length=0.28,
+            tip_radius=0.065,
+            shaft_radius=0.022,
+            tip_resolution=24,
+            shaft_resolution=24,
+        )
+
+    def _estimate_contact_normal_vector(self, sensor_matrix):
+        if self.points_origin is None or self.normals is None:
+            return None
+
+        values = np.asarray(sensor_matrix, dtype=float)
+        if values.shape != (self.n_row, self.n_col):
+            return None
+
+        pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
+        peak_threshold = max(0.0, float(getattr(self, "contact_normal_threshold_pct", 3.0)))
+        peak_flat = int(np.argmax(pressure))
+        peak_row, peak_col = np.unravel_index(peak_flat, pressure.shape)
+        peak_pressure = float(pressure[peak_row, peak_col])
+        if peak_pressure < peak_threshold:
+            return None
+
+        cluster_floor = max(0.0, float(getattr(self, "contact_normal_cluster_floor_pct", 0.8)))
+        cluster_threshold = min(
+            peak_threshold,
+            max(cluster_floor, peak_pressure * 0.08),
+        )
+
+        cluster = self._contact_cluster_mask(pressure, peak_row, peak_col, cluster_threshold)
+        if not bool(cluster.any()):
+            return None
+
+        weights = np.where(cluster, np.maximum(pressure - cluster_threshold, 0.0), 0.0)
+        weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-9:
+            weights = np.where(cluster, pressure, 0.0)
+            weight_sum = float(np.sum(weights))
+        if weight_sum <= 1e-9:
+            return None
+
+        rows, cols = np.indices((self.n_row, self.n_col))
+        center_row = float(np.sum(rows * weights) / weight_sum)
+        center_col = float(np.sum(cols * weights) / weight_sum)
+
+        weighted_point = np.zeros(3, dtype=float)
+        weighted_surface_normal = np.zeros(3, dtype=float)
+        for col in range(self.n_col):
+            for row in range(self.n_row):
+                weight = float(weights[row, col])
+                if weight <= 0.0:
+                    continue
+                idx = _column_major_idx(self.n_row, col, row)
+                weighted_point += np.asarray(self.points_origin[idx], dtype=float) * weight
+                weighted_surface_normal += np.asarray(self.normals[idx], dtype=float) * weight
+
+        contact_point = weighted_point / weight_sum
+        peak_idx = _column_major_idx(self.n_row, int(peak_col), int(peak_row))
+        surface_normal = self._normalize_vector(
+            weighted_surface_normal / weight_sum,
+            fallback=self.normals[peak_idx],
+        )
+
+        delta_col = float(center_col - peak_col)
+        delta_row = float(center_row - peak_row)
+        mode = str(getattr(self, "contact_normal_estimator_mode", "touch_anchor_v4"))
+        residual_strength = 0.0
+        if mode in ("motion_direction_v3", "touch_anchor_v4"):
+            anchor_col = int(np.clip(round(center_col), 0, max(0, self.n_col - 1)))
+            anchor_row = int(np.clip(round(center_row), 0, max(0, self.n_row - 1)))
+            tangent_col, tangent_row = self._local_contact_tangent_axes(
+                anchor_col,
+                anchor_row,
+                surface_normal,
+            )
+            if mode == "touch_anchor_v4":
+                raw_delta, smoothed_delta = self._contact_anchor_delta(center_row, center_col)
+            else:
+                raw_delta, smoothed_delta = self._contact_motion_delta(center_row, center_col)
+            motion_cells = float(np.linalg.norm(smoothed_delta))
+            deadband_cells = max(0.0, float(getattr(self, "contact_motion_deadband_cells", 0.025)))
+            motion_vector = tangent_row * float(smoothed_delta[0]) + tangent_col * float(smoothed_delta[1])
+            motion_vector_norm = float(np.linalg.norm(motion_vector))
+            motion_over_deadband = max(0.0, motion_cells - deadband_cells)
+            has_motion = motion_over_deadband > 0.0 and motion_vector_norm > 1e-9
+            if has_motion:
+                motion_direction = self._normalize_vector(motion_vector, fallback=tangent_col)
+                max_tilt_deg = max(
+                    0.0,
+                    min(90.0, float(getattr(self, "contact_motion_max_tilt_deg", 90.0))),
+                )
+                motion_strength = 1.0 - float(
+                    np.exp(
+                        -motion_over_deadband
+                        * max(0.0, float(getattr(self, "contact_motion_tilt_gain", 6.0)))
+                    )
+                )
+                tilt_rad = np.radians(max_tilt_deg * np.clip(motion_strength, 0.0, 1.0))
+                display_direction = self._normalize_vector(
+                    (-surface_normal * float(np.cos(tilt_rad)))
+                    + (motion_direction * float(np.sin(tilt_rad))),
+                    fallback=-surface_normal,
+                )
+                vector_type = "motion tilt"
+            else:
+                display_direction = self._normalize_vector(-surface_normal, fallback=(0.0, 0.0, -1.0))
+                vector_type = "perpendicular"
+
+            normal = self._normalize_vector(-display_direction, fallback=surface_normal)
+            tilt_deg = self._angle_between_vectors_deg(-surface_normal, display_direction)
+            return {
+                "point": contact_point,
+                "surface_normal": surface_normal,
+                "normal": normal,
+                "display_direction": display_direction,
+                "center_row": center_row,
+                "center_col": center_col,
+                "peak_row": int(peak_row),
+                "peak_col": int(peak_col),
+                "peak_pressure": peak_pressure,
+                "tilt_deg": tilt_deg,
+                "mode": mode,
+                "mode_label": (
+                    "Touch Anchor Direction (V4)"
+                    if mode == "touch_anchor_v4"
+                    else "Motion Direction (V3)"
+                ),
+                "residual_strength": residual_strength,
+                "motion_cells": motion_cells,
+                "anchor_row": (
+                    float(self._contact_anchor_center[0])
+                    if mode == "touch_anchor_v4"
+                    and getattr(self, "_contact_anchor_center", None) is not None
+                    else None
+                ),
+                "anchor_col": (
+                    float(self._contact_anchor_center[1])
+                    if mode == "touch_anchor_v4"
+                    and getattr(self, "_contact_anchor_center", None) is not None
+                    else None
+                ),
+                "raw_motion_row": float(raw_delta[0]),
+                "raw_motion_col": float(raw_delta[1]),
+                "smoothed_motion_row": float(smoothed_delta[0]),
+                "smoothed_motion_col": float(smoothed_delta[1]),
+                "vector_type": vector_type,
+            }
+
+        if mode == "peak_offset_v1":
+            tangent_col, tangent_row = self._local_contact_tangent_axes(
+                int(peak_col),
+                int(peak_row),
+                surface_normal,
+            )
+            tilt = tangent_col * delta_col + tangent_row * delta_row
+            mode_label = "Peak Offset (V1)"
+        else:
+            anchor_col = int(np.clip(round(center_col), 0, max(0, self.n_col - 1)))
+            anchor_row = int(np.clip(round(center_row), 0, max(0, self.n_row - 1)))
+            tangent_col, tangent_row = self._local_contact_tangent_axes(
+                anchor_col,
+                anchor_row,
+                surface_normal,
+            )
+            tilt_row, tilt_col, residual_strength = self._pressure_residual_tilt_components(
+                weights,
+                center_row,
+                center_col,
+            )
+            tilt = tangent_col * tilt_col + tangent_row * tilt_row
+            mode_label = "Balanced Residual (V2)"
+
+        normal = self._normalize_vector(
+            surface_normal + float(self.contact_normal_tilt_gain) * tilt,
+            fallback=surface_normal,
+        )
+        tilt_deg = float(
+            np.degrees(
+                np.arccos(
+                    np.clip(float(np.dot(surface_normal, normal)), -1.0, 1.0)
+                )
+            )
+        )
+        return {
+            "point": contact_point,
+            "surface_normal": surface_normal,
+            "normal": normal,
+            "center_row": center_row,
+            "center_col": center_col,
+            "peak_row": int(peak_row),
+            "peak_col": int(peak_col),
+            "peak_pressure": peak_pressure,
+            "tilt_deg": tilt_deg,
+            "mode": mode,
+            "mode_label": mode_label,
+            "residual_strength": residual_strength,
+        }
+
+    def _update_contact_normal_visualization(self, sensor_matrix):
+        if not bool(getattr(self, "show_contact_normal_vector", True)):
+            return
+
+        estimate = self._estimate_contact_normal_vector(sensor_matrix)
+        if estimate is None:
+            if str(getattr(self, "contact_normal_estimator_mode", "")) in (
+                "motion_direction_v3",
+                "touch_anchor_v4",
+            ):
+                self._reset_contact_motion_tracker()
+            self._contact_normal_missing_frames += 1
+            grace = max(0, int(getattr(self, "contact_normal_missing_grace_frames", 4)))
+            if self.contactNormalActor is not None and self._contact_normal_missing_frames <= grace:
+                self._set_contact_normal_status("Normal vector: holding last estimate")
+                return
+            self._clear_contact_normal_actor()
+            self._set_contact_normal_status("Normal vector: no contact")
+            return
+        self._contact_normal_missing_frames = 0
+
+        span = self._sensor_scene_span()
+        arrow_length = max(span * 0.22, 0.03)
+        surface_offset = max(span * 0.015, 0.003)
+        display_surface_normal = -estimate["surface_normal"]
+        direction = estimate.get("display_direction")
+        if direction is None:
+            direction = -estimate["normal"]
+        direction = self._normalize_vector(direction, fallback=-estimate["surface_normal"])
+        start = estimate["point"] + display_surface_normal * surface_offset
+        preserve_direction_sign = estimate.get("mode") in (
+            "motion_direction_v3",
+            "touch_anchor_v4",
+        )
+        start, direction = self._smooth_contact_normal_pose(
+            start,
+            direction,
+            preserve_direction_sign=preserve_direction_sign,
+        )
+
+        try:
+            new_arrow = self._make_contact_normal_arrow_mesh(start, direction, arrow_length)
+            if self.contactNormalMesh is None or self.contactNormalActor is None:
+                self.contactNormalMesh = new_arrow
+                self.contactNormalActor = self.plotter.add_mesh(
+                    self.contactNormalMesh,
+                    color="#ffd34d",
+                    smooth_shading=True,
+                    reset_camera=False,
+                    name="contact_normal_vector",
+                    render=False,
+                )
+            else:
+                self.contactNormalMesh.copy_from(new_arrow)
+                self.contactNormalMesh.Modified()
+        except Exception as exc:
+            self._clear_contact_normal_actor()
+            self._set_contact_normal_status(f"Normal vector error: {exc}")
+            return
+
+        if estimate.get("mode") in ("motion_direction_v3", "touch_anchor_v4"):
+            if estimate.get("mode") == "touch_anchor_v4":
+                anchor_text = (
+                    f"anchor r{estimate.get('anchor_row', 0.0):.2f} "
+                    f"c{estimate.get('anchor_col', 0.0):.2f}, "
+                )
+                distance_label = "anchor displacement"
+            else:
+                anchor_text = ""
+                distance_label = "frame motion"
+            self._set_contact_normal_status(
+                "Contact vector: "
+                f"{estimate.get('mode_label', 'Motion Direction (V3)')}, "
+                f"{estimate.get('vector_type', 'motion')}, "
+                f"{anchor_text}"
+                f"row {estimate['center_row']:.2f}, col {estimate['center_col']:.2f}, "
+                f"{distance_label} {estimate.get('motion_cells', 0.0):.3f} cells, "
+                f"tilt {estimate.get('tilt_deg', 0.0):.1f} deg, "
+                f"v=({direction[0]:+.2f}, {direction[1]:+.2f}, {direction[2]:+.2f})"
+            )
+        else:
+            self._set_contact_normal_status(
+                "Normal vector: "
+                f"{estimate.get('mode_label', 'Balanced Residual (V2)')}, "
+                f"row {estimate['center_row']:.2f}, col {estimate['center_col']:.2f}, "
+                f"tilt {estimate['tilt_deg']:.1f} deg, "
+                f"residual {estimate.get('residual_strength', 0.0):.2f}, "
+                f"n=({direction[0]:+.2f}, {direction[1]:+.2f}, {direction[2]:+.2f})"
+            )
 
     def set_touch_sensitivity(self, new_value: float):
         """

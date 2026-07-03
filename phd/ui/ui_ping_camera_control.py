@@ -201,12 +201,6 @@ class CameraControlMixin:
             "toggle_ai_direct_finger_motion_execution",
             "AI Direct Finger Motion execution",
         )
-        self._shutdown_toggle_helper(
-            "direct_finger_motion_v2_class",
-            "is_running",
-            "toggle_direct_finger_motion_v2",
-            "Direct Finger Motion V2",
-        )
         self._shutdown_proximity_helper()
         self._shutdown_console_helper()
         self._shutdown_recording_helper()
@@ -239,9 +233,9 @@ class CameraControlMixin:
                 self._startup_log(f"⚠️ Failed to stop sensor reader cleanly: {exc}")
 
         self._shutdown_dialog("direct_finger_motion_settings_dialog", "Direct Finger Motion settings")
-        self._shutdown_dialog("direct_finger_motion_v2_settings_dialog", "Direct Finger Motion V2 settings")
         self._shutdown_dialog("console_control_settings_dialog", "Console Control settings")
         self._shutdown_dialog("proximity_settings_dialog", "Proximity Control settings")
+        self._shutdown_dialog("sensor_parameters_dialog", "Sensor Parameters")
         self._shutdown_dialog("ps5_controller_test_dialog", "PS5 controller test dialog")
         self._shutdown_dialog("sensor_controller_test_dialog", "Sensor controller test dialog")
         self._shutdown_dialog(

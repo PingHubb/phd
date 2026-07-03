@@ -23,8 +23,10 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 from pyvistaqt import QtInteractor
 from phd.dependence.paths import resource_path, robot_resource_path  # pyright: ignore[reportMissingImports]
@@ -563,11 +565,13 @@ class DirectFingerMotionMixin:
         ),
         "min_speed_ratio": (
             "Minimum non-zero speed ratio once motion is detected.\n"
+            "Also used as the light-pressure speed ratio for push/pull.\n"
             "Larger → motion starts more decisively.\n"
             "Smaller → motion starts more softly."
         ),
         "max_speed_ratio": (
             "Maximum speed ratio allowed after gain scaling.\n"
+            "Also used as the hard-pressure speed ratio for push/pull.\n"
             "Larger → allows faster peak speed.\n"
             "Smaller → caps aggressive motion."
         ),
@@ -595,8 +599,9 @@ class DirectFingerMotionMixin:
             "Larger → push is more stable but adds delay."
         ),
         "push_speed": (
-            "Robot speed used once push is triggered.\n"
-            "Larger → stronger push motion.\n"
+            "Maximum robot speed used once push is triggered.\n"
+            "Actual push speed is scaled by press strength between Min/Max Speed Ratio.\n"
+            "Larger → stronger maximum push motion.\n"
             "Smaller → gentler push motion."
         ),
         "push_exit_value_offset": (
@@ -604,6 +609,11 @@ class DirectFingerMotionMixin:
             "Larger → push mode is more 'sticky' once entered.\n"
             "Smaller → push mode exits more easily.\n"
             "Prevents push/swipe flickering at threshold boundary."
+        ),
+        "pull_value_threshold": (
+            "Average two-finger touch strength threshold for pull.\n"
+            "More negative → requires a deeper two-finger press before pull starts.\n"
+            "Pull speed ratio starts increasing only after this threshold."
         ),
         "pinch_axis_deadband": (
             "Minimum left/right finger motion needed for pinch detection.\n"
@@ -626,8 +636,9 @@ class DirectFingerMotionMixin:
             "Larger → more stable but slower."
         ),
         "pull_speed": (
-            "Robot speed used for two-finger pull after pinch-in detection.\n"
-            "Larger → faster pull.\n"
+            "Maximum robot speed used for two-finger pull after pinch-in detection.\n"
+            "Actual pull speed is scaled by two-finger press strength between Min/Max Speed Ratio.\n"
+            "Larger → faster maximum pull.\n"
             "Smaller → gentler pull."
         ),
         "push_pinch_enabled": (
@@ -674,12 +685,17 @@ class DirectFingerMotionMixin:
             "If the robot is moving and the sensor stream stalls longer than this,\n"
             "DFM sends an immediate zero velocity command."
         ),
+        "motion_ratio_log_enabled": (
+            "Log compact DFM motion lines with only detected mode and speed ratio.\n"
+            "Useful when checking whether light/strong press changes the ratio.\n"
+            "The log is throttled so it does not print every sensor frame."
+        ),
     }
 
     def _build_direct_finger_motion_settings_dialog(self):
         self.direct_finger_motion_settings_dialog = QDialog(self)
         self.direct_finger_motion_settings_dialog.setWindowTitle("Direct Finger Motion Parameters")
-        self.direct_finger_motion_settings_dialog.resize(780, 620)
+        self.direct_finger_motion_settings_dialog.resize(900, 720)
         self.direct_finger_motion_settings_dialog.setStyleSheet(
             "QToolTip {"
             " color: #111111;"
@@ -691,107 +707,116 @@ class DirectFingerMotionMixin:
 
         dialog_layout = QVBoxLayout(self.direct_finger_motion_settings_dialog)
 
-        header_layout = QHBoxLayout()
-        self.direct_finger_motion_logo = QLabel("🖐")
-        self.direct_finger_motion_logo.setAlignment(Qt.AlignCenter)
-        self.direct_finger_motion_logo.setFixedSize(56, 56)
-        self.direct_finger_motion_logo.setStyleSheet(
-            "font-size: 28px; border: 1px solid #8c8c8c; border-radius: 12px; background: rgba(255,255,255,0.08);"
-        )
-
         header_text_layout = QVBoxLayout()
         self.direct_finger_motion_title_label = QLabel("Direct Finger Motion Control Panel")
         self.direct_finger_motion_title_label.setStyleSheet("font-size: 16px; font-weight: 600;")
         self.direct_finger_motion_subtitle_label = QLabel(
-            "Single-finger swipe, hard-press push, two-finger pull, and two-finger swipe."
+            "Tactile detection, speed scaling, push/pull, two-finger rotation, and runtime settings."
         )
         self.direct_finger_motion_subtitle_label.setStyleSheet("color: #b0b0b0;")
         header_text_layout.addWidget(self.direct_finger_motion_title_label)
         header_text_layout.addWidget(self.direct_finger_motion_subtitle_label)
-        header_text_layout.addStretch()
-
-        header_layout.addWidget(self.direct_finger_motion_logo)
-        header_layout.addLayout(header_text_layout)
-        header_layout.addStretch()
-        dialog_layout.addLayout(header_layout)
+        dialog_layout.addLayout(header_text_layout)
 
         self.direct_finger_motion_settings_group = QGroupBox("DFM Parameters")
         panel_layout = QVBoxLayout(self.direct_finger_motion_settings_group)
-        grid = QGridLayout()
-
         self.direct_finger_motion_inputs = {}
 
-        def add_double(name, label, row, col, minimum, maximum, step, decimals=4):
+        def make_section(title):
+            section = QGroupBox(title)
+            section_grid = QGridLayout(section)
+            section_grid.setHorizontalSpacing(10)
+            section_grid.setVerticalSpacing(6)
+            section_grid.setColumnStretch(1, 1)
+            section_grid.setColumnStretch(3, 1)
+            return section, section_grid
+
+        def add_field(section_grid, name, label, row, col, widget):
+            widget.setMinimumWidth(120)
+            label_widget = QLabel(label)
+            label_widget.setMinimumWidth(150)
+            tooltip = self.DFM_PARAMETER_TOOLTIPS.get(name, "")
+            if tooltip:
+                label_widget.setToolTip(tooltip)
+                widget.setToolTip(tooltip)
+            section_grid.addWidget(label_widget, row, col)
+            section_grid.addWidget(widget, row, col + 1)
+            self.direct_finger_motion_inputs[name] = widget
+
+        def add_double(section_grid, name, label, row, col, minimum, maximum, step, decimals=4):
             widget = QDoubleSpinBox()
             widget.setDecimals(decimals)
             widget.setRange(minimum, maximum)
             widget.setSingleStep(step)
-            widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
-            tooltip = self.DFM_PARAMETER_TOOLTIPS.get(name, "")
-            if tooltip:
-                label_widget.setToolTip(tooltip)
-                widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
-            self.direct_finger_motion_inputs[name] = widget
+            add_field(section_grid, name, label, row, col, widget)
 
-        def add_int(name, label, row, col, minimum, maximum, step=1):
+        def add_int(section_grid, name, label, row, col, minimum, maximum, step=1):
             widget = QSpinBox()
             widget.setRange(minimum, maximum)
             widget.setSingleStep(step)
-            widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
-            tooltip = self.DFM_PARAMETER_TOOLTIPS.get(name, "")
-            if tooltip:
-                label_widget.setToolTip(tooltip)
-                widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
-            self.direct_finger_motion_inputs[name] = widget
+            add_field(section_grid, name, label, row, col, widget)
 
-        def add_bool(name, label, row, col):
-            widget = QCheckBox()
-            label_widget = QLabel(label)
-            tooltip = self.DFM_PARAMETER_TOOLTIPS.get(name, "")
-            if tooltip:
-                label_widget.setToolTip(tooltip)
-                widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
-            self.direct_finger_motion_inputs[name] = widget
+        def add_bool(section_grid, name, label, row, col):
+            add_field(section_grid, name, label, row, col, QCheckBox())
 
-        add_double("motion_threshold", "Motion Threshold", 0, 0, -1000.0, 1000.0, 0.1, 3)
-        add_int("no_touch_reset_limit", "No-touch Reset Frames", 1, 0, 0, 999)
-        add_double("keep_margin", "Keep Margin", 2, 0, 0.0, 100.0, 0.05, 3)
-        add_double("robot_speed", "Robot Speed", 3, 0, 0.0, 10.0, 0.01, 4)
-        add_double("centroid_deadband", "Centroid Deadband", 4, 0, 0.0, 10.0, 0.001, 4)
-        add_double("centroid_gain", "Centroid Gain", 5, 0, 0.0, 100.0, 0.1, 3)
-        add_double("min_speed_ratio", "Min Speed Ratio", 6, 0, 0.0, 100.0, 0.05, 3)
-        add_double("max_speed_ratio", "Max Speed Ratio", 7, 0, 0.0, 100.0, 0.05, 3)
-        add_double("push_value_threshold", "Push Value Threshold", 0, 2, -1000.0, 1000.0, 0.5, 3)
-        add_double("push_hold_deadband", "Push Hold Deadband", 1, 2, 0.0, 100.0, 0.01, 3)
-        add_int("push_hold_frames_required", "Push Hold Frames", 2, 2, 0, 999)
-        add_double("push_speed", "Push Speed", 3, 2, 0.0, 10.0, 0.01, 4)
-        add_double("pinch_axis_deadband", "Pinch Axis Deadband", 4, 2, 0.0, 100.0, 0.001, 4)
-        add_double("pinch_distance_threshold", "Pinch Distance Threshold", 5, 2, 0.0, 100.0, 0.005, 4)
-        add_double("pinch_midpoint_deadband", "Pinch Midpoint Deadband", 6, 2, 0.0, 100.0, 0.05, 3)
-        add_int("pinch_frames_required", "Pinch Frames", 7, 2, 0, 999)
-        add_double("velocity_smoothing_alpha", "Velocity Smoothing α", 8, 0, 0.0, 1.0, 0.05, 2)
-        add_double("push_exit_value_offset", "Push Exit Offset", 8, 2, 0.0, 50.0, 0.5, 1)
-        add_double("pull_speed", "Pull Speed", 9, 0, 0.0, 10.0, 0.01, 4)
-        add_double("rotation_speed", "Rotation Speed", 9, 2, 0.0, 10.0, 0.001, 4)
-        add_double("two_finger_swipe_deadband", "2-Finger Swipe Deadband", 10, 0, 0.0, 100.0, 0.01, 3)
-        add_double("two_finger_swipe_dominance_ratio", "2-Finger Swipe Dominance", 10, 2, 0.0, 100.0, 0.01, 3)
-        add_int("two_finger_release_grace_frames", "2-Finger Release Grace", 11, 0, 0, 999)
-        add_int("two_finger_swipe_axis_lock_frames", "2-Finger Axis Lock Frames", 11, 2, 0, 999)
-        add_double("sensor_frame_timeout_sec", "Sensor Timeout (s)", 12, 0, 0.0, 5.0, 0.01, 2)
-        add_int("frame_interval_ms", "Timer Interval (ms)", 12, 2, 0, 10000)
-        add_bool("two_finger_swipe_enable_horizontal", "Enable 2-Finger Horizontal Swipe", 13, 0)
-        add_bool("two_finger_swipe_enable_vertical", "Enable 2-Finger Vertical Swipe", 13, 2)
-        add_bool("push_pinch_enabled", "Enable Push/Pinch", 14, 0)
+        touch_group, touch_grid = make_section("Touch Detection & Tracking")
+        add_double(touch_grid, "motion_threshold", "Motion Threshold", 0, 0, -1000.0, 1000.0, 0.1, 3)
+        add_double(touch_grid, "centroid_deadband", "Centroid Deadband", 1, 0, 0.0, 10.0, 0.001, 4)
+        add_double(touch_grid, "keep_margin", "Keep Margin", 2, 0, 0.0, 100.0, 0.05, 3)
+        add_int(touch_grid, "no_touch_reset_limit", "No-touch Reset Frames", 3, 0, 0, 999)
 
-        panel_layout.addLayout(grid)
+        speed_group, speed_grid = make_section("Speed, Ratio & Smoothing")
+        add_double(speed_grid, "robot_speed", "Robot Speed", 0, 0, 0.0, 10.0, 0.01, 4)
+        add_double(speed_grid, "centroid_gain", "Centroid Gain", 1, 0, 0.0, 100.0, 0.1, 3)
+        add_double(speed_grid, "min_speed_ratio", "Min Speed Ratio", 2, 0, 0.0, 100.0, 0.05, 3)
+        add_double(speed_grid, "max_speed_ratio", "Max Speed Ratio", 3, 0, 0.0, 100.0, 0.05, 3)
+        add_double(speed_grid, "velocity_smoothing_alpha", "Velocity Smoothing α", 4, 0, 0.0, 1.0, 0.05, 2)
+
+        push_pull_group, push_pull_grid = make_section("Push & Pull")
+        add_bool(push_pull_grid, "push_pinch_enabled", "Enable Push/Pinch", 0, 0)
+        add_double(push_pull_grid, "push_value_threshold", "Push Value Threshold", 1, 0, -1000.0, 1000.0, 0.5, 3)
+        add_double(push_pull_grid, "push_speed", "Push Speed", 2, 0, 0.0, 10.0, 0.01, 4)
+        add_double(push_pull_grid, "push_hold_deadband", "Push Hold Deadband", 3, 0, 0.0, 100.0, 0.01, 3)
+        add_int(push_pull_grid, "push_hold_frames_required", "Push Hold Frames", 4, 0, 0, 999)
+        add_double(push_pull_grid, "push_exit_value_offset", "Push Exit Offset", 5, 0, 0.0, 50.0, 0.5, 1)
+        add_double(push_pull_grid, "pull_value_threshold", "Pull Value Threshold", 1, 2, -1000.0, 1000.0, 0.5, 3)
+        add_double(push_pull_grid, "pull_speed", "Pull Speed", 2, 2, 0.0, 10.0, 0.01, 4)
+        add_double(push_pull_grid, "pinch_axis_deadband", "Pinch Axis Deadband", 3, 2, 0.0, 100.0, 0.001, 4)
+        add_double(push_pull_grid, "pinch_distance_threshold", "Pinch Distance Threshold", 4, 2, 0.0, 100.0, 0.005, 4)
+        add_double(push_pull_grid, "pinch_midpoint_deadband", "Pinch Midpoint Deadband", 5, 2, 0.0, 100.0, 0.05, 3)
+        add_int(push_pull_grid, "pinch_frames_required", "Pinch Frames", 6, 2, 0, 999)
+
+        rotation_group, rotation_grid = make_section("Two-Finger Swipe Rotation")
+        add_bool(rotation_grid, "two_finger_swipe_enable_horizontal", "Enable Horizontal Swipe", 0, 0)
+        add_bool(rotation_grid, "two_finger_swipe_enable_vertical", "Enable Vertical Swipe", 1, 0)
+        add_double(rotation_grid, "rotation_speed", "Rotation Speed", 2, 0, 0.0, 10.0, 0.001, 4)
+        add_double(rotation_grid, "two_finger_swipe_deadband", "Swipe Deadband", 3, 0, 0.0, 100.0, 0.01, 3)
+        add_double(rotation_grid, "two_finger_swipe_dominance_ratio", "Swipe Dominance", 4, 0, 0.0, 100.0, 0.01, 3)
+        add_int(rotation_grid, "two_finger_swipe_axis_lock_frames", "Axis Lock Frames", 5, 0, 0, 999)
+        add_int(rotation_grid, "two_finger_release_grace_frames", "Release Grace Frames", 6, 0, 0, 999)
+
+        runtime_group, runtime_grid = make_section("Runtime & Logging")
+        add_double(runtime_grid, "sensor_frame_timeout_sec", "Sensor Timeout (s)", 0, 0, 0.0, 5.0, 0.01, 2)
+        add_int(runtime_grid, "frame_interval_ms", "Timer Interval (ms)", 1, 0, 0, 10000)
+        add_bool(runtime_grid, "motion_ratio_log_enabled", "Enable Motion Ratio Log", 2, 0)
+
+        content_widget = QWidget()
+        content_layout = QGridLayout(content_widget)
+        content_layout.setHorizontalSpacing(12)
+        content_layout.setVerticalSpacing(10)
+        content_layout.addWidget(touch_group, 0, 0)
+        content_layout.addWidget(speed_group, 0, 1)
+        content_layout.addWidget(push_pull_group, 1, 0, 1, 2)
+        content_layout.addWidget(rotation_group, 2, 0)
+        content_layout.addWidget(runtime_group, 2, 1)
+        content_layout.setColumnStretch(0, 1)
+        content_layout.setColumnStretch(1, 1)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        scroll_area.setWidget(content_widget)
+        panel_layout.addWidget(scroll_area)
 
         button_row = QHBoxLayout()
         self.apply_direct_finger_motion_settings_button = QPushButton("Apply DFM Params")
@@ -810,107 +835,6 @@ class DirectFingerMotionMixin:
         self._ensure_direct_finger_motion_tool_pose_timer()
         self._load_direct_finger_motion_settings_into_ui()
 
-    def _build_direct_finger_motion_v2_settings_dialog(self):
-        self.direct_finger_motion_v2_settings_dialog = QDialog(self)
-        self.direct_finger_motion_v2_settings_dialog.setWindowTitle("Direct Finger Motion V2 Parameters")
-        self.direct_finger_motion_v2_settings_dialog.resize(720, 520)
-
-        dialog_layout = QVBoxLayout(self.direct_finger_motion_v2_settings_dialog)
-        title = QLabel("Direct Finger Motion (Version 2) Parameters")
-        title.setStyleSheet("font-size: 16px; font-weight: 600;")
-        subtitle = QLabel("Tune two-finger span control: pinch inward to pull, spread outward to move away.")
-        subtitle.setStyleSheet("color: #b0b0b0;")
-        subtitle.setWordWrap(True)
-        dialog_layout.addWidget(title)
-        dialog_layout.addWidget(subtitle)
-
-        profile_row = QHBoxLayout()
-        profile_row.addWidget(QLabel("Sensor Profile"))
-        self.direct_finger_motion_v2_profile_combo = QComboBox()
-        self.direct_finger_motion_v2_profile_combo.setEditable(True)
-        self.direct_finger_motion_v2_profile_combo.setMinimumWidth(220)
-        self.direct_finger_motion_v2_profile_combo.setToolTip(
-            "Choose or type a profile name. Apply saves the current parameters to that profile."
-        )
-        self.load_direct_finger_motion_v2_profile_button = QPushButton("Load Profile")
-        profile_row.addWidget(self.direct_finger_motion_v2_profile_combo)
-        profile_row.addWidget(self.load_direct_finger_motion_v2_profile_button)
-        profile_row.addStretch()
-        dialog_layout.addLayout(profile_row)
-
-        group = QGroupBox("DFM V2 Parameters")
-        panel_layout = QVBoxLayout(group)
-        grid = QGridLayout()
-        self.direct_finger_motion_v2_inputs = {}
-
-        def add_double(name, label, row, col, minimum, maximum, step, decimals=4, tooltip=""):
-            widget = QDoubleSpinBox()
-            widget.setDecimals(decimals)
-            widget.setRange(minimum, maximum)
-            widget.setSingleStep(step)
-            widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
-            if tooltip:
-                label_widget.setToolTip(tooltip)
-                widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
-            self.direct_finger_motion_v2_inputs[name] = widget
-
-        def add_int(name, label, row, col, minimum, maximum, step=1, tooltip=""):
-            widget = QSpinBox()
-            widget.setRange(minimum, maximum)
-            widget.setSingleStep(step)
-            widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
-            if tooltip:
-                label_widget.setToolTip(tooltip)
-                widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
-            self.direct_finger_motion_v2_inputs[name] = widget
-
-        add_double("motion_threshold", "Touch Threshold", 0, 0, -1000.0, 1000.0, 0.1, 3, "Sensor threshold used to detect touched electrodes.")
-        add_double("pull_speed", "Pull Speed", 1, 0, 0.0, 1.0, 0.01, 4, "Fixed speed when two fingers move toward center.")
-        add_double("push_speed", "Move-Away Speed", 2, 0, 0.0, 1.0, 0.01, 4, "Fixed speed when two fingers move away from center.")
-        add_double("robot_speed", "Planar Move Speed", 3, 0, 0.0, 1.0, 0.01, 4, "Speed for two fingers moving together left/right/up/down.")
-        add_double("v2_span_deadband", "Two-Finger Span Deadband", 4, 0, 0.0, 1.0, 0.001, 4, "Minimum span change before v2 switches between pull and move-away.")
-        add_double("v2_midpoint_deadband", "Midpoint Drift Deadband", 5, 0, 0.0, 1.0, 0.005, 4, "Allowed two-finger midpoint movement during pinch/spread detection.")
-        add_double("v2_planar_span_tolerance", "Planar Span Tolerance", 6, 0, 0.0, 1.0, 0.005, 4, "Allowed two-finger span noise while detecting up/down/left/right movement.")
-        add_double("v2_rotation_speed", "Cylinder Rotation Speed", 7, 0, 0.0, 1.0, 0.01, 4, "Angular speed for left-up/right-down cylinder rotation gestures.")
-        add_double("v2_rotation_deadband", "Cylinder Rotation Deadband", 8, 0, 0.0, 1.0, 0.001, 4, "Minimum left/right vertical difference before rotation triggers.")
-        add_double("v2_rotation_direction_sign", "Rotation Direction Sign", 9, 0, -1.0, 1.0, 1.0, 0, "Use -1 if clockwise/counter-clockwise is reversed on the robot.")
-        add_double("v2_force_lateral_speed", "Side Press Lateral Speed", 10, 0, 0.0, 1.0, 0.01, 4, "Sideways speed when pressing the left or right side.")
-        add_double("v2_force_lateral_deadband", "Side Press Force Threshold", 11, 0, 0.0, 100.0, 0.1, 3, "Minimum side press force before sideways motion triggers.")
-        add_double("v2_force_lateral_center_deadband", "Side Press Center Deadband", 12, 0, 0.0, 0.5, 0.01, 3, "How far from the sensor center a single finger must be before side press triggers.")
-        add_double("v2_force_lateral_direction_sign", "Side Press Direction Sign", 13, 0, -1.0, 1.0, 1.0, 0, "Use -1 if left-side / right-side sideways direction is reversed.")
-        add_double("centroid_deadband", "Planar Motion Deadband", 0, 2, 0.0, 1.0, 0.001, 4, "Minimum two-finger center movement before left/right/up/down motion triggers.")
-        add_double("centroid_gain", "Planar Motion Gain", 1, 2, 0.0, 100.0, 0.1, 3, "Sensitivity of two-finger center movement to planar robot speed.")
-        add_double("v2_planar_dominance_ratio", "Planar Dominance Ratio", 2, 2, 0.0, 5.0, 0.1, 2, "Lower values make two-finger center movement win over span noise more easily.")
-        add_double("v2_up_down_direction_sign", "Up/Down Direction Sign", 3, 2, -1.0, 1.0, 1.0, 0, "Use -1 if finger up/down makes the robot move in the reversed vertical direction.")
-        add_double("v2_forward_backward_direction_sign", "Forward/Backward Direction Sign", 4, 2, -1.0, 1.0, 1.0, 0, "Use -1 if pinch/spread forward-backward motion is reversed.")
-        add_double("velocity_smoothing_alpha", "Velocity Smoothing Alpha", 5, 2, 0.0, 1.0, 0.05, 2, "1.0 is most responsive; lower values smooth commands.")
-        add_double("pinch_axis_deadband", "Finger Axis Deadband", 6, 2, 0.0, 1.0, 0.001, 4, "Compatibility threshold from DFM v1 two-finger detection.")
-        add_double("pinch_distance_threshold", "Pinch Distance Threshold", 7, 2, 0.0, 1.0, 0.001, 4, "Compatibility distance threshold from DFM v1.")
-        add_double("pinch_midpoint_deadband", "Pinch Midpoint Deadband", 8, 2, 0.0, 10.0, 0.05, 3, "Compatibility midpoint threshold from DFM v1.")
-        add_int("frame_interval_ms", "Timer Interval (ms)", 9, 2, 0, 1000, tooltip="0 means run as fast as Qt event loop allows.")
-
-        panel_layout.addLayout(grid)
-        button_row = QHBoxLayout()
-        self.apply_direct_finger_motion_v2_settings_button = QPushButton("Apply DFM V2 Params")
-        self.reload_direct_finger_motion_v2_settings_button = QPushButton("Reload Saved Params")
-        button_row.addWidget(self.apply_direct_finger_motion_v2_settings_button)
-        button_row.addWidget(self.reload_direct_finger_motion_v2_settings_button)
-        button_row.addStretch()
-        panel_layout.addLayout(button_row)
-        dialog_layout.addWidget(group)
-
-        button_box = QDialogButtonBox(QDialogButtonBox.Close)
-        button_box.rejected.connect(self.direct_finger_motion_v2_settings_dialog.close)
-        button_box.accepted.connect(self.direct_finger_motion_v2_settings_dialog.close)
-        dialog_layout.addWidget(button_box)
-        self._load_direct_finger_motion_v2_settings_into_ui()
-
     def open_direct_finger_motion_settings_dialog(self):
         if not hasattr(self, "direct_finger_motion_settings_dialog"):
             self._build_direct_finger_motion_settings_dialog()
@@ -918,15 +842,6 @@ class DirectFingerMotionMixin:
         self.direct_finger_motion_settings_dialog.show()
         self.direct_finger_motion_settings_dialog.raise_()
         self.direct_finger_motion_settings_dialog.activateWindow()
-
-    def open_direct_finger_motion_v2_settings_dialog(self):
-        if not hasattr(self, "direct_finger_motion_v2_settings_dialog"):
-            self._build_direct_finger_motion_v2_settings_dialog()
-        self._refresh_direct_finger_motion_v2_profiles()
-        self._load_direct_finger_motion_v2_settings_into_ui()
-        self.direct_finger_motion_v2_settings_dialog.show()
-        self.direct_finger_motion_v2_settings_dialog.raise_()
-        self.direct_finger_motion_v2_settings_dialog.activateWindow()
 
     def _build_console_control_settings_dialog(self):
         self.console_control_settings_dialog = QDialog(self)
@@ -1029,9 +944,6 @@ class DirectFingerMotionMixin:
     def _get_direct_finger_motion_helper(self):
         return self._get_sensor_helper("direct_finger_motion_class")
 
-    def _get_direct_finger_motion_v2_helper(self):
-        return self._get_sensor_helper("direct_finger_motion_v2_class")
-
     def _get_console_control_helper(self):
         return self._get_sensor_helper("console_control_class")
 
@@ -1040,6 +952,60 @@ class DirectFingerMotionMixin:
 
     def _get_ai_direct_finger_motion_execution_helper(self):
         return self._get_sensor_helper("ai_direct_finger_motion_execution_class")
+
+    def _ensure_ai_direct_execution_status_timer(self):
+        if hasattr(self, "_ai_direct_execution_status_timer"):
+            return
+        self._ai_direct_execution_status_timer = QTimer(self)
+        self._ai_direct_execution_status_timer.setInterval(50)
+        self._ai_direct_execution_status_timer.timeout.connect(
+            self._update_ai_direct_execution_prediction_status
+        )
+
+    @staticmethod
+    def _ai_direct_prediction_direction_text(mode, velocity):
+        velocity = [float(v) for v in list(velocity)[:6]]
+        if len(velocity) < 6:
+            velocity += [0.0] * (6 - len(velocity))
+        mode = str(mode or "unknown")
+        linear = velocity[:3]
+        axis_specs = (("X", linear[0]), ("Y", linear[1]), ("Z", linear[2]))
+        max_abs = max(abs(value) for _axis, value in axis_specs)
+        if mode == "stop" or max_abs < 1e-4:
+            return "stop"
+
+        active_axes = [
+            f"{axis}{'+' if value > 0 else '-'}"
+            for axis, value in axis_specs
+            if abs(value) >= max(0.004, 0.35 * max_abs)
+        ]
+        axis_text = "/".join(active_axes) if active_axes else "linear"
+
+        if mode == "push":
+            return f"push ({axis_text})"
+        if mode == "pull":
+            return f"pull ({axis_text})"
+        if mode == "move":
+            return f"move {axis_text}"
+        return f"{mode} {axis_text}"
+
+    def _update_ai_direct_execution_prediction_status(self):
+        label = getattr(self, "ai_direct_execution_prediction_status", None)
+        if label is None:
+            return
+        helper = self._get_ai_direct_finger_motion_execution_helper()
+        prediction = getattr(helper, "last_prediction", None) if helper is not None else None
+        if not prediction:
+            active = bool(getattr(self, "_ai_direct_finger_execution_active", False))
+            label.setText("Prediction: waiting" if active else "Prediction: idle")
+            return
+        velocity = prediction.get("velocity_sent", [0.0] * 6)
+        velocity_text = ", ".join(f"{float(v):+.3f}" for v in list(velocity)[:3])
+        mode = str(prediction.get("mode", "unknown"))
+        mode_text = self._ai_direct_prediction_direction_text(mode, velocity)
+        conf = float(prediction.get("mode_conf", 0.0))
+        run_text = "dry" if prediction.get("dry_run", True) else "live"
+        label.setText(f"Prediction: {mode_text} {conf:.2f} | [{velocity_text}] | {run_text}")
 
     def _ensure_direct_finger_motion_tool_pose_timer(self):
         if hasattr(self, "_direct_finger_motion_tool_pose_timer"):
@@ -4753,83 +4719,6 @@ class DirectFingerMotionMixin:
         except Exception as exc:
             print(f"[UI] Failed to apply direct finger motion settings: {exc}")
 
-    def _collect_direct_finger_motion_v2_settings_from_ui(self):
-        settings = {}
-        for name, widget in self.direct_finger_motion_v2_inputs.items():
-            settings[name] = widget.value()
-        return settings
-
-    def _current_direct_finger_motion_v2_profile_from_ui(self):
-        combo = getattr(self, "direct_finger_motion_v2_profile_combo", None)
-        if combo is None:
-            return "default"
-        return combo.currentText().strip() or "default"
-
-    def _refresh_direct_finger_motion_v2_profiles(self):
-        helper = self._get_direct_finger_motion_v2_helper()
-        combo = getattr(self, "direct_finger_motion_v2_profile_combo", None)
-        if helper is None or combo is None or not hasattr(helper, "list_profiles"):
-            return
-
-        current_profile = getattr(helper, "get_current_profile_name", lambda: "default")()
-        profiles = helper.list_profiles()
-        combo.blockSignals(True)
-        combo.clear()
-        combo.addItems(profiles)
-        if current_profile not in profiles:
-            combo.addItem(current_profile)
-        combo.setCurrentText(current_profile)
-        combo.blockSignals(False)
-
-    def _load_direct_finger_motion_v2_profile_from_ui(self):
-        helper = self._get_direct_finger_motion_v2_helper()
-        if helper is None or not hasattr(helper, "set_profile"):
-            print("[UI] Direct finger motion v2 helper is not ready yet.")
-            return
-
-        try:
-            profile_name = self._current_direct_finger_motion_v2_profile_from_ui()
-            active_profile = helper.set_profile(profile_name, load=True)
-            self._refresh_direct_finger_motion_v2_profiles()
-            if hasattr(self, "direct_finger_motion_v2_profile_combo"):
-                self.direct_finger_motion_v2_profile_combo.setCurrentText(active_profile)
-            self._load_direct_finger_motion_v2_settings_into_ui()
-            print(f"[UI] Direct finger motion v2 profile loaded: {active_profile}")
-        except Exception as exc:
-            print(f"[UI] Failed to load direct finger motion v2 profile: {exc}")
-
-    def _load_direct_finger_motion_v2_settings_into_ui(self):
-        helper = self._get_direct_finger_motion_v2_helper()
-        if helper is None or not hasattr(helper, "get_settings"):
-            return
-
-        try:
-            if hasattr(helper, "set_profile"):
-                helper.set_profile(self._current_direct_finger_motion_v2_profile_from_ui(), load=True)
-            self._refresh_direct_finger_motion_v2_profiles()
-            settings = helper.get_settings()
-            for name, widget in self.direct_finger_motion_v2_inputs.items():
-                if name in settings:
-                    widget.setValue(settings[name])
-        except Exception as exc:
-            print(f"[UI] Failed to load direct finger motion v2 settings into UI: {exc}")
-
-    def _apply_direct_finger_motion_v2_settings_from_ui(self):
-        helper = self._get_direct_finger_motion_v2_helper()
-        if helper is None or not hasattr(helper, "apply_settings"):
-            print("[UI] Direct finger motion v2 helper is not ready yet.")
-            return
-
-        try:
-            if hasattr(helper, "set_profile"):
-                helper.set_profile(self._current_direct_finger_motion_v2_profile_from_ui(), load=False)
-            settings = self._collect_direct_finger_motion_v2_settings_from_ui()
-            helper.apply_settings(settings, save_to_file=True)
-            self._refresh_direct_finger_motion_v2_profiles()
-            print("[UI] Direct finger motion v2 parameters applied.")
-        except Exception as exc:
-            print(f"[UI] Failed to apply direct finger motion v2 settings: {exc}")
-
     def _collect_console_control_settings_from_ui(self):
         settings = {}
         for name, widget in self.console_control_inputs.items():
@@ -4878,9 +4767,65 @@ class DirectFingerMotionMixin:
 
         self._update_anchor_button_label()
 
-    def _on_toggle_ai_direct_finger_motion(self):
-        self._ai_direct_finger_active = not getattr(self, "_ai_direct_finger_active", False)
+    def _teaching_label_display_text(self, label):
+        button = getattr(self, "ai_teaching_label_buttons", {}).get(label)
+        if button is not None:
+            try:
+                return button.text()
+            except Exception:
+                pass
+        return "Auto/DFM" if label == "auto" else str(label)
+
+    def _update_ai_teaching_label_ui(self):
+        active_label = getattr(self, "_ai_teaching_label", "auto")
+        for label, button in getattr(self, "ai_teaching_label_buttons", {}).items():
+            is_active = label == active_label
+            try:
+                button.setChecked(is_active)
+            except Exception:
+                pass
+            if hasattr(self, "_set_button_active"):
+                self._set_button_active(button, is_active)
+
+        status = getattr(self, "ai_teaching_label_status", None)
+        if status is not None:
+            status.setText(f"Teaching: {self._teaching_label_display_text(active_label)}")
+
+    def _set_ai_teaching_label(self, label="auto"):
+        label = str(label or "auto").strip().lower()
+        if label in {"dfm", "auto_dfm", "auto/dfm", "none"}:
+            label = "auto"
+        self._ai_teaching_label = label
+        helper = self._get_ai_direct_finger_motion_helper()
+        if helper is not None and hasattr(helper, "set_teaching_override"):
+            try:
+                self._ai_teaching_label = helper.set_teaching_override(label)
+            except Exception as exc:
+                print(f"[UI] Failed to set AI teaching label '{label}': {exc}")
+        self._update_ai_teaching_label_ui()
+
+    def _set_ai_direct_finger_record_buttons(self, no_robot_active=False, robot_active=False):
+        self._ai_direct_finger_active = bool(no_robot_active)
+        self._ai_direct_finger_robot_active = bool(robot_active)
         self._set_button_active(self.ai_direct_finger_motion_button, self._ai_direct_finger_active)
+        if hasattr(self, "ai_direct_finger_motion_robot_button"):
+            self._set_button_active(
+                self.ai_direct_finger_motion_robot_button,
+                self._ai_direct_finger_robot_active,
+            )
+
+    def _on_toggle_ai_direct_finger_motion(self, send_robot_commands=False):
+        was_no_robot_active = bool(getattr(self, "_ai_direct_finger_active", False))
+        was_robot_active = bool(getattr(self, "_ai_direct_finger_robot_active", False))
+        was_running = was_no_robot_active or was_robot_active
+
+        if was_running:
+            self._set_ai_direct_finger_record_buttons(False, False)
+        else:
+            self._set_ai_direct_finger_record_buttons(
+                no_robot_active=not bool(send_robot_commands),
+                robot_active=bool(send_robot_commands),
+            )
 
         session_tag = self.gesture_number_input.text().strip() if hasattr(self, "gesture_number_input") else ""
 
@@ -4888,13 +4833,18 @@ class DirectFingerMotionMixin:
             helper = self._get_ai_direct_finger_motion_helper()
             if helper is None:
                 raise AttributeError("ai_direct_finger_motion_class is not available")
+            if hasattr(helper, "set_teaching_override"):
+                self._ai_teaching_label = helper.set_teaching_override(
+                    getattr(self, "_ai_teaching_label", "auto")
+                )
+                self._update_ai_teaching_label_ui()
             helper.toggle_ai_direct_finger_motion(
-                session_tag=session_tag
+                session_tag=session_tag,
+                send_robot_commands=bool(send_robot_commands),
             )
         except Exception as exc:
             print(f"[UI] AI direct finger motion toggle failed: {exc}")
-            self._ai_direct_finger_active = not self._ai_direct_finger_active
-            self._set_button_active(self.ai_direct_finger_motion_button, self._ai_direct_finger_active)
+            self._set_ai_direct_finger_record_buttons(was_no_robot_active, was_robot_active)
 
     def _on_toggle_ai_direct_finger_motion_execution(self):
         self._ai_direct_finger_execution_active = not getattr(
@@ -4908,19 +4858,31 @@ class DirectFingerMotionMixin:
         model_path = ""
         if hasattr(self, "ai_direct_execution_model_path_input"):
             model_path = self.ai_direct_execution_model_path_input.text().strip()
+        dry_run_predictions_only = True
+        if hasattr(self, "ai_direct_execution_dry_run_checkbox"):
+            dry_run_predictions_only = bool(self.ai_direct_execution_dry_run_checkbox.isChecked())
 
         try:
             if hasattr(self.sensor_functions, "toggle_ai_direct_finger_motion_execution"):
                 self.sensor_functions.toggle_ai_direct_finger_motion_execution(
-                    model_checkpoint_path=model_path or None
+                    model_checkpoint_path=model_path or None,
+                    dry_run_predictions_only=dry_run_predictions_only,
                 )
             else:
                 helper = self._get_ai_direct_finger_motion_execution_helper()
                 if helper is None:
                     raise AttributeError("ai_direct_finger_motion_execution_class is not available")
+                if hasattr(helper, "set_dry_run_predictions_only"):
+                    helper.set_dry_run_predictions_only(dry_run_predictions_only)
                 helper.toggle_ai_direct_finger_motion_execution(
                     model_checkpoint_path=model_path or None
                 )
+            self._ensure_ai_direct_execution_status_timer()
+            if self._ai_direct_finger_execution_active:
+                self._ai_direct_execution_status_timer.start()
+            else:
+                self._ai_direct_execution_status_timer.stop()
+            self._update_ai_direct_execution_prediction_status()
         except Exception as exc:
             print(f"[UI] AI direct finger motion execution toggle failed: {exc}")
             self._ai_direct_finger_execution_active = not self._ai_direct_finger_execution_active
@@ -4928,3 +4890,4 @@ class DirectFingerMotionMixin:
                 self.ai_direct_finger_motion_execution_button,
                 self._ai_direct_finger_execution_active,
             )
+            self._update_ai_direct_execution_prediction_status()

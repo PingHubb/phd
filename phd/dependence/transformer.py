@@ -238,3 +238,97 @@ class _AI_DFM_CNNTactileTransformerAux(nn.Module):
             "finger_logits": self.finger_head(final_token),
             "velocity": self.velocity_head(final_token),
         }
+
+
+class TactileCNNGRUFrameEncoder(nn.Module):
+    """Spatial tactile encoder used by the AI Direct Finger Motion CNN-GRU policy."""
+
+    def __init__(self, in_channels, d_model, dropout):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.MaxPool2d(2, ceil_mode=True),
+            nn.Conv2d(64, 96, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(96),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+            nn.Linear(96, d_model),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class TactileCNNGRUPolicy(nn.Module):
+    """Causal CNN-GRU tactile policy for direct sensor-to-velocity control."""
+
+    def __init__(
+        self,
+        in_channels,
+        aux_dim,
+        d_model,
+        gru_hidden,
+        gru_layers,
+        dropout,
+        velocity_dim=6,
+        mode_classes=4,
+    ):
+        super().__init__()
+        self.frame_encoder = TactileCNNGRUFrameEncoder(in_channels, d_model, dropout)
+        self.aux_encoder = nn.Sequential(
+            nn.Linear(aux_dim, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+        )
+        self.fusion = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+        )
+        gru_dropout = dropout if gru_layers > 1 else 0.0
+        self.gru = nn.GRU(
+            input_size=d_model,
+            hidden_size=gru_hidden,
+            num_layers=gru_layers,
+            dropout=gru_dropout,
+            batch_first=True,
+        )
+        self.norm = nn.LayerNorm(gru_hidden)
+        self.velocity_head = nn.Sequential(
+            nn.Linear(gru_hidden, gru_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(gru_hidden, velocity_dim),
+        )
+        self.mode_head = nn.Sequential(
+            nn.Linear(gru_hidden, gru_hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(gru_hidden, mode_classes),
+        )
+
+    def forward(self, x, aux):
+        batch, steps, channels, rows, cols = x.shape
+        frame_tokens = self.frame_encoder(
+            x.reshape(batch * steps, channels, rows, cols)
+        ).reshape(batch, steps, -1)
+        aux_tokens = self.aux_encoder(aux.reshape(batch * steps, -1)).reshape(batch, steps, -1)
+        tokens = self.fusion(torch.cat([frame_tokens, aux_tokens], dim=-1))
+        encoded, _hidden = self.gru(tokens)
+        final = self.norm(encoded[:, -1, :])
+        return {
+            "velocity_norm": self.velocity_head(final),
+            "mode_logits": self.mode_head(final),
+        }

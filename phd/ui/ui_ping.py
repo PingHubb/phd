@@ -11,7 +11,9 @@ from PyQt5.QtCore import pyqtSignal, Qt, QTimer
 from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
 from PyQt5.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QGroupBox,
     QGridLayout,
@@ -179,9 +181,6 @@ class _NoOpToggle:
     def toggle_direct_finger_motion(self):
         return None
 
-    def toggle_direct_finger_motion_v2(self):
-        return None
-
     def toggle_proximity_control(self):
         return None
 
@@ -206,13 +205,19 @@ class _NoOpToggle:
     def toggle_ai_direct_finger_motion_execution(self, *args, **kwargs):
         return None
 
+    def set_dry_run_predictions_only(self, *args, **kwargs):
+        return None
+
+    def set_teaching_override(self, *args, **kwargs):
+        return None
+
 
 class DisabledSensorFunctions:
     DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH = ai_resource_path(
-        "models", "ai_direct_finger_motion", "best_model.pt"
+        "models", "ai_direct_finger_motion", "latest_cnn_gru_model.pt"
     )
     DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE = 3
-    DEFAULT_VISUALIZATION_TARGET_HZ = 30.0
+    DEFAULT_VISUALIZATION_TARGET_HZ = 60.0
 
     def __init__(self, parent):
         self.parent = parent
@@ -266,6 +271,53 @@ class DisabledSensorFunctions:
         return self.DEFAULT_VISUALIZATION_TARGET_HZ
 
     def set_visualization_target_hz(self, *_args, **_kwargs):
+        return None
+
+    def get_sensor_visualization_modes(self):
+        return [
+            ("point_grid", "Point Grid"),
+            ("stereo_field", "Stereo Field"),
+        ]
+
+    def set_sensor_visualization_mode(self, *_args, **_kwargs):
+        return None
+
+    def get_stereo_field_settings(self):
+        return {
+            "ignore_noise_enabled": True,
+            "deadband_pct": 0.35,
+            "response_scale_pct": 2.0,
+            "length_scale": 0.35,
+        }
+
+    def set_stereo_field_settings(self, *_args, **_kwargs):
+        return None
+
+    def set_saved_sensor_stereo_field_config(self, *_args, **_kwargs):
+        return None
+
+    def set_contact_normal_visualization_enabled(self, *_args, **_kwargs):
+        return None
+
+    def get_contact_normal_estimator_modes(self):
+        return [
+            ("motion_direction_v3", "Motion Direction (V3)"),
+            ("touch_anchor_v4", "Touch Anchor Direction (V4)"),
+        ]
+
+    def set_contact_normal_estimator_mode(self, *_args, **_kwargs):
+        return None
+
+    def set_sensor_point_labels_enabled(self, *_args, **_kwargs):
+        return None
+
+    def set_sensor_contact_force_scale(self, *_args, **_kwargs):
+        return None
+
+    def set_sensor_geometry_config(self, *_args, **_kwargs):
+        return None
+
+    def set_saved_sensor_geometry_config(self, *_args, **_kwargs):
         return None
 
     def get_ai_direct_finger_motion_execution_default_model_path(self):
@@ -1381,7 +1433,7 @@ class UI(
         self.sensor_choice = QListWidget(self.widget_func)
         self.sensor_choice.setSelectionMode(QListWidget.SingleSelection)
         self.sensor_choice.addItems([
-            "Elbow", "Kuka", "Double Curve", "2D", "Half Cylinder Surface"
+            "2D", "Elbow", "Kuka", "Double Curve", "Half Cylinder Surface"
         ])
         self.sensor_choice.setCurrentRow(0)
         send_layout.addWidget(self.sensor_choice)
@@ -1441,29 +1493,47 @@ class UI(
 
         viz_layout.addWidget(slider_container)
 
-        avg_window_container = QWidget()
-        avg_window_layout = QHBoxLayout(avg_window_container)
-        avg_window_layout.setContentsMargins(0, 0, 0, 0)
-        self.sensor_average_window_spin = QSpinBox()
-        self.sensor_average_window_spin.setRange(1, 30)
-        self.sensor_average_window_spin.setValue(DisabledSensorFunctions.DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE)
-        avg_window_layout.addWidget(QLabel("Average Window:"))
-        avg_window_layout.addWidget(self.sensor_average_window_spin)
-        avg_window_layout.addStretch()
-        viz_layout.addWidget(avg_window_container)
+        visual_mode_container = QWidget()
+        visual_mode_layout = QHBoxLayout(visual_mode_container)
+        visual_mode_layout.setContentsMargins(0, 0, 0, 0)
+        self.sensor_visualization_mode_combo = QComboBox()
+        self.sensor_visualization_mode_combo.addItem("Point Grid", "point_grid")
+        self.sensor_visualization_mode_combo.addItem("Stereo Field", "stereo_field")
+        self.sensor_visualization_mode_combo.setToolTip(
+            "Choose the live sensor rendering style."
+        )
+        visual_mode_layout.addWidget(QLabel("Visual Mode:"))
+        visual_mode_layout.addWidget(self.sensor_visualization_mode_combo)
+        visual_mode_layout.addStretch()
+        viz_layout.addWidget(visual_mode_container)
 
-        render_hz_container = QWidget()
-        render_hz_layout = QHBoxLayout(render_hz_container)
-        render_hz_layout.setContentsMargins(0, 0, 0, 0)
-        self.visualization_target_hz_spin = QDoubleSpinBox()
-        self.visualization_target_hz_spin.setDecimals(1)
-        self.visualization_target_hz_spin.setRange(1.0, 240.0)
-        self.visualization_target_hz_spin.setSingleStep(1.0)
-        self.visualization_target_hz_spin.setValue(DisabledSensorFunctions.DEFAULT_VISUALIZATION_TARGET_HZ)
-        render_hz_layout.addWidget(QLabel("Render Hz:"))
-        render_hz_layout.addWidget(self.visualization_target_hz_spin)
-        render_hz_layout.addStretch()
-        viz_layout.addWidget(render_hz_container)
+        normal_vector_container = QWidget()
+        normal_vector_layout = QVBoxLayout(normal_vector_container)
+        normal_vector_layout.setContentsMargins(0, 0, 0, 0)
+        normal_vector_layout.setSpacing(4)
+        self.contact_normal_checkbox = QCheckBox("Show Contact Vector")
+        self.contact_normal_checkbox.setChecked(True)
+        self.contact_normal_checkbox.setToolTip(
+            "Show an estimated contact arrow in the sensor scene."
+        )
+        self.contact_normal_estimator_combo = QComboBox()
+        self.contact_normal_estimator_combo.addItem("Motion Direction (V3)", "motion_direction_v3")
+        self.contact_normal_estimator_combo.addItem("Touch Anchor Direction (V4)", "touch_anchor_v4")
+        self.contact_normal_estimator_combo.setCurrentIndex(1)
+        self.contact_normal_estimator_combo.setToolTip(
+            "Choose whether the arrow shows pressure-derived normal tilt or contact motion direction."
+        )
+        self.contact_normal_status_label = QLabel("Normal vector: waiting for contact")
+        self.contact_normal_status_label.setWordWrap(True)
+        self.contact_normal_status_label.setStyleSheet("color: #b0b0b0;")
+        self.contact_force_status_label = QLabel("Contact force: waiting for contact")
+        self.contact_force_status_label.setWordWrap(True)
+        self.contact_force_status_label.setStyleSheet("color: #b0d8ff;")
+        normal_vector_layout.addWidget(self.contact_normal_checkbox)
+        normal_vector_layout.addWidget(self.contact_normal_estimator_combo)
+        normal_vector_layout.addWidget(self.contact_normal_status_label)
+        normal_vector_layout.addWidget(self.contact_force_status_label)
+        viz_layout.addWidget(normal_vector_container)
 
         send_page_layout.addWidget(send_group)
         send_page_layout.addWidget(viz_group)
@@ -1501,6 +1571,601 @@ class UI(
         self.sensor_sub_tabs.addTab(send_page, "Send Operation")
         self.sensor_sub_tabs.addTab(read_page, "Read Operation")
         layout.addWidget(self.sensor_sub_tabs)
+        self._build_sensor_parameters_dialog()
+
+    @staticmethod
+    def _sensor_reorder_mode_label(mode):
+        labels = {
+            "factory": "Factory Default",
+            "none": "No Reorder",
+            "row_to_col": "Row to Column",
+            "row_to_col_flipped": "Row to Column, Flip Row and Column",
+            "row_to_col_c_flip_only": "Row to Column, Flip Column",
+            "row_to_col_r_flip_only": "Row to Column, Flip Row",
+            "col_to_row": "Column to Row",
+            "col_to_row_flipped": "Column to Row, Flip Row and Column",
+            "col_to_row_c_flip_only": "Column to Row, Flip Column",
+            "col_to_row_r_flip_only": "Column to Row, Flip Row",
+            "vertical_flip": "Vertical Flip",
+            "horizontal_flip": "Horizontal Flip",
+            "flip_and_rotate": "Flip and Rotate",
+            "rotate_180": "Rotate 180",
+        }
+        return labels.get(str(mode), str(mode))
+
+    @staticmethod
+    def _set_combo_current_data(combo, data):
+        for index in range(combo.count()):
+            if combo.itemData(index) == data:
+                combo.setCurrentIndex(index)
+                return True
+        return False
+
+    def _build_sensor_parameters_dialog(self):
+        self.sensor_parameters_dialog = QDialog(self)
+        self.sensor_parameters_dialog.setWindowTitle("Sensor Parameters")
+        self.sensor_parameters_dialog.setModal(False)
+        self.sensor_parameters_dialog.resize(620, 300)
+
+        layout = QVBoxLayout(self.sensor_parameters_dialog)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+
+        self.sensor_parameter_model_combo = QComboBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_reorder_combo = QComboBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_force_scale_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_force_scale_spin.setDecimals(6)
+        self.sensor_parameter_force_scale_spin.setRange(0.0, 1000.0)
+        self.sensor_parameter_force_scale_spin.setSingleStep(0.001)
+        self.sensor_parameter_force_scale_spin.setToolTip(
+            "Calibration scale used to convert contact signal to Newtons.\n"
+            "Force (N) = contact signal × this scale."
+        )
+        self.sensor_average_window_spin = QSpinBox(self.sensor_parameters_dialog)
+        self.sensor_average_window_spin.setRange(1, 30)
+        self.sensor_average_window_spin.setValue(
+            DisabledSensorFunctions.DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE
+        )
+        self.visualization_target_hz_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.visualization_target_hz_spin.setDecimals(1)
+        self.visualization_target_hz_spin.setRange(1.0, 240.0)
+        self.visualization_target_hz_spin.setSingleStep(1.0)
+        self.visualization_target_hz_spin.setValue(
+            DisabledSensorFunctions.DEFAULT_VISUALIZATION_TARGET_HZ
+        )
+        self.visualization_target_hz_spin.setSuffix(" Hz")
+
+        self.sensor_parameter_shape_combo = QComboBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_shape_combo.addItem("Flat", "flat")
+        self.sensor_parameter_shape_combo.addItem("Cylinder Bend", "cylinder")
+
+        self.sensor_parameter_bend_axis_combo = QComboBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_bend_axis_combo.addItem("Across Columns (X)", "columns")
+        self.sensor_parameter_bend_axis_combo.addItem("Across Rows (Y)", "rows")
+
+        self.sensor_parameter_arc_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_arc_spin.setDecimals(1)
+        self.sensor_parameter_arc_spin.setRange(-180.0, 180.0)
+        self.sensor_parameter_arc_spin.setSingleStep(5.0)
+        self.sensor_parameter_arc_spin.setSuffix(" deg")
+
+        self.sensor_parameter_normal_flip_checkbox = QCheckBox("Flip Normals")
+        self.sensor_parameter_use_shape_checkbox = QCheckBox("Use Selected Shape")
+        self.sensor_parameter_stereo_ignore_noise_checkbox = QCheckBox("Ignore Stereo Field Noise")
+        self.sensor_parameter_stereo_ignore_noise_checkbox.setChecked(True)
+        self.sensor_parameter_stereo_ignore_noise_checkbox.setToolTip(
+            "Ignore small baseline sensor changes so the stereo field does not vibrate while idle."
+        )
+        self.sensor_parameter_stereo_deadband_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_stereo_deadband_spin.setDecimals(2)
+        self.sensor_parameter_stereo_deadband_spin.setRange(0.0, 20.0)
+        self.sensor_parameter_stereo_deadband_spin.setSingleStep(0.05)
+        self.sensor_parameter_stereo_deadband_spin.setValue(0.35)
+        self.sensor_parameter_stereo_deadband_spin.setToolTip(
+            "Minimum signal before the stereo field begins to compress."
+        )
+        self.sensor_parameter_stereo_length_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_stereo_length_spin.setDecimals(2)
+        self.sensor_parameter_stereo_length_spin.setRange(0.05, 2.0)
+        self.sensor_parameter_stereo_length_spin.setSingleStep(0.05)
+        self.sensor_parameter_stereo_length_spin.setValue(0.35)
+        self.sensor_parameter_stereo_length_spin.setToolTip(
+            "Stereo field line length relative to the sensor size."
+        )
+
+        grid.addWidget(QLabel("Sensor:"), 0, 0)
+        grid.addWidget(self.sensor_parameter_model_combo, 0, 1)
+        grid.addWidget(QLabel("Reorder Logic:"), 1, 0)
+        grid.addWidget(self.sensor_parameter_reorder_combo, 1, 1)
+        grid.addWidget(QLabel("Force Scale (N/signal):"), 2, 0)
+        grid.addWidget(self.sensor_parameter_force_scale_spin, 2, 1)
+        grid.addWidget(QLabel("Average Window:"), 3, 0)
+        grid.addWidget(self.sensor_average_window_spin, 3, 1)
+        grid.addWidget(QLabel("Render Hz:"), 4, 0)
+        grid.addWidget(self.visualization_target_hz_spin, 4, 1)
+        grid.setColumnStretch(1, 1)
+        layout.addLayout(grid)
+
+        self.sensor_parameter_point_labels_checkbox = QCheckBox("Show Point Labels")
+        self.sensor_parameter_point_labels_checkbox.setToolTip(
+            "Show each coarse sensor point label in the 3D sensor scene."
+        )
+        layout.addWidget(self.sensor_parameter_point_labels_checkbox)
+
+        stereo_group = QGroupBox("Stereo Field")
+        stereo_grid = QGridLayout(stereo_group)
+        stereo_grid.setHorizontalSpacing(12)
+        stereo_grid.setVerticalSpacing(8)
+        stereo_grid.addWidget(self.sensor_parameter_stereo_ignore_noise_checkbox, 0, 1)
+        stereo_grid.addWidget(QLabel("Noise Threshold:"), 1, 0)
+        stereo_grid.addWidget(self.sensor_parameter_stereo_deadband_spin, 1, 1)
+        stereo_grid.addWidget(QLabel("Line Length:"), 2, 0)
+        stereo_grid.addWidget(self.sensor_parameter_stereo_length_spin, 2, 1)
+        stereo_grid.setColumnStretch(1, 1)
+        layout.addWidget(stereo_group)
+
+        geometry_group = QGroupBox("2D Geometry")
+        geometry_grid = QGridLayout(geometry_group)
+        geometry_grid.setHorizontalSpacing(12)
+        geometry_grid.setVerticalSpacing(8)
+        geometry_grid.addWidget(self.sensor_parameter_use_shape_checkbox, 0, 1)
+        geometry_grid.addWidget(QLabel("Shape:"), 1, 0)
+        geometry_grid.addWidget(self.sensor_parameter_shape_combo, 1, 1)
+        geometry_grid.addWidget(QLabel("Bend Direction:"), 2, 0)
+        geometry_grid.addWidget(self.sensor_parameter_bend_axis_combo, 2, 1)
+        geometry_grid.addWidget(QLabel("Arc Angle:"), 3, 0)
+        geometry_grid.addWidget(self.sensor_parameter_arc_spin, 3, 1)
+        geometry_grid.addWidget(self.sensor_parameter_normal_flip_checkbox, 4, 1)
+        geometry_grid.setColumnStretch(1, 1)
+        self.sensor_parameter_geometry_group = geometry_group
+        layout.addWidget(geometry_group)
+
+        self.sensor_parameter_status_label = QLabel("")
+        self.sensor_parameter_status_label.setWordWrap(True)
+        self.sensor_parameter_status_label.setStyleSheet("color: #b0b0b0;")
+        layout.addWidget(self.sensor_parameter_status_label)
+
+        button_row = QHBoxLayout()
+        self.sensor_parameter_save_button = QPushButton("Save for Sensor")
+        self.sensor_parameter_reload_button = QPushButton("Reload Saved")
+        button_row.addWidget(self.sensor_parameter_save_button)
+        button_row.addWidget(self.sensor_parameter_reload_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        button_box.rejected.connect(self.sensor_parameters_dialog.close)
+        layout.addWidget(button_box)
+
+        self.sensor_parameter_model_combo.currentIndexChanged.connect(
+            self._load_sensor_parameter_reorder_mode
+        )
+        self.sensor_parameter_point_labels_checkbox.toggled.connect(
+            self._on_sensor_parameter_point_labels_toggled
+        )
+        self.sensor_parameter_force_scale_spin.valueChanged.connect(
+            self._on_sensor_parameter_force_scale_changed
+        )
+        self.sensor_parameter_use_shape_checkbox.toggled.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_shape_combo.currentIndexChanged.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_bend_axis_combo.currentIndexChanged.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_arc_spin.valueChanged.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_normal_flip_checkbox.toggled.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_stereo_ignore_noise_checkbox.toggled.connect(
+            self._on_sensor_parameter_stereo_field_changed
+        )
+        self.sensor_parameter_stereo_deadband_spin.valueChanged.connect(
+            self._on_sensor_parameter_stereo_field_changed
+        )
+        self.sensor_parameter_stereo_length_spin.valueChanged.connect(
+            self._on_sensor_parameter_stereo_field_changed
+        )
+        self.sensor_parameter_save_button.clicked.connect(
+            self._save_sensor_parameter_reorder_mode
+        )
+        self.sensor_parameter_reload_button.clicked.connect(
+            self._load_sensor_parameter_reorder_mode
+        )
+
+    def open_sensor_parameters_dialog(self):
+        if not hasattr(self, "sensor_parameters_dialog"):
+            self._build_sensor_parameters_dialog()
+        self._refresh_sensor_parameters_dialog()
+        self.sensor_parameters_dialog.show()
+        self.sensor_parameters_dialog.raise_()
+        self.sensor_parameters_dialog.activateWindow()
+
+    def _refresh_sensor_parameters_dialog(self):
+        helper = getattr(self, "sensor_functions", None)
+
+        selected_model = None
+        if helper is not None and hasattr(helper, "get_sensor_model_name_for_index"):
+            try:
+                selected_model = helper.get_sensor_model_name_for_index(self.sensor_choice.currentRow())
+            except Exception:
+                selected_model = None
+
+        self.sensor_parameter_model_combo.blockSignals(True)
+        self.sensor_parameter_model_combo.clear()
+        if helper is not None and hasattr(helper, "get_sensor_model_choices"):
+            try:
+                choices = helper.get_sensor_model_choices()
+            except Exception:
+                choices = []
+        else:
+            choices = []
+        if not choices:
+            choices = [
+                ("elbow", "Elbow"),
+                ("kuka", "Kuka"),
+                ("double_curve", "Double Curve"),
+                ("2d", "2D"),
+                ("half_cylinder_surface", "Half Cylinder Surface"),
+            ]
+        for model_name, label in choices:
+            self.sensor_parameter_model_combo.addItem(str(label), str(model_name))
+        self._set_combo_current_data(self.sensor_parameter_model_combo, selected_model)
+        self.sensor_parameter_model_combo.blockSignals(False)
+
+        self.sensor_parameter_reorder_combo.blockSignals(True)
+        self.sensor_parameter_reorder_combo.clear()
+        if helper is not None and hasattr(helper, "get_reorder_logic_options"):
+            try:
+                modes = helper.get_reorder_logic_options()
+            except Exception:
+                modes = []
+        else:
+            modes = []
+        if not modes:
+            modes = [
+                "factory",
+                "none",
+                "row_to_col",
+                "row_to_col_flipped",
+                "vertical_flip",
+                "horizontal_flip",
+                "flip_and_rotate",
+                "rotate_180",
+            ]
+        for mode in modes:
+            self.sensor_parameter_reorder_combo.addItem(
+                self._sensor_reorder_mode_label(mode),
+                str(mode),
+            )
+        self.sensor_parameter_reorder_combo.blockSignals(False)
+        self._load_sensor_parameter_reorder_mode()
+
+    def _selected_sensor_parameter_model_name(self):
+        data = self.sensor_parameter_model_combo.currentData()
+        if data is None:
+            text = self.sensor_parameter_model_combo.currentText().strip()
+            return text.lower().replace(" ", "_") if text else "sensor"
+        return str(data)
+
+    def _sensor_parameter_geometry_from_ui(self):
+        return {
+            "use_selected_shape": bool(self.sensor_parameter_use_shape_checkbox.isChecked()),
+            "shape": str(self.sensor_parameter_shape_combo.currentData() or "flat"),
+            "bend_axis": str(self.sensor_parameter_bend_axis_combo.currentData() or "columns"),
+            "arc_deg": float(self.sensor_parameter_arc_spin.value()),
+            "normal_flip": bool(self.sensor_parameter_normal_flip_checkbox.isChecked()),
+        }
+
+    def _sensor_parameter_stereo_field_from_ui(self):
+        return {
+            "ignore_noise_enabled": bool(
+                self.sensor_parameter_stereo_ignore_noise_checkbox.isChecked()
+            ),
+            "deadband_pct": float(self.sensor_parameter_stereo_deadband_spin.value()),
+            "response_scale_pct": 2.0,
+            "length_scale": float(self.sensor_parameter_stereo_length_spin.value()),
+        }
+
+    def _set_sensor_parameter_stereo_field_controls(self, stereo_field):
+        stereo_field = stereo_field if isinstance(stereo_field, dict) else {}
+        ignore_noise = bool(stereo_field.get("ignore_noise_enabled", True))
+        try:
+            deadband_pct = float(stereo_field.get("deadband_pct", 0.35))
+        except Exception:
+            deadband_pct = 0.35
+        try:
+            length_scale = float(stereo_field.get("length_scale", 0.35))
+        except Exception:
+            length_scale = 0.35
+
+        widgets = [
+            self.sensor_parameter_stereo_ignore_noise_checkbox,
+            self.sensor_parameter_stereo_deadband_spin,
+            self.sensor_parameter_stereo_length_spin,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.sensor_parameter_stereo_ignore_noise_checkbox.setChecked(ignore_noise)
+        self.sensor_parameter_stereo_deadband_spin.setValue(float(np.clip(deadband_pct, 0.0, 20.0)))
+        self.sensor_parameter_stereo_length_spin.setValue(float(np.clip(length_scale, 0.05, 2.0)))
+        self.sensor_parameter_stereo_deadband_spin.setEnabled(ignore_noise)
+        for widget in widgets:
+            widget.blockSignals(False)
+
+    def _update_sensor_parameter_geometry_subcontrols(self):
+        enabled = bool(
+            getattr(self, "sensor_parameter_geometry_group", None) is not None
+            and self.sensor_parameter_geometry_group.isEnabled()
+            and self.sensor_parameter_use_shape_checkbox.isChecked()
+        )
+        for widget in (
+            self.sensor_parameter_shape_combo,
+            self.sensor_parameter_bend_axis_combo,
+            self.sensor_parameter_arc_spin,
+            self.sensor_parameter_normal_flip_checkbox,
+        ):
+            widget.setEnabled(enabled)
+
+    def _set_sensor_parameter_geometry_controls_enabled(self, enabled: bool):
+        enabled = bool(enabled)
+        group = getattr(self, "sensor_parameter_geometry_group", None)
+        if group is not None:
+            group.setEnabled(enabled)
+        self._update_sensor_parameter_geometry_subcontrols()
+
+    def _set_sensor_parameter_geometry_controls(self, geometry):
+        geometry = geometry if isinstance(geometry, dict) else {}
+        shape = str(geometry.get("shape", "flat") or "flat")
+        bend_axis = str(geometry.get("bend_axis", "columns") or "columns")
+        try:
+            arc_deg = float(geometry.get("arc_deg", 0.0) or 0.0)
+        except Exception:
+            arc_deg = 0.0
+        normal_flip = bool(geometry.get("normal_flip", False))
+        use_selected_shape = bool(
+            geometry.get(
+                "use_selected_shape",
+                shape != "flat" or abs(arc_deg) > 1e-6,
+            )
+        )
+
+        widgets = [
+            self.sensor_parameter_use_shape_checkbox,
+            self.sensor_parameter_shape_combo,
+            self.sensor_parameter_bend_axis_combo,
+            self.sensor_parameter_arc_spin,
+            self.sensor_parameter_normal_flip_checkbox,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.sensor_parameter_use_shape_checkbox.setChecked(use_selected_shape)
+        self._set_combo_current_data(self.sensor_parameter_shape_combo, shape)
+        self._set_combo_current_data(self.sensor_parameter_bend_axis_combo, bend_axis)
+        self.sensor_parameter_arc_spin.setValue(float(np.clip(arc_deg, -180.0, 180.0)))
+        self.sensor_parameter_normal_flip_checkbox.setChecked(normal_flip)
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._update_sensor_parameter_geometry_subcontrols()
+
+    def _load_sensor_parameter_reorder_mode(self):
+        helper = getattr(self, "sensor_functions", None)
+        model_name = self._selected_sensor_parameter_model_name()
+        if helper is None or not hasattr(helper, "get_sensor_reorder_context"):
+            self.sensor_parameter_status_label.setText("Sensor parameters are not ready.")
+            return
+        try:
+            context = helper.get_sensor_reorder_context(model_name)
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(f"Failed to load sensor parameters: {exc}")
+            return
+
+        saved_mode = str(context.get("saved_mode", "factory"))
+        self._set_combo_current_data(self.sensor_parameter_reorder_combo, saved_mode)
+        self.sensor_parameter_point_labels_checkbox.blockSignals(True)
+        self.sensor_parameter_point_labels_checkbox.setChecked(
+            bool(context.get("point_labels_enabled", False))
+        )
+        self.sensor_parameter_point_labels_checkbox.blockSignals(False)
+        self.sensor_parameter_force_scale_spin.blockSignals(True)
+        self.sensor_parameter_force_scale_spin.setValue(
+            float(context.get("force_scale_n_per_signal", 0.0) or 0.0)
+        )
+        self.sensor_parameter_force_scale_spin.blockSignals(False)
+        geometry = context.get("geometry", {}) or {}
+        self._set_sensor_parameter_geometry_controls(geometry)
+        self._set_sensor_parameter_geometry_controls_enabled(model_name == "2d")
+        stereo_field = context.get("stereo_field", {}) or {}
+        self._set_sensor_parameter_stereo_field_controls(stereo_field)
+        default_logic = context.get("default_logic") or "none"
+        effective_logic = context.get("effective_logic") or "none"
+        point_labels = "on" if context.get("point_labels_enabled", False) else "off"
+        force_scale = float(context.get("force_scale_n_per_signal", 0.0) or 0.0)
+        geometry_shape = str(geometry.get("shape", "flat") or "flat")
+        geometry_axis = str(geometry.get("bend_axis", "columns") or "columns")
+        geometry_arc = float(geometry.get("arc_deg", 0.0) or 0.0)
+        geometry_normals = "flipped" if geometry.get("normal_flip", False) else "normal"
+        geometry_mode = (
+            "selected shape"
+            if geometry.get("use_selected_shape", geometry_shape != "flat" or abs(geometry_arc) > 1e-6)
+            else "flat 2D"
+        )
+        stereo_noise = "ignored" if stereo_field.get("ignore_noise_enabled", True) else "raw"
+        self.sensor_parameter_status_label.setText(
+            f"Key: {context.get('key', model_name)}\n"
+            f"Factory default: {default_logic}\n"
+            f"Saved mode: {self._sensor_reorder_mode_label(saved_mode)}\n"
+            f"Effective on next Build Scene: {effective_logic}\n"
+            f"Point labels: {point_labels}\n"
+            f"Force scale: {force_scale:.6f} N/signal\n"
+            f"Stereo field: noise {stereo_noise}, threshold "
+            f"{float(stereo_field.get('deadband_pct', 0.35) or 0.0):.2f}, "
+            f"length {float(stereo_field.get('length_scale', 0.35) or 0.35):.2f}\n"
+            f"Geometry: {geometry_mode}; {geometry_shape}, {geometry_axis}, "
+            f"{geometry_arc:.1f} deg, {geometry_normals}"
+        )
+
+    def _sensor_parameter_selected_model_is_current(self):
+        helper = getattr(self, "sensor_functions", None)
+        if helper is None:
+            return False
+        return str(getattr(helper, "current_model_name", "")) == self._selected_sensor_parameter_model_name()
+
+    def _on_sensor_parameter_point_labels_toggled(self, checked: bool):
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is not None
+            and hasattr(helper, "set_sensor_point_labels_enabled")
+            and self._sensor_parameter_selected_model_is_current()
+        ):
+            helper.set_sensor_point_labels_enabled(bool(checked), save_current_sensor=False)
+
+    def _on_sensor_parameter_force_scale_changed(self, value: float):
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is not None
+            and hasattr(helper, "set_sensor_contact_force_scale")
+            and self._sensor_parameter_selected_model_is_current()
+        ):
+            helper.set_sensor_contact_force_scale(float(value), save_current_sensor=False)
+
+    def _on_sensor_parameter_geometry_changed(self, *_args):
+        self._update_sensor_parameter_geometry_subcontrols()
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is not None
+            and hasattr(helper, "set_sensor_geometry_config")
+            and self._sensor_parameter_selected_model_is_current()
+        ):
+            helper.set_sensor_geometry_config(
+                self._sensor_parameter_geometry_from_ui(),
+                save_current_sensor=False,
+                render=True,
+            )
+
+    def _on_sensor_parameter_stereo_field_changed(self, *_args):
+        self.sensor_parameter_stereo_deadband_spin.setEnabled(
+            self.sensor_parameter_stereo_ignore_noise_checkbox.isChecked()
+        )
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is not None
+            and hasattr(helper, "set_stereo_field_settings")
+            and self._sensor_parameter_selected_model_is_current()
+        ):
+            helper.set_stereo_field_settings(
+                self._sensor_parameter_stereo_field_from_ui(),
+                save_current_sensor=False,
+            )
+
+    def _save_sensor_parameter_reorder_mode(self):
+        helper = getattr(self, "sensor_functions", None)
+        model_name = self._selected_sensor_parameter_model_name()
+        mode = self.sensor_parameter_reorder_combo.currentData()
+        if helper is None or not hasattr(helper, "set_saved_sensor_reorder_mode"):
+            self.sensor_parameter_status_label.setText("Sensor parameters are not ready.")
+            return
+        try:
+            ok = bool(helper.set_saved_sensor_reorder_mode(model_name, mode))
+            if hasattr(helper, "set_saved_sensor_point_labels_enabled"):
+                ok = bool(
+                    helper.set_saved_sensor_point_labels_enabled(
+                        model_name,
+                        self.sensor_parameter_point_labels_checkbox.isChecked(),
+                    )
+                ) and ok
+            if hasattr(helper, "set_saved_sensor_contact_force_scale"):
+                ok = bool(
+                    helper.set_saved_sensor_contact_force_scale(
+                        model_name,
+                        self.sensor_parameter_force_scale_spin.value(),
+                    )
+                ) and ok
+            if hasattr(helper, "set_saved_sensor_geometry_config"):
+                ok = bool(
+                    helper.set_saved_sensor_geometry_config(
+                        model_name,
+                        self._sensor_parameter_geometry_from_ui(),
+                    )
+                ) and ok
+            if hasattr(helper, "set_saved_sensor_stereo_field_config"):
+                ok = bool(
+                    helper.set_saved_sensor_stereo_field_config(
+                        model_name,
+                        self._sensor_parameter_stereo_field_from_ui(),
+                    )
+                ) and ok
+            if (
+                hasattr(helper, "set_sensor_point_labels_enabled")
+                and self._sensor_parameter_selected_model_is_current()
+            ):
+                helper.set_sensor_point_labels_enabled(
+                    self.sensor_parameter_point_labels_checkbox.isChecked(),
+                    save_current_sensor=False,
+                )
+            if (
+                hasattr(helper, "set_sensor_contact_force_scale")
+                and self._sensor_parameter_selected_model_is_current()
+            ):
+                helper.set_sensor_contact_force_scale(
+                    self.sensor_parameter_force_scale_spin.value(),
+                    save_current_sensor=False,
+                )
+            if (
+                hasattr(helper, "set_sensor_geometry_config")
+                and self._sensor_parameter_selected_model_is_current()
+            ):
+                helper.set_sensor_geometry_config(
+                    self._sensor_parameter_geometry_from_ui(),
+                    save_current_sensor=False,
+                    render=True,
+                )
+            if (
+                hasattr(helper, "set_stereo_field_settings")
+                and self._sensor_parameter_selected_model_is_current()
+            ):
+                helper.set_stereo_field_settings(
+                    self._sensor_parameter_stereo_field_from_ui(),
+                    save_current_sensor=False,
+                )
+            context = helper.get_sensor_reorder_context(model_name)
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(f"Failed to save sensor parameters: {exc}")
+            return
+
+        if ok:
+            saved_geometry = context.get("geometry", {}) or {}
+            saved_stereo = context.get("stereo_field", {}) or {}
+            saved_shape = str(saved_geometry.get("shape", "flat") or "flat")
+            saved_arc = float(saved_geometry.get("arc_deg", 0.0) or 0.0)
+            saved_mode = (
+                "selected shape"
+                if saved_geometry.get(
+                    "use_selected_shape",
+                    saved_shape != "flat" or abs(saved_arc) > 1e-6,
+                )
+                else "flat 2D"
+            )
+            self.sensor_parameter_status_label.setText(
+                f"Saved for {context.get('key', model_name)}.\n"
+                f"Effective on next Build Scene: {context.get('effective_logic') or 'none'}\n"
+                f"Point labels: {'on' if context.get('point_labels_enabled', False) else 'off'}\n"
+                f"Force scale: {float(context.get('force_scale_n_per_signal', 0.0) or 0.0):.6f} N/signal\n"
+                f"Stereo field: noise "
+                f"{'ignored' if saved_stereo.get('ignore_noise_enabled', True) else 'raw'}, "
+                f"threshold {float(saved_stereo.get('deadband_pct', 0.35) or 0.0):.2f}, "
+                f"length {float(saved_stereo.get('length_scale', 0.35) or 0.35):.2f}\n"
+                f"Geometry: {saved_mode}; {saved_shape}, "
+                f"{saved_geometry.get('bend_axis', 'columns')}, "
+                f"{saved_arc:.1f} deg"
+            )
+        else:
+            self.sensor_parameter_status_label.setText("Failed to save sensor parameters.")
 
     def setup_tab2(self, layout):
         self.read_group_robot = QGroupBox("Read Operations")
@@ -1731,28 +2396,34 @@ class UI(
             row, col = frame_button_positions[frame_key]
             frame_grid.addWidget(btn, row, col)
 
-        frame_grid.setColumnStretch(4, 1)
+        self.btn_toggle_anchor_axes = QPushButton("Axes: Anchored ON")  # label will be synced on init
+        self.btn_toggle_anchor_axes.setMinimumWidth(150)
+        self.btn_toggle_anchor_axes.setMinimumHeight(32)
+        frame_grid.addWidget(self.btn_toggle_anchor_axes, 0, 4, 2, 1)
+
+        frame_grid.setColumnStretch(5, 1)
         self._update_ai_frame_buttons()
         ai_model_layout.addWidget(frame_row)
 
-        # ---- Axes anchor toggle row ----
-        row_anchor = QWidget()
-        ha = QHBoxLayout(row_anchor)
-        ha.setContentsMargins(0, 0, 0, 0)
-        self.btn_toggle_anchor_axes = QPushButton("Axes: Anchored ON")  # label will be synced on init
-        ha.addWidget(self.btn_toggle_anchor_axes)
-        ha.addStretch()
-        ai_model_layout.addWidget(row_anchor)
+        ai_based_group = QGroupBox("AI-Based")
+        ai_based_layout = QVBoxLayout(ai_based_group)
+        ai_based_layout.setContentsMargins(10, 10, 10, 10)
+        ai_based_layout.setSpacing(6)
+
+        rule_based_group = QGroupBox("Rule-Based")
+        rule_based_layout = QVBoxLayout(rule_based_group)
+        rule_based_layout.setContentsMargins(10, 10, 10, 10)
+        rule_based_layout.setSpacing(6)
 
         self.direct_finger_motion_button = QPushButton("Direct Finger Motion")
-        self.direct_finger_motion_v2_button = QPushButton("Direct Finger Motion (Version 2)")
         self.console_control_button = QPushButton("Console Control (PS5)")
         self.console_control_sensor_button = QPushButton("Console Control (Sensor)")
         self.console_control_sensor_v2_button = QPushButton("Console Control (Sensor V2)")
         self.direct_finger_motion_tool_pose_record_menu_button = QPushButton("Tool Pose Recording")
         self.load_tool_pose_path_button = QPushButton("Load Tool Pose Path")
         self.clear_tool_pose_path_button = QPushButton("Clear Tool Pose Path")
-        self.ai_direct_finger_motion_button = QPushButton("AI Direct Finger Motion (Record)")
+        self.ai_direct_finger_motion_button = QPushButton("AI DFM Record (No Robot)")
+        self.ai_direct_finger_motion_robot_button = QPushButton("AI DFM Record + Robot")
         self.ai_direct_finger_motion_execution_button = QPushButton("AI Direct Finger Motion (Execute)")
 
         model_row = QWidget()
@@ -1767,6 +2438,20 @@ class UI(
         self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
         model_row_layout.addWidget(self.ai_direct_execution_model_path_input)
 
+        execute_safety_row = QWidget()
+        execute_safety_layout = QHBoxLayout(execute_safety_row)
+        execute_safety_layout.setContentsMargins(0, 0, 0, 0)
+        execute_safety_layout.setSpacing(8)
+        self.ai_direct_execution_dry_run_checkbox = QCheckBox("Dry run")
+        self.ai_direct_execution_dry_run_checkbox.setChecked(True)
+        self.ai_direct_execution_dry_run_checkbox.setToolTip(
+            "When checked, AI predicts live velocity but does not send robot motion commands."
+        )
+        self.ai_direct_execution_prediction_status = QLabel("Prediction: idle")
+        execute_safety_layout.addWidget(self.ai_direct_execution_dry_run_checkbox)
+        execute_safety_layout.addWidget(self.ai_direct_execution_prediction_status)
+        execute_safety_layout.addStretch()
+
         threelevel_row = QWidget()
         threelevel_row_layout = QHBoxLayout(threelevel_row)
         threelevel_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1778,7 +2463,7 @@ class UI(
             1,
         )
         threelevel_row_layout.addWidget(self.btn_toggle_3lvl_latch, 1)
-        ai_model_layout.addWidget(threelevel_row)
+        ai_based_layout.addWidget(threelevel_row)
         proximity_row = QWidget()
         proximity_row_layout = QHBoxLayout(proximity_row)
         proximity_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1787,9 +2472,8 @@ class UI(
         self.proximity_record_button.setMinimumWidth(0)
         proximity_row_layout.addWidget(self.proximity_control_button, 1)
         proximity_row_layout.addWidget(self.proximity_record_button, 1)
-        ai_model_layout.addWidget(proximity_row)
-        ai_model_layout.addWidget(self.direct_finger_motion_button)
-        ai_model_layout.addWidget(self.direct_finger_motion_v2_button)
+        rule_based_layout.addWidget(proximity_row)
+        rule_based_layout.addWidget(self.direct_finger_motion_button)
         console_row = QWidget()
         console_row_layout = QHBoxLayout(console_row)
         console_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1800,7 +2484,7 @@ class UI(
         console_row_layout.addWidget(self.console_control_button, 1)
         console_row_layout.addWidget(self.console_control_sensor_button, 1)
         console_row_layout.addWidget(self.console_control_sensor_v2_button, 1)
-        ai_model_layout.addWidget(console_row)
+        rule_based_layout.addWidget(console_row)
         tool_pose_row = QWidget()
         tool_pose_row_layout = QHBoxLayout(tool_pose_row)
         tool_pose_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -1811,12 +2495,14 @@ class UI(
         tool_pose_row_layout.addWidget(self.direct_finger_motion_tool_pose_record_menu_button, 1)
         tool_pose_row_layout.addWidget(self.load_tool_pose_path_button, 1)
         tool_pose_row_layout.addWidget(self.clear_tool_pose_path_button, 1)
-        ai_model_layout.addWidget(tool_pose_row)
+        rule_based_layout.addWidget(tool_pose_row)
         self._build_direct_finger_motion_settings_dialog()
-        self._build_direct_finger_motion_v2_settings_dialog()
         self._build_console_control_settings_dialog()
-        ai_model_layout.addWidget(model_row)
-        ai_model_layout.addWidget(self.ai_direct_finger_motion_execution_button)
+        ai_based_layout.addWidget(model_row)
+        ai_based_layout.addWidget(execute_safety_row)
+        ai_based_layout.addWidget(self.ai_direct_finger_motion_execution_button)
+        ai_model_layout.addWidget(ai_based_group)
+        ai_model_layout.addWidget(rule_based_group)
         ai_model_layout.addStretch()
 
         # ─── Subtab “Data Training” ───
@@ -1841,7 +2527,54 @@ class UI(
         self.record_gesture_button = QPushButton("Record")
         training_layout.addLayout(first_row_layout)
         training_layout.addWidget(self.record_gesture_button)
-        training_layout.addWidget(self.ai_direct_finger_motion_button)
+        ai_dfm_record_row = QWidget()
+        ai_dfm_record_row_layout = QHBoxLayout(ai_dfm_record_row)
+        ai_dfm_record_row_layout.setContentsMargins(0, 0, 0, 0)
+        ai_dfm_record_row_layout.setSpacing(6)
+        self.ai_direct_finger_motion_button.setMinimumWidth(0)
+        self.ai_direct_finger_motion_robot_button.setMinimumWidth(0)
+        ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_button, 1)
+        ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_robot_button, 1)
+        training_layout.addWidget(ai_dfm_record_row)
+
+        self.ai_teaching_label_group = QGroupBox("AI Teaching Label")
+        teaching_grid = QGridLayout(self.ai_teaching_label_group)
+        teaching_grid.setContentsMargins(8, 8, 8, 8)
+        teaching_grid.setHorizontalSpacing(6)
+        teaching_grid.setVerticalSpacing(6)
+
+        self.ai_teaching_label_buttons = {}
+        self.ai_teaching_label_status = QLabel("Teaching: Auto/DFM")
+
+        teaching_specs = [
+            ("auto", "Auto/DFM"),
+            ("stop", "Stop"),
+            ("normal_swipe", "Normal Swipe"),
+            ("push", "Push"),
+            ("pull", "Pull"),
+            ("x_pos", "X+"),
+            ("x_neg", "X-"),
+            ("y_pos", "Y+"),
+            ("y_neg", "Y-"),
+            ("z_pos", "Z+"),
+            ("z_neg", "Z-"),
+            ("rx_pos", "RX+"),
+            ("rx_neg", "RX-"),
+            ("ry_pos", "RY+"),
+            ("ry_neg", "RY-"),
+            ("rz_pos", "RZ+"),
+            ("rz_neg", "RZ-"),
+        ]
+        for idx, (label_key, label_text) in enumerate(teaching_specs):
+            button = QPushButton(label_text)
+            button.setCheckable(True)
+            button.setMinimumHeight(30)
+            button.setMinimumWidth(96)
+            self.ai_teaching_label_buttons[label_key] = button
+            teaching_grid.addWidget(button, idx // 4, idx % 4)
+
+        teaching_grid.addWidget(self.ai_teaching_label_status, 5, 0, 1, 4)
+        training_layout.addWidget(self.ai_teaching_label_group)
         training_layout.addStretch()
 
         self.ai_sub_tabs.addTab(ai_model_page, "AI Model")
@@ -1902,8 +2635,21 @@ class UI(
         layout.addWidget(camera_group)
 
     def setup_tab5(self, layout):
+        self.hand_sub_tabs = QTabWidget()
+        self.hand_sub_tabs.setUsesScrollButtons(False)
+
+        hand_monitor_page = QWidget()
+        hand_monitor_layout = QVBoxLayout(hand_monitor_page)
+        hand_monitor_layout.setContentsMargins(0, 0, 0, 0)
+        hand_monitor_layout.setSpacing(8)
+
+        hand_motion_page = QWidget()
+        hand_motion_layout = QVBoxLayout(hand_motion_page)
+        hand_motion_layout.setContentsMargins(0, 0, 0, 0)
+        hand_motion_layout.setSpacing(8)
+
         self.hand_state_label = QLabel("RH56F1 status: idle")
-        layout.addWidget(self.hand_state_label)
+        hand_monitor_layout.addWidget(self.hand_state_label)
 
         model_group = QGroupBox("3D Hand Model")
         model_layout = QHBoxLayout(model_group)
@@ -1912,7 +2658,7 @@ class UI(
         self.hand_model_status_label = QLabel("resource/dexterous_hand")
         self.hand_model_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         model_layout.addWidget(self.hand_model_status_label, stretch=1)
-        layout.addWidget(model_group)
+        hand_monitor_layout.addWidget(model_group)
 
         tactile_group = QGroupBox("Tactile Sensor Readout")
         tactile_layout = QVBoxLayout(tactile_group)
@@ -1961,7 +2707,8 @@ class UI(
                 self.hand_tactile_table.setItem(row, col, item)
 
         tactile_layout.addWidget(self.hand_tactile_table)
-        layout.addWidget(tactile_group)
+        hand_monitor_layout.addWidget(tactile_group)
+        hand_monitor_layout.addStretch()
 
         self.hand_tactile_timer = QTimer(self)
         self.hand_tactile_timer.setInterval(100)
@@ -1983,7 +2730,7 @@ class UI(
         sf_layout.addWidget(self.hand_force_spin, 1, 1)
         self.hand_apply_force_button = QPushButton("Apply Force")
         sf_layout.addWidget(self.hand_apply_force_button, 1, 2)
-        layout.addWidget(speed_force_group)
+        hand_motion_layout.addWidget(speed_force_group)
 
         open_close_group = QGroupBox("Quick Actions")
         oc_layout = QHBoxLayout(open_close_group)
@@ -1993,7 +2740,7 @@ class UI(
         oc_layout.addWidget(self.hand_open_all_button)
         oc_layout.addWidget(self.hand_close_all_button)
         oc_layout.addWidget(self.hand_read_angles_button)
-        layout.addWidget(open_close_group)
+        hand_motion_layout.addWidget(open_close_group)
 
         thumb_group = QGroupBox("Thumb Rotation Presets")
         thumb_layout = QHBoxLayout(thumb_group)
@@ -2003,7 +2750,7 @@ class UI(
         thumb_layout.addWidget(self.hand_thumb_left_button)
         thumb_layout.addWidget(self.hand_thumb_center_button)
         thumb_layout.addWidget(self.hand_thumb_right_button)
-        layout.addWidget(thumb_group)
+        hand_motion_layout.addWidget(thumb_group)
 
         # Per-finger sliders. Drag a slider to set the target angle; the
         # right-most "Send" button sends just that finger (others left
@@ -2112,8 +2859,12 @@ class UI(
         bottom_row.addWidget(self.hand_send_custom_angles_button)
 
         slider_outer.addLayout(bottom_row)
-        layout.addWidget(slider_group)
-        layout.addStretch()
+        hand_motion_layout.addWidget(slider_group)
+        hand_motion_layout.addStretch()
+
+        self.hand_sub_tabs.addTab(hand_monitor_page, "Tactile / Model")
+        self.hand_sub_tabs.addTab(hand_motion_page, "Motion Controls")
+        layout.addWidget(self.hand_sub_tabs)
 
     def _set_button_active(self, btn: QPushButton, active: bool):
         """Green when active; when inactive, revert to the default theme."""

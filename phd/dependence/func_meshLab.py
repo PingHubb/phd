@@ -1,6 +1,7 @@
 import pyvista as pv
 import numpy as np
 from pyvistaqt import QtInteractor
+import json
 import os
 import re
 import xml.etree.ElementTree as ET
@@ -14,6 +15,8 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMessageBox,
     QApplication,
+    QComboBox,
+    QDoubleSpinBox,
 )
 import time
 from phd.dependence.paths import resource_path, robot_resource_path
@@ -44,7 +47,6 @@ class MyMeshLab():
     _RH56F1_PALM_DATA_REGIONS = ("palm_left", "palm_middle", "palm_right")
     # Full-scale raw force for colour mapping: manual states raw 1024 = 10.24 N.
     _RH56F1_FORCE_FULL_SCALE = 1024.0
-
     def __init__(self, parent) -> None:
         self.parent = parent
         self.plotter: QtInteractor = self.parent.plotter
@@ -1300,6 +1302,95 @@ class MyMeshLab():
         return urdf_path if urdf_path.exists() else None
 
     @staticmethod
+    def _hand_tactile_region_choices():
+        return (
+            ("thumb", "Thumb"),
+            ("index", "Index"),
+            ("middle", "Middle"),
+            ("ring", "Ring"),
+            ("little", "Little"),
+            ("palm_left", "Palm left"),
+            ("palm_middle", "Palm middle"),
+            ("palm_right", "Palm right"),
+        )
+
+    @staticmethod
+    def _hand_sensor_adjustment_config_path():
+        return Path(resource_path("config", "dexterous_hand_sensor_adjustments.json"))
+
+    @staticmethod
+    def _default_hand_sensor_adjustment():
+        return {
+            "translation_mm": [0.0, 0.0, 0.0],
+            "rotation_deg": [0.0, 0.0, 0.0],
+        }
+
+    def _load_hand_sensor_adjustments(self):
+        path = self._hand_sensor_adjustment_config_path()
+        if not path.exists():
+            return {}
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            return {}
+        regions = payload.get("regions") if isinstance(payload, dict) else None
+        return regions if isinstance(regions, dict) else {}
+
+    def _save_hand_sensor_adjustments(self, adjustments):
+        path = self._hand_sensor_adjustment_config_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "config_version": 1,
+                "note": "RH56F1 tactile pad translation/rotation offsets in the centered 3D display frame.",
+                "regions": adjustments,
+            }
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            return True
+        except Exception as exc:
+            print(f"[DexterousHandModel] Failed to save sensor adjustments: {exc}")
+            return False
+
+    def _coerce_hand_sensor_adjustment(self, value):
+        result = self._default_hand_sensor_adjustment()
+        if not isinstance(value, dict):
+            return result
+        for key in ("translation_mm", "rotation_deg"):
+            raw_values = value.get(key, result[key])
+            try:
+                values = [float(v) for v in raw_values[:3]]
+            except Exception:
+                values = list(result[key])
+            if len(values) != 3:
+                values = list(result[key])
+            result[key] = values
+        return result
+
+    def _get_hand_sensor_adjustment(self, region):
+        adjustments = self._load_hand_sensor_adjustments()
+        return self._coerce_hand_sensor_adjustment(adjustments.get(str(region), {}))
+
+    def _apply_tactile_region_adjustment(self, mesh, region):
+        adjustment = self._get_hand_sensor_adjustment(region)
+        translation = np.asarray(adjustment["translation_mm"], dtype=float)
+        rotation_deg = np.asarray(adjustment["rotation_deg"], dtype=float)
+        if np.allclose(translation, 0.0) and np.allclose(rotation_deg, 0.0):
+            return mesh.copy(deep=True)
+
+        adjusted = mesh.copy(deep=True)
+        points = np.asarray(adjusted.points, dtype=float)
+        if points.size == 0:
+            return adjusted
+
+        center = points.mean(axis=0)
+        rpy = [math.radians(float(v)) for v in rotation_deg]
+        rotation = self._matrix_from_xyz_rpy([0.0, 0.0, 0.0], rpy)[:3, :3]
+        adjusted.points = (points - center) @ rotation.T + center + translation
+        return adjusted
+
+    @staticmethod
     def _matrix_from_xyz_rpy(xyz, rpy):
         x, y, z = xyz
         roll, pitch, yaw = rpy
@@ -1511,26 +1602,52 @@ class MyMeshLab():
             return 0.0
         return max(0.0, min(1.0, raw / self._RH56F1_FORCE_FULL_SCALE))
 
+    @staticmethod
+    def _direction_raw_to_degrees(value):
+        try:
+            raw = int(value)
+        except Exception:
+            return None
+        if raw < 0 or raw in {65535, 0xFFFF}:
+            return None
+        return float(raw % 360)
+
     def _extract_tactile_readings(self, data):
-        """Map tactile data to {region: {"level", "force_n"}}.
+        """Map tactile data to live values used by the hand-model overlay.
 
         Each fingertip reports one capacitive sensor (normal force, raw 1024 =
         10.24 N). The palm module reports three regions, each as a
-        (normal, tangential, direction) triple; only the normal force is used
-        for the heat colour - the direction angle (0-359) must never be
-        interpreted as a force.
+        (normal, tangential, direction) triple.
         """
         readings = {}
         if not data:
             return readings
 
         finger_forces = list(data.get("finger_forces") or [])
+        finger_tangentials = list(data.get("finger_tangentials") or [])
+        finger_angles = list(data.get("finger_angles") or [])
         for index, (region, _link_name) in enumerate(self._RH56F1_FINGER_SENSOR_LINKS):
             if index < len(finger_forces):
                 raw = self._valid_tactile_raw(finger_forces[index])
+                tangential_raw = (
+                    self._valid_tactile_raw(finger_tangentials[index])
+                    if index < len(finger_tangentials)
+                    else None
+                )
+                direction_deg = (
+                    self._direction_raw_to_degrees(finger_angles[index])
+                    if index < len(finger_angles)
+                    else None
+                )
                 readings[region] = {
                     "level": self._force_raw_to_level(raw),
                     "force_n": (raw / 100.0) if raw is not None else None,
+                    "tangential_raw": tangential_raw,
+                    "tangential_level": self._force_raw_to_level(tangential_raw),
+                    "tangential_n": (
+                        tangential_raw / 100.0 if tangential_raw is not None else None
+                    ),
+                    "direction_deg": direction_deg,
                 }
 
         palm_data = list(data.get("palm_data") or [])
@@ -1540,9 +1657,21 @@ class MyMeshLab():
             if not group:
                 continue
             raw = self._valid_tactile_raw(group[0])  # normal force only
+            tangential_raw = (
+                self._valid_tactile_raw(group[1]) if len(group) > 1 else None
+            )
+            direction_deg = (
+                self._direction_raw_to_degrees(group[2]) if len(group) > 2 else None
+            )
             readings[region] = {
                 "level": self._force_raw_to_level(raw),
                 "force_n": (raw / 100.0) if raw is not None else None,
+                "tangential_raw": tangential_raw,
+                "tangential_level": self._force_raw_to_level(tangential_raw),
+                "tangential_n": (
+                    tangential_raw / 100.0 if tangential_raw is not None else None
+                ),
+                "direction_deg": direction_deg,
             }
         return readings
 
@@ -1678,6 +1807,8 @@ class MyMeshLab():
             rgba = item["color"]
             color = tuple(rgba[:3])
             opacity = float(rgba[3]) if len(rgba) >= 4 else 1.0
+            if link_name.endswith("_tip"):
+                opacity = min(opacity, 0.32)
             try:
                 plotter.add_mesh(
                     mesh,
@@ -1694,6 +1825,10 @@ class MyMeshLab():
 
         idle_color = self._tactile_level_color(0.0)
         value_text_actors = {}
+        pad_frames = {}
+        base_meshes = {}
+        pad_meshes = {}
+        marker_meshes = {}
         for item in visual_meshes:
             link_name = item["link"]
             if not item["is_sensor"]:
@@ -1708,17 +1843,21 @@ class MyMeshLab():
                 ]
 
             for region, mesh in sensor_regions:
+                base_mesh = mesh.copy(deep=True)
+                mesh = self._apply_tactile_region_adjustment(base_mesh, region)
                 try:
                     actor = plotter.add_mesh(
                         mesh,
                         color=idle_color,
-                        opacity=0.45,
+                        opacity=0.32,
                         show_edges=False,
                         specular=0.55,
                         specular_power=20,
                         smooth_shading=True,
                     )
                     tactile_actors[region] = actor
+                    base_meshes[region] = base_mesh
+                    pad_meshes[region] = mesh
                 except Exception as exc:
                     print(f"[DexterousHandModel] Failed to display tactile pad {region}: {exc}")
                     continue
@@ -1729,12 +1868,15 @@ class MyMeshLab():
                     points = np.asarray(mesh.points, dtype=float)
                     center = points.mean(axis=0)
                     normal = self._estimate_sensor_outward_normal(mesh, center)
+                    pad_frames[region] = self._make_tactile_pad_frame(mesh, center, normal)
+                    marker_mesh = pv.Sphere(radius=1.1, center=center)
                     plotter.add_mesh(
-                        pv.Sphere(radius=1.1, center=center),
+                        marker_mesh,
                         color="#ffffff",
                         opacity=0.9,
                         smooth_shading=True,
                     )
+                    marker_meshes[region] = marker_mesh
                     text_actor = self._make_sensor_value_text_actor(
                         center + normal * 7.0
                     )
@@ -1745,6 +1887,10 @@ class MyMeshLab():
 
         self._hand_tactile_pad_actors = tactile_actors
         self._hand_tactile_value_text_actors = value_text_actors
+        self._hand_tactile_pad_frames = pad_frames
+        self._hand_tactile_base_meshes = base_meshes
+        self._hand_tactile_pad_meshes = pad_meshes
+        self._hand_tactile_marker_meshes = marker_meshes
         return body_count, len(tactile_actors), span
 
     @staticmethod
@@ -1773,6 +1919,324 @@ class MyMeshLab():
         if norm > 1e-9:
             return np.asarray(center, dtype=float) / norm
         return np.array([0.0, 0.0, 1.0])
+
+    @staticmethod
+    def _normalize_vector(vector, fallback):
+        arr = np.asarray(vector, dtype=float)
+        norm = float(np.linalg.norm(arr))
+        if norm > 1e-9:
+            return arr / norm
+        return np.asarray(fallback, dtype=float)
+
+    def _make_tactile_pad_frame(self, mesh, center, normal):
+        center = np.asarray(center, dtype=float)
+        normal = self._normalize_vector(normal, (0.0, 0.0, 1.0))
+        fallback_axis = np.array([0.0, 1.0, 0.0])
+        if abs(float(np.dot(normal, fallback_axis))) > 0.92:
+            fallback_axis = np.array([1.0, 0.0, 0.0])
+
+        tangent_x = fallback_axis - normal * float(np.dot(fallback_axis, normal))
+        try:
+            points = np.asarray(mesh.points, dtype=float)
+            offsets = points - center
+            planar_offsets = offsets - np.outer(offsets @ normal, normal)
+            if len(planar_offsets) >= 3 and float(np.max(np.linalg.norm(planar_offsets, axis=1))) > 1e-9:
+                _u, _s, vh = np.linalg.svd(planar_offsets, full_matrices=False)
+                candidate = vh[0]
+                candidate = candidate - normal * float(np.dot(candidate, normal))
+                if float(np.linalg.norm(candidate)) > 1e-9:
+                    tangent_x = candidate
+            spans = np.ptp(points, axis=0) if len(points) else np.array([8.0, 8.0, 8.0])
+            pad_span = max(float(np.max(spans)), 8.0)
+        except Exception:
+            pad_span = 12.0
+
+        tangent_x = self._normalize_vector(tangent_x, fallback_axis)
+        dominant_axis = int(np.argmax(np.abs(tangent_x)))
+        if tangent_x[dominant_axis] < 0:
+            tangent_x = -tangent_x
+        tangent_y = self._normalize_vector(np.cross(normal, tangent_x), (0.0, 1.0, 0.0))
+        tangent_x = self._normalize_vector(np.cross(tangent_y, normal), tangent_x)
+
+        return {
+            "center": center,
+            "normal": normal,
+            "tangent_x": tangent_x,
+            "tangent_y": tangent_y,
+            "arrow_offset": max(5.0, min(14.0, pad_span * 0.14)),
+            "arrow_scale": max(11.0, min(30.0, pad_span * 0.85)),
+        }
+
+    @staticmethod
+    def _make_tactile_direction_arrow_mesh(start, direction, scale):
+        direction = np.asarray(direction, dtype=float)
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-9:
+            direction = np.array([1.0, 0.0, 0.0])
+        else:
+            direction = direction / norm
+        return pv.Arrow(
+            start=tuple(np.asarray(start, dtype=float)),
+            direction=tuple(direction),
+            tip_length=0.34,
+            tip_radius=0.145,
+            shaft_radius=0.055,
+            shaft_resolution=16,
+            tip_resolution=24,
+            scale=float(scale),
+        )
+
+    @staticmethod
+    def _set_actor_visibility(actor, visible):
+        if actor is None:
+            return
+        try:
+            actor.SetVisibility(bool(visible))
+            return
+        except Exception:
+            pass
+        try:
+            actor.visibility = bool(visible)
+        except Exception:
+            pass
+
+    def _get_hand_tactile_overlay_renderer(self, plotter):
+        overlay = getattr(self, "_hand_tactile_overlay_renderer", None)
+        if overlay is not None:
+            return overlay
+        if plotter is None:
+            return None
+        try:
+            import vtk
+            render_window = getattr(plotter, "ren_win", None) or getattr(plotter, "render_window", None)
+            main_renderer = getattr(plotter, "renderer", None)
+            if render_window is None or main_renderer is None:
+                return None
+            render_window.SetNumberOfLayers(max(int(render_window.GetNumberOfLayers()), 2))
+            overlay = vtk.vtkRenderer()
+            overlay.SetLayer(1)
+            overlay.SetActiveCamera(main_renderer.GetActiveCamera())
+            overlay.SetPreserveColorBuffer(True)
+            overlay.SetPreserveDepthBuffer(False)
+            overlay.SetInteractive(False)
+            try:
+                overlay.SetBackgroundAlpha(0.0)
+            except Exception:
+                pass
+            render_window.AddRenderer(overlay)
+            self._hand_tactile_overlay_renderer = overlay
+            return overlay
+        except Exception:
+            return None
+
+    @staticmethod
+    def _style_hand_tactile_direction_actor(actor):
+        if actor is None:
+            return
+        try:
+            actor.UseBoundsOff()
+        except Exception:
+            pass
+        try:
+            actor.ForceOpaqueOn()
+        except Exception:
+            pass
+        try:
+            prop = actor.GetProperty()
+            prop.SetColor(0.125, 0.843, 1.0)
+            prop.SetOpacity(1.0)
+            prop.SetAmbient(0.75)
+            prop.SetDiffuse(0.7)
+            prop.SetSpecular(0.25)
+            prop.SetSpecularPower(10)
+        except Exception:
+            pass
+        try:
+            mapper = actor.GetMapper()
+            mapper.SetResolveCoincidentTopologyToPolygonOffset()
+            mapper.SetRelativeCoincidentTopologyPolygonOffsetParameters(-4.0, -66000.0)
+        except Exception:
+            pass
+
+    def _add_hand_tactile_direction_actor(self, plotter, mesh):
+        try:
+            import vtk
+            mapper = vtk.vtkPolyDataMapper()
+            mapper.SetInputData(mesh)
+            actor = vtk.vtkActor()
+            actor.SetMapper(mapper)
+            self._style_hand_tactile_direction_actor(actor)
+            overlay = self._get_hand_tactile_overlay_renderer(plotter)
+            if overlay is not None:
+                overlay.AddActor(actor)
+                return actor
+        except Exception:
+            pass
+
+        actor = plotter.add_mesh(
+            mesh,
+            color="#20d7ff",
+            opacity=1.0,
+            show_edges=False,
+            specular=0.35,
+            specular_power=16,
+            smooth_shading=True,
+            reset_camera=False,
+        )
+        self._style_hand_tactile_direction_actor(actor)
+        return actor
+
+    def _remove_hand_tactile_direction_actor(self, plotter, actor):
+        if actor is None:
+            return
+        overlay = getattr(self, "_hand_tactile_overlay_renderer", None)
+        if overlay is not None:
+            try:
+                overlay.RemoveActor(actor)
+                return
+            except Exception:
+                pass
+        if plotter is not None:
+            try:
+                plotter.remove_actor(actor, reset_camera=False)
+            except Exception:
+                pass
+
+    def _update_hand_tactile_direction_vector(self, plotter, region, reading):
+        if plotter is None:
+            return
+        frames = getattr(self, "_hand_tactile_pad_frames", None) or {}
+        frame = frames.get(region)
+        if frame is None:
+            return
+
+        direction_deg = reading.get("direction_deg")
+        tangential_n = reading.get("tangential_n")
+        force_n = reading.get("force_n")
+        tangential_level = float(reading.get("tangential_level") or 0.0)
+        arrow_actors = getattr(self, "_hand_tactile_direction_actors", None)
+        if arrow_actors is None:
+            arrow_actors = {}
+            self._hand_tactile_direction_actors = arrow_actors
+        arrow_meshes = getattr(self, "_hand_tactile_direction_meshes", None)
+        if arrow_meshes is None:
+            arrow_meshes = {}
+            self._hand_tactile_direction_meshes = arrow_meshes
+
+        actor = arrow_actors.get(region)
+        has_contact = force_n is not None and float(force_n) > 0.0
+        has_shear = tangential_n is not None and float(tangential_n) > 0.0
+        if direction_deg is None or not (has_contact or has_shear):
+            self._set_actor_visibility(actor, False)
+            return
+
+        angle_rad = math.radians(float(direction_deg))
+        direction = (
+            math.cos(angle_rad) * np.asarray(frame["tangent_x"], dtype=float)
+            + math.sin(angle_rad) * np.asarray(frame["tangent_y"], dtype=float)
+        )
+        start = (
+            np.asarray(frame["center"], dtype=float)
+            + np.asarray(frame["normal"], dtype=float) * float(frame["arrow_offset"])
+        )
+        arrow_scale = float(frame["arrow_scale"]) * (0.45 + 0.75 * min(1.0, tangential_level))
+        new_mesh = self._make_tactile_direction_arrow_mesh(start, direction, arrow_scale)
+
+        existing_mesh = arrow_meshes.get(region)
+        if existing_mesh is not None and actor is not None:
+            try:
+                existing_mesh.copy_from(new_mesh)
+                self._style_hand_tactile_direction_actor(actor)
+                self._set_actor_visibility(actor, True)
+                return
+            except Exception:
+                self._remove_hand_tactile_direction_actor(plotter, actor)
+                arrow_actors.pop(region, None)
+                arrow_meshes.pop(region, None)
+
+        try:
+            arrow_meshes[region] = new_mesh
+            actor = self._add_hand_tactile_direction_actor(plotter, new_mesh)
+            arrow_actors[region] = actor
+        except Exception as exc:
+            print(f"[DexterousHandModel] Failed to display direction vector {region}: {exc}")
+
+    def _refresh_hand_tactile_region_adjustment(self, plotter, region):
+        if plotter is None:
+            return False
+        base_meshes = getattr(self, "_hand_tactile_base_meshes", None) or {}
+        pad_meshes = getattr(self, "_hand_tactile_pad_meshes", None) or {}
+        marker_meshes = getattr(self, "_hand_tactile_marker_meshes", None) or {}
+        actors = getattr(self, "_hand_tactile_pad_actors", None) or {}
+        region = str(region)
+        base_mesh = base_meshes.get(region)
+        if base_mesh is None:
+            return False
+
+        adjusted_mesh = self._apply_tactile_region_adjustment(base_mesh, region)
+        displayed_mesh = pad_meshes.get(region)
+        if displayed_mesh is not None:
+            try:
+                displayed_mesh.copy_from(adjusted_mesh)
+            except Exception:
+                old_actor = actors.get(region)
+                if old_actor is not None:
+                    try:
+                        plotter.remove_actor(old_actor, reset_camera=False)
+                    except Exception:
+                        pass
+                try:
+                    actors[region] = plotter.add_mesh(
+                        adjusted_mesh,
+                        color=self._tactile_level_color(0.0),
+                        opacity=0.32,
+                        show_edges=False,
+                        specular=0.55,
+                        specular_power=20,
+                        smooth_shading=True,
+                        reset_camera=False,
+                    )
+                    pad_meshes[region] = adjusted_mesh
+                    displayed_mesh = adjusted_mesh
+                except Exception:
+                    return False
+        else:
+            pad_meshes[region] = adjusted_mesh
+            displayed_mesh = adjusted_mesh
+
+        try:
+            points = np.asarray(displayed_mesh.points, dtype=float)
+            center = points.mean(axis=0)
+            normal = self._estimate_sensor_outward_normal(displayed_mesh, center)
+            self._hand_tactile_pad_frames[region] = self._make_tactile_pad_frame(
+                displayed_mesh,
+                center,
+                normal,
+            )
+
+            marker_mesh = marker_meshes.get(region)
+            if marker_mesh is not None:
+                marker_mesh.copy_from(pv.Sphere(radius=1.1, center=center))
+
+            text_actor = (getattr(self, "_hand_tactile_value_text_actors", None) or {}).get(region)
+            if text_actor is not None:
+                text_actor.SetPosition(*[float(v) for v in center + normal * 7.0])
+        except Exception:
+            pass
+
+        arrow_actors = getattr(self, "_hand_tactile_direction_actors", None) or {}
+        arrow_meshes = getattr(self, "_hand_tactile_direction_meshes", None) or {}
+        arrow_actor = arrow_actors.pop(region, None)
+        arrow_meshes.pop(region, None)
+        if arrow_actor is not None:
+            self._remove_hand_tactile_direction_actor(plotter, arrow_actor)
+
+        try:
+            plotter.render()
+        except Exception:
+            pass
+        self._apply_latest_dexterous_hand_tactile()
+        return True
 
     @staticmethod
     def _make_sensor_value_text_actor(position):
@@ -1858,18 +2322,27 @@ class MyMeshLab():
 
         readings = self._extract_tactile_readings(data)
         text_actors = getattr(self, "_hand_tactile_value_text_actors", None) or {}
+        plotter = getattr(self, "_hand_model_dialog_plotter", None)
         max_force = None
+        max_tangential = None
         max_level = 0.0
         for region, actor in actors.items():
             reading = readings.get(region) or {}
             level = float(reading.get("level") or 0.0)
             force_n = reading.get("force_n")
+            tangential_n = reading.get("tangential_n")
             max_level = max(max_level, level)
             if force_n is not None and (max_force is None or force_n > max_force):
                 max_force = force_n
+            if (
+                tangential_n is not None
+                and (max_tangential is None or tangential_n > max_tangential)
+            ):
+                max_tangential = tangential_n
             color = self._tactile_level_color(level)
-            opacity = 0.40 + 0.55 * max(0.0, min(1.0, level))
+            opacity = 0.24 + 0.34 * max(0.0, min(1.0, level))
             self._set_actor_visual(actor, color, opacity)
+            self._update_hand_tactile_direction_vector(plotter, region, reading)
 
             text_actor = text_actors.get(region)
             if text_actor is not None:
@@ -1884,13 +2357,17 @@ class MyMeshLab():
         label = getattr(self, "_hand_tactile_overlay_label", None)
         if label is not None:
             if data and max_force is not None:
-                label.setText(f"Tactile overlay: peak {max_force:.2f} N")
+                if max_tangential is not None and max_tangential > 0.0:
+                    label.setText(
+                        f"Tactile overlay: peak {max_force:.2f} N | shear {max_tangential:.2f} N"
+                    )
+                else:
+                    label.setText(f"Tactile overlay: peak {max_force:.2f} N")
             elif data:
                 label.setText("Tactile overlay: no contact")
             else:
                 label.setText("Tactile overlay: idle")
 
-        plotter = getattr(self, "_hand_model_dialog_plotter", None)
         self._render_hand_tactile_plotter(plotter)
         return True
 
@@ -1944,12 +2421,23 @@ class MyMeshLab():
         return cloud, original_count, len(point_array)
 
     def _add_hand_dialog_axes(self, plotter, length):
-        length = max(float(length), 1.0)
+        return None
+
+    @staticmethod
+    def _reset_hand_dialog_camera(plotter, zoom=1.65):
         try:
-            plotter.add_mesh(pv.Line((-length, 0, 0), (length, 0, 0)), color="#ff5050", line_width=2)
-            plotter.add_mesh(pv.Line((0, -length, 0), (0, length, 0)), color="#50ff50", line_width=2)
-            plotter.add_mesh(pv.Line((0, 0, -length), (0, 0, length)), color="#5080ff", line_width=2)
-            plotter.add_axes(interactive=False)
+            plotter.reset_camera()
+        except Exception:
+            return
+        try:
+            plotter.camera.Zoom(float(zoom))
+        except Exception:
+            try:
+                plotter.camera.zoom(float(zoom))
+            except Exception:
+                pass
+        try:
+            plotter.reset_camera_clipping_range()
         except Exception:
             pass
 
@@ -1998,15 +2486,61 @@ class MyMeshLab():
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(8, 6, 8, 6)
         status_label = QLabel("Loading hand model...")
-        toolbar.addWidget(status_label)
+        toolbar.addWidget(status_label, 1)
+
         tactile_status_label = QLabel("Tactile overlay: idle")
         tactile_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         toolbar.addWidget(tactile_status_label)
-        toolbar.addStretch(1)
 
         reset_button = QPushButton("Reset View")
         toolbar.addWidget(reset_button)
         layout.addLayout(toolbar)
+
+        adjust_layout = QHBoxLayout()
+        adjust_layout.setContentsMargins(8, 0, 8, 6)
+        adjust_layout.setSpacing(6)
+        adjust_layout.addWidget(QLabel("Adjust"))
+
+        adjust_region_combo = QComboBox()
+        for region_key, region_label in self._hand_tactile_region_choices():
+            adjust_region_combo.addItem(region_label, region_key)
+        adjust_layout.addWidget(adjust_region_combo)
+
+        def _make_adjust_spin(suffix, decimals, step, minimum, maximum):
+            spin = QDoubleSpinBox()
+            spin.setRange(float(minimum), float(maximum))
+            spin.setDecimals(int(decimals))
+            spin.setSingleStep(float(step))
+            spin.setSuffix(suffix)
+            spin.setFixedWidth(90)
+            return spin
+
+        adjust_layout.addWidget(QLabel("X"))
+        adjust_x_spin = _make_adjust_spin(" mm", 2, 0.5, -100.0, 100.0)
+        adjust_layout.addWidget(adjust_x_spin)
+        adjust_layout.addWidget(QLabel("Y"))
+        adjust_y_spin = _make_adjust_spin(" mm", 2, 0.5, -100.0, 100.0)
+        adjust_layout.addWidget(adjust_y_spin)
+        adjust_layout.addWidget(QLabel("Z"))
+        adjust_z_spin = _make_adjust_spin(" mm", 2, 0.5, -100.0, 100.0)
+        adjust_layout.addWidget(adjust_z_spin)
+
+        adjust_layout.addWidget(QLabel("RX"))
+        adjust_rx_spin = _make_adjust_spin(" deg", 1, 1.0, -180.0, 180.0)
+        adjust_layout.addWidget(adjust_rx_spin)
+        adjust_layout.addWidget(QLabel("RY"))
+        adjust_ry_spin = _make_adjust_spin(" deg", 1, 1.0, -180.0, 180.0)
+        adjust_layout.addWidget(adjust_ry_spin)
+        adjust_layout.addWidget(QLabel("RZ"))
+        adjust_rz_spin = _make_adjust_spin(" deg", 1, 1.0, -180.0, 180.0)
+        adjust_layout.addWidget(adjust_rz_spin)
+
+        apply_adjust_button = QPushButton("Apply")
+        reset_adjust_button = QPushButton("Reset")
+        adjust_layout.addWidget(apply_adjust_button)
+        adjust_layout.addWidget(reset_adjust_button)
+        adjust_layout.addStretch(1)
+        layout.addLayout(adjust_layout)
 
         plotter = QtInteractor(dialog)
         layout.addWidget(plotter.interactor)
@@ -2019,6 +2553,13 @@ class MyMeshLab():
         try:
             self._hand_tactile_pad_actors = {}
             self._hand_tactile_value_text_actors = {}
+            self._hand_tactile_pad_frames = {}
+            self._hand_tactile_direction_actors = {}
+            self._hand_tactile_direction_meshes = {}
+            self._hand_tactile_base_meshes = {}
+            self._hand_tactile_pad_meshes = {}
+            self._hand_tactile_marker_meshes = {}
+            self._hand_tactile_overlay_renderer = None
             self._hand_tactile_overlay_label = tactile_status_label
 
             if urdf_path is not None:
@@ -2072,7 +2613,7 @@ class MyMeshLab():
                 self._add_hand_dialog_axes(plotter, span * 0.6)
                 status_label.setText(f"{model_path.name} | mesh loaded")
 
-            plotter.reset_camera()
+            self._reset_hand_dialog_camera(plotter)
             plotter.render()
         except Exception as exc:
             QMessageBox.warning(
@@ -2088,12 +2629,84 @@ class MyMeshLab():
 
         def _reset_view():
             try:
-                plotter.reset_camera()
+                self._reset_hand_dialog_camera(plotter)
                 plotter.render()
             except Exception:
                 pass
 
         reset_button.clicked.connect(_reset_view)
+
+        adjust_spins = (
+            adjust_x_spin,
+            adjust_y_spin,
+            adjust_z_spin,
+            adjust_rx_spin,
+            adjust_ry_spin,
+            adjust_rz_spin,
+        )
+
+        def _selected_adjust_region():
+            return str(adjust_region_combo.currentData() or "thumb")
+
+        def _set_adjust_spins(region):
+            adjustment = self._get_hand_sensor_adjustment(region)
+            values = list(adjustment["translation_mm"]) + list(adjustment["rotation_deg"])
+            for spin, value in zip(adjust_spins, values):
+                spin.blockSignals(True)
+                spin.setValue(float(value))
+                spin.blockSignals(False)
+
+        def _current_adjustment_from_spins():
+            return {
+                "translation_mm": [
+                    float(adjust_x_spin.value()),
+                    float(adjust_y_spin.value()),
+                    float(adjust_z_spin.value()),
+                ],
+                "rotation_deg": [
+                    float(adjust_rx_spin.value()),
+                    float(adjust_ry_spin.value()),
+                    float(adjust_rz_spin.value()),
+                ],
+            }
+
+        def _write_adjustment(region, adjustment):
+            adjustments = self._load_hand_sensor_adjustments()
+            translation = np.asarray(adjustment["translation_mm"], dtype=float)
+            rotation = np.asarray(adjustment["rotation_deg"], dtype=float)
+            if np.allclose(translation, 0.0) and np.allclose(rotation, 0.0):
+                adjustments.pop(region, None)
+            else:
+                adjustments[region] = adjustment
+            return self._save_hand_sensor_adjustments(adjustments)
+
+        def _apply_region_adjustment():
+            region = _selected_adjust_region()
+            adjustment = _current_adjustment_from_spins()
+            if not _write_adjustment(region, adjustment):
+                QMessageBox.warning(self.parent, "Sensor Adjustment", "Failed to save adjustment.")
+                return
+            if self._refresh_hand_tactile_region_adjustment(plotter, region):
+                status_label.setText(f"Applied {region} sensor adjustment")
+            else:
+                status_label.setText(f"{region} sensor adjustment saved")
+
+        def _reset_region_adjustment():
+            region = _selected_adjust_region()
+            default_adjustment = self._default_hand_sensor_adjustment()
+            _write_adjustment(region, default_adjustment)
+            _set_adjust_spins(region)
+            if self._refresh_hand_tactile_region_adjustment(plotter, region):
+                status_label.setText(f"Reset {region} sensor adjustment")
+            else:
+                status_label.setText(f"{region} sensor adjustment reset")
+
+        adjust_region_combo.currentIndexChanged.connect(
+            lambda _index: _set_adjust_spins(_selected_adjust_region())
+        )
+        apply_adjust_button.clicked.connect(_apply_region_adjustment)
+        reset_adjust_button.clicked.connect(_reset_region_adjustment)
+        _set_adjust_spins(_selected_adjust_region())
 
         def _on_finished(_result):
             dlg_plotter = getattr(self, "_hand_model_dialog_plotter", None)
@@ -2116,6 +2729,13 @@ class MyMeshLab():
             self._hand_model_actor = None
             self._hand_tactile_pad_actors = {}
             self._hand_tactile_value_text_actors = {}
+            self._hand_tactile_pad_frames = {}
+            self._hand_tactile_direction_actors = {}
+            self._hand_tactile_direction_meshes = {}
+            self._hand_tactile_base_meshes = {}
+            self._hand_tactile_pad_meshes = {}
+            self._hand_tactile_marker_meshes = {}
+            self._hand_tactile_overlay_renderer = None
             self._hand_tactile_overlay_label = None
             self._poke_main_plotters()
 

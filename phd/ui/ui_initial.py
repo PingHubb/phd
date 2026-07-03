@@ -479,12 +479,6 @@ class MyMainWindow(MainWindow):
 
         self.action_direct_finger_motion_params = QAction(self.style().standardIcon(QStyle.SP_CommandLink), '🖐 DFM Parameters', self)
         self.action_direct_finger_motion_params.setToolTip('Open the Direct Finger Motion parameter editor')
-        self.action_direct_finger_motion_v2_params = QAction(
-            self.style().standardIcon(QStyle.SP_MediaSeekForward),
-            'DFM V2 Parameters',
-            self,
-        )
-        self.action_direct_finger_motion_v2_params.setToolTip('Open the Direct Finger Motion V2 parameter editor')
         self.action_proximity_control_params = QAction(
             self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
             'Proximity Parameters',
@@ -497,6 +491,12 @@ class MyMainWindow(MainWindow):
             self,
         )
         self.action_console_control_params.setToolTip('Open the Console Control parameter editor')
+        self.action_sensor_params = QAction(
+            self.style().standardIcon(QStyle.SP_FileDialogListView),
+            'Sensor Parameters',
+            self,
+        )
+        self.action_sensor_params.setToolTip('Open the Sensor parameter editor')
         self.action_parameter_settings = QAction(
             self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
             'Parameter Settings',
@@ -549,9 +549,9 @@ class MyMainWindow(MainWindow):
         function_menu.addAction(self.action_keyboard_tool_velocity)
         parameter_menu = function_menu.addMenu('Parameter Settings')
         parameter_menu.addAction(self.action_direct_finger_motion_params)
-        parameter_menu.addAction(self.action_direct_finger_motion_v2_params)
         parameter_menu.addAction(self.action_proximity_control_params)
         parameter_menu.addAction(self.action_console_control_params)
+        parameter_menu.addAction(self.action_sensor_params)
         function_menu.addSeparator()
         function_menu.addAction(self.action_toggle_controls)
         function_menu.addSeparator()
@@ -573,9 +573,9 @@ class MyMainWindow(MainWindow):
         self.toolbar_parameter_button.setPopupMode(QToolButton.InstantPopup)
         parameter_popup_menu = QMenu(toolbar)
         parameter_popup_menu.addAction(self.action_direct_finger_motion_params)
-        parameter_popup_menu.addAction(self.action_direct_finger_motion_v2_params)
         parameter_popup_menu.addAction(self.action_proximity_control_params)
         parameter_popup_menu.addAction(self.action_console_control_params)
+        parameter_popup_menu.addAction(self.action_sensor_params)
         self.toolbar_parameter_button.setMenu(parameter_popup_menu)
         toolbar.addWidget(self.toolbar_parameter_button)
         toolbar.addAction(self.action_toggle_controls)
@@ -725,9 +725,9 @@ class MyMainWindow(MainWindow):
         self.action_sensor_controller_test.triggered.connect(self.open_sensor_controller_test_window)
         self.action_keyboard_tool_velocity.toggled.connect(self._on_keyboard_tool_velocity_toggled)
         self.action_direct_finger_motion_params.triggered.connect(self.open_direct_finger_motion_params_window)
-        self.action_direct_finger_motion_v2_params.triggered.connect(self.open_direct_finger_motion_v2_params_window)
         self.action_proximity_control_params.triggered.connect(self.open_proximity_control_params_window)
         self.action_console_control_params.triggered.connect(self.open_console_control_params_window)
+        self.action_sensor_params.triggered.connect(self.open_sensor_params_window)
         self.action_update_sensor.triggered.connect(self._trigger_global_sensor_update)
         self.action_sensor_zero_mask.triggered.connect(self._open_sensor_zero_mask_window)
         self.sidebar_btn_start.clicked.connect(self._start_sidebar_control)
@@ -890,17 +890,6 @@ class MyMainWindow(MainWindow):
         else:
             QMessageBox.information(self, "Info", "DFM parameter editor is not available in the current UI.")
 
-    def open_direct_finger_motion_v2_params_window(self):
-        if not self._require_ui_ros(
-            "Please wait for Ping Mode to load before opening the DFM V2 parameter editor."
-        ):
-            return
-
-        if hasattr(self.ui_ros, 'open_direct_finger_motion_v2_settings_dialog'):
-            self.ui_ros.open_direct_finger_motion_v2_settings_dialog()
-        else:
-            QMessageBox.information(self, "Info", "DFM V2 parameter editor is not available in the current UI.")
-
     def open_proximity_control_params_window(self):
         if not self._require_ui_ros(
             "Please wait for Ping Mode to load before opening the Proximity parameter editor."
@@ -922,6 +911,17 @@ class MyMainWindow(MainWindow):
             self.ui_ros.open_console_control_settings_dialog()
         else:
             QMessageBox.information(self, "Info", "Console Control parameter editor is not available in the current UI.")
+
+    def open_sensor_params_window(self):
+        if not self._require_ui_ros(
+            "Please wait for Ping Mode to load before opening the Sensor parameter editor."
+        ):
+            return
+
+        if hasattr(self.ui_ros, 'open_sensor_parameters_dialog'):
+            self.ui_ros.open_sensor_parameters_dialog()
+        else:
+            QMessageBox.information(self, "Info", "Sensor parameter editor is not available in the current UI.")
 
     def run_ping_mode(self):
         """Initializes and displays the main 'Ping Mode' UI, replacing the placeholder."""

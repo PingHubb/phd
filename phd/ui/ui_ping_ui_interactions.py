@@ -60,7 +60,6 @@ class UiInteractionsMixin:
         self.close_proximity_settings_button.clicked.connect(self.proximity_settings_dialog.close)
         self._load_proximity_settings_into_ui()
         self.direct_finger_motion_button.pressed.connect(self._on_toggle_direct_finger_motion)
-        self.direct_finger_motion_v2_button.pressed.connect(self._on_toggle_direct_finger_motion_v2)
         self.console_control_button.pressed.connect(self._on_toggle_console_control)
         self.console_control_sensor_button.pressed.connect(
             self._on_toggle_console_control_sensor_placeholder
@@ -79,28 +78,46 @@ class UiInteractionsMixin:
         self.reload_direct_finger_motion_settings_button.clicked.connect(
             self._load_direct_finger_motion_settings_into_ui
         )
-        self.apply_direct_finger_motion_v2_settings_button.clicked.connect(
-            self._apply_direct_finger_motion_v2_settings_from_ui
-        )
-        self.reload_direct_finger_motion_v2_settings_button.clicked.connect(
-            self._load_direct_finger_motion_v2_settings_into_ui
-        )
-        self.load_direct_finger_motion_v2_profile_button.clicked.connect(
-            self._load_direct_finger_motion_v2_profile_from_ui
-        )
         self.apply_console_control_settings_button.clicked.connect(
             self._apply_console_control_settings_from_ui
         )
         self.reload_console_control_settings_button.clicked.connect(
             self._load_console_control_settings_into_ui
         )
-        self.ai_direct_finger_motion_button.pressed.connect(self._on_toggle_ai_direct_finger_motion)
+        if hasattr(self, "ai_teaching_label_buttons"):
+            for teaching_label, button in self.ai_teaching_label_buttons.items():
+                if teaching_label == "auto":
+                    button.clicked.connect(
+                        lambda _checked=False, label=teaching_label: self._set_ai_teaching_label(label)
+                    )
+                else:
+                    button.pressed.connect(
+                        lambda label=teaching_label: self._set_ai_teaching_label(label)
+                    )
+                    button.released.connect(
+                        lambda label="auto": self._set_ai_teaching_label(label)
+                    )
+            self._update_ai_teaching_label_ui()
+        self.ai_direct_finger_motion_button.pressed.connect(
+            lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=False)
+        )
+        if hasattr(self, "ai_direct_finger_motion_robot_button"):
+            self.ai_direct_finger_motion_robot_button.pressed.connect(
+                lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=True)
+            )
         self.ai_direct_finger_motion_execution_button.pressed.connect(
             self._on_toggle_ai_direct_finger_motion_execution
         )
         self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         self.sensor_average_window_spin.valueChanged.connect(self._on_sensor_average_window_changed)
         self.visualization_target_hz_spin.valueChanged.connect(self._on_visualization_target_hz_changed)
+        self.sensor_visualization_mode_combo.currentIndexChanged.connect(
+            self._on_sensor_visualization_mode_changed
+        )
+        self.contact_normal_checkbox.toggled.connect(self._on_contact_normal_visibility_changed)
+        self.contact_normal_estimator_combo.currentIndexChanged.connect(
+            self._on_contact_normal_estimator_changed
+        )
         self.btn_toggle_anchor_axes.pressed.connect(self._on_toggle_anchor_axes)
         self.hand_open_all_button.clicked.connect(self._on_hand_open_all)
         self.hand_close_all_button.clicked.connect(self._on_hand_close_all)
@@ -196,6 +213,29 @@ class UiInteractionsMixin:
     def _on_visualization_target_hz_changed(self, value: float):
         self.sensor_functions.set_visualization_target_hz(value)
 
+    def _on_sensor_visualization_mode_changed(self, *_args):
+        helper = getattr(self, "sensor_functions", None)
+        combo = getattr(self, "sensor_visualization_mode_combo", None)
+        if helper is None or combo is None:
+            return
+        mode = combo.currentData()
+        if hasattr(helper, "set_sensor_visualization_mode"):
+            helper.set_sensor_visualization_mode(mode)
+
+    def _on_contact_normal_visibility_changed(self, checked: bool):
+        helper = getattr(self, "sensor_functions", None)
+        if helper is not None and hasattr(helper, "set_contact_normal_visualization_enabled"):
+            helper.set_contact_normal_visualization_enabled(bool(checked))
+
+    def _on_contact_normal_estimator_changed(self, *_args):
+        helper = getattr(self, "sensor_functions", None)
+        combo = getattr(self, "contact_normal_estimator_combo", None)
+        if helper is None or combo is None:
+            return
+        mode = combo.currentData()
+        if hasattr(helper, "set_contact_normal_estimator_mode"):
+            helper.set_contact_normal_estimator_mode(mode)
+
     def _set_record_trigger_mode(self, mode: str):
         helper = self._get_sensor_helper("record_gesture_class")
         if helper is not None:
@@ -253,24 +293,6 @@ class UiInteractionsMixin:
         recording = bool(getattr(helper, "is_recording", False)) if helper is not None else False
         if hasattr(self, "_set_button_active"):
             self._set_button_active(self.proximity_record_button, recording)
-
-    def _on_toggle_direct_finger_motion_v2(self):
-        self._direct_finger_v2_active = not getattr(self, "_direct_finger_v2_active", False)
-        if hasattr(self, "_set_button_active"):
-            self._set_button_active(self.direct_finger_motion_v2_button, self._direct_finger_v2_active)
-        try:
-            helper = self._get_sensor_helper("direct_finger_motion_v2_class")
-            if helper is None:
-                raise AttributeError("direct_finger_motion_v2_class is not available")
-            helper.toggle_direct_finger_motion_v2()
-            self._direct_finger_v2_active = bool(getattr(helper, "is_running", self._direct_finger_v2_active))
-            if hasattr(self, "_set_button_active"):
-                self._set_button_active(self.direct_finger_motion_v2_button, self._direct_finger_v2_active)
-        except Exception as exc:
-            print(f"[UI] Direct finger motion v2 toggle failed: {exc}")
-            self._direct_finger_v2_active = not self._direct_finger_v2_active
-            if hasattr(self, "_set_button_active"):
-                self._set_button_active(self.direct_finger_motion_v2_button, self._direct_finger_v2_active)
 
     def _on_toggle_console_control(self):
         self._console_control_active = not getattr(self, "_console_control_active", False)
@@ -1004,6 +1026,7 @@ class UiInteractionsMixin:
             return
         # ``result`` is expected to expose ``angle0..angle5`` (rh56f1 service).
         sliders = getattr(self, "hand_angle_sliders", []) or []
+        labels = getattr(self, "_hand_angle_value_labels", []) or []
         values: list = []
         for i in range(6):
             attr = f"angle{i}"
@@ -1018,7 +1041,14 @@ class UiInteractionsMixin:
         for i, s in enumerate(sliders):
             if i < len(values) and values[i] is not None:
                 v = max(s.minimum(), min(s.maximum(), int(values[i])))
+                s.blockSignals(True)
                 s.setValue(v)
+                s.blockSignals(False)
+                if i < len(labels):
+                    try:
+                        labels[i].setText(str(int(v)))
+                    except Exception:
+                        pass
         self._hand_log(f"Sliders synced from actual angles: {values}")
 
     def adjust_splitter_sizes(self):
