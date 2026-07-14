@@ -1,0 +1,88 @@
+\relax 
+\@writefile{toc}{\contentsline {title}{From Hand-Crafted Rules to Learned Policies: Robust Continuous Finger-Motion Guidance of a Collaborative Robot through a Capacitive Tactile Skin}{1}{}\protected@file@percent }
+\@writefile{toc}{\authcount {3}}
+\@writefile{toc}{\contentsline {author}{\textcolor {red}{[\textbf  {PLACEHOLDER:} Author One]} \and \textcolor {red}{[\textbf  {PLACEHOLDER:} Author Two]} \and \textcolor {red}{[\textbf  {PLACEHOLDER:} Author Three]}}{1}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{2}{}\protected@file@percent }
+\newlabel{sec:intro}{{1}{2}{}{section.1}{}}
+\citation{dahiya2010tactile,cannata2008embedded,mittendorfer2011humanoid}
+\citation{robosweater,luo2021conformal,tamura2020woven}
+\citation{yuan2017gelsight,luo2025tactileroboticsoutlook}
+\citation{liu2022machine,fitter2016qualitative}
+\citation{Iskandar2024ScienceRobotics}
+\citation{pomerleau1989alvinn,argall2009survey}
+\citation{ross2011dagger}
+\citation{chen2020learning}
+\citation{lee2020learning}
+\citation{levine2016end,finn2016deep}
+\citation{hendrycks2019robustness}
+\citation{taunyazov2019tactile}
+\citation{caesar2020nuscenes}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Related Work}{3}{}\protected@file@percent }
+\newlabel{sec:related}{{2}{3}{}{section.2}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Tactile skins for physical human--robot interaction.}{3}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Learning from demonstration and behavior cloning.}{3}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Robustness evaluation of tactile pipelines.}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {3}System Overview}{4}{}\protected@file@percent }
+\newlabel{sec:system}{{3}{4}{}{section.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.1}Sensing Substrate and Control Loop}{4}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.2}The Rule-Based Teacher}{4}{}\protected@file@percent }
+\newlabel{sec:teacher}{{3.2}{4}{}{subsection.3.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {3.3}Teacher-Supervised Data Collection}{4}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Policy architecture. A location-preserving convolutional encoder turns each tactile frame into soft-argmax keypoints and intensities; a recurrent head integrates the 16-frame window and emits a 6-DOF velocity command and an interaction mode.}}{5}{}\protected@file@percent }
+\newlabel{fig:arch}{{1}{5}{}{figure.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Learned Policy}{5}{}\protected@file@percent }
+\newlabel{sec:method}{{4}{5}{}{section.4}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.1}Input Representation}{5}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.2}Location-Preserving Spatiotemporal Architecture}{5}{}\protected@file@percent }
+\newlabel{eq:ssoftmax}{{1}{5}{}{equation.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.3}Geometry-Aware Augmentation}{6}{}\protected@file@percent }
+\newlabel{sec:augment}{{4.3}{6}{}{subsection.4.3}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {4.4}Training Protocol}{6}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {5}Faithful-Replay Robustness Benchmark}{7}{}\protected@file@percent }
+\newlabel{sec:benchmark}{{5}{7}{}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Design}{7}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Perturbation Families}{7}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Results}{7}{}\protected@file@percent }
+\newlabel{sec:results}{{6}{7}{}{section.6}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.1}Offline Imitation Fidelity}{7}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Predicted vs.\ teacher velocity on held-out validation episodes (first 800 windows; $v_x$, $v_y$, $v_z$ from top to bottom). The policy reproduces direction changes, push/pull events ($v_y$), and stop phases.}}{8}{}\protected@file@percent }
+\newlabel{fig:timeseries}{{2}{8}{}{figure.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.2}Robustness under Sensor Perturbation}{8}{}\protected@file@percent }
+\newlabel{sec:results-robust}{{6.2}{8}{}{subsection.6.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Faithful-replay benchmark on held-out episodes (4{,}614 frames): velocity RMSE (m/s, lower is better) and canonical-mode agreement (higher is better) against the clean-input teacher command. Both controllers receive identical perturbed streams. Bold marks the better controller per condition.}}{9}{}\protected@file@percent }
+\newlabel{tab:robust}{{1}{9}{}{table.1}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {6.3}Ablation: Location-Preserving Encoding and Augmentation}{9}{}\protected@file@percent }
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Velocity RMSE against the clean-input teacher command as a function of perturbation magnitude, for the rule pipeline (circles) and the learned policy (squares), across all four perturbation families.}}{10}{}\protected@file@percent }
+\newlabel{fig:robust}{{3}{10}{}{figure.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Limitations and Future Work}{10}{}\protected@file@percent }
+\newlabel{sec:limitations}{{7}{10}{}{section.7}{}}
+\bibstyle{splncs04}
+\bibdata{references}
+\bibcite{argall2009survey}{1}
+\bibcite{caesar2020nuscenes}{2}
+\bibcite{cannata2008embedded}{3}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Effect of the location-preserving encoder and geometry-aware augmentation on noise robustness (velocity RMSE, m/s). The baseline variant uses a global-average-pooling encoder without geometric augmentation. Both variants are benchmarked identically. \textcolor {red}{[\textbf  {PLACEHOLDER:} Re-run as a controlled single-variable ablation (same sequence length and training budget) before camera-ready; current numbers compare deployed variants that also differ in window length (8 vs.\ 16).]}}}{11}{}\protected@file@percent }
+\newlabel{tab:ablation}{{2}{11}{}{table.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Conclusion}{11}{}\protected@file@percent }
+\newlabel{sec:conclusion}{{8}{11}{}{section.8}{}}
+\@writefile{toc}{\contentsline {subsubsection}{Acknowledgements.}{11}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Disclosure of Interests.}{11}{}\protected@file@percent }
+\bibcite{chen2020learning}{4}
+\bibcite{dahiya2010tactile}{5}
+\bibcite{finn2016deep}{6}
+\bibcite{fitter2016qualitative}{7}
+\bibcite{hendrycks2019robustness}{8}
+\bibcite{Iskandar2024ScienceRobotics}{9}
+\bibcite{lee2020learning}{10}
+\bibcite{levine2016end}{11}
+\bibcite{liu2022machine}{12}
+\bibcite{luo2025tactileroboticsoutlook}{13}
+\bibcite{luo2021conformal}{14}
+\bibcite{mittendorfer2011humanoid}{15}
+\bibcite{pomerleau1989alvinn}{16}
+\bibcite{ross2011dagger}{17}
+\bibcite{robosweater}{18}
+\bibcite{tamura2020woven}{19}
+\bibcite{taunyazov2019tactile}{20}
+\bibcite{yuan2017gelsight}{21}
+\gdef \@abspage@last{12}

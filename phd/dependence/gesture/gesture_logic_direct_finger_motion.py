@@ -1658,7 +1658,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             print(f"Failed to load AI direct finger motion model: {exc}")
 
     def _load_cnn_gru_checkpoint(self, _checkpoint, config):
-        from phd.dependence.transformer import TactileCNNGRUPolicy
+        from phd.dependence.tactile_models import TactileCNNGRUPolicy
 
         self.model_kind = "cnn_gru"
         self.seq_len = int(config.get("seq_len", 16))
@@ -1699,10 +1699,11 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             dropout=float(config.get("dropout", 0.12)),
             velocity_dim=int(config.get("velocity_dim", 6)),
             mode_classes=int(config.get("mode_classes", len(self.MODE_TO_INDEX))),
+            encoder_type=str(config.get("encoder_type", "avgpool")),
         ).to(self.device)
 
     def _load_legacy_transformer_checkpoint(self, _checkpoint, config):
-        from phd.dependence.transformer import _AI_DFM_CNNTactileTransformerAux
+        from phd.dependence.tactile_models import _AI_DFM_CNNTactileTransformerAux
 
         self.model_kind = "legacy_transformer"
         self.seq_len = int(config.get("seq_len", 20))

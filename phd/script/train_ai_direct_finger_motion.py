@@ -342,6 +342,13 @@ def compute_normalization(episodes: list[Episode]) -> dict[str, np.ndarray]:
 
 
 class SequenceDataset(Dataset):
+    # Axis semantics from the rule-based teacher (gesture_logic_direct_finger_motion):
+    # sensor column motion -> vx (and two-finger horizontal swipe -> rz),
+    # sensor row motion -> vz (and two-finger vertical swipe -> rx),
+    # push/pull -> vy (spatially direction-invariant).
+    COL_FLIP_TARGET_AXES = (0, 5)  # vx, rz
+    ROW_FLIP_TARGET_AXES = (2, 3)  # vz, rx
+
     def __init__(
         self,
         episodes: list[Episode],
@@ -349,10 +356,29 @@ class SequenceDataset(Dataset):
         seq_len: int,
         normalization: dict[str, np.ndarray],
         stride: int = 1,
+        channels: tuple[str, ...] = DEFAULT_CHANNELS,
+        aux_features: tuple[str, ...] = DEFAULT_AUX_FEATURES,
+        augment: bool = False,
+        aug_flip_prob: float = 0.5,
+        aug_max_shift: int = 2,
+        aug_noise_std: float = 0.02,
+        seed: int = 0,
     ):
         self.episodes = episodes
         self.seq_len = int(seq_len)
         self.normalization = normalization
+        self.channels = tuple(channels)
+        self.aux_features = tuple(aux_features)
+        self.augment = bool(augment)
+        self.aug_flip_prob = float(aug_flip_prob)
+        self.aug_max_shift = int(aug_max_shift)
+        self.aug_noise_std = float(aug_noise_std)
+        self._rng = np.random.default_rng(seed)
+        self._aux_idx = {name: idx for idx, name in enumerate(self.aux_features)}
+        self._touch_mask_channel = self.channels.index("touchMask") if "touchMask" in self.channels else None
+        self._noise_channel_indices = [
+            idx for idx, name in enumerate(self.channels) if name != "touchMask"
+        ]
         self.indices: list[tuple[int, int]] = []
         for episode_idx, episode in enumerate(episodes):
             for end_idx in range(self.seq_len - 1, episode.frame_count, max(1, int(stride))):
@@ -360,6 +386,92 @@ class SequenceDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.indices)
+
+    def _aux_col(self, aux: np.ndarray, name: str) -> np.ndarray | None:
+        idx = self._aux_idx.get(name)
+        return aux[:, idx] if idx is not None else None
+
+    def _touch_present_mask(self, aux: np.ndarray) -> np.ndarray:
+        touch = self._aux_col(aux, "touch_present")
+        if touch is not None:
+            return touch > 0.5
+        return np.ones(aux.shape[0], dtype=bool)
+
+    def _flip_aux_axis(self, aux: np.ndarray, *, center: str, deltas: tuple[str, ...]) -> None:
+        touch = self._touch_present_mask(aux)
+        center_col = self._aux_col(aux, center)
+        if center_col is not None:
+            center_col[touch] = 1.0 - center_col[touch]
+        for name in deltas:
+            delta_col = self._aux_col(aux, name)
+            if delta_col is not None:
+                delta_col *= -1.0
+
+    def _active_cell_mask(self, x: np.ndarray) -> np.ndarray:
+        if self._touch_mask_channel is not None:
+            return (x[:, self._touch_mask_channel] > 0.5).any(axis=0)
+        return (np.abs(x[:, 0]) > 1e-6).any(axis=0)
+
+    def _shift_bounds(self, active: np.ndarray, axis: int, size: int) -> tuple[int, int]:
+        occupied = np.where(active.any(axis=1 - axis))[0]
+        if occupied.size == 0:
+            return 0, 0
+        low = max(-self.aug_max_shift, -int(occupied[0]))
+        high = min(self.aug_max_shift, int(size - 1 - occupied[-1]))
+        return low, max(low, high)
+
+    def _augment_sample(
+        self, x: np.ndarray, aux: np.ndarray, y: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rows, cols = int(x.shape[-2]), int(x.shape[-1])
+
+        if self._rng.random() < self.aug_flip_prob:
+            x = x[..., ::-1]
+            for axis in self.COL_FLIP_TARGET_AXES:
+                y[axis] = -y[axis]
+            self._flip_aux_axis(aux, center="center_col", deltas=("delta_col", "delta_col_norm"))
+
+        if self._rng.random() < self.aug_flip_prob:
+            x = x[..., ::-1, :]
+            for axis in self.ROW_FLIP_TARGET_AXES:
+                y[axis] = -y[axis]
+            self._flip_aux_axis(aux, center="center_row", deltas=("delta_row", "delta_row_norm"))
+
+        if self.aug_max_shift > 0:
+            active = self._active_cell_mask(x)
+            row_low, row_high = self._shift_bounds(active, axis=0, size=rows)
+            col_low, col_high = self._shift_bounds(active, axis=1, size=cols)
+            shift_r = int(self._rng.integers(row_low, row_high + 1))
+            shift_c = int(self._rng.integers(col_low, col_high + 1))
+            if shift_r != 0 or shift_c != 0:
+                shifted = np.zeros_like(x)
+                src_r = slice(max(0, -shift_r), rows - max(0, shift_r))
+                dst_r = slice(max(0, shift_r), rows - max(0, -shift_r))
+                src_c = slice(max(0, -shift_c), cols - max(0, shift_c))
+                dst_c = slice(max(0, shift_c), cols - max(0, -shift_c))
+                shifted[..., dst_r, dst_c] = x[..., src_r, src_c]
+                x = shifted
+                touch = self._touch_present_mask(aux)
+                center_row = self._aux_col(aux, "center_row")
+                if center_row is not None and shift_r != 0:
+                    center_row[touch] = np.clip(
+                        center_row[touch] + shift_r / max(1.0, rows - 1.0), 0.0, 1.0
+                    )
+                center_col = self._aux_col(aux, "center_col")
+                if center_col is not None and shift_c != 0:
+                    center_col[touch] = np.clip(
+                        center_col[touch] + shift_c / max(1.0, cols - 1.0), 0.0, 1.0
+                    )
+
+        if self.aug_noise_std > 0.0 and self._noise_channel_indices:
+            x = np.ascontiguousarray(x)
+            for channel_idx in self._noise_channel_indices:
+                scale = self.aug_noise_std * float(self.normalization["channel_std"][channel_idx])
+                x[:, channel_idx] += self._rng.normal(
+                    0.0, scale, size=x[:, channel_idx].shape
+                ).astype(np.float32)
+
+        return np.ascontiguousarray(x), aux, y
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         episode_idx, end_idx = self.indices[idx]
@@ -369,6 +481,9 @@ class SequenceDataset(Dataset):
         aux = episode.aux[start : end_idx + 1].copy()
         y = episode.target[end_idx].copy()
         mode = int(episode.mode[end_idx])
+
+        if self.augment:
+            x, aux, y = self._augment_sample(x, aux, y)
 
         x = (x - self.normalization["channel_mean"][None, :, None, None]) / self.normalization["channel_std"][
             None, :, None, None
@@ -412,6 +527,65 @@ class TactileFrameEncoder(nn.Module):
         return self.net(x)
 
 
+class TactileSpatialSoftmax(nn.Module):
+    """Per-channel soft-argmax over the spatial map.
+
+    Returns the expected (row, col) coordinate of each feature channel in
+    [-1, 1], preserving *where* activations are instead of averaging them away.
+    Must stay in sync with phd.dependence.tactile_models.TactileSpatialSoftmax.
+    """
+
+    def __init__(self, temperature_init: float = 1.0):
+        super().__init__()
+        self.log_temperature = nn.Parameter(torch.log(torch.tensor(float(temperature_init))))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        attention = torch.softmax(
+            (x / torch.exp(self.log_temperature)).reshape(b, c, h * w), dim=-1
+        ).reshape(b, c, h, w)
+        rows = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
+        cols = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
+        expected_row = (attention.sum(dim=3) * rows[None, None, :]).sum(dim=2)
+        expected_col = (attention.sum(dim=2) * cols[None, None, :]).sum(dim=2)
+        return torch.cat([expected_row, expected_col], dim=1)
+
+
+class TactileSpatialSoftmaxEncoder(nn.Module):
+    """Location-preserving tactile encoder (no spatial pooling).
+
+    Must stay in sync with
+    phd.dependence.tactile_models.TactileCNNGRUSpatialSoftmaxEncoder so trained
+    checkpoints load on the execution side.
+    """
+
+    def __init__(self, in_channels: int, d_model: int, dropout: float, feature_channels: int = 64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, feature_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.GELU(),
+        )
+        self.spatial_softmax = TactileSpatialSoftmax()
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(feature_channels * 3, d_model),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.conv(x)
+        keypoints = self.spatial_softmax(features)
+        intensity = features.mean(dim=(2, 3))
+        return self.head(torch.cat([keypoints, intensity], dim=1))
+
+
 class TactileCNNGRUPolicy(nn.Module):
     def __init__(
         self,
@@ -424,9 +598,13 @@ class TactileCNNGRUPolicy(nn.Module):
         dropout: float,
         velocity_dim: int = 6,
         mode_classes: int = 4,
+        encoder_type: str = "avgpool",
     ):
         super().__init__()
-        self.frame_encoder = TactileFrameEncoder(in_channels, d_model, dropout)
+        if encoder_type == "spatial_softmax":
+            self.frame_encoder = TactileSpatialSoftmaxEncoder(in_channels, d_model, dropout)
+        else:
+            self.frame_encoder = TactileFrameEncoder(in_channels, d_model, dropout)
         self.aux_encoder = nn.Sequential(
             nn.Linear(aux_dim, d_model),
             nn.GELU(),
@@ -850,17 +1028,28 @@ def train(args: argparse.Namespace) -> Path:
         split_each_session=len(session_paths) > 1,
     )
     normalization = compute_normalization(train_episodes)
+    augment_enabled = not args.no_augment
     train_dataset = SequenceDataset(
         train_episodes,
         seq_len=args.seq_len,
         normalization=normalization,
         stride=args.stride,
+        channels=channels,
+        aux_features=aux_features,
+        augment=augment_enabled,
+        aug_flip_prob=args.aug_flip_prob,
+        aug_max_shift=args.aug_max_shift,
+        aug_noise_std=args.aug_noise_std,
+        seed=int(args.seed),
     )
     val_dataset = SequenceDataset(
         val_episodes,
         seq_len=args.seq_len,
         normalization=normalization,
         stride=args.stride,
+        channels=channels,
+        aux_features=aux_features,
+        augment=False,
     )
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise ValueError("Not enough sequence samples for training/validation.")
@@ -922,7 +1111,12 @@ def train(args: argparse.Namespace) -> Path:
         "dropout": float(args.dropout),
         "velocity_dim": 6,
         "mode_classes": len(INDEX_TO_MODE),
+        "encoder_type": args.encoder,
         "lock_rotation_axes": bool(not args.allow_rotation_output),
+        "augment": augment_enabled,
+        "aug_flip_prob": float(args.aug_flip_prob),
+        "aug_max_shift": int(args.aug_max_shift),
+        "aug_noise_std": float(args.aug_noise_std),
         "recording_note": "offline training only; do not execute on robot until validated",
     }
 
@@ -935,6 +1129,7 @@ def train(args: argparse.Namespace) -> Path:
         dropout=args.dropout,
         velocity_dim=6,
         mode_classes=len(INDEX_TO_MODE),
+        encoder_type=args.encoder,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -1098,6 +1293,31 @@ def main() -> int:
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=20260623)
+    parser.add_argument(
+        "--encoder",
+        choices=("spatial_softmax", "avgpool"),
+        default="spatial_softmax",
+        help="Frame encoder. spatial_softmax preserves touch location; avgpool is the legacy encoder.",
+    )
+    parser.add_argument("--no-augment", action="store_true", help="Disable training-time data augmentation.")
+    parser.add_argument(
+        "--aug-flip-prob",
+        type=float,
+        default=0.5,
+        help="Probability of each geometric flip (row/col) with matching velocity-target sign flips.",
+    )
+    parser.add_argument(
+        "--aug-max-shift",
+        type=int,
+        default=2,
+        help="Max random translation (cells) of the touch pattern; velocity target unchanged.",
+    )
+    parser.add_argument(
+        "--aug-noise-std",
+        type=float,
+        default=0.02,
+        help="Gaussian sensor-noise std as a fraction of each channel's training std (0 disables).",
+    )
     parser.add_argument("--cpu", action="store_true", help="Force CPU training.")
     parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision.")
     parser.add_argument("--no-plots", action="store_true", help="Skip PNG plot generation.")

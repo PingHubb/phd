@@ -110,7 +110,7 @@ class ThreeLevelTransformer:
             num_q = int(config_3level["NUM_QUALITY_CLASSES"])
 
             import torch
-            from phd.dependence.transformer import (
+            from phd.dependence.tactile_models import (
                 GestureBackbone,
                 ThreeLevelHierarchicalModel,
             )

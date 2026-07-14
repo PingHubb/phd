@@ -2443,7 +2443,7 @@ class UI(
         execute_safety_layout.setContentsMargins(0, 0, 0, 0)
         execute_safety_layout.setSpacing(8)
         self.ai_direct_execution_dry_run_checkbox = QCheckBox("Dry run")
-        self.ai_direct_execution_dry_run_checkbox.setChecked(True)
+        self.ai_direct_execution_dry_run_checkbox.setChecked(False)
         self.ai_direct_execution_dry_run_checkbox.setToolTip(
             "When checked, AI predicts live velocity but does not send robot motion commands."
         )

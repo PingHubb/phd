@@ -267,6 +267,66 @@ class TactileCNNGRUFrameEncoder(nn.Module):
         return self.net(x)
 
 
+class TactileSpatialSoftmax(nn.Module):
+    """Per-channel soft-argmax over the spatial map.
+
+    Returns the expected (row, col) coordinate of each feature channel in
+    [-1, 1], preserving *where* activations are instead of averaging them away.
+    """
+
+    def __init__(self, temperature_init=1.0):
+        super().__init__()
+        self.log_temperature = nn.Parameter(
+            torch.log(torch.tensor(float(temperature_init)))
+        )
+
+    def forward(self, x):
+        b, c, h, w = x.shape
+        attention = torch.softmax(
+            (x / torch.exp(self.log_temperature)).reshape(b, c, h * w), dim=-1
+        ).reshape(b, c, h, w)
+        rows = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
+        cols = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
+        expected_row = (attention.sum(dim=3) * rows[None, None, :]).sum(dim=2)
+        expected_col = (attention.sum(dim=2) * cols[None, None, :]).sum(dim=2)
+        return torch.cat([expected_row, expected_col], dim=1)
+
+
+class TactileCNNGRUSpatialSoftmaxEncoder(nn.Module):
+    """Location-preserving tactile encoder.
+
+    Full-resolution conv stack (no spatial pooling; the sensor grid is tiny)
+    followed by soft-argmax keypoints per channel plus per-channel mean
+    intensity, so both touch location and pressure magnitude survive.
+    """
+
+    def __init__(self, in_channels, d_model, dropout, feature_channels=64):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.Conv2d(64, feature_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(feature_channels),
+            nn.GELU(),
+        )
+        self.spatial_softmax = TactileSpatialSoftmax()
+        self.head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(feature_channels * 3, d_model),
+            nn.GELU(),
+        )
+
+    def forward(self, x):
+        features = self.conv(x)
+        keypoints = self.spatial_softmax(features)
+        intensity = features.mean(dim=(2, 3))
+        return self.head(torch.cat([keypoints, intensity], dim=1))
+
+
 class TactileCNNGRUPolicy(nn.Module):
     """Causal CNN-GRU tactile policy for direct sensor-to-velocity control."""
 
@@ -280,9 +340,13 @@ class TactileCNNGRUPolicy(nn.Module):
         dropout,
         velocity_dim=6,
         mode_classes=4,
+        encoder_type="avgpool",
     ):
         super().__init__()
-        self.frame_encoder = TactileCNNGRUFrameEncoder(in_channels, d_model, dropout)
+        if encoder_type == "spatial_softmax":
+            self.frame_encoder = TactileCNNGRUSpatialSoftmaxEncoder(in_channels, d_model, dropout)
+        else:
+            self.frame_encoder = TactileCNNGRUFrameEncoder(in_channels, d_model, dropout)
         self.aux_encoder = nn.Sequential(
             nn.Linear(aux_dim, d_model),
             nn.GELU(),
