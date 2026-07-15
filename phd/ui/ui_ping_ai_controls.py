@@ -174,9 +174,9 @@ class AiControlsMixin:
 
         if not anchor_available:
             self.btn_toggle_anchor_axes.setText("Axes: Anchored OFF")
-            self.btn_toggle_anchor_axes.setStyleSheet(
-                "QPushButton { background-color: #cfcfcf; color: #7a7a7a; }"
-            )
+            # setEnabled(False) above + the global QSS ":disabled" rule already
+            # render the proper muted style; just clear any active override.
+            self.btn_toggle_anchor_axes.setStyleSheet("")
             return
 
         three = self._get_sensor_helper("threelevel_hierarchical_transformer_class")

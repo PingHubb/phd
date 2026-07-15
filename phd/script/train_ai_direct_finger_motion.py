@@ -31,6 +31,18 @@ from torch.utils.data import DataLoader, Dataset
 warnings.filterwarnings("ignore", message="CUDA initialization.*", category=UserWarning)
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+
+# Single source of truth for the model architecture: the runtime module.
+# Importing it (instead of keeping a copy here) guarantees that trained
+# checkpoints always load on the execution side.
+try:
+    from phd.dependence.tactile_models import TactileCNNGRUPolicy
+except ModuleNotFoundError:  # running directly from the source tree
+    import sys
+
+    sys.path.insert(0, str(PACKAGE_ROOT.parent))
+    from phd.dependence.tactile_models import TactileCNNGRUPolicy
+
 DEFAULT_SESSION = "first_trial_no_rotation"
 DEFAULT_TARGET_KEY = "intended_velocity_target"
 DEFAULT_SEQ_LEN = 16
@@ -362,6 +374,9 @@ class SequenceDataset(Dataset):
         aug_flip_prob: float = 0.5,
         aug_max_shift: int = 2,
         aug_noise_std: float = 0.02,
+        aug_sensor_noise_max: float = 0.0,
+        aug_drift_max: float = 0.0,
+        aug_touch_threshold: float = -3.0,
         seed: int = 0,
     ):
         self.episodes = episodes
@@ -373,7 +388,11 @@ class SequenceDataset(Dataset):
         self.aug_flip_prob = float(aug_flip_prob)
         self.aug_max_shift = int(aug_max_shift)
         self.aug_noise_std = float(aug_noise_std)
+        self.aug_sensor_noise_max = float(aug_sensor_noise_max)
+        self.aug_drift_max = float(aug_drift_max)
+        self.aug_touch_threshold = float(aug_touch_threshold)
         self._rng = np.random.default_rng(seed)
+        self._channel_idx = {name: idx for idx, name in enumerate(self.channels)}
         self._aux_idx = {name: idx for idx, name in enumerate(self.aux_features)}
         self._touch_mask_channel = self.channels.index("touchMask") if "touchMask" in self.channels else None
         self._noise_channel_indices = [
@@ -471,7 +490,75 @@ class SequenceDataset(Dataset):
                     0.0, scale, size=x[:, channel_idx].shape
                 ).astype(np.float32)
 
+        if self.aug_sensor_noise_max > 0.0 or self.aug_drift_max > 0.0:
+            x = self._apply_sensor_perturbation(x)
+
         return np.ascontiguousarray(x), aux, y
+
+    def _apply_sensor_perturbation(self, x: np.ndarray) -> np.ndarray:
+        """Emulate physical sensor corruption on the input window only.
+
+        Mirrors the deployment-time failure modes (i.i.d. electrical noise and
+        baseline drift toward the touch threshold) consistently across the
+        derived channels: the averaged channel receives the moving average of
+        the same noise (spatially flipped, matching the live pipeline), the
+        temporal-difference channel receives the frame-to-frame noise delta,
+        and the touch mask is recomputed from the corrupted averaged channel.
+        Velocity/mode targets are deliberately unchanged: the operator's
+        finger is doing the same thing regardless of sensor health.
+        """
+        diff_idx = self._channel_idx.get("diffPerData")
+        ave_idx = self._channel_idx.get("diffPerDataAve")
+        frame_diff_idx = self._channel_idx.get("frameDiff")
+        mask_idx = self._touch_mask_channel
+
+        x = np.ascontiguousarray(x)
+        frames = x.shape[0]
+        rows, cols = int(x.shape[-2]), int(x.shape[-1])
+
+        # Apply at most one perturbation family per window (mutually exclusive,
+        # matching the one-family-at-a-time robustness benchmark). Stacking
+        # noise and drift on the same window compounds the ambiguity and makes
+        # the policy hedge velocity magnitudes on clean input.
+        sigma = 0.0
+        drift = 0.0
+        enabled = [name for name, mx in (("noise", self.aug_sensor_noise_max), ("drift", self.aug_drift_max)) if mx > 0.0]
+        if enabled and self._rng.random() < 0.5:
+            choice = enabled[int(self._rng.integers(len(enabled)))]
+            if choice == "noise":
+                sigma = float(self._rng.uniform(0.0, self.aug_sensor_noise_max))
+            else:
+                drift = float(self._rng.uniform(0.0, self.aug_drift_max))
+        if sigma <= 0.0 and drift <= 0.0:
+            return x
+
+        if sigma > 0.0:
+            noise = self._rng.normal(0.0, sigma, size=(frames, rows, cols)).astype(np.float32)
+            moving_avg = np.empty_like(noise)
+            for t in range(frames):
+                lo = max(0, t - 2)
+                moving_avg[t] = noise[lo : t + 1].mean(axis=0)
+            moving_avg = moving_avg[:, ::-1, :]
+            if diff_idx is not None:
+                x[:, diff_idx] += noise
+            if ave_idx is not None:
+                x[:, ave_idx] += moving_avg
+            if frame_diff_idx is not None:
+                frame_diff_noise = np.zeros_like(noise)
+                frame_diff_noise[1:] = noise[1:] - noise[:-1]
+                x[:, frame_diff_idx] += frame_diff_noise
+
+        if drift > 0.0:
+            # Toward the (negative) touch threshold; constant offsets cancel in
+            # the temporal-difference channel, so frameDiff is unaffected.
+            for idx in (diff_idx, ave_idx):
+                if idx is not None:
+                    x[:, idx] -= drift
+
+        if mask_idx is not None and ave_idx is not None:
+            x[:, mask_idx] = (x[:, ave_idx] < self.aug_touch_threshold).astype(np.float32)
+
+        return x
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
         episode_idx, end_idx = self.indices[idx]
@@ -499,158 +586,6 @@ class SequenceDataset(Dataset):
             "mode": torch.tensor(mode, dtype=torch.long),
             "episode_idx": torch.tensor(episode_idx, dtype=torch.long),
             "frame_idx": torch.tensor(end_idx, dtype=torch.long),
-        }
-
-
-class TactileFrameEncoder(nn.Module):
-    def __init__(self, in_channels: int, d_model: int, dropout: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.MaxPool2d(2, ceil_mode=True),
-            nn.Conv2d(64, 96, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(96),
-            nn.GELU(),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
-            nn.Dropout(dropout),
-            nn.Linear(96, d_model),
-            nn.GELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class TactileSpatialSoftmax(nn.Module):
-    """Per-channel soft-argmax over the spatial map.
-
-    Returns the expected (row, col) coordinate of each feature channel in
-    [-1, 1], preserving *where* activations are instead of averaging them away.
-    Must stay in sync with phd.dependence.tactile_models.TactileSpatialSoftmax.
-    """
-
-    def __init__(self, temperature_init: float = 1.0):
-        super().__init__()
-        self.log_temperature = nn.Parameter(torch.log(torch.tensor(float(temperature_init))))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        b, c, h, w = x.shape
-        attention = torch.softmax(
-            (x / torch.exp(self.log_temperature)).reshape(b, c, h * w), dim=-1
-        ).reshape(b, c, h, w)
-        rows = torch.linspace(-1.0, 1.0, h, device=x.device, dtype=x.dtype)
-        cols = torch.linspace(-1.0, 1.0, w, device=x.device, dtype=x.dtype)
-        expected_row = (attention.sum(dim=3) * rows[None, None, :]).sum(dim=2)
-        expected_col = (attention.sum(dim=2) * cols[None, None, :]).sum(dim=2)
-        return torch.cat([expected_row, expected_col], dim=1)
-
-
-class TactileSpatialSoftmaxEncoder(nn.Module):
-    """Location-preserving tactile encoder (no spatial pooling).
-
-    Must stay in sync with
-    phd.dependence.tactile_models.TactileCNNGRUSpatialSoftmaxEncoder so trained
-    checkpoints load on the execution side.
-    """
-
-    def __init__(self, in_channels: int, d_model: int, dropout: float, feature_channels: int = 64):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.Conv2d(64, feature_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(feature_channels),
-            nn.GELU(),
-        )
-        self.spatial_softmax = TactileSpatialSoftmax()
-        self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(feature_channels * 3, d_model),
-            nn.GELU(),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        features = self.conv(x)
-        keypoints = self.spatial_softmax(features)
-        intensity = features.mean(dim=(2, 3))
-        return self.head(torch.cat([keypoints, intensity], dim=1))
-
-
-class TactileCNNGRUPolicy(nn.Module):
-    def __init__(
-        self,
-        *,
-        in_channels: int,
-        aux_dim: int,
-        d_model: int,
-        gru_hidden: int,
-        gru_layers: int,
-        dropout: float,
-        velocity_dim: int = 6,
-        mode_classes: int = 4,
-        encoder_type: str = "avgpool",
-    ):
-        super().__init__()
-        if encoder_type == "spatial_softmax":
-            self.frame_encoder = TactileSpatialSoftmaxEncoder(in_channels, d_model, dropout)
-        else:
-            self.frame_encoder = TactileFrameEncoder(in_channels, d_model, dropout)
-        self.aux_encoder = nn.Sequential(
-            nn.Linear(aux_dim, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-        )
-        self.fusion = nn.Sequential(
-            nn.Linear(d_model * 2, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-        )
-        gru_dropout = dropout if gru_layers > 1 else 0.0
-        self.gru = nn.GRU(
-            input_size=d_model,
-            hidden_size=gru_hidden,
-            num_layers=gru_layers,
-            dropout=gru_dropout,
-            batch_first=True,
-        )
-        self.norm = nn.LayerNorm(gru_hidden)
-        self.velocity_head = nn.Sequential(
-            nn.Linear(gru_hidden, gru_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(gru_hidden, velocity_dim),
-        )
-        self.mode_head = nn.Sequential(
-            nn.Linear(gru_hidden, gru_hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(gru_hidden, mode_classes),
-        )
-
-    def forward(self, x: torch.Tensor, aux: torch.Tensor) -> dict[str, torch.Tensor]:
-        batch, steps, channels, rows, cols = x.shape
-        frame_tokens = self.frame_encoder(x.reshape(batch * steps, channels, rows, cols)).reshape(batch, steps, -1)
-        aux_tokens = self.aux_encoder(aux.reshape(batch * steps, -1)).reshape(batch, steps, -1)
-        tokens = self.fusion(torch.cat([frame_tokens, aux_tokens], dim=-1))
-        encoded, _hidden = self.gru(tokens)
-        final = self.norm(encoded[:, -1, :])
-        return {
-            "velocity_norm": self.velocity_head(final),
-            "mode_logits": self.mode_head(final),
         }
 
 
@@ -1040,6 +975,8 @@ def train(args: argparse.Namespace) -> Path:
         aug_flip_prob=args.aug_flip_prob,
         aug_max_shift=args.aug_max_shift,
         aug_noise_std=args.aug_noise_std,
+        aug_sensor_noise_max=args.aug_sensor_noise_max,
+        aug_drift_max=args.aug_drift_max,
         seed=int(args.seed),
     )
     val_dataset = SequenceDataset(
@@ -1117,6 +1054,8 @@ def train(args: argparse.Namespace) -> Path:
         "aug_flip_prob": float(args.aug_flip_prob),
         "aug_max_shift": int(args.aug_max_shift),
         "aug_noise_std": float(args.aug_noise_std),
+        "aug_sensor_noise_max": float(args.aug_sensor_noise_max),
+        "aug_drift_max": float(args.aug_drift_max),
         "recording_note": "offline training only; do not execute on robot until validated",
     }
 
@@ -1317,6 +1256,26 @@ def main() -> int:
         type=float,
         default=0.02,
         help="Gaussian sensor-noise std as a fraction of each channel's training std (0 disables).",
+    )
+    parser.add_argument(
+        "--aug-sensor-noise-max",
+        type=float,
+        default=0.0,
+        help=(
+            "Max i.i.d. sensor-noise std in raw signal units, applied consistently across "
+            "channels (instantaneous, moving-average, temporal-difference, recomputed touch "
+            "mask). Sampled uniformly per window with 50%% probability. 0 disables."
+        ),
+    )
+    parser.add_argument(
+        "--aug-drift-max",
+        type=float,
+        default=0.0,
+        help=(
+            "Max baseline-drift magnitude in raw signal units toward the touch threshold, "
+            "with the touch mask recomputed. Sampled uniformly per window with 50%% "
+            "probability. 0 disables."
+        ),
     )
     parser.add_argument("--cpu", action="store_true", help="Force CPU training.")
     parser.add_argument("--no-amp", action="store_true", help="Disable CUDA mixed precision.")

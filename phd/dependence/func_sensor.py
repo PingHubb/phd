@@ -1,5 +1,6 @@
 import json
 import os
+import threading
 from importlib import import_module
 
 import pyvista as pv
@@ -134,6 +135,32 @@ class _SensorReadWorker(QObject):
                     time.sleep(self.idle_sleep_sec)
         finally:
             self.finished.emit()
+
+
+class _SensorCalibrationBridge(QObject):
+    """Carries the result of a background calibration back to the GUI thread."""
+
+    finished = pyqtSignal(bool)
+
+
+class _SensorPayloadBridge(QObject):
+    """GUI-thread bridge between the serial reader thread and MySensor.
+
+    MySensor is not a QObject, so connecting the worker signal directly to one
+    of its methods would run that method in the *reader* thread. Routing the
+    payload through this bridge (created in the GUI thread) makes Qt use a
+    queued connection: `deliver` always runs on the GUI thread, immediately
+    after the frame arrives, so frames are processed event-driven with no
+    polling latency and no busy-wait timer.
+    """
+
+    def __init__(self, sensor):
+        super().__init__()
+        self._sensor = sensor
+
+    def deliver(self, generation, port_name, data_list):
+        self._sensor._on_sensor_reader_payload(generation, port_name, data_list)
+        self._sensor.update_animation()
 
 
 class data:
@@ -721,6 +748,9 @@ class MySensor:
         self._contact_motion_previous_center = None
         self._contact_anchor_center = None
         self._contact_motion_smoothed_delta = None
+        self.referenceAxisActors = []
+        self.actorPlaneXY = None
+        self.show_sensor_background_reference = True
         self._sensor_geometry_base_points_origin = None
         self._sensor_geometry_base_normals = None
         self._sensor_geometry_base_fine_points = None
@@ -751,9 +781,17 @@ class MySensor:
         self.sensor_average_window_size = self.SENSOR_AVERAGE_WINDOW_SIZE
         self.visualization_target_hz = self.VISUALIZATION_TARGET_HZ
         self.creatPlaneXY()
+        # Frames are processed event-driven (see _SensorPayloadBridge): the
+        # reader thread's signal triggers update_animation() the moment a
+        # payload arrives. This timer is only a low-rate safety net so a
+        # missed signal can never stall the pipeline; it must NOT run at 0 ms
+        # (busy-waiting starves the reader thread via the GIL).
+        self._payload_bridge = _SensorPayloadBridge(self)
+        self._calibration_bridge = _SensorCalibrationBridge()
+        self._calibration_bridge.finished.connect(self._finish_update_cal)
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
-        self.timer.start(0)
+        self.timer.start(100)
         self.is_connected = False
         self.visualization_min_interval_sec = 1.0 / self.visualization_target_hz
         self._last_visualization_time = 0.0
@@ -802,18 +840,25 @@ class MySensor:
     def creatPlaneXY(self):
         self.plotter.camera.position = (1, -1, 1)
         self.saveCameraPara()
+        self.referenceAxisActors = []
 
         # X-axis line
         line_x = pv.Line((-50, 0, 0), (50, 0, 0))
-        self.plotter.add_mesh(line_x, color='r', line_width=2, label='X Axis')
+        self.referenceAxisActors.append(
+            self.plotter.add_mesh(line_x, color='r', line_width=2, label='X Axis')
+        )
 
         # Y-axis line
         line_y = pv.Line((0, -50, 0), (0, 50, 0))
-        self.plotter.add_mesh(line_y, color='g', line_width=2, label='Y Axis')
+        self.referenceAxisActors.append(
+            self.plotter.add_mesh(line_y, color='g', line_width=2, label='Y Axis')
+        )
 
         # Z-axis line
         # line_z = pv.Line((0, 0, -50), (0, 0, 50))
-        # self.plotter.add_mesh(line_z, color='b', line_width=2, label='Z Axis')
+        # self.referenceAxisActors.append(
+        #     self.plotter.add_mesh(line_z, color='b', line_width=2, label='Z Axis')
+        # )
 
         planeXY = pv.Plane(
             center=(0, 0, 0),
@@ -824,6 +869,7 @@ class MySensor:
             j_resolution=100,
         )
         self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray', style='wireframe')
+        self._apply_sensor_background_reference_visibility(render=False)
 
     def initChannel(self):
         self.com_options = []
@@ -1577,7 +1623,9 @@ class MySensor:
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
-        worker.raw_payload_ready.connect(self._on_sensor_reader_payload)
+        # Queued connection into the GUI thread: stores the payload AND
+        # processes it immediately (event-driven, no polling delay).
+        worker.raw_payload_ready.connect(self._payload_bridge.deliver)
         worker.error.connect(self._on_sensor_reader_error)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
@@ -1809,6 +1857,34 @@ class MySensor:
         settings[key] = item
         return self._write_reorder_logic_file(payload)
 
+    def get_saved_sensor_background_reference_enabled(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        if not isinstance(item, dict):
+            return True
+        return bool(item.get("background_reference_enabled", True))
+
+    def set_saved_sensor_background_reference_enabled(self, model_name, enabled, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "background_reference_enabled": bool(enabled),
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
     def get_saved_sensor_contact_force_scale(self, model_name=None, n_row=None, n_col=None):
         model = str(model_name or self.current_model_name or "sensor")
         key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
@@ -1852,7 +1928,29 @@ class MySensor:
             "bend_axis": "columns",
             "arc_deg": 0.0,
             "normal_flip": False,
+            "rotation_deg": [0.0, 0.0, 0.0],
         }
+
+    @staticmethod
+    def _normalize_sensor_rotation_degrees(value):
+        if isinstance(value, dict):
+            raw_values = [
+                value.get("x", value.get("rx", 0.0)),
+                value.get("y", value.get("ry", 0.0)),
+                value.get("z", value.get("rz", 0.0)),
+            ]
+        elif isinstance(value, (list, tuple, np.ndarray)) and len(value) >= 3:
+            raw_values = value[:3]
+        else:
+            raw_values = [0.0, 0.0, 0.0]
+
+        rotation_deg = []
+        for raw_value in raw_values:
+            try:
+                rotation_deg.append(float(np.clip(float(raw_value), -180.0, 180.0)))
+            except Exception:
+                rotation_deg.append(0.0)
+        return rotation_deg
 
     def _normalize_sensor_geometry_config(self, config):
         default = self._default_sensor_geometry_config()
@@ -1878,12 +1976,22 @@ class MySensor:
         else:
             use_selected_shape = shape != "flat" or abs(arc_deg) > 1e-6
 
+        if "rotation_deg" in config:
+            rotation_deg = self._normalize_sensor_rotation_degrees(config.get("rotation_deg"))
+        else:
+            rotation_deg = self._normalize_sensor_rotation_degrees([
+                config.get("rotation_x_deg", default["rotation_deg"][0]),
+                config.get("rotation_y_deg", default["rotation_deg"][1]),
+                config.get("rotation_z_deg", default["rotation_deg"][2]),
+            ])
+
         return {
             "use_selected_shape": use_selected_shape,
             "shape": shape,
             "bend_axis": bend_axis,
             "arc_deg": arc_deg,
             "normal_flip": bool(config.get("normal_flip", default["normal_flip"])),
+            "rotation_deg": rotation_deg,
         }
 
     def _effective_sensor_geometry_config(self, config):
@@ -2026,6 +2134,11 @@ class MySensor:
             n_row=n_row,
             n_col=n_col,
         )
+        background_reference_enabled = self.get_saved_sensor_background_reference_enabled(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
         force_scale = self.get_saved_sensor_contact_force_scale(
             model,
             n_row=n_row,
@@ -2051,6 +2164,7 @@ class MySensor:
             "default_logic": default_logic,
             "effective_logic": effective_logic,
             "point_labels_enabled": point_labels_enabled,
+            "background_reference_enabled": background_reference_enabled,
             "force_scale_n_per_signal": force_scale,
             "geometry": geometry,
             "stereo_field": stereo_field,
@@ -2078,6 +2192,15 @@ class MySensor:
             model,
             n_row=n_row,
             n_col=n_col,
+        )
+        self.set_sensor_background_reference_enabled(
+            self.get_saved_sensor_background_reference_enabled(
+                model,
+                n_row=n_row,
+                n_col=n_col,
+            ),
+            save_current_sensor=False,
+            render=False,
         )
         self.contact_force_scale_n_per_signal = self.get_saved_sensor_contact_force_scale(
             model,
@@ -2113,6 +2236,56 @@ class MySensor:
             self.plotter.render()
         except Exception:
             pass
+
+    @staticmethod
+    def _set_actor_visible(actor, visible):
+        if actor is None:
+            return
+        try:
+            actor.SetVisibility(bool(visible))
+            return
+        except Exception:
+            pass
+        try:
+            actor.visibility = bool(visible)
+        except Exception:
+            pass
+
+    def _apply_sensor_background_reference_visibility(self, render: bool = True):
+        visible = bool(getattr(self, "show_sensor_background_reference", True))
+        for actor in getattr(self, "referenceAxisActors", []) or []:
+            self._set_actor_visible(actor, visible)
+        self._set_actor_visible(getattr(self, "actorPlaneXY", None), visible)
+        mesh_functions = getattr(getattr(self, "parent", None), "mesh_functions", None)
+        if mesh_functions is not None and hasattr(
+            mesh_functions,
+            "set_secondary_background_reference_enabled",
+        ):
+            try:
+                mesh_functions.set_secondary_background_reference_enabled(visible, render=False)
+            except Exception:
+                pass
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def set_sensor_background_reference_enabled(
+        self,
+        enabled: bool,
+        save_current_sensor: bool = False,
+        render: bool = True,
+    ):
+        self.show_sensor_background_reference = bool(enabled)
+        if save_current_sensor and self.current_model_name:
+            self.set_saved_sensor_background_reference_enabled(
+                self.current_model_name,
+                self.show_sensor_background_reference,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            )
+        self._apply_sensor_background_reference_visibility(render=render)
 
     def set_sensor_contact_force_scale(self, scale, save_current_sensor: bool = False):
         try:
@@ -2218,6 +2391,75 @@ class MySensor:
 
         return points_np
 
+    @classmethod
+    def _sensor_geometry_rotation_matrix_deg(cls, rotation_deg):
+        rx_deg, ry_deg, rz_deg = cls._normalize_sensor_rotation_degrees(rotation_deg)
+        rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
+
+        cos_x, sin_x = np.cos(rx), np.sin(rx)
+        cos_y, sin_y = np.cos(ry), np.sin(ry)
+        cos_z, sin_z = np.cos(rz), np.sin(rz)
+
+        rot_x = np.array([
+            [1.0, 0.0, 0.0],
+            [0.0, cos_x, -sin_x],
+            [0.0, sin_x, cos_x],
+        ])
+        rot_y = np.array([
+            [cos_y, 0.0, sin_y],
+            [0.0, 1.0, 0.0],
+            [-sin_y, 0.0, cos_y],
+        ])
+        rot_z = np.array([
+            [cos_z, -sin_z, 0.0],
+            [sin_z, cos_z, 0.0],
+            [0.0, 0.0, 1.0],
+        ])
+        return rot_z @ rot_y @ rot_x
+
+    @staticmethod
+    def _sensor_geometry_rotation_pivot(points):
+        points_np = np.array(points, dtype=float, copy=False)
+        if points_np.ndim != 2 or points_np.shape[1] != 3:
+            return np.zeros(3, dtype=float)
+        finite_rows = np.all(np.isfinite(points_np), axis=1)
+        if not np.any(finite_rows):
+            return np.zeros(3, dtype=float)
+        return np.mean(points_np[finite_rows], axis=0)
+
+    @classmethod
+    def _rotate_sensor_geometry(cls, points, rotation_deg, normals=None, pivot=None):
+        points_np = np.array(points, dtype=float, copy=True)
+        if points_np.ndim != 2 or points_np.shape[1] != 3:
+            if normals is None:
+                return points_np
+            return points_np, np.array(normals, dtype=float, copy=True)
+
+        rotation = cls._sensor_geometry_rotation_matrix_deg(rotation_deg)
+        if pivot is None:
+            pivot_np = cls._sensor_geometry_rotation_pivot(points_np)
+        else:
+            pivot_np = np.array(pivot, dtype=float, copy=False)
+            if pivot_np.shape != (3,) or not np.all(np.isfinite(pivot_np)):
+                pivot_np = cls._sensor_geometry_rotation_pivot(points_np)
+
+        finite_rows = np.all(np.isfinite(points_np), axis=1)
+        if np.any(finite_rows):
+            points_np[finite_rows] = (points_np[finite_rows] - pivot_np) @ rotation.T + pivot_np
+
+        if normals is None:
+            return points_np
+
+        normals_np = np.array(normals, dtype=float, copy=True)
+        if normals_np.ndim != 2 or normals_np.shape[1] != 3:
+            return points_np, normals_np
+        normals_np = normals_np @ rotation.T
+        normal_norms = np.linalg.norm(normals_np, axis=1)
+        valid_norms = np.isfinite(normal_norms) & (normal_norms > 1e-9)
+        normals_np[valid_norms] = normals_np[valid_norms] / normal_norms[valid_norms, None]
+        normals_np[~valid_norms] = [0.0, 0.0, 1.0]
+        return points_np, normals_np
+
     def set_sensor_geometry_config(self, config, save_current_sensor: bool = False, render: bool = True):
         geometry = self._normalize_sensor_geometry_config(config)
         self.current_sensor_geometry_config = geometry
@@ -2239,11 +2481,19 @@ class MySensor:
         if base_points is None or base_normals is None:
             return False
 
-        self.points_origin, self.normals = self._bend_points_to_cylinder(
+        bent_points, bent_normals = self._bend_points_to_cylinder(
             base_points,
             effective_geometry,
             return_normals=True,
             base_normals=base_normals,
+        )
+        rotation_deg = effective_geometry.get("rotation_deg", [0.0, 0.0, 0.0])
+        rotation_pivot = self._sensor_geometry_rotation_pivot(bent_points)
+        self.points_origin, self.normals = self._rotate_sensor_geometry(
+            bent_points,
+            rotation_deg,
+            normals=bent_normals,
+            pivot=rotation_pivot,
         )
         self.points = self.points_origin + self.normals * float(
             getattr(self, "sensor_visual_offset_scale", 0.0)
@@ -2251,10 +2501,15 @@ class MySensor:
 
         base_fine_points = getattr(self, "_sensor_geometry_base_fine_points", None)
         if self._2D_map is not None and base_fine_points is not None:
-            self._2D_map.points = self._bend_points_to_cylinder(
+            fine_points = self._bend_points_to_cylinder(
                 base_fine_points,
                 effective_geometry,
                 return_normals=False,
+            )
+            self._2D_map.points = self._rotate_sensor_geometry(
+                fine_points,
+                rotation_deg,
+                pivot=rotation_pivot,
             )
             try:
                 self._2D_map.Modified()
@@ -2508,6 +2763,13 @@ class MySensor:
         return True
 
     def updateCal(self):
+        """Start a sensor recalibration without blocking the GUI.
+
+        The serial round-trips (stop reader, update_cal per port, warm the
+        sliding window) can take seconds, so they run on a background thread;
+        `_finish_update_cal` restarts the reader on the GUI thread when done.
+        Returns immediately; repeated calls while running are ignored.
+        """
         if self._sensor_calibration_in_progress:
             print("Sensor calibration is already running.")
             return
@@ -2515,6 +2777,13 @@ class MySensor:
         self._sensor_calibration_in_progress = True
         self._set_sensor_update_button_enabled(False)
         self.is_connected = False
+        threading.Thread(
+            target=self._run_calibration_sequence,
+            name="sensor-calibration",
+            daemon=True,
+        ).start()
+
+    def _run_calibration_sequence(self):
         calibration_succeeded = False
         try:
             if not self._stop_sensor_reader_worker():
@@ -2534,16 +2803,22 @@ class MySensor:
                 self._data.getCal(self._reshape_sensor_values(cal_data_list, self.n_row, self.n_col))
                 if self._warm_sensor_window(sensor_api, ser):
                     calibration_succeeded = True
+        except Exception as exc:
+            print(f"Sensor calibration failed: {exc}")
+            calibration_succeeded = False
         finally:
-            self.is_connected = calibration_succeeded
-            if calibration_succeeded:
-                try:
-                    self._start_sensor_reader_worker()
-                except Exception as exc:
-                    self.is_connected = False
-                    print(f"Failed to restart sensor reader after calibration: {exc}")
-            self._sensor_calibration_in_progress = False
-            self._set_sensor_update_button_enabled(True)
+            self._calibration_bridge.finished.emit(calibration_succeeded)
+
+    def _finish_update_cal(self, calibration_succeeded):
+        self.is_connected = bool(calibration_succeeded)
+        if calibration_succeeded:
+            try:
+                self._start_sensor_reader_worker()
+            except Exception as exc:
+                self.is_connected = False
+                print(f"Failed to restart sensor reader after calibration: {exc}")
+        self._sensor_calibration_in_progress = False
+        self._set_sensor_update_button_enabled(True)
 
     def update_animation(self):
         if not self.is_connected:

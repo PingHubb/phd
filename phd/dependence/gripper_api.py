@@ -197,8 +197,12 @@ class GripperHelper(Node if ROS_AVAILABLE else object):
         index = msg.name.index(self.TARGET_JOINT)
         try:
             self.current_finger_pos = float(msg.position[index])
-        except Exception:
-            pass
+        except Exception as exc:
+            # Throttled: a malformed JointState would otherwise flood stdout.
+            now = time.monotonic()
+            if now - getattr(self, "_last_pos_error_log", 0.0) > 5.0:
+                self._last_pos_error_log = now
+                print(f"[Gripper] Failed to read finger position from JointState: {exc}")
 
     # ------------------------------------------------------------------
     # Commands

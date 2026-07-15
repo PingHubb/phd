@@ -1,0 +1,29 @@
+# PingLab runtime dependencies.
+# Versions reflect the known-good lab machine (Python 3.10, Ubuntu 22.04).
+# ROS 2 packages (rclpy, tm_msgs, service_interfaces) are NOT pip-installable:
+# source your ROS 2 workspace first (e.g. `source /opt/ros/humble/setup.bash`).
+
+# --- UI ---
+PyQt5>=5.15,<6
+pyvista>=0.46,<0.47
+pyvistaqt>=0.11,<0.12
+
+# --- Numerics / ML ---
+numpy>=1.26,<2
+torch>=2.4,<3
+scipy>=1.15,<2
+
+# --- Hardware ---
+pyserial>=3.5,<4
+pyrealsense2>=2.56          # RealSense camera (camera tab)
+
+# --- Vision ---
+ultralytics>=8.3,<9         # YOLO auto-centering
+# opencv is provided by the system package (python3-opencv 4.5.4 on this
+# machine); uncomment the next line if installing into a clean virtualenv:
+# opencv-python>=4.5,<5
+
+# --- Misc ---
+matplotlib>=3.5,<4
+transforms3d>=0.4,<0.5
+tqdm>=4.66,<5

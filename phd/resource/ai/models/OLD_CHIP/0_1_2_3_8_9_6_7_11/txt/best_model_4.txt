@@ -1,0 +1,14 @@
+num_layers: 1
+k_folds: 5
+hidden_dim: 64
+epochs: 50
+batch_size: 16
+learning_rate: 0.001
+weight_decay: 0
+dropout_rate: 0.2
+step_size: 30
+gamma: 0.5
+train_accuracy: 100.0
+validation_accuracy: 99.39393939393939
+output_dim: 9
+test_accuracy: 99.63636363636364

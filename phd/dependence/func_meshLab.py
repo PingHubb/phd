@@ -55,6 +55,11 @@ class MyMeshLab():
         self.origin_list = []
         self.robotActor = []
         self.reT = []
+        self.referenceAxisActors = []
+        self.referenceAxisActors_2 = []
+        self.actorPlaneXY = None
+        self.actorPlaneXY_2 = None
+        self.show_secondary_background_reference = True
         self.creatPlaneXY()
         self.timer = QTimer()
         # self.timer.timeout.connect(self.update_animation)
@@ -102,17 +107,27 @@ class MyMeshLab():
         self.plotter_2.camera.position = (1, -1, 1)
 
         self.saveCameraPara()
+        self.referenceAxisActors = []
+        self.referenceAxisActors_2 = []
         line = pv.Line((-50, 0, 0), (50, 0, 0))
 
         # 添加X轴线段，并设置为红色
-        self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
-        self.plotter_2.add_mesh(line, color='r', line_width=2, label='X Axis')
+        self.referenceAxisActors.append(
+            self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
+        )
+        self.referenceAxisActors_2.append(
+            self.plotter_2.add_mesh(line, color='r', line_width=2, label='X Axis')
+        )
 
         line = pv.Line((0, -50, 0), (0, 50, 0))
 
         # 添加Y轴线段，并设置为绿色
-        self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
-        self.plotter_2.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        self.referenceAxisActors.append(
+            self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        )
+        self.referenceAxisActors_2.append(
+            self.plotter_2.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        )
 
         planeXY = pv.Plane(
             center=(0, 0, 0),
@@ -125,6 +140,36 @@ class MyMeshLab():
 
         self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray', style='wireframe')
         self.actorPlaneXY_2 = self.plotter_2.add_mesh(planeXY, color='gray', style='wireframe')
+        self._apply_secondary_background_reference_visibility(render=False)
+
+    @staticmethod
+    def _set_actor_visible(actor, visible):
+        if actor is None:
+            return
+        try:
+            actor.SetVisibility(bool(visible))
+            return
+        except Exception:
+            pass
+        try:
+            actor.visibility = bool(visible)
+        except Exception:
+            pass
+
+    def _apply_secondary_background_reference_visibility(self, render=True):
+        visible = bool(getattr(self, "show_secondary_background_reference", True))
+        for actor in getattr(self, "referenceAxisActors_2", []) or []:
+            self._set_actor_visible(actor, visible)
+        self._set_actor_visible(getattr(self, "actorPlaneXY_2", None), visible)
+        if render:
+            try:
+                self.plotter_2.render()
+            except Exception:
+                pass
+
+    def set_secondary_background_reference_enabled(self, enabled, render=True):
+        self.show_secondary_background_reference = bool(enabled)
+        self._apply_secondary_background_reference_visibility(render=render)
 
     def add_sphere(self, showEdge):
         self.saveCameraPara()

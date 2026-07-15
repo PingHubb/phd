@@ -15,9 +15,12 @@ def main() -> int:
     print("Starting PingLab...")
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
-    # Only apply Calibri when it is available on the host system.
-    if "Calibri" in QtGui.QFontDatabase().families():
-        app.setFont(QtGui.QFont("Calibri", 12))
+    # Prefer the design-system font (Inter); fall back to Calibri if present.
+    families = QtGui.QFontDatabase().families()
+    for family in ("Inter", "Calibri"):
+        if family in families:
+            app.setFont(QtGui.QFont(family, 11))
+            break
 
     window = MyMainWindow()
     window.showMaximized()

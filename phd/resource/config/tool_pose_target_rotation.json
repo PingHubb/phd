@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "by_target": {
+    "path_2_points_xyz.csv": {
+      "rx_deg": 90.0,
+      "ry_deg": 0.0,
+      "rz_deg": 45.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/path_2_points_xyz.csv"
+    },
+    "SPIRAL.csv": {
+      "rx_deg": 90.0,
+      "ry_deg": 180.0,
+      "rz_deg": 45.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/SPIRAL.csv"
+    },
+    "tool_pose_record_20260527_151335.csv": {
+      "rx_deg": 0.0,
+      "ry_deg": 0.0,
+      "rz_deg": 0.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/tool_pose_record_20260527_151335.csv"
+    },
+    "LINEAR.csv": {
+      "rx_deg": 270.0,
+      "ry_deg": 0.0,
+      "rz_deg": 45.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/LINEAR.csv"
+    },
+    "ROTATION.csv": {
+      "rx_deg": 270.0,
+      "ry_deg": 0.0,
+      "rz_deg": 180.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/ROTATION.csv"
+    },
+    "ROTATION2.csv": {
+      "rx_deg": 270.0,
+      "ry_deg": 0.0,
+      "rz_deg": 180.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/ROTATION2.csv"
+    },
+    "freeform.csv": {
+      "rx_deg": 0.0,
+      "ry_deg": 0.0,
+      "rz_deg": 0.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/robot/tool_pose_logs/freeform.csv"
+    }
+  }
+}

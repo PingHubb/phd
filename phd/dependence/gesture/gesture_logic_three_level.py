@@ -33,7 +33,18 @@ class ThreeLevelTransformer:
         self.n_col = n_col
         self.is_recognizing_gesture = False
         self.recognition_timer = QTimer()
+        # Poll slightly faster than any realistic sensor frame rate; the
+        # frame_sequence gate in run_recognition_step() ensures each sensor
+        # frame is processed exactly once. Never leave this at 0 ms: it would
+        # re-run full Transformer inference on duplicated frames thousands of
+        # times per second and corrupt the temporal window.
+        self.recognition_timer.setInterval(5)
         self.recognition_timer.timeout.connect(self.run_recognition_step)
+        self._last_processed_sensor_frame = None
+        # Background inference keeps the Transformer forward pass off the GUI
+        # thread; results are collected at the top of run_recognition_step.
+        self._inference_executor = None
+        self._pending_inference = None
         self.current_gesture_data = []
         self.window_size = 20
         self.latch_mode = False
@@ -305,6 +316,7 @@ class ThreeLevelTransformer:
                 self.ros_splitter.robot_api.send_request(self.ros_splitter.robot_api.enable_joint_velocity_mode())
                 print("3-Level Transformer Recognition STARTED (Joint Control).")
         else:
+            self._pending_inference = None  # discard any in-flight inference
             if self._is_frame_control_shape():
                 self._stop_frame_control_recognition()
             if self._is_joint_control_shape():
@@ -393,7 +405,44 @@ class ThreeLevelTransformer:
         frame = self._get_requested_frame() or "tool"
         self._anchor_R = self._get_R_for_frame(frame)
 
+    def _ensure_inference_executor(self):
+        if self._inference_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._inference_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="threelevel-infer"
+            )
+        return self._inference_executor
+
+    def _collect_pending_inference(self):
+        """Handle a finished background inference on the GUI thread."""
+        future = self._pending_inference
+        if future is None or not future.done():
+            return
+        self._pending_inference = None
+        try:
+            result = future.result()
+        except Exception as exc:
+            print(f"[3-Level] Background inference failed: {exc}")
+            return
+        if result is None or not self.is_recognizing_gesture:
+            return
+        self.handle_state_logic(*result)
+
     def run_recognition_step(self):
+        # Apply any inference finished since the last tick (robot commands and
+        # state changes always happen here, on the GUI thread).
+        self._collect_pending_inference()
+
+        # Only act on genuinely new sensor frames; otherwise the sliding
+        # window fills with duplicates and inference runs redundantly.
+        data_obj = getattr(self.my_sensor, "_data", None)
+        frame_seq = getattr(data_obj, "frame_sequence", None)
+        if frame_seq is not None:
+            if frame_seq == self._last_processed_sensor_frame:
+                return
+            self._last_processed_sensor_frame = frame_seq
+
         model_input_frame = self._current_model_input_frame()
         standardized_frame = (model_input_frame - self.global_mean) / self.global_std
         self.current_gesture_data.append(standardized_frame)
@@ -404,6 +453,10 @@ class ThreeLevelTransformer:
             return
 
         self._latest_raw_mean = self._current_raw_mean()
+        if self._pending_inference is not None:
+            # Previous inference still running; the window keeps sliding, so
+            # the next submission will include this frame.
+            return
         self.predict_gesture(list(self.current_gesture_data))
 
     def predict_gesture(self, gesture_data_list):
@@ -411,9 +464,18 @@ class ThreeLevelTransformer:
             return
 
         gesture_array = np.array(gesture_data_list, dtype=np.float32)
+        if self._torch is None:
+            return
+
+        self._pending_inference = self._ensure_inference_executor().submit(
+            self._run_inference, gesture_array
+        )
+
+    def _run_inference(self, gesture_array):
+        """Torch forward pass on the worker thread (no Qt/robot access here)."""
         torch = self._torch
-        if torch is None:
-            return None, None, None, 0.0, 0.0, 0.0
+        if torch is None or self.model is None:
+            return None
 
         data_tensor = torch.tensor(gesture_array, dtype=torch.float32).unsqueeze(0).to(self.device)
         padding_mask = torch.zeros(1, self.window_size, dtype=torch.bool).to(self.device)
@@ -423,14 +485,14 @@ class ThreeLevelTransformer:
             f_conf, f_pred = torch.softmax(f_logits, dim=1).max(1)
             g_conf, g_pred = torch.softmax(g_logits, dim=1).max(1)
             q_conf, q_pred = torch.softmax(q_logits, dim=1).max(1)
-            self.handle_state_logic(
-                f_pred.item(),
-                f_conf.item(),
-                g_pred.item(),
-                g_conf.item(),
-                q_pred.item(),
-                q_conf.item(),
-            )
+        return (
+            f_pred.item(),
+            f_conf.item(),
+            g_pred.item(),
+            g_conf.item(),
+            q_pred.item(),
+            q_conf.item(),
+        )
 
     def _maybe_send_once(self):
         latch = getattr(self, "latch_mode", False)

@@ -1,0 +1,4 @@
+num_good_versions: 100
+num_damaged_versions: 0
+window_size: 30
+min_gesture_len: 10

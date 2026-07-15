@@ -13,6 +13,7 @@ from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath, QPixmap, QF
 import numpy as np
 from pyvistaqt import QtInteractor, MainWindow
 from phd.dependence.paths import icon_path, stylesheet_path
+from phd.ui import theme
 from phd.ui.ui_ping import UI
 from phd.ui import experiment_tasks
 from phd.dependence.sensor_signal_window import SensorSignalWindow
@@ -92,7 +93,7 @@ class SimpleLineChartWidget(QWidget):
     def paintEvent(self, _event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#16181c"))
+        painter.fillRect(self.rect(), QColor(theme.INPUT_BG))
 
         left = 72
         right = 24
@@ -131,7 +132,7 @@ class SimpleLineChartWidget(QWidget):
         x_ticks = self._build_linear_ticks(min_t, max_t, 6)
         y_ticks = self._build_linear_ticks(min_v, max_v, 5)
 
-        grid_pen = QPen(QColor("#2b3138"))
+        grid_pen = QPen(QColor(theme.BORDER_SUBTLE))
         grid_pen.setWidth(1)
         grid_pen.setStyle(Qt.DashLine)
         painter.setPen(grid_pen)
@@ -252,52 +253,52 @@ class SensorCaptureResultDialog(QDialog):
         self.setWindowTitle("Sensor Peak Change (10s)")
         self.resize(980, 620)
         self.setStyleSheet(
-            """
-            QDialog {
-                background-color: #15181d;
-                color: #dce3ea;
-            }
-            QLabel#resultTitle {
+            f"""
+            QDialog {{
+                background-color: {theme.WINDOW_BG};
+                color: {theme.TEXT_PRIMARY};
+            }}
+            QLabel#resultTitle {{
                 font-size: 20px;
                 font-weight: 600;
-                color: #f3f6f9;
-            }
-            QLabel#resultSubtitle {
+                color: #FFFFFF;
+            }}
+            QLabel#resultSubtitle {{
                 font-size: 12px;
-                color: #9fb0bf;
-            }
-            QFrame#metricCard {
-                background-color: #1d232b;
-                border: 1px solid #2c3642;
+                color: {theme.TEXT_MUTED};
+            }}
+            QFrame#metricCard {{
+                background-color: {theme.SURFACE_RAISED};
+                border: 1px solid {theme.BORDER};
                 border-radius: 10px;
-            }
-            QLabel#metricName {
+            }}
+            QLabel#metricName {{
                 font-size: 11px;
-                color: #8fa1b3;
-            }
-            QLabel#metricValue {
+                color: {theme.TEXT_MUTED};
+            }}
+            QLabel#metricValue {{
                 font-size: 18px;
                 font-weight: 600;
-                color: #f0f4f8;
-            }
-            QFrame#sectionCard {
-                background-color: #1b2027;
-                border: 1px solid #2a333e;
+                color: {theme.TEXT_PRIMARY};
+            }}
+            QFrame#sectionCard {{
+                background-color: {theme.SURFACE};
+                border: 1px solid {theme.BORDER_SUBTLE};
                 border-radius: 12px;
-            }
-            QLabel#sectionTitle {
+            }}
+            QLabel#sectionTitle {{
                 font-size: 13px;
                 font-weight: 600;
-                color: #e6edf3;
-            }
-            QLabel#sectionBody {
+                color: {theme.TEXT_PRIMARY};
+            }}
+            QLabel#sectionBody {{
                 font-size: 12px;
-                color: #b8c4cf;
-            }
-            QPushButton {
+                color: {theme.TEXT_MUTED};
+            }}
+            QPushButton {{
                 min-width: 88px;
                 min-height: 30px;
-            }
+            }}
             """
         )
 
@@ -590,18 +591,18 @@ class MyMainWindow(MainWindow):
         self.toolbar_update_sensor_button.setAutoRaise(True)
         self.toolbar_update_sensor_button.setStyleSheet(
             "QToolButton {"
-            " border: 1px solid #4fc3f7;"
+            f" border: 1px solid {theme.ACCENT};"
             " border-radius: 6px;"
             " padding: 4px 10px;"
             " font-weight: 600;"
-            " color: #e8f6ff;"
-            " background-color: rgba(79, 195, 247, 0.14);"
+            f" color: {theme.TEXT_PRIMARY};"
+            " background-color: rgba(61, 130, 240, 0.16);"
             "}"
             "QToolButton:hover {"
-            " background-color: rgba(79, 195, 247, 0.26);"
+            " background-color: rgba(61, 130, 240, 0.30);"
             "}"
             "QToolButton:pressed {"
-            " background-color: rgba(79, 195, 247, 0.38);"
+            " background-color: rgba(61, 130, 240, 0.45);"
             "}"
         )
         self.toolbar_update_sensor_button.clicked.connect(self.action_update_sensor.trigger)
@@ -677,8 +678,8 @@ class MyMainWindow(MainWindow):
         self.sidebar_task_info = QLabel()
         self.sidebar_task_info.setWordWrap(True)
         self.sidebar_task_info.setStyleSheet(
-            "color: #d6dbe0; background-color: rgba(255,255,255,0.05); "
-            "border: 1px solid rgba(255,255,255,0.08); padding: 8px; border-radius: 6px;"
+            f"color: {theme.TEXT_MUTED}; background-color: {theme.SURFACE_RAISED}; "
+            f"border: 1px solid {theme.BORDER_SUBTLE}; padding: 8px; border-radius: 6px;"
         )
         layout.addWidget(self.sidebar_task_info)
         self._update_sidebar_task_info()

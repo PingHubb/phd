@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 from phd.dependence.paths import ai_resource_path, resource_path
+from phd.ui import theme
 from phd.ui.ui_ping_ai_controls import AiControlsMixin
 from phd.ui.ui_ping_camera_control import CameraControlMixin
 from phd.ui.ui_ping_direct_finger_motion import DirectFingerMotionMixin
@@ -335,6 +336,9 @@ class NullMeshLab:
         return None
 
     def addDexterousHandInDialog(self):
+        return None
+
+    def set_secondary_background_reference_enabled(self, *_args, **_kwargs):
         return None
 
     def updateDexterousHandTactile(self, *_args, **_kwargs):
@@ -1322,7 +1326,7 @@ class UI(
         layout_plotter = QGridLayout(self.widget_plotter)
         layout_plotter.setContentsMargins(0, 0, 0, 0)
         self.plotter = QtInteractor(self.widget_plotter)
-        self.plotter.background_color = '#202020'
+        self.plotter.background_color = theme.VIEWPORT_BG
         layout_plotter.addWidget(self.plotter.interactor)
         self.widget_plotter.setVisible(False)
 
@@ -1330,7 +1334,7 @@ class UI(
         layout_plotter_2 = QGridLayout(self.widget_plotter_2)
         layout_plotter_2.setContentsMargins(0, 0, 0, 0)
         self.plotter_2 = QtInteractor(self.widget_plotter_2)
-        self.plotter_2.background_color = '#202020'
+        self.plotter_2.background_color = theme.VIEWPORT_BG
         layout_plotter_2.addWidget(self.plotter_2.interactor)
 
         self.log_display = QTextEdit()
@@ -1525,10 +1529,10 @@ class UI(
         )
         self.contact_normal_status_label = QLabel("Normal vector: waiting for contact")
         self.contact_normal_status_label.setWordWrap(True)
-        self.contact_normal_status_label.setStyleSheet("color: #b0b0b0;")
+        self.contact_normal_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
         self.contact_force_status_label = QLabel("Contact force: waiting for contact")
         self.contact_force_status_label.setWordWrap(True)
-        self.contact_force_status_label.setStyleSheet("color: #b0d8ff;")
+        self.contact_force_status_label.setStyleSheet(theme.INFO_LABEL_STYLE)
         normal_vector_layout.addWidget(self.contact_normal_checkbox)
         normal_vector_layout.addWidget(self.contact_normal_estimator_combo)
         normal_vector_layout.addWidget(self.contact_normal_status_label)
@@ -1605,7 +1609,7 @@ class UI(
         self.sensor_parameters_dialog = QDialog(self)
         self.sensor_parameters_dialog.setWindowTitle("Sensor Parameters")
         self.sensor_parameters_dialog.setModal(False)
-        self.sensor_parameters_dialog.resize(620, 300)
+        self.sensor_parameters_dialog.resize(620, 500)
 
         layout = QVBoxLayout(self.sensor_parameters_dialog)
         grid = QGridLayout()
@@ -1650,6 +1654,33 @@ class UI(
         self.sensor_parameter_arc_spin.setSingleStep(5.0)
         self.sensor_parameter_arc_spin.setSuffix(" deg")
 
+        self.sensor_parameter_rotation_x_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_rotation_x_spin.setDecimals(1)
+        self.sensor_parameter_rotation_x_spin.setRange(-180.0, 180.0)
+        self.sensor_parameter_rotation_x_spin.setSingleStep(5.0)
+        self.sensor_parameter_rotation_x_spin.setSuffix(" deg")
+        self.sensor_parameter_rotation_x_spin.setToolTip(
+            "Rotate the complete 2D sensor around X after shape bending."
+        )
+
+        self.sensor_parameter_rotation_y_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_rotation_y_spin.setDecimals(1)
+        self.sensor_parameter_rotation_y_spin.setRange(-180.0, 180.0)
+        self.sensor_parameter_rotation_y_spin.setSingleStep(5.0)
+        self.sensor_parameter_rotation_y_spin.setSuffix(" deg")
+        self.sensor_parameter_rotation_y_spin.setToolTip(
+            "Rotate the complete 2D sensor around Y after shape bending."
+        )
+
+        self.sensor_parameter_rotation_z_spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+        self.sensor_parameter_rotation_z_spin.setDecimals(1)
+        self.sensor_parameter_rotation_z_spin.setRange(-180.0, 180.0)
+        self.sensor_parameter_rotation_z_spin.setSingleStep(5.0)
+        self.sensor_parameter_rotation_z_spin.setSuffix(" deg")
+        self.sensor_parameter_rotation_z_spin.setToolTip(
+            "Rotate the complete 2D sensor around Z after shape bending."
+        )
+
         self.sensor_parameter_normal_flip_checkbox = QCheckBox("Flip Normals")
         self.sensor_parameter_use_shape_checkbox = QCheckBox("Use Selected Shape")
         self.sensor_parameter_stereo_ignore_noise_checkbox = QCheckBox("Ignore Stereo Field Noise")
@@ -1693,6 +1724,13 @@ class UI(
         )
         layout.addWidget(self.sensor_parameter_point_labels_checkbox)
 
+        self.sensor_parameter_background_reference_checkbox = QCheckBox("Show Background Axes/Grid")
+        self.sensor_parameter_background_reference_checkbox.setToolTip(
+            "Show the red/green reference axes and gray XY wireframe plane behind the sensor."
+        )
+        self.sensor_parameter_background_reference_checkbox.setChecked(True)
+        layout.addWidget(self.sensor_parameter_background_reference_checkbox)
+
         stereo_group = QGroupBox("Stereo Field")
         stereo_grid = QGridLayout(stereo_group)
         stereo_grid.setHorizontalSpacing(12)
@@ -1717,13 +1755,19 @@ class UI(
         geometry_grid.addWidget(QLabel("Arc Angle:"), 3, 0)
         geometry_grid.addWidget(self.sensor_parameter_arc_spin, 3, 1)
         geometry_grid.addWidget(self.sensor_parameter_normal_flip_checkbox, 4, 1)
+        geometry_grid.addWidget(QLabel("Rotation X:"), 5, 0)
+        geometry_grid.addWidget(self.sensor_parameter_rotation_x_spin, 5, 1)
+        geometry_grid.addWidget(QLabel("Rotation Y:"), 6, 0)
+        geometry_grid.addWidget(self.sensor_parameter_rotation_y_spin, 6, 1)
+        geometry_grid.addWidget(QLabel("Rotation Z:"), 7, 0)
+        geometry_grid.addWidget(self.sensor_parameter_rotation_z_spin, 7, 1)
         geometry_grid.setColumnStretch(1, 1)
         self.sensor_parameter_geometry_group = geometry_group
         layout.addWidget(geometry_group)
 
         self.sensor_parameter_status_label = QLabel("")
         self.sensor_parameter_status_label.setWordWrap(True)
-        self.sensor_parameter_status_label.setStyleSheet("color: #b0b0b0;")
+        self.sensor_parameter_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
         layout.addWidget(self.sensor_parameter_status_label)
 
         button_row = QHBoxLayout()
@@ -1744,6 +1788,9 @@ class UI(
         self.sensor_parameter_point_labels_checkbox.toggled.connect(
             self._on_sensor_parameter_point_labels_toggled
         )
+        self.sensor_parameter_background_reference_checkbox.toggled.connect(
+            self._on_sensor_parameter_background_reference_toggled
+        )
         self.sensor_parameter_force_scale_spin.valueChanged.connect(
             self._on_sensor_parameter_force_scale_changed
         )
@@ -1760,6 +1807,15 @@ class UI(
             self._on_sensor_parameter_geometry_changed
         )
         self.sensor_parameter_normal_flip_checkbox.toggled.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_rotation_x_spin.valueChanged.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_rotation_y_spin.valueChanged.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_rotation_z_spin.valueChanged.connect(
             self._on_sensor_parameter_geometry_changed
         )
         self.sensor_parameter_stereo_ignore_noise_checkbox.toggled.connect(
@@ -1860,7 +1916,40 @@ class UI(
             "bend_axis": str(self.sensor_parameter_bend_axis_combo.currentData() or "columns"),
             "arc_deg": float(self.sensor_parameter_arc_spin.value()),
             "normal_flip": bool(self.sensor_parameter_normal_flip_checkbox.isChecked()),
+            "rotation_deg": [
+                float(self.sensor_parameter_rotation_x_spin.value()),
+                float(self.sensor_parameter_rotation_y_spin.value()),
+                float(self.sensor_parameter_rotation_z_spin.value()),
+            ],
         }
+
+    @staticmethod
+    def _sensor_parameter_rotation_from_geometry(geometry):
+        if not isinstance(geometry, dict):
+            return [0.0, 0.0, 0.0]
+        raw_rotation = geometry.get("rotation_deg")
+        if isinstance(raw_rotation, dict):
+            raw_values = [
+                raw_rotation.get("x", raw_rotation.get("rx", 0.0)),
+                raw_rotation.get("y", raw_rotation.get("ry", 0.0)),
+                raw_rotation.get("z", raw_rotation.get("rz", 0.0)),
+            ]
+        elif isinstance(raw_rotation, (list, tuple, np.ndarray)) and len(raw_rotation) >= 3:
+            raw_values = raw_rotation[:3]
+        else:
+            raw_values = [
+                geometry.get("rotation_x_deg", 0.0),
+                geometry.get("rotation_y_deg", 0.0),
+                geometry.get("rotation_z_deg", 0.0),
+            ]
+
+        rotation = []
+        for raw_value in raw_values:
+            try:
+                rotation.append(float(np.clip(float(raw_value), -180.0, 180.0)))
+            except Exception:
+                rotation.append(0.0)
+        return rotation
 
     def _sensor_parameter_stereo_field_from_ui(self):
         return {
@@ -1899,18 +1988,24 @@ class UI(
             widget.blockSignals(False)
 
     def _update_sensor_parameter_geometry_subcontrols(self):
-        enabled = bool(
+        group_enabled = bool(
             getattr(self, "sensor_parameter_geometry_group", None) is not None
             and self.sensor_parameter_geometry_group.isEnabled()
-            and self.sensor_parameter_use_shape_checkbox.isChecked()
         )
+        shape_enabled = group_enabled and self.sensor_parameter_use_shape_checkbox.isChecked()
         for widget in (
             self.sensor_parameter_shape_combo,
             self.sensor_parameter_bend_axis_combo,
             self.sensor_parameter_arc_spin,
             self.sensor_parameter_normal_flip_checkbox,
         ):
-            widget.setEnabled(enabled)
+            widget.setEnabled(shape_enabled)
+        for widget in (
+            self.sensor_parameter_rotation_x_spin,
+            self.sensor_parameter_rotation_y_spin,
+            self.sensor_parameter_rotation_z_spin,
+        ):
+            widget.setEnabled(group_enabled)
 
     def _set_sensor_parameter_geometry_controls_enabled(self, enabled: bool):
         enabled = bool(enabled)
@@ -1934,6 +2029,7 @@ class UI(
                 shape != "flat" or abs(arc_deg) > 1e-6,
             )
         )
+        rotation_deg = self._sensor_parameter_rotation_from_geometry(geometry)
 
         widgets = [
             self.sensor_parameter_use_shape_checkbox,
@@ -1941,6 +2037,9 @@ class UI(
             self.sensor_parameter_bend_axis_combo,
             self.sensor_parameter_arc_spin,
             self.sensor_parameter_normal_flip_checkbox,
+            self.sensor_parameter_rotation_x_spin,
+            self.sensor_parameter_rotation_y_spin,
+            self.sensor_parameter_rotation_z_spin,
         ]
         for widget in widgets:
             widget.blockSignals(True)
@@ -1949,6 +2048,9 @@ class UI(
         self._set_combo_current_data(self.sensor_parameter_bend_axis_combo, bend_axis)
         self.sensor_parameter_arc_spin.setValue(float(np.clip(arc_deg, -180.0, 180.0)))
         self.sensor_parameter_normal_flip_checkbox.setChecked(normal_flip)
+        self.sensor_parameter_rotation_x_spin.setValue(rotation_deg[0])
+        self.sensor_parameter_rotation_y_spin.setValue(rotation_deg[1])
+        self.sensor_parameter_rotation_z_spin.setValue(rotation_deg[2])
         for widget in widgets:
             widget.blockSignals(False)
         self._update_sensor_parameter_geometry_subcontrols()
@@ -1972,6 +2074,11 @@ class UI(
             bool(context.get("point_labels_enabled", False))
         )
         self.sensor_parameter_point_labels_checkbox.blockSignals(False)
+        self.sensor_parameter_background_reference_checkbox.blockSignals(True)
+        self.sensor_parameter_background_reference_checkbox.setChecked(
+            bool(context.get("background_reference_enabled", True))
+        )
+        self.sensor_parameter_background_reference_checkbox.blockSignals(False)
         self.sensor_parameter_force_scale_spin.blockSignals(True)
         self.sensor_parameter_force_scale_spin.setValue(
             float(context.get("force_scale_n_per_signal", 0.0) or 0.0)
@@ -1985,11 +2092,13 @@ class UI(
         default_logic = context.get("default_logic") or "none"
         effective_logic = context.get("effective_logic") or "none"
         point_labels = "on" if context.get("point_labels_enabled", False) else "off"
+        background_reference = "on" if context.get("background_reference_enabled", True) else "off"
         force_scale = float(context.get("force_scale_n_per_signal", 0.0) or 0.0)
         geometry_shape = str(geometry.get("shape", "flat") or "flat")
         geometry_axis = str(geometry.get("bend_axis", "columns") or "columns")
         geometry_arc = float(geometry.get("arc_deg", 0.0) or 0.0)
         geometry_normals = "flipped" if geometry.get("normal_flip", False) else "normal"
+        geometry_rotation = self._sensor_parameter_rotation_from_geometry(geometry)
         geometry_mode = (
             "selected shape"
             if geometry.get("use_selected_shape", geometry_shape != "flat" or abs(geometry_arc) > 1e-6)
@@ -2002,12 +2111,15 @@ class UI(
             f"Saved mode: {self._sensor_reorder_mode_label(saved_mode)}\n"
             f"Effective on next Build Scene: {effective_logic}\n"
             f"Point labels: {point_labels}\n"
+            f"Background axes/grid: {background_reference}\n"
             f"Force scale: {force_scale:.6f} N/signal\n"
             f"Stereo field: noise {stereo_noise}, threshold "
             f"{float(stereo_field.get('deadband_pct', 0.35) or 0.0):.2f}, "
             f"length {float(stereo_field.get('length_scale', 0.35) or 0.35):.2f}\n"
             f"Geometry: {geometry_mode}; {geometry_shape}, {geometry_axis}, "
-            f"{geometry_arc:.1f} deg, {geometry_normals}"
+            f"{geometry_arc:.1f} deg, {geometry_normals}, "
+            f"rot XYZ=({geometry_rotation[0]:.1f}, {geometry_rotation[1]:.1f}, "
+            f"{geometry_rotation[2]:.1f}) deg"
         )
 
     def _sensor_parameter_selected_model_is_current(self):
@@ -2024,6 +2136,19 @@ class UI(
             and self._sensor_parameter_selected_model_is_current()
         ):
             helper.set_sensor_point_labels_enabled(bool(checked), save_current_sensor=False)
+
+    def _on_sensor_parameter_background_reference_toggled(self, checked: bool):
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is not None
+            and hasattr(helper, "set_sensor_background_reference_enabled")
+            and self._sensor_parameter_selected_model_is_current()
+        ):
+            helper.set_sensor_background_reference_enabled(
+                bool(checked),
+                save_current_sensor=False,
+                render=True,
+            )
 
     def _on_sensor_parameter_force_scale_changed(self, value: float):
         helper = getattr(self, "sensor_functions", None)
@@ -2079,6 +2204,13 @@ class UI(
                         self.sensor_parameter_point_labels_checkbox.isChecked(),
                     )
                 ) and ok
+            if hasattr(helper, "set_saved_sensor_background_reference_enabled"):
+                ok = bool(
+                    helper.set_saved_sensor_background_reference_enabled(
+                        model_name,
+                        self.sensor_parameter_background_reference_checkbox.isChecked(),
+                    )
+                ) and ok
             if hasattr(helper, "set_saved_sensor_contact_force_scale"):
                 ok = bool(
                     helper.set_saved_sensor_contact_force_scale(
@@ -2107,6 +2239,15 @@ class UI(
                 helper.set_sensor_point_labels_enabled(
                     self.sensor_parameter_point_labels_checkbox.isChecked(),
                     save_current_sensor=False,
+                )
+            if (
+                hasattr(helper, "set_sensor_background_reference_enabled")
+                and self._sensor_parameter_selected_model_is_current()
+            ):
+                helper.set_sensor_background_reference_enabled(
+                    self.sensor_parameter_background_reference_checkbox.isChecked(),
+                    save_current_sensor=False,
+                    render=True,
                 )
             if (
                 hasattr(helper, "set_sensor_contact_force_scale")
@@ -2143,6 +2284,7 @@ class UI(
             saved_stereo = context.get("stereo_field", {}) or {}
             saved_shape = str(saved_geometry.get("shape", "flat") or "flat")
             saved_arc = float(saved_geometry.get("arc_deg", 0.0) or 0.0)
+            saved_rotation = self._sensor_parameter_rotation_from_geometry(saved_geometry)
             saved_mode = (
                 "selected shape"
                 if saved_geometry.get(
@@ -2155,6 +2297,7 @@ class UI(
                 f"Saved for {context.get('key', model_name)}.\n"
                 f"Effective on next Build Scene: {context.get('effective_logic') or 'none'}\n"
                 f"Point labels: {'on' if context.get('point_labels_enabled', False) else 'off'}\n"
+                f"Background axes/grid: {'on' if context.get('background_reference_enabled', True) else 'off'}\n"
                 f"Force scale: {float(context.get('force_scale_n_per_signal', 0.0) or 0.0):.6f} N/signal\n"
                 f"Stereo field: noise "
                 f"{'ignored' if saved_stereo.get('ignore_noise_enabled', True) else 'raw'}, "
@@ -2162,7 +2305,9 @@ class UI(
                 f"length {float(saved_stereo.get('length_scale', 0.35) or 0.35):.2f}\n"
                 f"Geometry: {saved_mode}; {saved_shape}, "
                 f"{saved_geometry.get('bend_axis', 'columns')}, "
-                f"{saved_arc:.1f} deg"
+                f"{saved_arc:.1f} deg, "
+                f"rot XYZ=({saved_rotation[0]:.1f}, {saved_rotation[1]:.1f}, "
+                f"{saved_rotation[2]:.1f}) deg"
             )
         else:
             self.sensor_parameter_status_label.setText("Failed to save sensor parameters.")
@@ -2241,7 +2386,7 @@ class UI(
             name_label = QLabel(name)
             desc_label = QLabel(description)
             desc_label.setWordWrap(True)
-            desc_label.setStyleSheet("color: #b0b0b0;")
+            desc_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
             tooltip = f"{name}\n\n{description}"
             name_label.setToolTip(tooltip)
             desc_label.setToolTip(tooltip)
@@ -2869,7 +3014,7 @@ class UI(
     def _set_button_active(self, btn: QPushButton, active: bool):
         """Green when active; when inactive, revert to the default theme."""
         if active:
-            btn.setStyleSheet("QPushButton { background-color: #2e7d32; color: white; }")
+            btn.setStyleSheet(theme.active_button_style())
         else:
             btn.setStyleSheet("")  # clear → default OS/theme styling
 

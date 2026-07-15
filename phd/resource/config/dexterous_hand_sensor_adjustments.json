@@ -1,0 +1,18 @@
+{
+  "config_version": 1,
+  "note": "RH56F1 tactile pad translation/rotation offsets in the centered 3D display frame.",
+  "regions": {
+    "thumb": {
+      "translation_mm": [
+        -5.0,
+        0.0,
+        2.5
+      ],
+      "rotation_deg": [
+        -5.0,
+        -20.0,
+        -20.0
+      ]
+    }
+  }
+}

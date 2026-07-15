@@ -256,6 +256,9 @@ def make_ai_helper(model_path: Path) -> AI_DirectFingerMotion_execution:
     with contextlib.redirect_stdout(io.StringIO()):
         helper = AI_DirectFingerMotion_execution(make_stub_splitter(), sensor)
     helper.dry_run_predictions_only = True
+    # The benchmark drives run_step() synchronously and reads last_prediction
+    # right after each step, so inference must run inline (not in background).
+    helper.inference_in_background = False
     helper.load_model(str(model_path))
     if not helper.model_loaded:
         raise RuntimeError(f"Could not load AI checkpoint: {model_path}")

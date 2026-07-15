@@ -19,7 +19,12 @@ class RecordGesture:
         self.my_sensor = my_sensor_instance
 
         self.timer_record_gesture = QTimer()
+        # 5 ms poll + frame_sequence gate in record_gesture(): each sensor
+        # frame is recorded exactly once (a 0 ms timer would record the same
+        # frame many times and waste CPU).
+        self.timer_record_gesture.setInterval(5)
         self.timer_record_gesture.timeout.connect(self.record_gesture)
+        self._last_recorded_sensor_frame = None
 
         self.auto_timer = QTimer()
         self.auto_timer.setSingleShot(True)
@@ -65,7 +70,8 @@ class RecordGesture:
             self.trial_number = self.get_next_trial_number(self.gesture_number)
             self._reset_recorded_frames()
 
-            self.timer_record_gesture.start(0)
+            self._last_recorded_sensor_frame = None
+            self.timer_record_gesture.start()
 
             print(f"Recording ARMED for gesture '{self.gesture_number}'.")
             if self.trigger_mode == "trigger":
@@ -106,7 +112,8 @@ class RecordGesture:
         self.random_duration = random.randint(5, 10)
         print(f"Next noise recording will be for {self.random_duration} seconds.")
         self._reset_recorded_frames()
-        self.timer_record_gesture.start(0)
+        self._last_recorded_sensor_frame = None
+        self.timer_record_gesture.start()
         self.auto_timer.start(self.random_duration * 1000)
 
     def auto_record_timeout(self):
@@ -142,6 +149,14 @@ class RecordGesture:
         if not self.is_recording:
             self.timer_record_gesture.stop()
             return
+
+        # Record each sensor frame exactly once.
+        data_obj = getattr(self.my_sensor, "_data", None)
+        frame_seq = getattr(data_obj, "frame_sequence", None)
+        if frame_seq is not None:
+            if frame_seq == self._last_recorded_sensor_frame:
+                return
+            self._last_recorded_sensor_frame = frame_seq
 
         column_major_flat_frame = flatten_column_major_view(self.my_sensor._data.diffPerDataAve)
 

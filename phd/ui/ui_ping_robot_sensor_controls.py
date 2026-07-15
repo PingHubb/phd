@@ -1,5 +1,17 @@
 from __future__ import annotations
 
+import threading
+import time
+
+from PyQt5 import QtCore
+
+
+class _SensorHzResultBridge(QtCore.QObject):
+    """Delivers a background Hz measurement result back to the GUI thread."""
+
+    finished = QtCore.pyqtSignal(object)
+
+
 class RobotSensorControlsMixin:
     def set_robot_subtab_enabled(self, enabled: bool):
         self._set_widgets_enabled(
@@ -27,19 +39,93 @@ class RobotSensorControlsMixin:
             self.log_display.append("Sensor API is not ready yet.")
 
     def _on_sensor_api_read_raw_hz(self):
-        if self.ensure_sensor_api():
-            result = self.sensor_api.measure_read_raw_hz(duration_sec=1.0)
-            if not result:
-                self.log_display.append("Sensor API raw Hz measurement failed.")
-                return
-            self.log_display.append(
-                "Sensor API raw Hz: "
-                f"{result['hz']:.2f} | "
-                f"success={result['success_count']} / attempts={result['total_attempts']} | "
-                f"elapsed={result['elapsed_sec']:.2f}s"
-            )
-        else:
+        if getattr(self, "_sensor_hz_measurement_running", False):
+            self.log_display.append("Sensor Hz measurement is already in progress.")
+            return
+
+        # While the live visualization is streaming, the serial port belongs to
+        # the background reader thread. Poking the port from here would corrupt
+        # both streams (and can close the shared port, freezing the display),
+        # so measure the rate passively from the frames that already arrive.
+        sensor = getattr(self, "sensor_functions", None)
+        if sensor is not None and getattr(sensor, "_sensor_reader_is_running", lambda: False)():
+            self._measure_stream_hz(sensor)
+            return
+
+        if not self.ensure_sensor_api():
             self.log_display.append("Sensor API is not ready yet.")
+            return
+        self._measure_direct_hz()
+
+    def _set_sensor_hz_measurement_running(self, running: bool):
+        self._sensor_hz_measurement_running = bool(running)
+        button = getattr(self, "read_sensor_api_hz_button", None)
+        if button is not None:
+            button.setEnabled(not running)
+
+    def _measure_stream_hz(self, sensor, duration_ms=1000):
+        data_obj = getattr(sensor, "_data", None)
+        start_seq = getattr(data_obj, "frame_sequence", None)
+        if start_seq is None:
+            self.log_display.append("Sensor stream is running but its frame counter is unavailable.")
+            return
+
+        self._set_sensor_hz_measurement_running(True)
+        self.log_display.append("Measuring live sensor stream rate over 1s...")
+        started = time.perf_counter()
+        start_seq = int(start_seq)
+
+        def finish():
+            self._set_sensor_hz_measurement_running(False)
+            elapsed = max(time.perf_counter() - started, 1e-9)
+            current = getattr(getattr(sensor, "_data", None), "frame_sequence", None)
+            if current is None:
+                self.log_display.append("Sensor stream stopped during the Hz measurement.")
+                return
+            frames = max(0, int(current) - start_seq)
+            self.log_display.append(
+                "Sensor stream Hz (live, non-intrusive): "
+                f"{frames / elapsed:.2f} | frames={frames} | elapsed={elapsed:.2f}s"
+            )
+
+        QtCore.QTimer.singleShot(int(duration_ms), finish)
+
+    def _measure_direct_hz(self):
+        self._set_sensor_hz_measurement_running(True)
+        self.log_display.append("Measuring sensor API raw Hz over 1s (background)...")
+
+        bridge = _SensorHzResultBridge(self)
+        bridge.finished.connect(self._on_sensor_hz_measured)
+        api = self.sensor_api
+
+        def worker():
+            try:
+                result = api.measure_read_raw_hz(duration_sec=1.0)
+            except Exception as exc:
+                result = exc
+            # Queued signal: the handler runs back on the GUI thread.
+            bridge.finished.emit(result)
+
+        threading.Thread(target=worker, name="sensor-hz-measure", daemon=True).start()
+
+    def _on_sensor_hz_measured(self, result):
+        self._set_sensor_hz_measurement_running(False)
+        bridge = self.sender()
+        if bridge is not None:
+            bridge.deleteLater()
+
+        if isinstance(result, Exception):
+            self.log_display.append(f"Sensor API raw Hz measurement failed: {result}")
+            return
+        if not result:
+            self.log_display.append("Sensor API raw Hz measurement failed.")
+            return
+        self.log_display.append(
+            "Sensor API raw Hz: "
+            f"{result['hz']:.2f} | "
+            f"success={result['success_count']} / attempts={result['total_attempts']} | "
+            f"elapsed={result['elapsed_sec']:.2f}s"
+        )
 
     def _on_sensor_api_channel_check(self):
         if self.ensure_sensor_api():

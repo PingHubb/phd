@@ -182,7 +182,10 @@ class DirectFingerMotion:
 
         if self.is_running:
             self._reset_state()
-            self.control_timer.start(int(self.frame_interval_ms))
+            # Floor of 5 ms: run_step() already skips stale frames via
+            # frame_sequence, so polling faster than the sensor delivers
+            # frames only burns CPU (0 ms would busy-spin the GUI thread).
+            self.control_timer.start(max(5, int(self.frame_interval_ms)))
             print("Direct finger motion STARTED")
         else:
             self.control_timer.stop()
@@ -1569,6 +1572,13 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self._prev_diff_for_frame_diff = None
         self.zero_keepalive_sec = 0.5
         self.idle_reenable_sec = 1.0
+        # Background inference (keeps torch forward passes off the GUI
+        # thread). The robustness benchmark sets this to False because it
+        # drives run_step() synchronously and reads last_prediction directly.
+        self.inference_in_background = True
+        self._inference_executor = None
+        self._pending_inference = None  # (epoch, Future) or None
+        self._inference_epoch = 0
         self._reset_execution_runtime_state()
 
     def _load_torch_runtime(self):
@@ -1590,6 +1600,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.frame_buffer = []
         self.aux_buffer = []
         self._prev_diff_for_frame_diff = None
+        # Invalidate any in-flight background inference.
+        self._inference_epoch += 1
+        self._pending_inference = None
 
     def _reset_execution_runtime_state(self):
         self.last_robot_velocity_cmd = None
@@ -1743,6 +1756,11 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         if self.my_sensor.n_row < 2 or self.my_sensor.n_col < 2:
             return
 
+        # Apply any inference that finished since the previous tick before
+        # deciding what to do with the current frame.
+        if self.inference_in_background:
+            self._collect_pending_prediction()
+
         data_obj = getattr(self.my_sensor, "_data", None)
         sensor_frame_sequence = getattr(data_obj, "frame_sequence", None)
         perf_timestamp = time.perf_counter()
@@ -1754,6 +1772,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
                     and self.last_robot_velocity_cmd != self._zero_velocity()
                     and (perf_timestamp - self._last_sensor_frame_seen_at) >= timeout
                 ):
+                    self._discard_pending_predictions()
                     self._apply_prediction(
                         {
                             "mode": "stop",
@@ -1782,6 +1801,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         if len(self.aux_buffer) > self.seq_len:
             self.aux_buffer.pop(0)
         if not bool(getattr(self, "_last_live_touch_present", False)):
+            self._discard_pending_predictions()
             self._apply_prediction(
                 {
                     "mode": "stop",
@@ -1792,9 +1812,21 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
                 }
             )
             return
-        prediction = self._predict_from_buffer()
-        if prediction is not None:
-            self._apply_prediction(prediction)
+        if self.inference_in_background:
+            # One inference in flight at a time; if the previous one is still
+            # running, this frame still entered the buffers, so the next
+            # submission covers it.
+            if self._pending_inference is None:
+                prepared = self._prepare_prediction_window()
+                if prepared is not None:
+                    future = self._ensure_inference_executor().submit(
+                        self._run_model_inference, *prepared
+                    )
+                    self._pending_inference = (self._inference_epoch, future)
+        else:
+            prediction = self._predict_from_buffer()
+            if prediction is not None:
+                self._apply_prediction(prediction)
 
     def _snapshot_sensor_frame(self):
         data = self.my_sensor._data
@@ -1867,11 +1899,11 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         velocity[3:] = np.clip(velocity[3:], -angular_limit, angular_limit)
         return velocity
 
-    def _predict_from_buffer(self):
+    def _prepare_prediction_window(self):
+        """Snapshot + normalize the current input window (GUI thread, cheap)."""
         if self.model is None or not self.frame_buffer:
             return None
-        torch = self._torch
-        if torch is None:
+        if self._torch is None:
             return None
 
         window = np.stack(self.frame_buffer, axis=0)
@@ -1882,6 +1914,18 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             aux_window = np.concatenate([np.repeat(aux_window[0:1], pad_len, axis=0), aux_window], axis=0)
         window = (window - self.scaler_mean[None, :, None, None]) / self.scaler_std[None, :, None, None]
         aux_window = (aux_window - self.aux_mean[None, :]) / self.aux_std[None, :]
+        return window, aux_window
+
+    def _predict_from_buffer(self):
+        prepared = self._prepare_prediction_window()
+        if prepared is None:
+            return None
+        return self._run_model_inference(*prepared)
+
+    def _run_model_inference(self, window, aux_window):
+        """Torch forward pass. Safe to run on a worker thread: it only reads
+        model/scaler attributes that stay fixed while execution is running."""
+        torch = self._torch
 
         x = torch.from_numpy(window[None, ...].astype(np.float32)).to(self.device)
         aux = torch.from_numpy(aux_window[None, ...].astype(np.float32)).to(self.device)
@@ -1910,6 +1954,39 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             "finger_conf": finger_conf,
             "velocity_sent": velocity_sent,
         }
+
+    def _ensure_inference_executor(self):
+        if self._inference_executor is None:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self._inference_executor = ThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="ai-dfm-infer"
+            )
+        return self._inference_executor
+
+    def _collect_pending_prediction(self):
+        """Apply the result of a finished background inference, if any."""
+        pending = self._pending_inference
+        if pending is None:
+            return
+        epoch, future = pending
+        if not future.done():
+            return
+        self._pending_inference = None
+        try:
+            prediction = future.result()
+        except Exception as exc:
+            print(f"[AI-DFM] Background inference failed: {exc}")
+            return
+        # Discard the result if a stop/reset happened after submission —
+        # otherwise a stale motion command could override the stop.
+        if epoch != self._inference_epoch or prediction is None:
+            return
+        self._apply_prediction(prediction)
+
+    def _discard_pending_predictions(self):
+        self._inference_epoch += 1
+        self._pending_inference = None
 
     def _apply_prediction(self, prediction):
         mode = prediction["mode"]
@@ -1994,20 +2071,22 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self._send_robot_velocity_execution(zero_velocity)
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if stop_mode and robot_api is not None:
+            # Never swallow failures silently here: if the robot cannot leave
+            # velocity mode it may keep executing the last velocity command.
             if hasattr(robot_api, "exit_end_effector_velocity_mode"):
                 try:
                     robot_api.exit_end_effector_velocity_mode(send_zero=False)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[AI-DFM] WARNING: failed to exit velocity mode: {exc}")
             else:
                 try:
                     robot_api.send_request(robot_api.suspend_end_effector_velocity_mode())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[AI-DFM] WARNING: failed to suspend velocity mode: {exc}")
                 try:
                     robot_api.send_request(robot_api.stop_end_effector_velocity_mode())
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"[AI-DFM] WARNING: failed to stop velocity mode: {exc}")
         if stop_mode:
             self._velocity_mode_enabled = False
             self.last_robot_velocity_cmd = None

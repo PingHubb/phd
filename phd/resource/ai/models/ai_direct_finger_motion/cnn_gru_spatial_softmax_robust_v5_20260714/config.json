@@ -1,0 +1,72 @@
+{
+  "model_family": "tactile_cnn_gru_policy",
+  "dataset_session": "",
+  "dataset_sessions": [
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1"
+  ],
+  "dataset_files": [
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0001_20260623_162516.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0002_20260623_162559.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0003_20260623_162657.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0004_20260623_162934.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0005_20260623_163003.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0001_20260624_153100.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0002_20260624_153153.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0003_20260624_153324.npz"
+  ],
+  "train_files": [
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0001_20260623_162516.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0002_20260623_162559.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0003_20260623_162657.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0004_20260623_162934.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0001_20260624_153100.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0002_20260624_153153.npz"
+  ],
+  "val_files": [
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0005_20260623_163003.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0003_20260624_153324.npz"
+  ],
+  "target_key": "intended_velocity_target",
+  "seq_len": 16,
+  "channels": [
+    "diffPerData",
+    "diffPerDataAve",
+    "frameDiff",
+    "touchMask"
+  ],
+  "aux_feature_names": [
+    "center_row",
+    "center_col",
+    "delta_row",
+    "delta_col",
+    "delta_row_norm",
+    "delta_col_norm",
+    "speed",
+    "peak_value",
+    "mean_active_value",
+    "touch_present",
+    "control_frame_idx"
+  ],
+  "sensor_shape": [
+    10,
+    10
+  ],
+  "in_channels": 4,
+  "aux_dim": 11,
+  "d_model": 128,
+  "gru_hidden": 192,
+  "gru_layers": 1,
+  "dropout": 0.1,
+  "velocity_dim": 6,
+  "mode_classes": 4,
+  "encoder_type": "spatial_softmax",
+  "lock_rotation_axes": true,
+  "augment": true,
+  "aug_flip_prob": 0.5,
+  "aug_max_shift": 2,
+  "aug_noise_std": 0.02,
+  "aug_sensor_noise_max": 2.0,
+  "aug_drift_max": 2.0,
+  "recording_note": "offline training only; do not execute on robot until validated"
+}

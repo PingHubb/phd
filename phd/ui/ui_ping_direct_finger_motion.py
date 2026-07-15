@@ -30,6 +30,7 @@ from PyQt5.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 from phd.dependence.paths import resource_path, robot_resource_path  # pyright: ignore[reportMissingImports]
+from phd.ui import theme
 
 try:
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -117,16 +118,23 @@ class DirectFingerMotionMixin:
         self.ps5_controller_test_dialog.finished.connect(lambda *_: self._stop_ps5_controller_test())
 
     def _ps5_indicator_style(self, active):
-        if active:
-            return "background-color: #2ecc71; color: #111111; border: 1px solid #1e874b; border-radius: 6px;"
-        return "background-color: #3a3a3a; color: #dddddd; border: 1px solid #666666; border-radius: 6px;"
+        return theme.indicator_style(bool(active))
 
     def _sensor_indicator_style(self, active, center=False):
-        if not active:
-            return "background-color: #3a3a3a; color: #dddddd; border: 1px solid #666666; border-radius: 6px;"
-        if center:
-            return "background-color: #3498db; color: #111111; border: 1px solid #21618c; border-radius: 6px;"
-        return "background-color: #2ecc71; color: #111111; border: 1px solid #1e874b; border-radius: 6px;"
+        return theme.indicator_style(bool(active), center=bool(center))
+
+    @staticmethod
+    def _set_widget_style_if_changed(widget, style):
+        """setStyleSheet only when the style actually changed.
+
+        The indicator/grid update paths run on 20-30 ms timers; re-applying an
+        identical stylesheet forces Qt to re-polish and repaint the widget, so
+        skipping unchanged styles removes thousands of repaints per second.
+        """
+        if widget.property("_last_style") == style:
+            return
+        widget.setProperty("_last_style", style)
+        widget.setStyleSheet(style)
 
     def open_ps5_controller_test_dialog(self):
         if not hasattr(self, "ps5_controller_test_dialog"):
@@ -263,7 +271,9 @@ class DirectFingerMotionMixin:
         label = self.sensor_controller_indicator_labels.get(key)
         if label is not None:
             center = bool(label.property("sensor_indicator_center"))
-            label.setStyleSheet(self._sensor_indicator_style(bool(active), center=center))
+            self._set_widget_style_if_changed(
+                label, self._sensor_indicator_style(bool(active), center=center)
+            )
 
     def _ensure_sensor_touch_grid(self, n_row, n_col):
         shape = (int(n_row), int(n_col))
@@ -284,7 +294,8 @@ class DirectFingerMotionMixin:
                 cell.setAlignment(Qt.AlignCenter)
                 cell.setMinimumSize(18, 18)
                 cell.setStyleSheet(
-                    "background-color: #1f1f1f; border: 1px solid #3a3a3a; color: #d0d0d0;"
+                    f"background-color: {theme.INPUT_BG}; "
+                    f"border: 1px solid {theme.BORDER_SUBTLE}; color: {theme.TEXT_MUTED};"
                 )
                 self.sensor_touch_grid_layout.addWidget(cell, row, col)
                 row_cells.append(cell)
@@ -299,8 +310,14 @@ class DirectFingerMotionMixin:
         blue = int(35 + 50 * (1.0 - strength))
         return (
             f"background-color: rgb({red}, {green}, {blue}); "
-            "border: 1px solid #3a3a3a; color: #ffffff;"
+            f"border: 1px solid {theme.BORDER_SUBTLE}; color: #ffffff;"
         )
+
+    @staticmethod
+    def _quantize_touch_strength(strength):
+        """Bucket strength into 32 levels so tiny fluctuations do not force
+        a restyle of the cell every 30 ms tick."""
+        return round(float(strength) * 31.0) / 31.0
 
     def _update_sensor_touch_grid(self, helper):
         my_sensor = getattr(helper, "my_sensor", None)
@@ -319,17 +336,32 @@ class DirectFingerMotionMixin:
 
         flip_lr = bool(int(getattr(helper, "console_sensor_touch_grid_flip_lr", 0)))
         flip_ud = bool(int(getattr(helper, "console_sensor_touch_grid_flip_ud", 0)))
+        # Dirty-check per cell: most cells are unchanged between 30 ms ticks,
+        # and setText/setStyleSheet each force a repaint, so only touch cells
+        # whose (active, quantized strength) state actually changed.
+        if not hasattr(self, "_sensor_touch_cell_states"):
+            self._sensor_touch_cell_states = {}
+        if self._sensor_touch_grid_shape != getattr(self, "_sensor_touch_states_shape", None):
+            self._sensor_touch_cell_states = {}
+            self._sensor_touch_states_shape = self._sensor_touch_grid_shape
         for matrix_row in range(n_row):
             for matrix_col in range(n_col):
                 disp_row = (n_row - 1 - matrix_row) if flip_ud else matrix_row
                 disp_col = (n_col - 1 - matrix_col) if flip_lr else matrix_col
                 value = float(matrix[matrix_row, matrix_col])
                 is_active = value < threshold
+                strength = (
+                    self._quantize_touch_strength(norm[matrix_row, matrix_col])
+                    if is_active
+                    else 0.0
+                )
+                state = (is_active, strength)
+                if self._sensor_touch_cell_states.get((disp_row, disp_col)) == state:
+                    continue
+                self._sensor_touch_cell_states[(disp_row, disp_col)] = state
                 cell = self._sensor_touch_cells[disp_row][disp_col]
                 cell.setText("●" if is_active else "")
-                cell.setStyleSheet(
-                    self._touch_cell_style(norm[matrix_row, matrix_col] if is_active else 0.0)
-                )
+                cell.setStyleSheet(self._touch_cell_style(strength))
 
     def _apply_sensor_touch_grid_flip(self, key, checked):
         helper = self._get_sensor_helper("console_control_class")
@@ -471,7 +503,7 @@ class DirectFingerMotionMixin:
     def _set_ps5_indicator(self, key, active):
         label = self.ps5_controller_indicator_labels.get(key)
         if label is not None:
-            label.setStyleSheet(self._ps5_indicator_style(bool(active)))
+            self._set_widget_style_if_changed(label, self._ps5_indicator_style(bool(active)))
 
     def _update_ps5_controller_test(self):
         self._read_ps5_test_events()
@@ -696,24 +728,17 @@ class DirectFingerMotionMixin:
         self.direct_finger_motion_settings_dialog = QDialog(self)
         self.direct_finger_motion_settings_dialog.setWindowTitle("Direct Finger Motion Parameters")
         self.direct_finger_motion_settings_dialog.resize(900, 720)
-        self.direct_finger_motion_settings_dialog.setStyleSheet(
-            "QToolTip {"
-            " color: #111111;"
-            " background-color: #fff7cc;"
-            " border: 1px solid #5f5f5f;"
-            " padding: 6px;"
-            "}"
-        )
+        # Tooltips inherit the themed QToolTip style from the global QSS.
 
         dialog_layout = QVBoxLayout(self.direct_finger_motion_settings_dialog)
 
         header_text_layout = QVBoxLayout()
         self.direct_finger_motion_title_label = QLabel("Direct Finger Motion Control Panel")
-        self.direct_finger_motion_title_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self.direct_finger_motion_title_label.setStyleSheet(theme.TITLE_LABEL_STYLE)
         self.direct_finger_motion_subtitle_label = QLabel(
             "Tactile detection, speed scaling, push/pull, two-finger rotation, and runtime settings."
         )
-        self.direct_finger_motion_subtitle_label.setStyleSheet("color: #b0b0b0;")
+        self.direct_finger_motion_subtitle_label.setStyleSheet(theme.SUBTITLE_LABEL_STYLE)
         header_text_layout.addWidget(self.direct_finger_motion_title_label)
         header_text_layout.addWidget(self.direct_finger_motion_subtitle_label)
         dialog_layout.addLayout(header_text_layout)
@@ -850,9 +875,9 @@ class DirectFingerMotionMixin:
 
         dialog_layout = QVBoxLayout(self.console_control_settings_dialog)
         title = QLabel("Console Control Parameters")
-        title.setStyleSheet("font-size: 16px; font-weight: 600;")
+        title.setStyleSheet(theme.TITLE_LABEL_STYLE)
         subtitle = QLabel("Tune PS5/Linux joystick mapping, speeds, deadband, and direction signs.")
-        subtitle.setStyleSheet("color: #b0b0b0;")
+        subtitle.setStyleSheet(theme.SUBTITLE_LABEL_STYLE)
         subtitle.setWordWrap(True)
         dialog_layout.addWidget(title)
         dialog_layout.addWidget(subtitle)
@@ -4321,7 +4346,7 @@ class DirectFingerMotionMixin:
         )
 
         plotter = QtInteractor(dialog)
-        plotter.background_color = "#202020"
+        plotter.background_color = theme.VIEWPORT_BG
         layout.addWidget(plotter.interactor)
         try:
             plotter.add_axes()

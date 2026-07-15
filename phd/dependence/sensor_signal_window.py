@@ -1011,16 +1011,44 @@ class SensorSignalWindow(QWidget):
         if self.table.rowCount() != rows or self.table.columnCount() != columns:
             self.table.setRowCount(rows)
             self.table.setColumnCount(columns)
+            self._last_cell_states = {}
+
+        # Dirty-check cache: only touch QTableWidgetItems whose content
+        # actually changed. This runs at ~33 Hz over the whole grid, and
+        # unchanged cells are the common case, so skipping them removes
+        # thousands of redundant item updates per second.
+        if not hasattr(self, "_last_cell_states"):
+            self._last_cell_states = {}
 
         zero_mask = self._get_zero_mask_matrix(rows, columns)
         masked_brush = QBrush(QColor(210, 210, 210))  # neutral light gray
         masked_positions: list = []
+        changed_any = False
 
         idx = 0
         for col in range(columns):
             for row in range(rows):
                 if idx < n:
                     is_masked = bool(zero_mask[row, col]) if zero_mask is not None else False
+                    if is_masked:
+                        masked_positions.append((row, col))
+                        state = ("masked",)
+                    else:
+                        cal = (
+                            self.calibration_data[idx]
+                            if idx < len(self.calibration_data)
+                            else None
+                        )
+                        pct = percent_list[idx] if idx < len(percent_list) else 0.0
+                        # Quantize the heat percentage so imperceptible color
+                        # changes do not force a repaint.
+                        state = (display_list[idx], cal, round(pct, 1))
+
+                    if self._last_cell_states.get((row, col)) == state:
+                        idx += 1
+                        continue
+                    self._last_cell_states[(row, col)] = state
+                    changed_any = True
 
                     item = self.table.item(row, col)
                     if item is None:
@@ -1034,18 +1062,15 @@ class SensorSignalWindow(QWidget):
                         item.setData(Qt.DisplayRole, "—")
                         item.setData(CALIBRATION_ROLE, None)
                         item.setBackground(masked_brush)
-                        masked_positions.append((row, col))
                     else:
-                        item.setData(Qt.DisplayRole, display_list[idx])
-                        if idx < len(self.calibration_data):
-                            item.setData(CALIBRATION_ROLE, self.calibration_data[idx])
-                        else:
-                            item.setData(CALIBRATION_ROLE, None)
-
-                        pct = percent_list[idx] if idx < len(percent_list) else 0.0
-                        item.setBackground(QBrush(self._color_for_cell(pct)))
+                        item.setData(Qt.DisplayRole, state[0])
+                        item.setData(CALIBRATION_ROLE, state[1])
+                        item.setBackground(QBrush(self._color_for_cell(state[2])))
                 else:
-                    self.table.setItem(row, col, QTableWidgetItem())
+                    if self._last_cell_states.get((row, col)) != ("empty",):
+                        self._last_cell_states[(row, col)] = ("empty",)
+                        self.table.setItem(row, col, QTableWidgetItem())
+                        changed_any = True
                 idx += 1
 
         # Diagnostic: warn (once per change) when the number of cells the
@@ -1067,7 +1092,8 @@ class SensorSignalWindow(QWidget):
             elif expected == actual:
                 self._last_mask_mismatch = None
 
-        self.table.viewport().update()
+        if changed_any:
+            self.table.viewport().update()
 
     def _get_zero_mask_matrix(self, rows: int, columns: int):
         """Pull the latest ``cell_zero_mask`` from the shared MySensor (the same

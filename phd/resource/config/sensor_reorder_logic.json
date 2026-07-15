@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "settings": {
+    "2d_10x10": {
+      "model": "2d",
+      "n_row": 10,
+      "n_col": 10,
+      "reorder_mode": "row_to_col",
+      "point_labels_enabled": false,
+      "force_scale_n_per_signal": 0.0,
+      "geometry": {
+        "use_selected_shape": true,
+        "shape": "cylinder",
+        "bend_axis": "rows",
+        "arc_deg": 180.0,
+        "normal_flip": false,
+        "rotation_deg": [
+          0.0,
+          90.0,
+          0.0
+        ]
+      },
+      "stereo_field": {
+        "ignore_noise_enabled": false,
+        "deadband_pct": 0.35,
+        "response_scale_pct": 2.0,
+        "length_scale": 0.35
+      },
+      "background_reference_enabled": false
+    }
+  }
+}

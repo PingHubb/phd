@@ -20,27 +20,29 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from phd.ui import theme
+
 
 class SensorZeroMaskDialog(QDialog):
     """Pick which sensor cells should always be forced to 0."""
 
     CELL_STYLE = (
         "QToolButton {"
-        " border: 1px solid #555;"
+        f" border: 1px solid {theme.BORDER};"
         " border-radius: 3px;"
-        " color: #dddddd;"
-        " background: #2b2b2b;"
+        f" color: {theme.TEXT_MUTED};"
+        f" background: {theme.SURFACE_RAISED};"
         " font-size: 10px;"
         " padding: 0px;"
         "}"
         "QToolButton:checked {"
-        " background: #d04545;"
+        f" background: {theme.DANGER};"
         " color: white;"
-        " border: 1px solid #ff7676;"
+        f" border: 1px solid {theme.DANGER_HOVER};"
         " font-weight: 600;"
         "}"
         "QToolButton:hover {"
-        " border: 1px solid #4fc3f7;"
+        f" border: 1px solid {theme.ACCENT};"
         "}"
     )
 
@@ -86,7 +88,7 @@ class SensorZeroMaskDialog(QDialog):
         info = QLabel(
             f"Sensor key: <b>{self._sensor_key}</b> &nbsp;&nbsp;"
             f"Grid: {self._n_row} × {self._n_col}<br>"
-            "<span style='color:#bbbbbb'>Click a cell to mark it as always 0. "
+            f"<span style='color:{theme.TEXT_MUTED}'>Click a cell to mark it as always 0. "
             "Click again to release.<br>'Save to File' stores the mask under the "
             "sensor key so it auto-loads next time you build the same sensor.</span>"
         )
@@ -137,7 +139,7 @@ class SensorZeroMaskDialog(QDialog):
         # Footer: status text + close button.
         footer = QHBoxLayout()
         self._status_label = QLabel("")
-        self._status_label.setStyleSheet("color: #4fc3f7;")
+        self._status_label.setStyleSheet(theme.INFO_LABEL_STYLE)
         footer.addWidget(self._status_label, stretch=1)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)

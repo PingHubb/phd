@@ -1,0 +1,71 @@
+\relax 
+\@writefile{toc}{\contentsline {title}{Reducing Cognitive Translation Cost in Embodied Tactile Robot Control with a Learned Spatiotemporal Policy}{1}{}\protected@file@percent }
+\@writefile{toc}{\authcount {3}}
+\@writefile{toc}{\contentsline {author}{First Author \and Second Author \and Third Author}{1}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {1}Introduction}{1}{}\protected@file@percent }
+\newlabel{sec:intro}{{1}{1}{}{section.1}{}}
+\citation{fitts1953}
+\citation{goodrich2007,billard2019}
+\citation{fitts1953}
+\citation{dahiya2010,si2023,luo2021}
+\citation{argall2010}
+\@writefile{toc}{\contentsline {section}{\numberline {2}Related Work}{2}{}\protected@file@percent }
+\newlabel{sec:related}{{2}{2}{}{section.2}{}}
+\citation{pomerleau1989,argall2009}
+\citation{ross2011}
+\citation{levine2016,finn2016}
+\citation{baranyi2012}
+\citation{hendrycks2019}
+\@writefile{toc}{\contentsline {section}{\numberline {3}Cognitive Translation-Cost Framework}{3}{}\protected@file@percent }
+\newlabel{sec:framework}{{3}{3}{}{section.3}{}}
+\newlabel{eq:pathway}{{1}{3}{}{equation.1}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {1}{\ignorespaces Intention-to-action pathway. Embodied tactile input targets the human-side costs $S$, $M$, and $N$; this paper concentrates on the highlighted machine-decoding stage $U \rightarrow C$, whose brittleness under sensor degradation would re-enter the pathway as corrective inputs.}}{4}{}\protected@file@percent }
+\newlabel{fig:pathway}{{1}{4}{}{figure.1}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {4}Embodied Tactile Platform and Demonstration Data}{4}{}\protected@file@percent }
+\newlabel{sec:platform}{{4}{4}{}{section.4}{}}
+\newlabel{sec:data}{{4}{4}{}{section.4}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {5}Learned Decoding Policy}{5}{}\protected@file@percent }
+\newlabel{sec:policy}{{5}{5}{}{section.5}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.1}Input Representation and Architecture}{5}{}\protected@file@percent }
+\newlabel{eq:ssoftmax}{{2}{5}{}{equation.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.2}Geometry- and Perturbation-Aware Augmentation}{5}{}\protected@file@percent }
+\newlabel{sec:augment}{{5.2}{5}{}{subsection.5.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {5.3}Training Protocol}{6}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {section}{\numberline {6}Faithful-Replay Robustness Benchmark}{6}{}\protected@file@percent }
+\newlabel{sec:benchmark}{{6}{6}{}{section.6}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {2}{\ignorespaces Predicted vs.\ demonstrated velocity on a held-out validation segment ($v_x$, $v_y$, $v_z$ from top to bottom). The policy reproduces direction changes on all three axes, push/pull events ($v_y$), and stop phases.}}{7}{}\protected@file@percent }
+\newlabel{fig:timeseries}{{2}{7}{}{figure.2}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {7}Results}{7}{}\protected@file@percent }
+\newlabel{sec:results}{{7}{7}{}{section.7}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.1}Fidelity to the Demonstrated Commands}{7}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.2}Robustness under Sensor Perturbation}{7}{}\protected@file@percent }
+\newlabel{sec:results-robust}{{7.2}{7}{}{subsection.7.2}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {1}{\ignorespaces Faithful-replay benchmark on held-out episodes: velocity RMSE (m/s, lower is better) and mode agreement (higher is better) against the clean-input reference. Bold marks the better controller per condition.}}{8}{}\protected@file@percent }
+\newlabel{tab:robust}{{1}{8}{}{table.1}{}}
+\@writefile{lot}{\contentsline {table}{\numberline {2}{\ignorespaces Ablation on robustness (velocity RMSE, m/s; lower is better); each row adds one ingredient. The hand-crafted centroid controller scores 0.033--0.034 under these noise conditions. \textcolor {red}{\textbf  {[Re-run the first row as a controlled single-variable ablation before submission.]}}}}{8}{}\protected@file@percent }
+\newlabel{tab:ablation}{{2}{8}{}{table.2}{}}
+\@writefile{toc}{\contentsline {subsection}{\numberline {7.3}Ablation: Location-Preserving Encoding and Augmentation}{8}{}\protected@file@percent }
+\newlabel{sec:results-ablation}{{7.3}{8}{}{subsection.7.3}{}}
+\@writefile{lof}{\contentsline {figure}{\numberline {3}{\ignorespaces Velocity RMSE vs.\ perturbation magnitude for both controllers. Green shading marks conditions where the learned policy has the lower error: every tested condition of all four families.}}{9}{}\protected@file@percent }
+\newlabel{fig:robust}{{3}{9}{}{figure.3}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {8}Planned User Evaluation}{9}{}\protected@file@percent }
+\newlabel{sec:userstudy}{{8}{9}{}{section.8}{}}
+\@writefile{toc}{\contentsline {section}{\numberline {9}Limitations and Conclusion}{9}{}\protected@file@percent }
+\newlabel{sec:conclusion}{{9}{9}{}{section.9}{}}
+\bibcite{goodrich2007}{1}
+\bibcite{billard2019}{2}
+\bibcite{fitts1953}{3}
+\bibcite{dahiya2010}{4}
+\bibcite{si2023}{5}
+\bibcite{luo2021}{6}
+\bibcite{argall2010}{7}
+\bibcite{pomerleau1989}{8}
+\bibcite{argall2009}{9}
+\bibcite{ross2011}{10}
+\bibcite{levine2016}{11}
+\bibcite{finn2016}{12}
+\bibcite{hendrycks2019}{13}
+\bibcite{baranyi2012}{14}
+\@writefile{toc}{\contentsline {subsubsection}{Acknowledgements.}{10}{}\protected@file@percent }
+\@writefile{toc}{\contentsline {subsubsection}{Disclosure of Interests.}{10}{}\protected@file@percent }
+\gdef \@abspage@last{10}
