@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import threading
@@ -9,7 +10,7 @@ import serial
 import serial.tools.list_ports
 import time
 from pyvistaqt import QtInteractor
-from PyQt5.QtCore import QObject, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QThread, QTimer
 from PyQt5.QtWidgets import QListWidgetItem
 from tqdm import tqdm
 from phd.dependence.paths import resource_path, sensor_resource_path
@@ -18,6 +19,39 @@ from phd.dependence.sensor_layout import (
     flatten_column_major_view as _flatten_column_major_view,
     reshape_sensor_values_to_row_col_matrix,
     row_major_idx as _row_major_idx,
+)
+from phd.dependence.sensor_geometry import (
+    compute_grid_normals,
+    heatmap_corner_points_from_centres,
+    heatmap_surface_from_corner_lattice,
+    interpolate_coarse_deformation,
+    normalize_point_array,
+    structured_grid_edge_pairs,
+    structured_grid_edges,
+)
+from phd.dependence.sensor_data import SensorDataBuffer
+from phd.dependence.sensor_heatmap import (
+    DEFAULT_HEATMAP_3D_COLOR_GAIN,
+    DEFAULT_HEATMAP_3D_PALETTE,
+    DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
+    DEFAULT_HEATMAP_RESPONSE_MODE,
+    DEFAULT_HEATMAP_SATURATION_PCT,
+    DEFAULT_PROXIMITY_KNEE,
+    DEFAULT_PROXIMITY_NOISE_FLOOR,
+    DEFAULT_PROXIMITY_SATURATION,
+    HEATMAP_RESPONSE_PROXIMITY_ENHANCED,
+    heatmap_3d_rgb,
+    normalize_heatmap_3d_palette,
+    normalize_heatmap_response_mode,
+)
+from phd.dependence.sensor_protocol import (
+    DEFAULT_SENSOR_BAUD_RATE,
+    DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
+)
+from phd.dependence.sensor_serial import (
+    SensorCalibrationBridge,
+    SensorPayloadBridge,
+    SensorReadWorker,
 )
 
 # Persistent storage for per-sensor "always-zero" cell masks. The file holds
@@ -51,198 +85,11 @@ REORDER_LOGIC_OPTIONS = (
     "rotate_180",
 )
 
-
-class _SensorReadWorker(QObject):
-    """Continuously read raw sensor payloads without blocking Qt rendering."""
-
-    raw_payload_ready = pyqtSignal(int, str, list)
-    error = pyqtSignal(str)
-    finished = pyqtSignal()
-
-    def __init__(self, serial_ports, generation=0, response_timeout=0.5, idle_sleep_sec=0.002):
-        super().__init__()
-        self.serial_ports = list(serial_ports or [])
-        self.generation = int(generation)
-        self.response_timeout = max(0.05, float(response_timeout))
-        self.idle_sleep_sec = max(0.0, float(idle_sleep_sec))
-        self._running = False
-
-    def stop(self):
-        self._running = False
-
-    @staticmethod
-    def _parse_ints(text):
-        values = []
-        for token in str(text).split():
-            try:
-                values.append(int(token))
-            except ValueError:
-                continue
-        return values
-
-    def _read_raw_from_port(self, ser):
-        try:
-            ser.write(b"readRaw\n")
-        except Exception as exc:
-            self.error.emit(f"Sensor write failed on {getattr(ser, 'port', 'unknown')}: {exc}")
-            return None
-
-        deadline = time.time() + self.response_timeout
-        while self._running and time.time() < deadline:
-            try:
-                waiting = int(getattr(ser, "in_waiting", 0))
-            except Exception as exc:
-                self.error.emit(f"Sensor read failed on {getattr(ser, 'port', 'unknown')}: {exc}")
-                return None
-
-            if waiting <= 0:
-                time.sleep(self.idle_sleep_sec)
-                continue
-
-            try:
-                line = ser.readline().decode("utf-8", errors="ignore").rstrip()
-            except Exception as exc:
-                self.error.emit(f"Sensor line read failed on {getattr(ser, 'port', 'unknown')}: {exc}")
-                return None
-
-            if not line:
-                continue
-
-            data_list = self._parse_ints(line)
-            if data_list:
-                return data_list[2:-2] if len(data_list) >= 4 else data_list
-
-        return None
-
-    def run(self):
-        self._running = True
-        try:
-            while self._running:
-                emitted = False
-                for ser in self.serial_ports:
-                    if not self._running:
-                        break
-                    data_list = self._read_raw_from_port(ser)
-                    if data_list is None:
-                        continue
-                    self.raw_payload_ready.emit(
-                        self.generation,
-                        str(getattr(ser, "port", "sensor")),
-                        list(data_list),
-                    )
-                    emitted = True
-                if not emitted:
-                    time.sleep(self.idle_sleep_sec)
-        finally:
-            self.finished.emit()
-
-
-class _SensorCalibrationBridge(QObject):
-    """Carries the result of a background calibration back to the GUI thread."""
-
-    finished = pyqtSignal(bool)
-
-
-class _SensorPayloadBridge(QObject):
-    """GUI-thread bridge between the serial reader thread and MySensor.
-
-    MySensor is not a QObject, so connecting the worker signal directly to one
-    of its methods would run that method in the *reader* thread. Routing the
-    payload through this bridge (created in the GUI thread) makes Qt use a
-    queued connection: `deliver` always runs on the GUI thread, immediately
-    after the frame arrives, so frames are processed event-driven with no
-    polling latency and no busy-wait timer.
-    """
-
-    def __init__(self, sensor):
-        super().__init__()
-        self._sensor = sensor
-
-    def deliver(self, generation, port_name, data_list):
-        self._sensor._on_sensor_reader_payload(generation, port_name, data_list)
-        self._sensor.update_animation()
-
-
-class data:
-    def __init__(self, n_row, n_col, window_size=3):
-        self.n_row = n_row
-        self.n_col = n_col
-        self.windowSize = max(1, int(window_size))
-        self.calData = np.zeros((self.n_row, self.n_col))
-        self.rawData = np.zeros((self.n_row, self.n_col))
-        self.diffData = np.zeros((self.n_row, self.n_col))
-        self.diffPerData = np.zeros((self.n_row, self.n_col))
-        self.rawDataWin = np.zeros((self.windowSize, self.n_row, self.n_col))
-        self.diffDataWin = np.zeros((self.windowSize, self.n_row, self.n_col))
-        self.diffPerDataWin = np.zeros((self.windowSize, self.n_row, self.n_col))
-        self.rawDataAve = np.zeros((self.n_row, self.n_col))
-        self.diffDataAve = np.zeros((self.n_row, self.n_col))
-        self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
-        self.frame_sequence = 0
-
-    def _recompute_averages(self):
-        self.rawDataAve = np.flipud(np.mean(self.rawDataWin, axis=0))
-        self.diffDataAve = np.flipud(np.mean(self.diffDataWin, axis=0))
-        self.diffPerDataAve = np.flipud(np.mean(self.diffPerDataWin, axis=0))
-
-    def setWindowSize(self, window_size):
-        self.windowSize = max(1, int(window_size))
-        self.rawDataWin = np.repeat(self.rawData[None, ...], self.windowSize, axis=0)
-        self.diffDataWin = np.repeat(self.diffData[None, ...], self.windowSize, axis=0)
-        self.diffPerDataWin = np.repeat(self.diffPerData[None, ...], self.windowSize, axis=0)
-        self._recompute_averages()
-
-    def getRaw(self, rawData):
-        self.rawData = rawData
-
-    def getCal(self, calData):
-        self.calData = calData
-
-    def calDiff(self):
-        self.diffData = self.rawData - self.calData
-
-    def calDiffPer(self):
-        non_zero_mask = self.calData != 0
-        self.diffPerData = np.zeros_like(self.calData, dtype=float)
-        np.divide(
-            100 * self.diffData,
-            self.calData,
-            out=self.diffPerData,
-            where=non_zero_mask
-        )
-
-    def clearData(self):
-        self.rawDataWin = np.zeros((self.windowSize, self.n_row, self.n_col))
-        self.diffDataWin = np.zeros((self.windowSize, self.n_row, self.n_col))
-        self.diffPerDataWin = np.zeros((self.windowSize, self.n_row, self.n_col))
-        self.rawDataAve = np.zeros((self.n_row, self.n_col))
-        self.diffDataAve = np.zeros((self.n_row, self.n_col))
-        self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
-        self.frame_sequence = 0
-
-    def getWin(self, i):
-        # This index logic seems to be 1-based. Using i-1 to be safe.
-        # It also looks like you want to handle a circular buffer.
-        # Let's adjust the index to be robust using modulo.
-        idx = (i - 1) % self.windowSize
-
-        # The original code shifts the window only when i == windowSize.
-        # A more common approach is to always shift, which might be what's intended.
-        # However, sticking to the original logic:
-        if i == self.windowSize:
-            self.rawDataWin[:-1] = self.rawDataWin[1:]
-            self.diffDataWin[:-1] = self.diffDataWin[1:]
-            self.diffPerDataWin[:-1] = self.diffPerDataWin[1:]
-            # The last element will be overwritten below.
-
-        # Place the new data using the normalized index.
-        self.rawDataWin[idx] = self.rawData
-        self.diffDataWin[idx] = self.diffData
-        self.diffPerDataWin[idx] = self.diffPerData
-
-        if i >= self.windowSize:  # Calculate average once the window is full
-            self._recompute_averages()
-            self.frame_sequence += 1
+# Compatibility aliases keep the established internal and external imports stable.
+_SensorReadWorker = SensorReadWorker
+_SensorCalibrationBridge = SensorCalibrationBridge
+_SensorPayloadBridge = SensorPayloadBridge
+data = SensorDataBuffer
 
 
 class SensorModelFactory:
@@ -716,7 +563,9 @@ class MySensor:
     SENSOR_VISUALIZATION_MODE_OPTIONS = (
         ("point_grid", "Point Grid"),
         ("stereo_field", "Stereo Field"),
+        ("heatmap_3d", "3D Heatmap"),
     )
+    SENSOR_REFERENCE_OPACITY = 0.12
 
     def __init__(self, parent) -> None:
         self.parent = parent
@@ -726,6 +575,25 @@ class MySensor:
         self.matrixLineActor = None
         self.matrixLinePoly = None
         self.matrixLineColors = None
+        self.heatmapActor = None
+        self.heatmapPoly = None
+        self.heatmapColors = None
+        self.heatmapGridActor = None
+        self.heatmapGridPoly = None
+        self.heatmapGridDisplayPoly = None
+        self._heatmap_logical_edges = None
+        self._heatmap_tile_vertices = None
+        self._last_sensor_visualization_matrix = None
+        self._pending_sensor_visualization_matrix = None
+        self._heatmap_calibration_override = None
+        self.heatmap_saturation_pct = DEFAULT_HEATMAP_SATURATION_PCT
+        self.heatmap_noise_floor_pct = DEFAULT_HEATMAP_NOISE_FLOOR_PCT
+        self.heatmap_response_mode = DEFAULT_HEATMAP_RESPONSE_MODE
+        self.heatmap_proximity_noise_floor = DEFAULT_PROXIMITY_NOISE_FLOOR
+        self.heatmap_proximity_knee = DEFAULT_PROXIMITY_KNEE
+        self.heatmap_proximity_saturation = DEFAULT_PROXIMITY_SATURATION
+        self.heatmap_3d_color_gain = DEFAULT_HEATMAP_3D_COLOR_GAIN
+        self.heatmap_3d_palette = DEFAULT_HEATMAP_3D_PALETTE
         self._matrix_visual_actor_mode = None
         self._matrix_line_dense_shape = (0, 0)
         self._matrix_line_base_points = None
@@ -762,7 +630,7 @@ class MySensor:
         self.n_row = 0
         self.touch_sensitivity_scale = 0.05
         self.sensor_visualization_mode = "point_grid"
-        self.show_contact_normal_vector = True
+        self.show_contact_normal_vector = False
         self.show_sensor_point_labels = False
         self.contact_normal_estimator_mode = "touch_anchor_v4"
         self.contact_normal_threshold_pct = 3.0
@@ -780,6 +648,8 @@ class MySensor:
         self.cal_data = []
         self.sensor_average_window_size = self.SENSOR_AVERAGE_WINDOW_SIZE
         self.visualization_target_hz = self.VISUALIZATION_TARGET_HZ
+        self.main_visualization_enabled = True
+        self._heatmap_playback_active = False
         self.creatPlaneXY()
         # Frames are processed event-driven (see _SensorPayloadBridge): the
         # reader thread's signal triggers update_animation() the moment a
@@ -792,6 +662,13 @@ class MySensor:
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_animation)
         self.timer.start(100)
+        self._visualization_timer = QTimer()
+        self._visualization_timer.timeout.connect(
+            self._render_pending_sensor_visualization
+        )
+        self._visualization_timer.start(
+            max(1, int(round(1000.0 / self.visualization_target_hz)))
+        )
         self.is_connected = False
         self.visualization_min_interval_sec = 1.0 / self.visualization_target_hz
         self._last_visualization_time = 0.0
@@ -806,9 +683,14 @@ class MySensor:
         self._sensor_read_thread = None
         self._sensor_read_worker = None
         self._latest_sensor_payloads = {}
+        self._last_sensor_api_payloads = {}
         self._sensor_reader_generation = 0
         self._last_sensor_reader_error_log_time = 0.0
         self._sensor_calibration_in_progress = False
+        self._sensor_calibration_thread = None
+        self._sensor_calibration_stop_event = threading.Event()
+        self._is_shutting_down = False
+        self._last_sensor_stream_error = ""
         self.current_model_name = None
         self.current_reorder_mode = REORDER_FACTORY_DEFAULT
         self.current_effective_reorder_logic = None
@@ -836,6 +718,123 @@ class MySensor:
         self.plotter.camera.position = camera_pos
         self.plotter.camera.focal_point = camera_focal
         self.plotter.camera.view_angle = camera_view_angle
+
+    @staticmethod
+    def _normalize_sensor_camera_config(config):
+        if not isinstance(config, dict):
+            return None
+
+        def _finite_vector(name):
+            try:
+                vector = np.asarray(config.get(name), dtype=float).reshape(-1)
+            except Exception:
+                return None
+            if vector.size != 3 or not np.all(np.isfinite(vector)):
+                return None
+            return vector
+
+        position = _finite_vector("position")
+        focal_point = _finite_vector("focal_point")
+        view_up = _finite_vector("view_up")
+        if position is None or focal_point is None or view_up is None:
+            return None
+        view_direction = focal_point - position
+        if (
+            float(np.linalg.norm(view_direction)) <= 1e-9
+            or float(np.linalg.norm(view_up)) <= 1e-9
+            or float(np.linalg.norm(np.cross(view_direction, view_up))) <= 1e-9
+        ):
+            return None
+
+        try:
+            view_angle = float(config.get("view_angle", 30.0))
+        except Exception:
+            view_angle = 30.0
+        try:
+            parallel_scale = float(config.get("parallel_scale", 1.0))
+        except Exception:
+            parallel_scale = 1.0
+        if not np.isfinite(view_angle):
+            view_angle = 30.0
+        if not np.isfinite(parallel_scale) or parallel_scale <= 0.0:
+            parallel_scale = 1.0
+
+        return {
+            "position": position.tolist(),
+            "focal_point": focal_point.tolist(),
+            "view_up": (view_up / np.linalg.norm(view_up)).tolist(),
+            "view_angle": float(np.clip(view_angle, 1.0, 179.0)),
+            "parallel_projection": bool(
+                config.get("parallel_projection", False)
+            ),
+            "parallel_scale": parallel_scale,
+        }
+
+    def capture_sensor_camera_config(self):
+        camera = getattr(self.plotter, "camera", None)
+        if camera is None:
+            return None
+        try:
+            config = {
+                "position": list(camera.GetPosition()),
+                "focal_point": list(camera.GetFocalPoint()),
+                "view_up": list(camera.GetViewUp()),
+                "view_angle": float(camera.GetViewAngle()),
+                "parallel_projection": bool(camera.GetParallelProjection()),
+                "parallel_scale": float(camera.GetParallelScale()),
+            }
+        except Exception:
+            try:
+                config = {
+                    "position": list(camera.position),
+                    "focal_point": list(camera.focal_point),
+                    "view_up": list(camera.up),
+                    "view_angle": float(camera.view_angle),
+                    "parallel_projection": bool(camera.parallel_projection),
+                    "parallel_scale": float(camera.parallel_scale),
+                }
+            except Exception:
+                return None
+        return self._normalize_sensor_camera_config(config)
+
+    def apply_sensor_camera_config(self, config, render=True):
+        camera_config = self._normalize_sensor_camera_config(config)
+        camera = getattr(self.plotter, "camera", None)
+        if camera_config is None or camera is None:
+            return False
+        try:
+            camera.SetPosition(*camera_config["position"])
+            camera.SetFocalPoint(*camera_config["focal_point"])
+            camera.SetViewUp(*camera_config["view_up"])
+            camera.SetViewAngle(camera_config["view_angle"])
+            camera.SetParallelProjection(
+                int(camera_config["parallel_projection"])
+            )
+            camera.SetParallelScale(camera_config["parallel_scale"])
+        except Exception:
+            try:
+                camera.position = camera_config["position"]
+                camera.focal_point = camera_config["focal_point"]
+                camera.up = camera_config["view_up"]
+                camera.view_angle = camera_config["view_angle"]
+                camera.parallel_projection = camera_config[
+                    "parallel_projection"
+                ]
+                camera.parallel_scale = camera_config["parallel_scale"]
+            except Exception:
+                return False
+
+        self.saveCameraPara()
+        try:
+            self.plotter.reset_camera_clipping_range()
+        except Exception:
+            pass
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+        return True
 
     def creatPlaneXY(self):
         self.plotter.camera.position = (1, -1, 1)
@@ -915,6 +914,13 @@ class MySensor:
 
     def _make_lazy_helper(self, attr_name, feature_name, factory):
         return _LazyFeatureProxy(self, attr_name, feature_name, factory)
+
+    def get_initialized_helper(self, attr_name, default=None):
+        """Return an already-created optional helper without resolving a proxy."""
+        helper = self.__dict__.get(str(attr_name), default)
+        if isinstance(helper, _LazyFeatureProxy):
+            return default
+        return helper
 
     def _load_ai_helper_class(self, attr_name):
         module_name, symbol_name = self.AI_HELPER_IMPORTS[attr_name]
@@ -1000,6 +1006,152 @@ class MySensor:
     def set_visualization_target_hz(self, hz):
         self.visualization_target_hz = max(1.0, float(hz))
         self.visualization_min_interval_sec = 1.0 / self.visualization_target_hz
+        timer = getattr(self, "_visualization_timer", None)
+        if timer is not None:
+            timer.setInterval(
+                max(1, int(round(1000.0 / self.visualization_target_hz)))
+            )
+
+    def _render_pending_sensor_visualization(self):
+        if self._is_shutting_down or not self.is_connected:
+            return
+        if not bool(getattr(self, "main_visualization_enabled", True)):
+            return
+        if bool(getattr(self, "_heatmap_playback_active", False)):
+            return
+        sensor_matrix = self._pending_sensor_visualization_matrix
+        if sensor_matrix is None:
+            return
+        self._pending_sensor_visualization_matrix = None
+        self._last_visualization_time = time.perf_counter()
+        self.saveCameraPara()
+        self.update_visualization(sensor_matrix)
+
+    def _ensure_main_sensor_visualization_actors(self):
+        """Create main-plotter actors after an external-only scene build."""
+        if (
+            self.objActor is None
+            and self._2D_map is not None
+            and int(getattr(self._2D_map, "n_points", 0) or 0) > 0
+        ):
+            self.objActor = self.plotter.add_mesh(
+                self._2D_map,
+                show_edges=True,
+                scalars=self.colors,
+                rgb=True,
+                opacity=self.SENSOR_REFERENCE_OPACITY,
+            )
+
+        if self.actionMesh is None and self.line_poly is not None:
+            self.actionMesh = self.plotter.add_mesh(
+                self.line_poly,
+                scalars=self.colors_3d,
+                point_size=10,
+                line_width=3,
+                render_points_as_spheres=True,
+                rgb=True,
+            )
+
+        if self.actionMesh is not None or self.matrixLineActor is not None:
+            self._rebuild_matrix_visualization_actor(render=False)
+        if self._is_heatmap_visualization_mode(
+            getattr(self, "sensor_visualization_mode", "point_grid")
+        ):
+            self._ensure_heatmap_visualization_actor(render=False)
+        self._refresh_sensor_point_label_actor()
+
+    def set_main_visualization_enabled(self, enabled: bool, render: bool = True):
+        """Enable/disable only the main sensor plotter rendering.
+
+        Sensor acquisition and frame processing continue while disabled. This
+        lets another view (for example the robot-model sensor overlay) consume
+        the same single serial stream without rendering the sensor twice.
+        """
+        enabled = bool(enabled)
+        self.main_visualization_enabled = enabled
+        if enabled:
+            visualization_was_built = any(
+                actor is not None
+                for actor in (
+                    getattr(self, "objActor", None),
+                    getattr(self, "actionMesh", None),
+                    getattr(self, "matrixLineActor", None),
+                    getattr(self, "heatmapActor", None),
+                )
+            )
+            self._ensure_main_sensor_visualization_actors()
+            self._refresh_sensor_visualization_mode_actors()
+            if not visualization_was_built:
+                self.restore_saved_sensor_perspective(render=False)
+            self._apply_sensor_background_reference_visibility(render=False)
+            self._set_actor_visible(
+                getattr(self, "contactNormalActor", None),
+                bool(getattr(self, "show_contact_normal_vector", False)),
+            )
+            self._set_actor_visible(
+                getattr(self, "sensorPointLabelActor", None),
+                bool(getattr(self, "show_sensor_point_labels", False)),
+            )
+        else:
+            for actor in (
+                getattr(self, "objActor", None),
+                getattr(self, "actionMesh", None),
+                getattr(self, "matrixLineActor", None),
+                getattr(self, "heatmapActor", None),
+                getattr(self, "contactNormalActor", None),
+                getattr(self, "sensorPointLabelActor", None),
+                getattr(self, "actorPlaneXY", None),
+            ):
+                self._set_actor_visible(actor, False)
+            for actor in getattr(self, "referenceAxisActors", []) or []:
+                self._set_actor_visible(actor, False)
+            mesh_functions = getattr(
+                getattr(self, "parent", None), "mesh_functions", None
+            )
+            if mesh_functions is not None and hasattr(
+                mesh_functions, "set_secondary_background_reference_enabled"
+            ):
+                try:
+                    mesh_functions.set_secondary_background_reference_enabled(
+                        False, render=False
+                    )
+                except Exception:
+                    pass
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def get_last_sensor_stream_error(self):
+        return str(getattr(self, "_last_sensor_stream_error", "") or "")
+
+    def _set_sensor_stream_error(self, message):
+        self._last_sensor_stream_error = str(message or "")
+
+    def start_external_visualization_stream(self):
+        """Build/calibrate one sensor stream without main-plotter rendering."""
+        self._set_sensor_stream_error("")
+        if self._sensor_calibration_in_progress:
+            return True
+        if self._sensor_reader_is_running() and self.is_connected:
+            self.set_main_visualization_enabled(False, render=True)
+            return True
+
+        self.buildScene(show_main_visualization=False)
+        if not self.ser_list or self._data is None:
+            return False
+        self.updateCal()
+        return True
+
+    def stop_external_visualization_stream(self):
+        """Stop a stream started for an external visualization."""
+        if self._sensor_calibration_in_progress:
+            return False
+        stopped = self._close_serial_ports()
+        if stopped:
+            self.is_connected = False
+        return bool(stopped)
 
     def get_sensor_visualization_modes(self):
         return list(self.SENSOR_VISUALIZATION_MODE_OPTIONS)
@@ -1021,6 +1173,13 @@ class MySensor:
             )
         ):
             self._rebuild_matrix_visualization_actor(render=False)
+        if self._is_heatmap_visualization_mode(mode):
+            self._ensure_heatmap_visualization_actor(render=False)
+            current_matrix = getattr(self, "_last_sensor_visualization_matrix", None)
+            if current_matrix is None:
+                current_matrix = self._current_heatmap_sensor_matrix()
+            if current_matrix is not None:
+                self._update_heatmap_visualization(current_matrix)
         self._refresh_sensor_visualization_mode_actors()
         try:
             self.plotter.render()
@@ -1030,6 +1189,10 @@ class MySensor:
     @staticmethod
     def _is_matrix_visualization_mode(mode):
         return str(mode) == "stereo_field"
+
+    @staticmethod
+    def _is_heatmap_visualization_mode(mode):
+        return str(mode) == "heatmap_3d"
 
     @staticmethod
     def _set_actor_visible(actor, visible):
@@ -1046,12 +1209,665 @@ class MySensor:
             pass
 
     def _refresh_sensor_visualization_mode_actors(self):
-        matrix_mode = self._is_matrix_visualization_mode(
-            getattr(self, "sensor_visualization_mode", "point_grid")
-        )
-        self._set_actor_visible(getattr(self, "objActor", None), not matrix_mode)
-        self._set_actor_visible(getattr(self, "actionMesh", None), not matrix_mode)
+        mode = str(getattr(self, "sensor_visualization_mode", "point_grid"))
+        enabled = bool(getattr(self, "main_visualization_enabled", True))
+        point_grid_mode = enabled and mode == "point_grid"
+        matrix_mode = enabled and self._is_matrix_visualization_mode(mode)
+        heatmap_mode = enabled and self._is_heatmap_visualization_mode(mode)
+        self._set_actor_visible(getattr(self, "objActor", None), point_grid_mode)
+        self._set_actor_visible(getattr(self, "actionMesh", None), point_grid_mode)
         self._set_actor_visible(getattr(self, "matrixLineActor", None), matrix_mode)
+        self._set_actor_visible(getattr(self, "heatmapActor", None), heatmap_mode)
+        self._set_actor_visible(
+            getattr(self, "heatmapGridActor", None), heatmap_mode
+        )
+
+    @staticmethod
+    def _heatmap_axis_half_vector(point_grid, row, col, axis):
+        rows, cols = point_grid.shape[:2]
+        if axis == 0 and rows > 1:
+            if 0 < row < rows - 1:
+                return (point_grid[row + 1, col] - point_grid[row - 1, col]) * 0.25
+            neighbour = row + 1 if row == 0 else row - 1
+            direction = 1.0 if row == 0 else -1.0
+            return (point_grid[neighbour, col] - point_grid[row, col]) * 0.5 * direction
+        if axis == 1 and cols > 1:
+            if 0 < col < cols - 1:
+                return (point_grid[row, col + 1] - point_grid[row, col - 1]) * 0.25
+            neighbour = col + 1 if col == 0 else col - 1
+            direction = 1.0 if col == 0 else -1.0
+            return (point_grid[row, neighbour] - point_grid[row, col]) * 0.5 * direction
+        return np.zeros(3, dtype=float)
+
+    @staticmethod
+    def _heatmap_tangent_vector(vector, normal):
+        vector_np = np.asarray(vector, dtype=float)
+        normal_np = np.asarray(normal, dtype=float)
+        tangent = vector_np - normal_np * float(np.dot(vector_np, normal_np))
+        if np.all(np.isfinite(tangent)):
+            return tangent
+        return np.zeros(3, dtype=float)
+
+    def _custom_heatmap_grid_vectors(self):
+        """Return independently edited heatmap centres and normals, if enabled."""
+        geometry = self._normalize_sensor_geometry_config(
+            getattr(self, "current_sensor_geometry_config", None)
+        )
+        if not bool(geometry.get("use_custom_heatmap_shape", False)):
+            return None, None
+
+        expected_count = int(self.n_row) * int(self.n_col)
+        local_points = normalize_point_array(
+            geometry.get("custom_heatmap_points", []), expected_count
+        )
+        if local_points is None:
+            return None, None
+
+        effective_geometry = self._effective_sensor_geometry_config(geometry)
+        local_sensor_points, _local_sensor_normals = self._sensor_local_geometry(
+            effective_geometry
+        )
+        if local_sensor_points is None:
+            return None, None
+        local_normals = compute_grid_normals(
+            local_points,
+            self.n_row,
+            self.n_col,
+            normal_flip=bool(effective_geometry.get("normal_flip", False)),
+        )
+        if local_normals is None:
+            return None, None
+
+        rotation_pivot = self._sensor_geometry_rotation_pivot(local_sensor_points)
+        world_points, world_normals = self._rotate_sensor_geometry(
+            local_points,
+            effective_geometry.get("rotation_deg", [0.0, 0.0, 0.0]),
+            normals=local_normals,
+            pivot=rotation_pivot,
+        )
+        return (
+            self._coarse_grid_vectors(world_points),
+            self._coarse_grid_vectors(world_normals),
+        )
+
+    def _custom_heatmap_corner_grid(self):
+        """Return a rotated shared-corner heatmap grid, if one is enabled."""
+        geometry = self._normalize_sensor_geometry_config(
+            getattr(self, "current_sensor_geometry_config", None)
+        )
+        if not bool(geometry.get("use_custom_heatmap_shape", False)):
+            return None
+
+        corner_rows = int(self.n_row) + 1
+        corner_cols = int(self.n_col) + 1
+        local_corners = normalize_point_array(
+            geometry.get("custom_heatmap_corners", []),
+            corner_rows * corner_cols,
+        )
+        if local_corners is None:
+            return None
+
+        effective_geometry = self._effective_sensor_geometry_config(geometry)
+        local_sensor_points, _local_sensor_normals = self._sensor_local_geometry(
+            effective_geometry
+        )
+        if local_sensor_points is None:
+            return None
+        rotation_pivot = self._sensor_geometry_rotation_pivot(local_sensor_points)
+        world_corners = self._rotate_sensor_geometry(
+            local_corners,
+            effective_geometry.get("rotation_deg", [0.0, 0.0, 0.0]),
+            pivot=rotation_pivot,
+        )
+        corner_grid = np.empty((corner_rows, corner_cols, 3), dtype=float)
+        for col in range(corner_cols):
+            for row in range(corner_rows):
+                corner_grid[row, col] = world_corners[col * corner_rows + row]
+        return corner_grid
+
+    def _custom_heatmap_curve_offsets_world(self):
+        geometry = self._normalize_sensor_geometry_config(
+            getattr(self, "current_sensor_geometry_config", None)
+        )
+        if not bool(geometry.get("use_curved_heatmap_edges", False)):
+            return None
+        edge_count = len(
+            structured_grid_edge_pairs(
+                int(self.n_row) + 1,
+                int(self.n_col) + 1,
+            )
+        )
+        local_offsets = normalize_point_array(
+            geometry.get("custom_heatmap_edge_offsets", []), edge_count
+        )
+        if local_offsets is None:
+            local_offsets = np.zeros((edge_count, 3), dtype=float)
+        rotation = self._sensor_geometry_rotation_matrix_deg(
+            self._effective_sensor_geometry_config(geometry).get(
+                "rotation_deg", [0.0, 0.0, 0.0]
+            )
+        )
+        return local_offsets @ rotation.T
+
+    def _build_connected_heatmap_polydata(self, corner_grid):
+        """Build taxel quads whose neighboring edges share exact coordinates."""
+        corner_rows = int(self.n_row) + 1
+        corner_cols = int(self.n_col) + 1
+        corner_points = np.asarray(
+            [
+                corner_grid[row, col]
+                for col in range(corner_cols)
+                for row in range(corner_rows)
+            ],
+            dtype=float,
+        )
+        edge_offsets = self._custom_heatmap_curve_offsets_world()
+        surface = heatmap_surface_from_corner_lattice(
+            corner_points,
+            corner_rows,
+            corner_cols,
+            edge_offsets=edge_offsets,
+            curve_resolution=6 if edge_offsets is not None else 1,
+        )
+        if surface is None:
+            return None, None, None
+        tile_points = surface["points"]
+        faces = surface["faces"]
+        tile_vertices = surface["tile_vertices"]
+
+        logical_edges = []
+        for pair, samples in zip(
+            surface["edge_pairs"], surface["edge_samples"]
+        ):
+            first, second = (int(pair[0]), int(pair[1]))
+            first_col, first_row = divmod(first, corner_rows)
+            second_col, second_row = divmod(second, corner_rows)
+            adjacent_cells = []
+            if first_col == second_col:
+                edge_col = first_col
+                edge_row = min(first_row, second_row)
+                candidates = (
+                    (edge_row, edge_col - 1),
+                    (edge_row, edge_col),
+                )
+            else:
+                edge_col = min(first_col, second_col)
+                edge_row = first_row
+                candidates = (
+                    (edge_row - 1, edge_col),
+                    (edge_row, edge_col),
+                )
+            for row, col in candidates:
+                if 0 <= row < self.n_row and 0 <= col < self.n_col:
+                    adjacent_cells.append((row, col))
+            logical_edges.append(
+                {
+                    "points": np.asarray(samples, dtype=float),
+                    "cells": adjacent_cells,
+                }
+            )
+        self._heatmap_logical_edges = logical_edges
+
+        poly = pv.PolyData(
+            np.asarray(tile_points, dtype=float),
+            np.asarray(faces, dtype=np.int_),
+        )
+        colors = np.full((len(tile_points), 4), 255, dtype=np.uint8)
+        mask = self._cell_zero_mask_for_plotter()
+        for col in range(self.n_col):
+            for row in range(self.n_row):
+                if mask[row, col]:
+                    colors[tile_vertices[row, col], 3] = 0
+        poly.point_data["heatmap_colors"] = colors
+        poly.set_active_scalars("heatmap_colors")
+        return poly, colors, tile_vertices
+
+    def _build_visible_heatmap_grid_polydata(self):
+        """Return grid edges belonging to at least one unmasked taxel."""
+        heatmap_poly = getattr(self, "heatmapPoly", None)
+        if heatmap_poly is None:
+            return pv.PolyData()
+        mask = self._cell_zero_mask_for_plotter()
+        logical_edges = getattr(self, "_heatmap_logical_edges", None)
+        if logical_edges:
+            line_points = []
+            lines = []
+            for edge in logical_edges:
+                if not any(
+                    not bool(mask[row, col])
+                    for row, col in edge.get("cells", [])
+                ):
+                    continue
+                samples = np.asarray(edge.get("points", []), dtype=float)
+                if samples.ndim != 2 or samples.shape[0] < 2:
+                    continue
+                first_index = len(line_points)
+                line_points.extend(samples)
+                lines.extend(
+                    [
+                        len(samples),
+                        *range(first_index, first_index + len(samples)),
+                    ]
+                )
+            if not line_points:
+                return pv.PolyData()
+            grid_poly = pv.PolyData(np.asarray(line_points, dtype=float))
+            grid_poly.lines = np.asarray(lines, dtype=np.int_)
+            return grid_poly
+
+        visible_cell_ids = [
+            col * int(self.n_row) + row
+            for col in range(int(self.n_col))
+            for row in range(int(self.n_row))
+            if not bool(mask[row, col])
+        ]
+        if not visible_cell_ids:
+            return pv.PolyData()
+        visible_surface = heatmap_poly.extract_cells(
+            np.asarray(visible_cell_ids, dtype=int)
+        ).extract_surface()
+        return visible_surface.clean().extract_all_edges()
+
+    def _build_heatmap_polydata(self):
+        self._heatmap_logical_edges = None
+        custom_corner_grid = self._custom_heatmap_corner_grid()
+        if custom_corner_grid is not None:
+            return self._build_connected_heatmap_polydata(custom_corner_grid)
+
+        point_grid = self._coarse_grid_vectors(getattr(self, "points_origin", None))
+        normal_grid = self._coarse_grid_vectors(getattr(self, "normals", None))
+        custom_point_grid, custom_normal_grid = self._custom_heatmap_grid_vectors()
+        if custom_point_grid is not None and custom_normal_grid is not None:
+            point_grid = custom_point_grid
+            normal_grid = custom_normal_grid
+        if point_grid is None or normal_grid is None:
+            return None, None, None
+
+        finite_points = point_grid[np.all(np.isfinite(point_grid), axis=2)]
+        if finite_points.size:
+            sensor_span = float(
+                np.linalg.norm(np.max(finite_points, axis=0) - np.min(finite_points, axis=0))
+            )
+        else:
+            sensor_span = 0.05
+        fallback_half_size = max(sensor_span * 0.025, 0.001)
+        surface_lift = max(sensor_span * 0.002, 0.0001)
+        tile_scale = 0.94
+
+        tile_points = []
+        faces = []
+        tile_vertices = np.empty((self.n_row, self.n_col, 4), dtype=int)
+        for col in range(self.n_col):
+            for row in range(self.n_row):
+                center = np.asarray(point_grid[row, col], dtype=float)
+                normal = self._normalize_vector(normal_grid[row, col])
+                row_half = self._heatmap_tangent_vector(
+                    self._heatmap_axis_half_vector(point_grid, row, col, axis=0),
+                    normal,
+                )
+                col_half = self._heatmap_tangent_vector(
+                    self._heatmap_axis_half_vector(point_grid, row, col, axis=1),
+                    normal,
+                )
+
+                row_norm = float(np.linalg.norm(row_half))
+                col_norm = float(np.linalg.norm(col_half))
+                if row_norm <= 1e-9 and col_norm > 1e-9:
+                    row_half = self._normalize_vector(
+                        np.cross(normal, col_half)
+                    ) * max(col_norm, fallback_half_size)
+                elif col_norm <= 1e-9 and row_norm > 1e-9:
+                    col_half = self._normalize_vector(
+                        np.cross(row_half, normal)
+                    ) * max(row_norm, fallback_half_size)
+                elif row_norm <= 1e-9 and col_norm <= 1e-9:
+                    reference = np.array([0.0, 0.0, 1.0], dtype=float)
+                    if abs(float(np.dot(normal, reference))) > 0.9:
+                        reference = np.array([0.0, 1.0, 0.0], dtype=float)
+                    col_half = self._normalize_vector(
+                        np.cross(reference, normal)
+                    ) * fallback_half_size
+                    row_half = self._normalize_vector(
+                        np.cross(normal, col_half)
+                    ) * fallback_half_size
+
+                row_half *= tile_scale
+                col_half *= tile_scale
+                lifted_center = center + normal * surface_lift
+                corners = (
+                    lifted_center - row_half - col_half,
+                    lifted_center - row_half + col_half,
+                    lifted_center + row_half + col_half,
+                    lifted_center + row_half - col_half,
+                )
+                first_vertex = len(tile_points)
+                tile_points.extend(corners)
+                vertex_ids = np.arange(first_vertex, first_vertex + 4, dtype=int)
+                tile_vertices[row, col] = vertex_ids
+                faces.extend([4, *vertex_ids.tolist()])
+
+        poly = pv.PolyData(
+            np.asarray(tile_points, dtype=float),
+            np.asarray(faces, dtype=np.int_),
+        )
+        colors = np.full((len(tile_points), 4), 255, dtype=np.uint8)
+        mask = self._cell_zero_mask_for_plotter()
+        for col in range(self.n_col):
+            for row in range(self.n_row):
+                if mask[row, col]:
+                    colors[tile_vertices[row, col], 3] = 0
+        poly.point_data["heatmap_colors"] = colors
+        poly.set_active_scalars("heatmap_colors")
+        return poly, colors, tile_vertices
+
+    def _rebuild_heatmap_visualization_actor(self, render=False):
+        self.heatmapActor = self._remove_actor_safely(
+            getattr(self, "heatmapActor", None)
+        )
+        self.heatmapGridActor = self._remove_actor_safely(
+            getattr(self, "heatmapGridActor", None)
+        )
+        self.heatmapPoly = None
+        self.heatmapColors = None
+        self.heatmapGridPoly = None
+        self.heatmapGridDisplayPoly = None
+        self._heatmap_logical_edges = None
+        self._heatmap_tile_vertices = None
+
+        poly, colors, tile_vertices = self._build_heatmap_polydata()
+        if poly is None:
+            return
+        self.heatmapPoly = poly
+        self.heatmapColors = colors
+        self._heatmap_tile_vertices = tile_vertices
+        try:
+            self.heatmapActor = self.plotter.add_mesh(
+                self.heatmapPoly,
+                scalars="heatmap_colors",
+                rgb=True,
+                preference="point",
+                show_edges=False,
+                smooth_shading=False,
+                lighting=False,
+                ambient=1.0,
+                name="sensor_heatmap_3d",
+                render=False,
+            )
+        except Exception as exc:
+            self.heatmapActor = None
+            self.heatmapPoly = None
+            self.heatmapColors = None
+            self._heatmap_tile_vertices = None
+            print(f"[SensorVisualization] Failed to build 3D heatmap: {exc}")
+            return
+        self._rebuild_heatmap_grid_actor(render=render)
+
+    def _rebuild_heatmap_grid_actor(self, render=False):
+        self.heatmapGridActor = self._remove_actor_safely(
+            getattr(self, "heatmapGridActor", None)
+        )
+        self.heatmapGridPoly = self._build_visible_heatmap_grid_polydata()
+        self.heatmapGridDisplayPoly = None
+        if self.heatmapGridPoly.n_lines <= 0:
+            return
+        try:
+            bounds = np.asarray(self.heatmapGridPoly.bounds, dtype=float)
+            span = float(
+                np.linalg.norm(
+                    [bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4]]
+                )
+            )
+            tube_radius = max(span * 0.0015, 1e-6)
+            self.heatmapGridDisplayPoly = self.heatmapGridPoly.tube(
+                radius=tube_radius,
+                n_sides=10,
+                capping=True,
+            )
+            self.heatmapGridActor = self.plotter.add_mesh(
+                self.heatmapGridDisplayPoly,
+                color="#495057",
+                show_edges=False,
+                smooth_shading=False,
+                lighting=False,
+                pickable=False,
+                name="sensor_heatmap_grid",
+                render=render,
+            )
+        except Exception as exc:
+            self.heatmapGridActor = None
+            self.heatmapGridPoly = None
+            self.heatmapGridDisplayPoly = None
+            print(f"[SensorVisualization] Failed to build heatmap grid: {exc}")
+
+    def _ensure_heatmap_visualization_actor(self, render=False):
+        if (
+            getattr(self, "heatmapActor", None) is None
+            or getattr(self, "heatmapPoly", None) is None
+        ):
+            self._rebuild_heatmap_visualization_actor(render=render)
+
+    def _current_heatmap_sensor_matrix(self, fallback=None):
+        data_obj = getattr(self, "_data", None)
+        response_mode = normalize_heatmap_response_mode(
+            getattr(self, "heatmap_response_mode", DEFAULT_HEATMAP_RESPONSE_MODE)
+        )
+        raw_matrix = getattr(data_obj, "rawData", None) if data_obj is not None else None
+        calibration_override = getattr(
+            self, "_heatmap_calibration_override", None
+        )
+        if raw_matrix is not None and calibration_override is not None:
+            raw_values = np.asarray(raw_matrix, dtype=float)
+            calibration_values = np.asarray(calibration_override, dtype=float)
+            if raw_values.shape == calibration_values.shape:
+                difference = raw_values - calibration_values
+                if response_mode == HEATMAP_RESPONSE_PROXIMITY_ENHANCED:
+                    return difference
+                relative_difference = np.zeros_like(difference, dtype=float)
+                np.divide(
+                    100.0 * difference,
+                    calibration_values,
+                    out=relative_difference,
+                    where=calibration_values != 0,
+                )
+                return relative_difference
+
+        data_attr = (
+            "diffData"
+            if response_mode == HEATMAP_RESPONSE_PROXIMITY_ENHANCED
+            else "diffPerData"
+        )
+        matrix = getattr(data_obj, data_attr, None) if data_obj is not None else None
+        return fallback if matrix is None else matrix
+
+    def get_heatmap_sensor_matrix(self):
+        """Return the exact live value matrix currently coloured by the 3D heatmap."""
+        matrix = self._current_heatmap_sensor_matrix()
+        if matrix is None:
+            return None
+        return np.array(matrix, dtype=float, copy=True)
+
+    def get_heatmap_recording_snapshot(self):
+        """Return one self-contained tactile sample for experiment recording."""
+        heatmap_values = self.get_heatmap_sensor_matrix()
+        if heatmap_values is None:
+            return None
+        data_obj = getattr(self, "_data", None)
+        raw_values = getattr(data_obj, "rawData", None)
+        calibration_values = getattr(data_obj, "calData", None)
+        return {
+            "heatmap_values": np.array(heatmap_values, dtype=float, copy=True),
+            "raw_values": (
+                np.array(raw_values, dtype=float, copy=True)
+                if raw_values is not None
+                else None
+            ),
+            "calibration_values": (
+                np.array(calibration_values, dtype=float, copy=True)
+                if calibration_values is not None
+                else None
+            ),
+        }
+
+    def get_heatmap_recording_metadata(self):
+        """Describe the scene and colour mapping needed for faithful replay."""
+        return {
+            "model": str(getattr(self, "current_model_name", "") or ""),
+            "n_row": int(getattr(self, "n_row", 0) or 0),
+            "n_col": int(getattr(self, "n_col", 0) or 0),
+            "heatmap_settings": copy.deepcopy(self.get_heatmap_settings()),
+            "geometry": copy.deepcopy(
+                getattr(self, "current_sensor_geometry_config", None)
+            ),
+            "zero_mask": self.get_cell_zero_mask().astype(np.uint8).tolist(),
+            "average_window": int(self.get_sensor_average_window_size()),
+            "visualization_target_hz": float(self.get_visualization_target_hz()),
+            "recorded_value": "exact_3d_heatmap_matrix",
+        }
+
+    def set_heatmap_playback_active(self, active):
+        """Prevent live frames from replacing a recorded heatmap during replay."""
+        self._heatmap_playback_active = bool(active)
+        if self._heatmap_playback_active:
+            return
+        current_matrix = self.get_heatmap_sensor_matrix()
+        if (
+            current_matrix is not None
+            and getattr(self, "heatmapPoly", None) is not None
+            and self._is_heatmap_visualization_mode(
+                getattr(self, "sensor_visualization_mode", "point_grid")
+            )
+        ):
+            self._last_sensor_visualization_matrix = np.array(
+                current_matrix, dtype=float, copy=True
+            )
+            self._update_heatmap_visualization(current_matrix)
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def render_recorded_heatmap_frame(self, sensor_matrix):
+        """Render one saved heatmap matrix through the live 3D heatmap actor."""
+        values = np.asarray(sensor_matrix, dtype=float)
+        expected_shape = (int(self.n_row), int(self.n_col))
+        if values.shape != expected_shape or not np.all(np.isfinite(values)):
+            return False
+        self._ensure_heatmap_visualization_actor(render=False)
+        if getattr(self, "heatmapPoly", None) is None:
+            return False
+        self._last_sensor_visualization_matrix = np.array(
+            values, dtype=float, copy=True
+        )
+        self._update_heatmap_visualization(values)
+        try:
+            self.plotter.render()
+        except Exception:
+            return False
+        return True
+
+    def set_heatmap_calibration_baseline(self, values=None, n_row=None, n_col=None):
+        """Share the signal viewer's heatmap baseline with the 3D heatmap."""
+        if values is None:
+            self._heatmap_calibration_override = None
+            return True
+
+        rows = int(n_row if n_row is not None else self.n_row)
+        columns = int(n_col if n_col is not None else self.n_col)
+        try:
+            baseline = np.asarray(values, dtype=float)
+            if baseline.ndim == 1:
+                baseline = reshape_sensor_values_to_row_col_matrix(
+                    baseline, rows, columns
+                )
+        except Exception:
+            return False
+        if baseline.shape != (rows, columns):
+            return False
+
+        self._heatmap_calibration_override = np.array(
+            baseline, dtype=float, copy=True
+        )
+        current_matrix = self._current_heatmap_sensor_matrix()
+        if current_matrix is not None:
+            self._last_sensor_visualization_matrix = np.array(
+                current_matrix, dtype=float, copy=True
+            )
+            if getattr(self, "heatmapPoly", None) is not None:
+                self._update_heatmap_visualization(current_matrix)
+                if self._is_heatmap_visualization_mode(
+                    getattr(self, "sensor_visualization_mode", "point_grid")
+                ):
+                    try:
+                        self.plotter.render()
+                    except Exception:
+                        pass
+        return True
+
+    def _update_heatmap_visualization(self, sensor_matrix):
+        self._ensure_heatmap_visualization_actor(render=False)
+        if (
+            getattr(self, "heatmapPoly", None) is None
+            or getattr(self, "heatmapColors", None) is None
+            or getattr(self, "_heatmap_tile_vertices", None) is None
+        ):
+            return
+
+        values = np.asarray(sensor_matrix, dtype=float)
+        expected_shape = (int(self.n_row), int(self.n_col))
+        if values.shape != expected_shape:
+            if values.shape == (expected_shape[1], expected_shape[0]):
+                values = values.T
+            else:
+                return
+
+        # The table viewer uses top-down rows; the 3D plot uses bottom-up rows.
+        visual_values = np.flip(values, axis=0)
+        rgb = heatmap_3d_rgb(
+            visual_values,
+            palette=getattr(
+                self, "heatmap_3d_palette", DEFAULT_HEATMAP_3D_PALETTE
+            ),
+            response_mode=getattr(
+                self, "heatmap_response_mode", DEFAULT_HEATMAP_RESPONSE_MODE
+            ),
+            saturation_pct=getattr(
+                self, "heatmap_saturation_pct", DEFAULT_HEATMAP_SATURATION_PCT
+            ),
+            noise_floor_pct=getattr(
+                self, "heatmap_noise_floor_pct", DEFAULT_HEATMAP_NOISE_FLOOR_PCT
+            ),
+            proximity_noise_floor=getattr(
+                self,
+                "heatmap_proximity_noise_floor",
+                DEFAULT_PROXIMITY_NOISE_FLOOR,
+            ),
+            proximity_knee=getattr(
+                self, "heatmap_proximity_knee", DEFAULT_PROXIMITY_KNEE
+            ),
+            proximity_saturation=getattr(
+                self,
+                "heatmap_proximity_saturation",
+                DEFAULT_PROXIMITY_SATURATION,
+            ),
+            color_gain=getattr(
+                self,
+                "heatmap_3d_color_gain",
+                DEFAULT_HEATMAP_3D_COLOR_GAIN,
+            ),
+        )
+        mask = self._cell_zero_mask_for_plotter()
+        for col in range(self.n_col):
+            for row in range(self.n_row):
+                vertex_ids = self._heatmap_tile_vertices[row, col]
+                self.heatmapColors[vertex_ids, :3] = rgb[row, col]
+                self.heatmapColors[vertex_ids, 3] = 0 if mask[row, col] else 255
+
+        self.heatmapPoly.point_data["heatmap_colors"] = self.heatmapColors
+        self.heatmapPoly.set_active_scalars("heatmap_colors")
+        try:
+            self.heatmapPoly.Modified()
+        except Exception:
+            pass
 
     def _coarse_grid_vectors(self, vectors):
         if vectors is None or self.n_row <= 0 or self.n_col <= 0:
@@ -1089,6 +1905,41 @@ class MySensor:
             + grid[row1[:, None], col1[None, :]] * col_weight[..., None]
         )
         return top * (1.0 - row_weight)[..., None] + bottom * row_weight[..., None]
+
+    def _dense_cell_zero_mask(self, dense_rows, dense_cols):
+        """Expand the taxel zero mask to a dense visualization grid."""
+        dense_rows = int(dense_rows)
+        dense_cols = int(dense_cols)
+        if dense_rows <= 0 or dense_cols <= 0:
+            return np.zeros((0, 0), dtype=bool)
+        mask = self._cell_zero_mask_for_plotter()
+        if mask.shape != (int(self.n_row), int(self.n_col)) or mask.size == 0:
+            return np.zeros((dense_rows, dense_cols), dtype=bool)
+        row_indices = np.rint(
+            np.linspace(0.0, max(int(self.n_row) - 1, 0), dense_rows)
+        ).astype(int)
+        col_indices = np.rint(
+            np.linspace(0.0, max(int(self.n_col) - 1, 0), dense_cols)
+        ).astype(int)
+        return mask[row_indices[:, None], col_indices[None, :]]
+
+    def _apply_zero_mask_to_matrix_colors(
+        self,
+        colors,
+        dense_shape,
+        base_indices=None,
+        top_indices=None,
+    ):
+        if colors is None or np.asarray(colors).ndim != 2 or colors.shape[1] < 4:
+            return
+        dense_rows, dense_cols = dense_shape
+        dense_mask = self._dense_cell_zero_mask(dense_rows, dense_cols).reshape(-1)
+        alpha = np.where(dense_mask, 0, 255).astype(np.uint8)
+        if base_indices is not None and top_indices is not None:
+            colors[np.asarray(base_indices, dtype=int), 3] = alpha
+            colors[np.asarray(top_indices, dtype=int), 3] = alpha
+        elif colors.shape[0] == alpha.shape[0]:
+            colors[:, 3] = alpha
 
     def _normal_visualization_dense_grid(self, dense_scale=4, dense_cap=96):
         point_grid = self._coarse_grid_vectors(getattr(self, "points_origin", None))
@@ -1150,9 +2001,15 @@ class MySensor:
 
             poly = pv.PolyData(points)
             poly.lines = np.asarray(lines, dtype=np.int_)
-            colors = np.empty((points.shape[0], 3), dtype=np.uint8)
-            colors[base_indices] = [8, 70, 55]
-            colors[top_indices] = [55, 255, 185]
+            colors = np.empty((points.shape[0], 4), dtype=np.uint8)
+            colors[base_indices] = [8, 70, 55, 255]
+            colors[top_indices] = [55, 255, 185, 255]
+            self._apply_zero_mask_to_matrix_colors(
+                colors,
+                dense_shape,
+                base_indices=base_indices,
+                top_indices=top_indices,
+            )
             poly.point_data["matrix_colors"] = colors
             poly.set_active_scalars("matrix_colors")
 
@@ -1177,10 +2034,12 @@ class MySensor:
 
         poly = pv.PolyData(points)
         poly.lines = np.asarray(lines, dtype=np.int_)
-        colors = np.empty((points.shape[0], 3), dtype=np.uint8)
+        colors = np.empty((points.shape[0], 4), dtype=np.uint8)
         colors[:, 0] = 30
         colors[:, 1] = 235
         colors[:, 2] = 160
+        colors[:, 3] = 255
+        self._apply_zero_mask_to_matrix_colors(colors, dense_shape)
         poly.point_data["matrix_colors"] = colors
         poly.set_active_scalars("matrix_colors")
         self._matrix_line_base_points = None
@@ -1350,8 +2209,14 @@ class MySensor:
                 brightness = np.clip(0.62 + 0.38 * visibility, 0.35, 1.0)
                 top_rgb = np.clip(top_rgb * brightness[:, None], 0, 255)
                 base_rgb = np.clip(top_rgb * 0.32, 0, 255)
-                colors[base_indices] = base_rgb.astype(np.uint8)
-                colors[top_indices] = top_rgb.astype(np.uint8)
+                colors[top_indices, :3] = top_rgb.astype(np.uint8)
+                colors[base_indices, :3] = base_rgb.astype(np.uint8)
+                self._apply_zero_mask_to_matrix_colors(
+                    colors,
+                    (dense_rows, dense_cols),
+                    base_indices=base_indices,
+                    top_indices=top_indices,
+                )
                 self.matrixLinePoly.point_data["matrix_colors"] = colors
                 self.matrixLinePoly.set_active_scalars("matrix_colors")
                 try:
@@ -1363,6 +2228,10 @@ class MySensor:
         colors[:, 0] = np.clip(5 + visibility * 25, 0, 255).astype(np.uint8)
         colors[:, 1] = np.clip(5 + visibility * 230, 0, 255).astype(np.uint8)
         colors[:, 2] = np.clip(5 + visibility * 155, 0, 255).astype(np.uint8)
+        self._apply_zero_mask_to_matrix_colors(
+            colors,
+            (dense_rows, dense_cols),
+        )
         self.matrixLinePoly.point_data["matrix_colors"] = colors
         self.matrixLinePoly.set_active_scalars("matrix_colors")
         try:
@@ -1412,20 +2281,54 @@ class MySensor:
             model_checkpoint_path=model_checkpoint_path
         )
 
-    def buildScene(self):
+    def _ensure_sensor_api_backend(self):
+        """Load the real serial API without opening a competing port handle."""
+        ensure_api = getattr(self.parent, "ensure_sensor_api", None)
+        if not callable(ensure_api):
+            self._set_sensor_stream_error("The sensor serial API is unavailable.")
+            return False
+
+        try:
+            ready = bool(ensure_api(connect_immediately=False))
+        except TypeError:
+            ready = bool(ensure_api())
+        except Exception as exc:
+            self._set_sensor_stream_error(
+                f"Could not initialize the sensor serial API: {exc}"
+            )
+            return False
+
+        if not ready:
+            self._set_sensor_stream_error("The sensor serial API could not be loaded.")
+            return False
+        return True
+
+    def buildScene(self, show_main_visualization: bool = True):
+        self._set_sensor_stream_error("")
+        if not self._ensure_sensor_api_backend():
+            print(self.get_last_sensor_stream_error())
+            return
+        self.main_visualization_enabled = bool(show_main_visualization)
         self._reset_scene_build_state()
         self._set_sensor_update_button_enabled(False)
         self._clear_scene_actors()
         self._close_serial_ports()
+        self._close_standalone_sensor_api()
         self.is_connected = False
 
         selected_ports = self._get_selected_port_names()
         if not selected_ports:
-            print("No serial port selected. Please select one or more ports by highlighting them.")
+            message = "No serial port selected. Highlight a sensor port first."
+            self._set_sensor_stream_error(message)
+            print(message)
             return
 
         self.ser_list = self._open_serial_ports(selected_ports)
         if not self.ser_list:
+            if not self.get_last_sensor_stream_error():
+                self._set_sensor_stream_error(
+                    "Could not open any of the selected sensor ports."
+                )
             print("Could not open any of the selected ports.")
             return
 
@@ -1436,6 +2339,8 @@ class MySensor:
             return
         self.initialize_ai_helpers()
         self.update_ui_elements()
+        if not bool(show_main_visualization):
+            self.set_main_visualization_enabled(False, render=True)
 
     def _initialize_from_factory(self, model: SensorModelFactory):
         """Helper to assign all model attributes from the factory to the MySensor instance."""
@@ -1468,20 +2373,13 @@ class MySensor:
         self.show_PC = False
         self.show_FittedMesh = False
 
-        # Add newly created meshes to the plotter
-        if self._2D_map and self._2D_map.n_points > 0:
-            self.objActor = self.plotter.add_mesh(
-                self._2D_map, show_edges=True, scalars=self.colors, rgb=True
-            )
-
-        self.actionMesh = self.plotter.add_mesh(
-            self.line_poly, scalars=self.colors_3d, point_size=10, line_width=3,
-            render_points_as_spheres=True, rgb=True
-        )
-        if self.actionMesh is not None or self.matrixLineActor is not None:
-            self._rebuild_matrix_visualization_actor(render=False)
+        # Add meshes only when the main sensor plotter is the active consumer.
+        # Robot-dialog-only streaming still builds all geometry/data mappings,
+        # but avoids a second OpenGL render path.
+        if bool(getattr(self, "main_visualization_enabled", True)):
+            self._ensure_main_sensor_visualization_actors()
             self._refresh_sensor_visualization_mode_actors()
-        self._refresh_sensor_point_label_actor()
+            self.restore_saved_sensor_perspective(render=True)
 
     def init_2d_model(self, n_row=None, n_col=None):
         if n_row is None or n_col is None:
@@ -1529,6 +2427,7 @@ class MySensor:
         self._sensor_geometry_base_fine_points = None
         self.current_sensor_geometry_config = None
         self.sensor_visual_offset_scale = 0.0
+        self._last_sensor_visualization_matrix = None
         self._clear_contact_normal_actor()
         self._clear_sensor_point_label_actor()
 
@@ -1565,6 +2464,18 @@ class MySensor:
         self.matrixLineActor = self._remove_actor_safely(
             getattr(self, "matrixLineActor", None)
         )
+        self.heatmapActor = self._remove_actor_safely(
+            getattr(self, "heatmapActor", None)
+        )
+        self.heatmapGridActor = self._remove_actor_safely(
+            getattr(self, "heatmapGridActor", None)
+        )
+        self.heatmapPoly = None
+        self.heatmapColors = None
+        self.heatmapGridPoly = None
+        self.heatmapGridDisplayPoly = None
+        self._heatmap_tile_vertices = None
+        self._last_sensor_visualization_matrix = None
         self.matrixLinePoly = None
         self.matrixLineColors = None
         self._matrix_visual_actor_mode = None
@@ -1583,6 +2494,12 @@ class MySensor:
     def _get_selected_port_names(self):
         return [item.text() for item in self.parent.serial_channel.selectedItems()]
 
+    def _close_standalone_sensor_api(self):
+        sensor_api = getattr(self.parent, "sensor_api", None)
+        close = getattr(sensor_api, "close", None)
+        if callable(close):
+            close()
+
     def _close_serial_ports(self):
         if not self._stop_sensor_reader_worker():
             print("Serial ports left open because the sensor reader is still stopping.")
@@ -1599,10 +2516,17 @@ class MySensor:
         serial_ports = []
         for port_name in port_names:
             try:
-                ser = serial.Serial(port=f"/dev/{port_name}", baudrate=9600, timeout=0.1)
+                ser = serial.Serial(
+                    port=f"/dev/{port_name}",
+                    baudrate=DEFAULT_SENSOR_BAUD_RATE,
+                    timeout=DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
+                )
                 serial_ports.append(ser)
                 print(f"Opened port: /dev/{port_name}")
             except Exception as exc:
+                self._set_sensor_stream_error(
+                    f"Could not open /dev/{port_name}: {exc}"
+                )
                 print(f"Failed to open /dev/{port_name}: {exc}")
         return serial_ports
 
@@ -1615,6 +2539,7 @@ class MySensor:
             return
 
         self._latest_sensor_payloads = {}
+        self._last_sensor_api_payloads = {}
         self._sensor_reader_generation += 1
         generation = self._sensor_reader_generation
         thread_parent = self.parent if isinstance(self.parent, QObject) else None
@@ -1674,6 +2599,21 @@ class MySensor:
         if not self.is_connected:
             return
         self._latest_sensor_payloads[str(port_name)] = list(data_list or [])
+        self._last_sensor_api_payloads[str(port_name)] = list(data_list or [])
+
+    def get_last_sensor_api_payload(self, port_path=None):
+        """Return the last API-level payload received by the live reader."""
+        payloads = getattr(self, "_last_sensor_api_payloads", {})
+        if not payloads:
+            return None
+        if not port_path:
+            return list(next(iter(payloads.values())))
+
+        requested_path = os.path.realpath(str(port_path))
+        for saved_path, payload in payloads.items():
+            if os.path.realpath(str(saved_path)) == requested_path:
+                return list(payload)
+        return None
 
     def _on_sensor_reader_error(self, message):
         now = time.perf_counter()
@@ -1688,8 +2628,40 @@ class MySensor:
         return payloads
 
     def shutdown(self):
+        if self._is_shutting_down:
+            return
+        self._is_shutting_down = True
+        for timer_name in ("timer", "_visualization_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
+        self._sensor_calibration_stop_event.set()
+        calibration_thread = self._sensor_calibration_thread
+        if calibration_thread is not None and calibration_thread.is_alive():
+            calibration_thread.join(timeout=5.0)
         self._stop_sensor_reader_worker()
+        if calibration_thread is not None and calibration_thread.is_alive():
+            print(
+                "[SensorCalibration] Shutdown timed out; serial ports are left "
+                "open until calibration exits to avoid a close/read race."
+            )
+            return
+        self._sensor_calibration_thread = None
+        for attr_name in self.AI_HELPER_ATTRS:
+            helper = self.__dict__.get(attr_name)
+            if helper is None or isinstance(helper, _LazyFeatureProxy):
+                continue
+            shutdown = getattr(helper, "shutdown", None)
+            if callable(shutdown):
+                try:
+                    shutdown()
+                except Exception as exc:
+                    print(f"[{attr_name}] Shutdown failed: {exc}")
         self._close_serial_ports()
+        self._close_standalone_sensor_api()
 
     def _get_2d_grid_shape(self):
         default_n_row, default_n_col = self.DEFAULT_2D_GRID_SHAPE
@@ -1920,6 +2892,65 @@ class MySensor:
         settings[key] = item
         return self._write_reorder_logic_file(payload)
 
+    def get_saved_sensor_camera_config(
+        self, model_name=None, n_row=None, n_col=None
+    ):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        config = item.get("camera", {}) if isinstance(item, dict) else {}
+        return self._normalize_sensor_camera_config(config)
+
+    def set_saved_sensor_camera_config(
+        self, model_name, config, n_row=None, n_col=None
+    ):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        camera_config = self._normalize_sensor_camera_config(config)
+        if camera_config is None:
+            return False
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "camera": camera_config,
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    def save_current_sensor_perspective(self):
+        if not self.current_model_name or self.n_row <= 0 or self.n_col <= 0:
+            return False
+        camera_config = self.capture_sensor_camera_config()
+        if camera_config is None:
+            return False
+        return self.set_saved_sensor_camera_config(
+            self.current_model_name,
+            camera_config,
+            n_row=self.n_row,
+            n_col=self.n_col,
+        )
+
+    def restore_saved_sensor_perspective(self, render=True):
+        if not self.current_model_name or self.n_row <= 0 or self.n_col <= 0:
+            return False
+        camera_config = self.get_saved_sensor_camera_config(
+            self.current_model_name,
+            n_row=self.n_row,
+            n_col=self.n_col,
+        )
+        if camera_config is None:
+            return False
+        return self.apply_sensor_camera_config(camera_config, render=render)
+
     @staticmethod
     def _default_sensor_geometry_config():
         return {
@@ -1929,6 +2960,12 @@ class MySensor:
             "arc_deg": 0.0,
             "normal_flip": False,
             "rotation_deg": [0.0, 0.0, 0.0],
+            "custom_points": [],
+            "use_custom_heatmap_shape": False,
+            "custom_heatmap_points": [],
+            "custom_heatmap_corners": [],
+            "use_curved_heatmap_edges": False,
+            "custom_heatmap_edge_offsets": [],
         }
 
     @staticmethod
@@ -1958,7 +2995,7 @@ class MySensor:
             return dict(default)
 
         shape = str(config.get("shape", default["shape"]) or default["shape"]).strip().lower()
-        if shape not in ("flat", "cylinder"):
+        if shape not in ("flat", "cylinder", "custom"):
             shape = "flat"
 
         bend_axis = str(config.get("bend_axis", default["bend_axis"]) or default["bend_axis"]).strip().lower()
@@ -1985,6 +3022,17 @@ class MySensor:
                 config.get("rotation_z_deg", default["rotation_deg"][2]),
             ])
 
+        custom_points = normalize_point_array(config.get("custom_points", []))
+        custom_heatmap_points = normalize_point_array(
+            config.get("custom_heatmap_points", [])
+        )
+        custom_heatmap_corners = normalize_point_array(
+            config.get("custom_heatmap_corners", [])
+        )
+        custom_heatmap_edge_offsets = normalize_point_array(
+            config.get("custom_heatmap_edge_offsets", [])
+        )
+
         return {
             "use_selected_shape": use_selected_shape,
             "shape": shape,
@@ -1992,6 +3040,36 @@ class MySensor:
             "arc_deg": arc_deg,
             "normal_flip": bool(config.get("normal_flip", default["normal_flip"])),
             "rotation_deg": rotation_deg,
+            "custom_points": (
+                custom_points.tolist() if custom_points is not None else []
+            ),
+            "use_custom_heatmap_shape": bool(
+                config.get(
+                    "use_custom_heatmap_shape",
+                    default["use_custom_heatmap_shape"],
+                )
+            ),
+            "custom_heatmap_points": (
+                custom_heatmap_points.tolist()
+                if custom_heatmap_points is not None
+                else []
+            ),
+            "custom_heatmap_corners": (
+                custom_heatmap_corners.tolist()
+                if custom_heatmap_corners is not None
+                else []
+            ),
+            "use_curved_heatmap_edges": bool(
+                config.get(
+                    "use_curved_heatmap_edges",
+                    default["use_curved_heatmap_edges"],
+                )
+            ),
+            "custom_heatmap_edge_offsets": (
+                custom_heatmap_edge_offsets.tolist()
+                if custom_heatmap_edge_offsets is not None
+                else []
+            ),
         }
 
     def _effective_sensor_geometry_config(self, config):
@@ -2123,6 +3201,194 @@ class MySensor:
             )
         return True
 
+    @staticmethod
+    def _default_heatmap_config():
+        return {
+            "palette_3d": DEFAULT_HEATMAP_3D_PALETTE,
+            "response_mode": DEFAULT_HEATMAP_RESPONSE_MODE,
+            "saturation_pct": DEFAULT_HEATMAP_SATURATION_PCT,
+            "noise_floor_pct": DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
+            "proximity_noise_floor": DEFAULT_PROXIMITY_NOISE_FLOOR,
+            "proximity_knee": DEFAULT_PROXIMITY_KNEE,
+            "proximity_saturation": DEFAULT_PROXIMITY_SATURATION,
+            "color_gain_3d": DEFAULT_HEATMAP_3D_COLOR_GAIN,
+        }
+
+    def _normalize_heatmap_config(self, config):
+        default = self._default_heatmap_config()
+        if not isinstance(config, dict):
+            return dict(default)
+        try:
+            saturation_pct = float(
+                config.get("saturation_pct", default["saturation_pct"])
+            )
+        except Exception:
+            saturation_pct = default["saturation_pct"]
+        try:
+            noise_floor_pct = float(
+                config.get("noise_floor_pct", default["noise_floor_pct"])
+            )
+        except Exception:
+            noise_floor_pct = default["noise_floor_pct"]
+        try:
+            proximity_noise_floor = float(
+                config.get(
+                    "proximity_noise_floor", default["proximity_noise_floor"]
+                )
+            )
+        except Exception:
+            proximity_noise_floor = default["proximity_noise_floor"]
+        try:
+            proximity_knee = float(
+                config.get("proximity_knee", default["proximity_knee"])
+            )
+        except Exception:
+            proximity_knee = default["proximity_knee"]
+        try:
+            proximity_saturation = float(
+                config.get(
+                    "proximity_saturation", default["proximity_saturation"]
+                )
+            )
+        except Exception:
+            proximity_saturation = default["proximity_saturation"]
+        try:
+            color_gain_3d = float(
+                config.get("color_gain_3d", default["color_gain_3d"])
+            )
+        except Exception:
+            color_gain_3d = default["color_gain_3d"]
+        proximity_noise_floor = float(np.clip(proximity_noise_floor, 0.0, 1e9))
+        proximity_knee = float(
+            np.clip(proximity_knee, proximity_noise_floor + 0.1, 1e9)
+        )
+        proximity_saturation = float(
+            np.clip(proximity_saturation, proximity_knee + 0.1, 1e9)
+        )
+        return {
+            "palette_3d": normalize_heatmap_3d_palette(
+                config.get("palette_3d", default["palette_3d"])
+            ),
+            "response_mode": normalize_heatmap_response_mode(
+                config.get("response_mode", default["response_mode"])
+            ),
+            "saturation_pct": float(np.clip(saturation_pct, 0.1, 50.0)),
+            "noise_floor_pct": float(np.clip(noise_floor_pct, 0.0, 20.0)),
+            "proximity_noise_floor": proximity_noise_floor,
+            "proximity_knee": proximity_knee,
+            "proximity_saturation": proximity_saturation,
+            "color_gain_3d": float(np.clip(color_gain_3d, 1.0, 3.0)),
+        }
+
+    def get_saved_sensor_heatmap_config(self, model_name=None, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        item = payload.get("settings", {}).get(key, {})
+        config = item.get("heatmap", {}) if isinstance(item, dict) else {}
+        return self._normalize_heatmap_config(config)
+
+    def set_saved_sensor_heatmap_config(self, model_name, config, n_row=None, n_col=None):
+        model = str(model_name or self.current_model_name or "sensor")
+        if n_row is None or n_col is None:
+            n_row, n_col = self._sensor_shape_for_model(model)
+        key = self.get_sensor_reorder_key(model, n_row=n_row, n_col=n_col)
+        payload = self._read_reorder_logic_file()
+        settings = payload.setdefault("settings", {})
+        item = settings.get(key, {})
+        if not isinstance(item, dict):
+            item = {}
+        item.update({
+            "model": model,
+            "n_row": int(n_row),
+            "n_col": int(n_col),
+            "heatmap": self._normalize_heatmap_config(config),
+        })
+        settings[key] = item
+        return self._write_reorder_logic_file(payload)
+
+    def get_heatmap_settings(self):
+        return self._normalize_heatmap_config({
+            "palette_3d": getattr(
+                self, "heatmap_3d_palette", DEFAULT_HEATMAP_3D_PALETTE
+            ),
+            "response_mode": getattr(
+                self, "heatmap_response_mode", DEFAULT_HEATMAP_RESPONSE_MODE
+            ),
+            "saturation_pct": getattr(
+                self, "heatmap_saturation_pct", DEFAULT_HEATMAP_SATURATION_PCT
+            ),
+            "noise_floor_pct": getattr(
+                self, "heatmap_noise_floor_pct", DEFAULT_HEATMAP_NOISE_FLOOR_PCT
+            ),
+            "proximity_noise_floor": getattr(
+                self,
+                "heatmap_proximity_noise_floor",
+                DEFAULT_PROXIMITY_NOISE_FLOOR,
+            ),
+            "proximity_knee": getattr(
+                self, "heatmap_proximity_knee", DEFAULT_PROXIMITY_KNEE
+            ),
+            "proximity_saturation": getattr(
+                self,
+                "heatmap_proximity_saturation",
+                DEFAULT_PROXIMITY_SATURATION,
+            ),
+            "color_gain_3d": getattr(
+                self,
+                "heatmap_3d_color_gain",
+                DEFAULT_HEATMAP_3D_COLOR_GAIN,
+            ),
+        })
+
+    def set_heatmap_settings(self, config, save_current_sensor: bool = False):
+        settings = self._normalize_heatmap_config(config)
+        previous_settings = self.get_heatmap_settings()
+        settings_changed = any(
+            previous_settings.get(key) != settings.get(key)
+            for key in settings
+        )
+        self.heatmap_3d_palette = str(settings["palette_3d"])
+        self.heatmap_response_mode = str(settings["response_mode"])
+        self.heatmap_saturation_pct = float(settings["saturation_pct"])
+        self.heatmap_noise_floor_pct = float(settings["noise_floor_pct"])
+        self.heatmap_proximity_noise_floor = float(
+            settings["proximity_noise_floor"]
+        )
+        self.heatmap_proximity_knee = float(settings["proximity_knee"])
+        self.heatmap_proximity_saturation = float(
+            settings["proximity_saturation"]
+        )
+        self.heatmap_3d_color_gain = float(settings["color_gain_3d"])
+        if settings_changed:
+            current_matrix = self._current_heatmap_sensor_matrix(
+                getattr(self, "_last_sensor_visualization_matrix", None)
+            )
+            if current_matrix is not None:
+                self._last_sensor_visualization_matrix = np.array(
+                    current_matrix, dtype=float, copy=True
+                )
+            if (
+                current_matrix is not None
+                and getattr(self, "heatmapPoly", None) is not None
+            ):
+                self._update_heatmap_visualization(current_matrix)
+                if self._is_heatmap_visualization_mode(
+                    getattr(self, "sensor_visualization_mode", "point_grid")
+                ):
+                    try:
+                        self.plotter.render()
+                    except Exception:
+                        pass
+        if save_current_sensor and self.current_model_name:
+            self.set_saved_sensor_heatmap_config(
+                self.current_model_name,
+                settings,
+                n_row=self.n_row,
+                n_col=self.n_col,
+            )
+        return True
+
     def get_sensor_reorder_context(self, model_name=None):
         model = str(model_name or self.current_model_name or "sensor")
         n_row, n_col = self._sensor_shape_for_model(model)
@@ -2154,6 +3420,16 @@ class MySensor:
             n_row=n_row,
             n_col=n_col,
         )
+        heatmap = self.get_saved_sensor_heatmap_config(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
+        camera = self.get_saved_sensor_camera_config(
+            model,
+            n_row=n_row,
+            n_col=n_col,
+        )
         return {
             "model": model,
             "label": self.SENSOR_MODEL_LABELS.get(model, model),
@@ -2168,6 +3444,8 @@ class MySensor:
             "force_scale_n_per_signal": force_scale,
             "geometry": geometry,
             "stereo_field": stereo_field,
+            "heatmap": heatmap,
+            "camera": camera,
         }
 
     def _apply_saved_reorder_logic(self, model_kwargs):
@@ -2209,6 +3487,14 @@ class MySensor:
         )
         self.set_stereo_field_settings(
             self.get_saved_sensor_stereo_field_config(
+                model,
+                n_row=n_row,
+                n_col=n_col,
+            ),
+            save_current_sensor=False,
+        )
+        self.set_heatmap_settings(
+            self.get_saved_sensor_heatmap_config(
                 model,
                 n_row=n_row,
                 n_col=n_col,
@@ -2316,6 +3602,116 @@ class MySensor:
             if self._2D_map is not None and getattr(self._2D_map, "n_points", 0) > 0
             else None
         )
+
+    def _sensor_local_geometry(self, config):
+        base_points = getattr(self, "_sensor_geometry_base_points_origin", None)
+        base_normals = getattr(self, "_sensor_geometry_base_normals", None)
+        if base_points is None or base_normals is None:
+            return None, None
+
+        expected_count = int(self.n_row) * int(self.n_col)
+        if str(config.get("shape", "flat")) == "custom":
+            custom_points = normalize_point_array(
+                config.get("custom_points", []), expected_count
+            )
+            if custom_points is not None:
+                custom_normals = compute_grid_normals(
+                    custom_points,
+                    self.n_row,
+                    self.n_col,
+                    normal_flip=bool(config.get("normal_flip", False)),
+                )
+                return custom_points, custom_normals
+
+        return self._bend_points_to_cylinder(
+            base_points,
+            config,
+            return_normals=True,
+            base_normals=base_normals,
+        )
+
+    def get_sensor_geometry_editor_data(self, config=None):
+        """Return editable local geometry for the currently built 2D sensor."""
+        if str(self.current_model_name or "") != "2d":
+            return None
+        saved_geometry = self._normalize_sensor_geometry_config(
+            config if config is not None else self.current_sensor_geometry_config
+        )
+        geometry = self._effective_sensor_geometry_config(saved_geometry)
+        points, normals = self._sensor_local_geometry(geometry)
+        flat_points = normalize_point_array(
+            getattr(self, "_sensor_geometry_base_points_origin", None),
+            int(self.n_row) * int(self.n_col),
+        )
+        if points is None or normals is None or flat_points is None:
+            return None
+        expected_count = int(self.n_row) * int(self.n_col)
+        heatmap_points = normalize_point_array(
+            saved_geometry.get("custom_heatmap_points", []),
+            expected_count,
+        )
+        if heatmap_points is None:
+            heatmap_points = np.array(points, dtype=float, copy=True)
+        heatmap_normals = compute_grid_normals(
+            heatmap_points,
+            self.n_row,
+            self.n_col,
+            normal_flip=bool(geometry.get("normal_flip", False)),
+        )
+        default_heatmap_corners = heatmap_corner_points_from_centres(
+            points,
+            normals,
+            self.n_row,
+            self.n_col,
+        )
+        custom_heatmap_corners = normalize_point_array(
+            saved_geometry.get("custom_heatmap_corners", []),
+            (int(self.n_row) + 1) * (int(self.n_col) + 1),
+        )
+        if custom_heatmap_corners is None:
+            custom_heatmap_corners = heatmap_corner_points_from_centres(
+                heatmap_points,
+                heatmap_normals,
+                self.n_row,
+                self.n_col,
+            )
+        heatmap_edge_pairs = structured_grid_edge_pairs(
+            int(self.n_row) + 1,
+            int(self.n_col) + 1,
+        )
+        heatmap_edge_offsets = normalize_point_array(
+            saved_geometry.get("custom_heatmap_edge_offsets", []),
+            len(heatmap_edge_pairs),
+        )
+        if heatmap_edge_offsets is None:
+            heatmap_edge_offsets = np.zeros(
+                (len(heatmap_edge_pairs), 3), dtype=float
+            )
+        return {
+            "points": np.array(points, dtype=float, copy=True),
+            "normals": np.array(normals, dtype=float, copy=True),
+            "flat_points": flat_points,
+            "heatmap_points": np.array(heatmap_points, dtype=float, copy=True),
+            "heatmap_default_points": np.array(points, dtype=float, copy=True),
+            "heatmap_corners": np.array(
+                custom_heatmap_corners, dtype=float, copy=True
+            ),
+            "heatmap_default_corners": np.array(
+                default_heatmap_corners, dtype=float, copy=True
+            ),
+            "heatmap_edges": structured_grid_edges(
+                int(self.n_row) + 1,
+                int(self.n_col) + 1,
+            ),
+            "heatmap_n_row": int(self.n_row) + 1,
+            "heatmap_n_col": int(self.n_col) + 1,
+            "heatmap_edge_pairs": heatmap_edge_pairs,
+            "heatmap_edge_offsets": heatmap_edge_offsets,
+            "edges": np.array(self.edges, dtype=int, copy=True),
+            "n_row": int(self.n_row),
+            "n_col": int(self.n_col),
+            "geometry": saved_geometry,
+        }
 
     @staticmethod
     def _bend_points_to_cylinder(points, config, return_normals=False, base_normals=None):
@@ -2481,12 +3877,11 @@ class MySensor:
         if base_points is None or base_normals is None:
             return False
 
-        bent_points, bent_normals = self._bend_points_to_cylinder(
-            base_points,
-            effective_geometry,
-            return_normals=True,
-            base_normals=base_normals,
+        bent_points, bent_normals = self._sensor_local_geometry(
+            effective_geometry
         )
+        if bent_points is None or bent_normals is None:
+            return False
         rotation_deg = effective_geometry.get("rotation_deg", [0.0, 0.0, 0.0])
         rotation_pivot = self._sensor_geometry_rotation_pivot(bent_points)
         self.points_origin, self.normals = self._rotate_sensor_geometry(
@@ -2501,11 +3896,18 @@ class MySensor:
 
         base_fine_points = getattr(self, "_sensor_geometry_base_fine_points", None)
         if self._2D_map is not None and base_fine_points is not None:
-            fine_points = self._bend_points_to_cylinder(
-                base_fine_points,
-                effective_geometry,
-                return_normals=False,
-            )
+            if str(effective_geometry.get("shape", "flat")) == "custom":
+                fine_points = interpolate_coarse_deformation(
+                    base_points,
+                    bent_points,
+                    base_fine_points,
+                )
+            else:
+                fine_points = self._bend_points_to_cylinder(
+                    base_fine_points,
+                    effective_geometry,
+                    return_normals=False,
+                )
             self._2D_map.points = self._rotate_sensor_geometry(
                 fine_points,
                 rotation_deg,
@@ -2517,7 +3919,7 @@ class MySensor:
                 pass
 
         if self.line_poly is not None:
-            self.line_poly.points = self.points
+            self.line_poly.points = self._sensor_points_for_plotter(self.points)
             try:
                 self.line_poly.Modified()
             except Exception:
@@ -2525,7 +3927,18 @@ class MySensor:
 
         if self.actionMesh is not None or self.matrixLineActor is not None:
             self._rebuild_matrix_visualization_actor(render=False)
-            self._refresh_sensor_visualization_mode_actors()
+        if (
+            getattr(self, "heatmapActor", None) is not None
+            or getattr(self, "heatmapPoly", None) is not None
+            or self._is_heatmap_visualization_mode(
+                getattr(self, "sensor_visualization_mode", "point_grid")
+            )
+        ):
+            self._rebuild_heatmap_visualization_actor(render=False)
+            current_matrix = getattr(self, "_last_sensor_visualization_matrix", None)
+            if current_matrix is not None:
+                self._update_heatmap_visualization(current_matrix)
+        self._refresh_sensor_visualization_mode_actors()
         self._clear_contact_normal_actor()
         self._refresh_sensor_point_label_actor()
         if render:
@@ -2554,10 +3967,26 @@ class MySensor:
             return
         if self.line_poly is None or self.n_row <= 0 or self.n_col <= 0:
             return
+        mask = self._cell_zero_mask_for_plotter()
+        visible_indices = []
+        labels = []
+        all_labels = self._sensor_point_labels()
+        for col in range(int(self.n_col)):
+            for row in range(int(self.n_row)):
+                if mask[row, col]:
+                    continue
+                idx = _column_major_idx(self.n_row, col, row)
+                visible_indices.append(idx)
+                labels.append(all_labels[idx])
+        if not visible_indices:
+            return
+        label_points = pv.PolyData(
+            np.asarray(self.points, dtype=float)[visible_indices]
+        )
         try:
             self.sensorPointLabelActor = self.plotter.add_point_labels(
-                self.line_poly,
-                self._sensor_point_labels(),
+                label_points,
+                labels,
                 font_size=12,
                 text_color="#111111",
                 point_color="#00e5ff",
@@ -2577,25 +4006,78 @@ class MySensor:
 
     def _bind_sensor_api_to_port(self, ser):
         """Reuse the shared sensor API object while switching its active serial port."""
-        self.parent.sensor_api.ser = ser
-        return self.parent.sensor_api
+        sensor_api = self.parent.sensor_api
+        current_ser = getattr(sensor_api, "ser", None)
+        if (
+            current_ser is not None
+            and current_ser is not ser
+            and current_ser not in (self.ser_list or [])
+        ):
+            try:
+                current_ser.close()
+            except Exception:
+                pass
+        sensor_api.ser = ser
+        sensor_api.serial_port = str(getattr(ser, "port", sensor_api.serial_port))
+        return sensor_api
 
-    def _trim_sensor_payload(self, data_list, n_row, n_col):
+    def _raw_packet_has_extra_column(self):
+        checkbox = getattr(self.parent, "sensor_extra_column_checkbox", None)
+        if checkbox is None:
+            return True
+        try:
+            return bool(checkbox.isChecked())
+        except Exception:
+            return True
+
+    def _trim_sensor_payload(
+        self, data_list, n_row, n_col, expected_length=None
+    ):
         """Apply model-specific payload fixes before validating the sample size."""
-        if n_row == 10 and n_col == 9:
+        if expected_length is None:
+            expected_length = n_row * (n_col + 1)
+        if (
+            n_row == 10
+            and n_col == 9
+            and len(data_list) == int(expected_length) + n_row
+        ):
             return data_list[:-10]
         return data_list
 
     def _extract_sensor_values(self, data_list, n_row, n_col, port_name):
         if data_list is None:
+            message = f"No sensor response received from {port_name}."
+            self._set_sensor_stream_error(message)
             print(f"Error on port {port_name}: No sensor payload received.")
             return None
-        data_list = self._trim_sensor_payload(data_list, n_row, n_col)
-        expected_length = n_row * (n_col + 1)
+        has_extra_column = self._raw_packet_has_extra_column()
+        packet_columns = n_col + (1 if has_extra_column else 0)
+        expected_length = n_row * packet_columns
+        data_list = self._trim_sensor_payload(
+            data_list,
+            n_row,
+            n_col,
+            expected_length=expected_length,
+        )
         if len(data_list) != expected_length:
-            print(f"Error on port {port_name}: Data length is {len(data_list)}, expected {expected_length}")
+            packet_format = (
+                f"{n_row}x({n_col}+1)"
+                if has_extra_column
+                else f"{n_row}x{n_col}"
+            )
+            self._set_sensor_stream_error(
+                f"Invalid sensor response from {port_name}: received "
+                f"{len(data_list)} values, expected {expected_length} "
+                f"for {packet_format} packet format."
+            )
+            print(
+                f"Error on port {port_name}: Data length is {len(data_list)}, "
+                f"expected {expected_length} ({packet_format})"
+            )
             return None
-        return data_list[0:-n_row]
+        if has_extra_column:
+            return data_list[:-n_row]
+        return data_list
 
     def _reshape_sensor_values(self, values, n_row, n_col):
         return reshape_sensor_values_to_row_col_matrix(values, n_row, n_col)
@@ -2661,6 +4143,147 @@ class MySensor:
             self.cell_zero_mask = mask
         return mask
 
+    def _cell_zero_mask_for_plotter(self):
+        """Map top-down mask-dialog rows into the plotter's bottom-up rows."""
+        return np.flip(self.get_cell_zero_mask(), axis=0)
+
+    def _sensor_points_for_plotter(self, points=None):
+        """Return display points with masked taxels made non-renderable."""
+        source = self.points if points is None else points
+        try:
+            display_points = np.array(source, dtype=float, copy=True)
+        except Exception:
+            return source
+        expected_count = int(getattr(self, "n_row", 0)) * int(
+            getattr(self, "n_col", 0)
+        )
+        if display_points.ndim != 2 or display_points.shape != (expected_count, 3):
+            return display_points
+        mask = self._cell_zero_mask_for_plotter()
+        for col in range(int(self.n_col)):
+            for row in range(int(self.n_row)):
+                if mask[row, col]:
+                    display_points[_column_major_idx(self.n_row, col, row)] = np.nan
+        return display_points
+
+    def _apply_cell_zero_mask_to_visual_colors(self):
+        """Set masked coarse and dense point alpha to fully transparent."""
+        mask = self._cell_zero_mask_for_plotter()
+        colors_3d = getattr(self, "colors_3d", None)
+        dense_colors = getattr(self, "colors", None)
+        array_positions = getattr(self, "array_positions", None)
+        if (
+            isinstance(colors_3d, np.ndarray)
+            and colors_3d.ndim == 2
+            and colors_3d.shape[1] >= 4
+        ):
+            colors_3d[:, 3] = 1.0
+        if (
+            isinstance(dense_colors, np.ndarray)
+            and dense_colors.ndim == 2
+            and dense_colors.shape[1] >= 4
+        ):
+            dense_colors[:, 3] = 1.0
+        for col in range(int(self.n_col)):
+            for row in range(int(self.n_row)):
+                idx = _column_major_idx(self.n_row, col, row)
+                hidden = bool(mask[row, col])
+                if not hidden:
+                    continue
+                if (
+                    isinstance(colors_3d, np.ndarray)
+                    and colors_3d.ndim == 2
+                    and idx < colors_3d.shape[0]
+                    and colors_3d.shape[1] >= 4
+                ):
+                    colors_3d[idx, 3] = 0.0
+                if (
+                    isinstance(dense_colors, np.ndarray)
+                    and dense_colors.ndim == 2
+                    and dense_colors.shape[1] >= 4
+                    and array_positions is not None
+                    and idx < len(array_positions)
+                ):
+                    dense_indices = np.asarray(array_positions[idx], dtype=int)
+                    valid = dense_indices[
+                        (dense_indices >= 0) & (dense_indices < dense_colors.shape[0])
+                    ]
+                    dense_colors[valid, 3] = 0.0
+
+    def _refresh_cell_zero_mask_visualization(self, render=True):
+        """Apply the current mask to every active sensor visualization actor."""
+        self._apply_cell_zero_mask_to_visual_colors()
+
+        line_poly = getattr(self, "line_poly", None)
+        points = getattr(self, "points", None)
+        if line_poly is not None and points is not None:
+            line_poly.points = self._sensor_points_for_plotter(points)
+            try:
+                line_poly.Modified()
+            except Exception:
+                pass
+
+        fine_poly = getattr(self, "_2D_map", None)
+        if fine_poly is not None:
+            try:
+                fine_poly.Modified()
+            except Exception:
+                pass
+
+        matrix_colors = getattr(self, "matrixLineColors", None)
+        matrix_poly = getattr(self, "matrixLinePoly", None)
+        dense_shape = getattr(self, "_matrix_line_dense_shape", (0, 0))
+        if matrix_colors is not None and matrix_poly is not None:
+            self._apply_zero_mask_to_matrix_colors(
+                matrix_colors,
+                dense_shape,
+                base_indices=getattr(self, "_matrix_line_base_indices", None),
+                top_indices=getattr(self, "_matrix_line_top_indices", None),
+            )
+            matrix_poly.point_data["matrix_colors"] = matrix_colors
+            try:
+                matrix_poly.Modified()
+            except Exception:
+                pass
+
+        heatmap_colors = getattr(self, "heatmapColors", None)
+        heatmap_poly = getattr(self, "heatmapPoly", None)
+        tile_vertices = getattr(self, "_heatmap_tile_vertices", None)
+        if (
+            heatmap_colors is not None
+            and heatmap_poly is not None
+            and tile_vertices is not None
+        ):
+            visual_mask = self._cell_zero_mask_for_plotter()
+            for col in range(int(self.n_col)):
+                for row in range(int(self.n_row)):
+                    heatmap_colors[tile_vertices[row, col], 3] = (
+                        0 if visual_mask[row, col] else 255
+                    )
+            heatmap_poly.point_data["heatmap_colors"] = heatmap_colors
+            try:
+                heatmap_poly.Modified()
+            except Exception:
+                pass
+            self._rebuild_heatmap_grid_actor(render=False)
+            heatmap_mode = (
+                bool(getattr(self, "main_visualization_enabled", True))
+                and self._is_heatmap_visualization_mode(
+                    getattr(self, "sensor_visualization_mode", "point_grid")
+                )
+            )
+            self._set_actor_visible(
+                getattr(self, "heatmapGridActor", None), heatmap_mode
+            )
+
+        if hasattr(self, "sensorPointLabelActor"):
+            self._refresh_sensor_point_label_actor()
+        if render and hasattr(self, "plotter"):
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
     def set_cell_zero_mask(self, mask):
         n_row = int(getattr(self, "n_row", 0) or 0)
         n_col = int(getattr(self, "n_col", 0) or 0)
@@ -2673,12 +4296,14 @@ class MySensor:
         if arr.shape != (n_row, n_col):
             return False
         self.cell_zero_mask = arr.copy()
+        self._refresh_cell_zero_mask_visualization(render=True)
         return True
 
     def clear_cell_zero_mask(self):
         n_row = int(getattr(self, "n_row", 0) or 0)
         n_col = int(getattr(self, "n_col", 0) or 0)
         self.cell_zero_mask = np.zeros((n_row, n_col), dtype=bool)
+        self._refresh_cell_zero_mask_visualization(render=True)
 
     def _read_zero_mask_file(self):
         try:
@@ -2733,33 +4358,57 @@ class MySensor:
         if arr.shape != (n_row, n_col):
             return False
         self.cell_zero_mask = arr.copy()
+        self._refresh_cell_zero_mask_visualization(render=True)
         return True
 
-    def _read_port_sensor_values(self, ser, read_operation, error_prefix):
-        try:
-            sensor_api = self._bind_sensor_api_to_port(ser)
-            data_list = read_operation(sensor_api)
-        except Exception as exc:
-            print(f"{error_prefix} on port {ser.port}: {exc}")
-            return None, None
+    def _read_port_sensor_values(
+        self, ser, read_operation, error_prefix, max_attempts=3
+    ):
+        sensor_api = self._bind_sensor_api_to_port(ser)
+        max_attempts = max(1, int(max_attempts))
+        sensor_values = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                data_list = read_operation(sensor_api)
+            except Exception as exc:
+                self._set_sensor_stream_error(
+                    f"{error_prefix} on {ser.port}: {exc}"
+                )
+                print(f"{error_prefix} on port {ser.port}: {exc}")
+                data_list = None
 
-        sensor_values = self._extract_sensor_values(data_list, self.n_row, self.n_col, ser.port)
-        return sensor_api, sensor_values
+            sensor_values = self._extract_sensor_values(
+                data_list, self.n_row, self.n_col, ser.port
+            )
+            if sensor_values is not None:
+                return sensor_api, sensor_values
+
+            if attempt < max_attempts:
+                print(
+                    f"{error_prefix} on port {ser.port}: retrying "
+                    f"({attempt + 1}/{max_attempts})..."
+                )
+
+        return sensor_api, None
 
     def _warm_sensor_window(self, sensor_api, ser):
         self._data.clearData()
         for window_index in range(1, self._data.windowSize + 1):
-            try:
-                data_list = sensor_api.read_raw()
-            except Exception as exc:
-                print(f"Error during raw data processing on port {ser.port}: {exc}")
-                return False
-
-            raw_values = self._extract_sensor_values(data_list, self.n_row, self.n_col, ser.port)
+            sensor_api, raw_values = self._read_port_sensor_values(
+                ser,
+                lambda api: api.read_raw(),
+                "Error during sensor warm-up",
+            )
             if raw_values is None:
                 return False
 
-            self._update_data_window(self._data, raw_values, self.n_row, self.n_col, window_index)
+            self._update_data_window(
+                self._data,
+                raw_values,
+                self.n_row,
+                self.n_col,
+                window_index,
+            )
         return True
 
     def updateCal(self):
@@ -2770,27 +4419,38 @@ class MySensor:
         `_finish_update_cal` restarts the reader on the GUI thread when done.
         Returns immediately; repeated calls while running are ignored.
         """
+        if self._is_shutting_down:
+            return
         if self._sensor_calibration_in_progress:
             print("Sensor calibration is already running.")
             return
 
+        self._set_sensor_stream_error("")
         self._sensor_calibration_in_progress = True
+        self._sensor_calibration_stop_event.clear()
         self._set_sensor_update_button_enabled(False)
         self.is_connected = False
-        threading.Thread(
+        self._sensor_calibration_thread = threading.Thread(
             target=self._run_calibration_sequence,
             name="sensor-calibration",
             daemon=True,
-        ).start()
+        )
+        self._sensor_calibration_thread.start()
 
     def _run_calibration_sequence(self):
         calibration_succeeded = False
         try:
+            if self._sensor_calibration_stop_event.is_set():
+                return
             if not self._stop_sensor_reader_worker():
-                print("Sensor calibration aborted: live reader did not stop in time.")
+                message = "Sensor calibration aborted: live reader did not stop in time."
+                self._set_sensor_stream_error(message)
+                print(message)
                 return
 
             for ser in self.ser_list:
+                if self._sensor_calibration_stop_event.is_set():
+                    return
                 sensor_api, cal_data_list = self._read_port_sensor_values(
                     ser,
                     lambda api: api.update_cal(),
@@ -2801,22 +4461,46 @@ class MySensor:
 
                 self.cal_data = cal_data_list
                 self._data.getCal(self._reshape_sensor_values(cal_data_list, self.n_row, self.n_col))
+                if self._sensor_calibration_stop_event.is_set():
+                    return
                 if self._warm_sensor_window(sensor_api, ser):
                     calibration_succeeded = True
         except Exception as exc:
+            self._set_sensor_stream_error(f"Sensor calibration failed: {exc}")
             print(f"Sensor calibration failed: {exc}")
             calibration_succeeded = False
         finally:
-            self._calibration_bridge.finished.emit(calibration_succeeded)
+            shutting_down = self._is_shutting_down or self._sensor_calibration_stop_event.is_set()
+            if (
+                not shutting_down
+                and not calibration_succeeded
+                and not self.get_last_sensor_stream_error()
+            ):
+                self._set_sensor_stream_error(
+                    "Sensor calibration failed because no valid frame was received."
+                )
+            if not shutting_down:
+                self._calibration_bridge.finished.emit(calibration_succeeded)
 
     def _finish_update_cal(self, calibration_succeeded):
+        self._sensor_calibration_thread = None
+        if self._is_shutting_down:
+            return
         self.is_connected = bool(calibration_succeeded)
         if calibration_succeeded:
+            self._set_sensor_stream_error("")
             try:
                 self._start_sensor_reader_worker()
             except Exception as exc:
                 self.is_connected = False
+                self._set_sensor_stream_error(
+                    f"Failed to start the live sensor reader: {exc}"
+                )
                 print(f"Failed to restart sensor reader after calibration: {exc}")
+        elif not self.get_last_sensor_stream_error():
+            self._set_sensor_stream_error(
+                "Sensor calibration failed because no valid frame was received."
+            )
         self._sensor_calibration_in_progress = False
         self._set_sensor_update_button_enabled(True)
 
@@ -2844,12 +4528,19 @@ class MySensor:
                 print(f"Error processing data from port {port_name}: {exc}")
                 continue
 
-            if self._should_refresh_visualization():
-                self.saveCameraPara()
-                self.update_visualization(self._data.diffPerDataAve)
+            if bool(getattr(self, "main_visualization_enabled", True)):
+                self._pending_sensor_visualization_matrix = np.array(
+                    self._data.diffPerDataAve,
+                    dtype=float,
+                    copy=True,
+                )
 
     def update_visualization(self, sensor_matrix):
         self._record_visualization_tick()
+        latest_heatmap_matrix = self._current_heatmap_sensor_matrix(sensor_matrix)
+        self._last_sensor_visualization_matrix = np.array(
+            latest_heatmap_matrix, dtype=float, copy=True
+        )
         for col in range(self.n_col):
             for row in range(self.n_row):
                 idx = _column_major_idx(self.n_row, col, row)
@@ -2865,12 +4556,22 @@ class MySensor:
                 for k in self.array_positions[idx]:
                     self.colors[k] = [1, intensity, intensity, 1]
 
-        self.line_poly.points = self.points
+        self._apply_cell_zero_mask_to_visual_colors()
+        self.line_poly.points = self._sensor_points_for_plotter(self.points)
         self.line_poly.point_data.set_scalars(self.colors_3d)
+        try:
+            self._2D_map.Modified()
+            self.line_poly.Modified()
+        except Exception:
+            pass
         if self._is_matrix_visualization_mode(
             getattr(self, "sensor_visualization_mode", "point_grid")
         ):
             self._update_matrix_silhouette_visualization(sensor_matrix)
+        elif self._is_heatmap_visualization_mode(
+            getattr(self, "sensor_visualization_mode", "point_grid")
+        ):
+            self._update_heatmap_visualization(latest_heatmap_matrix)
         self._update_contact_force_status(sensor_matrix)
         self._update_contact_normal_visualization(sensor_matrix)
         self.plotter.render()
@@ -3014,13 +4715,15 @@ class MySensor:
                     stack.append((nr, nc))
         return cluster
 
-    def _estimate_contact_force_signal(self, sensor_matrix):
+    def _estimate_contact_force_signal(self, sensor_matrix, peak_threshold=None):
         values = np.asarray(sensor_matrix, dtype=float)
         if values.shape != (self.n_row, self.n_col):
             return None
 
         pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
-        peak_threshold = max(0.0, float(getattr(self, "contact_normal_threshold_pct", 3.0)))
+        if peak_threshold is None:
+            peak_threshold = getattr(self, "contact_normal_threshold_pct", 3.0)
+        peak_threshold = max(0.0, float(peak_threshold))
         peak_flat = int(np.argmax(pressure))
         peak_row, peak_col = np.unravel_index(peak_flat, pressure.shape)
         peak_pressure = float(pressure[peak_row, peak_col])
@@ -3466,7 +5169,7 @@ class MySensor:
         }
 
     def _update_contact_normal_visualization(self, sensor_matrix):
-        if not bool(getattr(self, "show_contact_normal_vector", True)):
+        if not bool(getattr(self, "show_contact_normal_vector", False)):
             return
 
         estimate = self._estimate_contact_normal_vector(sensor_matrix)

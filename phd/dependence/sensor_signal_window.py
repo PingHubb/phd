@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QHeaderView,
     QLabel,
@@ -20,6 +21,7 @@ from PyQt5.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QComboBox,
     QSlider,
     QStyledItemDelegate,
     QTableWidget,
@@ -29,17 +31,33 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 from PyQt5.QtGui import QBrush, QColor, QFont, QImage, QPainter
+from phd.dependence.sensor_heatmap import (
+    DEFAULT_HEATMAP_3D_COLOR_GAIN,
+    DEFAULT_HEATMAP_3D_PALETTE,
+    DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
+    DEFAULT_HEATMAP_RESPONSE_MODE,
+    DEFAULT_HEATMAP_SATURATION_PCT,
+    DEFAULT_PROXIMITY_KNEE,
+    DEFAULT_PROXIMITY_NOISE_FLOOR,
+    DEFAULT_PROXIMITY_SATURATION,
+    HEATMAP_RESPONSE_LINEAR_RELATIVE,
+    HEATMAP_RESPONSE_PROXIMITY_ENHANCED,
+    heatmap_rgb,
+    normalize_heatmap_3d_palette,
+    normalize_heatmap_response_mode,
+)
 from phd.dependence.paths import resource_path
+from phd.dependence.sensor_protocol import (
+    DEFAULT_SENSOR_BAUD_RATE,
+    DEFAULT_SENSOR_IDLE_SLEEP_SEC,
+    DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
+    SENSOR_READ_RAW_COMMAND,
+    parse_serial_ints,
+)
 
 
 CALIBRATION_ROLE = Qt.UserRole + 1
 THRESHOLD_OFFSET = 30
-# Percentage-change at which the heatmap saturates to deep red. Slightly
-# wider than the 3D plotter's default (~1.7 %) so the viewer feels less
-# twitchy. Lower values = more sensitive (smaller change → deeper red).
-DEFAULT_HEATMAP_SATURATION_PCT = 5.0
-# Anything strictly below this % stays pure white (kills baseline noise).
-DEFAULT_HEATMAP_NOISE_FLOOR_PCT = 0.5
 # Slider granularity: we use integer ticks of 0.1 % for both sliders.
 HEATMAP_SLIDER_SCALE = 10
 HEATMAP_SLIDER_MIN = 1          # 0.1 %
@@ -60,8 +78,8 @@ class _SensorSignalReadWorker(QObject):
         sensor_api,
         generation=0,
         interval_ms=REFRESH_INTERVAL_MS,
-        response_timeout=0.5,
-        idle_sleep_sec=0.002,
+        response_timeout=DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
+        idle_sleep_sec=DEFAULT_SENSOR_IDLE_SLEEP_SEC,
     ):
         super().__init__()
         self.sensor_api = sensor_api
@@ -76,13 +94,7 @@ class _SensorSignalReadWorker(QObject):
 
     @staticmethod
     def _parse_ints(text):
-        values = []
-        for token in str(text).split():
-            try:
-                values.append(int(token))
-            except ValueError:
-                continue
-        return values
+        return parse_serial_ints(text)
 
     def _read_raw(self):
         ser = getattr(self.sensor_api, "ser", None)
@@ -90,7 +102,7 @@ class _SensorSignalReadWorker(QObject):
             return None
 
         try:
-            ser.write(b"readRaw\n")
+            ser.write(SENSOR_READ_RAW_COMMAND)
         except Exception as exc:
             self.error.emit(f"write failed: {exc}")
             return None
@@ -264,9 +276,55 @@ class SensorSignalWindow(QWidget):
         self.selected_index = None
         self._heatmap_saturation_pct = float(DEFAULT_HEATMAP_SATURATION_PCT)
         self._heatmap_noise_floor_pct = float(DEFAULT_HEATMAP_NOISE_FLOOR_PCT)
+        self._heatmap_response_mode = DEFAULT_HEATMAP_RESPONSE_MODE
+        self._proximity_noise_floor = float(DEFAULT_PROXIMITY_NOISE_FLOOR)
+        self._proximity_knee = float(DEFAULT_PROXIMITY_KNEE)
+        self._proximity_saturation = float(DEFAULT_PROXIMITY_SATURATION)
+        self._heatmap_3d_color_gain = float(DEFAULT_HEATMAP_3D_COLOR_GAIN)
+        self._heatmap_3d_palette = DEFAULT_HEATMAP_3D_PALETTE
+        self._load_heatmap_settings_from_sensor()
 
         self._build_ui()
         self._connect_sensor()
+
+    def _load_heatmap_settings_from_sensor(self):
+        sensor_functions = self._resolve_sensor_functions()
+        get_settings = getattr(sensor_functions, "get_heatmap_settings", None)
+        if not callable(get_settings):
+            return False
+        try:
+            settings = get_settings()
+            self._heatmap_response_mode = normalize_heatmap_response_mode(
+                settings.get("response_mode", DEFAULT_HEATMAP_RESPONSE_MODE)
+            )
+            self._heatmap_saturation_pct = float(
+                settings.get("saturation_pct", DEFAULT_HEATMAP_SATURATION_PCT)
+            )
+            self._heatmap_noise_floor_pct = float(
+                settings.get("noise_floor_pct", DEFAULT_HEATMAP_NOISE_FLOOR_PCT)
+            )
+            self._proximity_noise_floor = float(
+                settings.get(
+                    "proximity_noise_floor", DEFAULT_PROXIMITY_NOISE_FLOOR
+                )
+            )
+            self._proximity_knee = float(
+                settings.get("proximity_knee", DEFAULT_PROXIMITY_KNEE)
+            )
+            self._proximity_saturation = float(
+                settings.get(
+                    "proximity_saturation", DEFAULT_PROXIMITY_SATURATION
+                )
+            )
+            self._heatmap_3d_color_gain = float(
+                settings.get("color_gain_3d", DEFAULT_HEATMAP_3D_COLOR_GAIN)
+            )
+            self._heatmap_3d_palette = normalize_heatmap_3d_palette(
+                settings.get("palette_3d", DEFAULT_HEATMAP_3D_PALETTE)
+            )
+            return True
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # UI setup
@@ -296,6 +354,85 @@ class SensorSignalWindow(QWidget):
 
         layout.addWidget(self.table)
 
+        response_row = QWidget()
+        response_layout = QHBoxLayout(response_row)
+        response_layout.setContentsMargins(0, 4, 0, 0)
+        response_layout.setSpacing(10)
+        response_layout.addWidget(QLabel("Heatmap response:"))
+        self._heatmap_response_combo = QComboBox()
+        self._heatmap_response_combo.addItem(
+            "Linear Relative (%)", HEATMAP_RESPONSE_LINEAR_RELATIVE
+        )
+        self._heatmap_response_combo.addItem(
+            "Proximity Enhanced (absolute difference)",
+            HEATMAP_RESPONSE_PROXIMITY_ENHANCED,
+        )
+        for index in range(self._heatmap_response_combo.count()):
+            if self._heatmap_response_combo.itemData(index) == self._heatmap_response_mode:
+                self._heatmap_response_combo.setCurrentIndex(index)
+                break
+        self._heatmap_response_combo.setToolTip(
+            "Linear Relative preserves the original percentage heatmap. "
+            "Proximity Enhanced expands small absolute changes before contact."
+        )
+        self._heatmap_response_combo.currentIndexChanged.connect(
+            self._on_heatmap_response_mode_changed
+        )
+        response_layout.addWidget(self._heatmap_response_combo)
+        response_layout.addStretch()
+        layout.addWidget(response_row)
+
+        proximity_row = QWidget()
+        proximity_layout = QHBoxLayout(proximity_row)
+        proximity_layout.setContentsMargins(0, 0, 0, 0)
+        proximity_layout.setSpacing(10)
+
+        def _proximity_spin(value, maximum):
+            spin = QDoubleSpinBox()
+            spin.setDecimals(1)
+            spin.setRange(0.0, float(maximum))
+            spin.setSingleStep(5.0)
+            spin.setValue(float(value))
+            spin.setKeyboardTracking(False)
+            return spin
+
+        self._proximity_floor_spin = _proximity_spin(
+            self._proximity_noise_floor, 1000000.0
+        )
+        self._proximity_knee_spin = _proximity_spin(
+            self._proximity_knee, 1000000.0
+        )
+        self._proximity_saturation_spin = _proximity_spin(
+            self._proximity_saturation, 1000000.0
+        )
+        self._proximity_floor_spin.setToolTip(
+            "Absolute signal difference treated as baseline noise."
+        )
+        self._proximity_knee_spin.setToolTip(
+            "End of the proximity-focused color range."
+        )
+        self._proximity_saturation_spin.setToolTip(
+            "Absolute signal difference rendered as full deep red."
+        )
+        proximity_layout.addWidget(QLabel("Baseline:"))
+        proximity_layout.addWidget(self._proximity_floor_spin)
+        proximity_layout.addWidget(QLabel("Proximity Knee:"))
+        proximity_layout.addWidget(self._proximity_knee_spin)
+        proximity_layout.addWidget(QLabel("Deep Red:"))
+        proximity_layout.addWidget(self._proximity_saturation_spin)
+        proximity_layout.addStretch()
+        self._proximity_floor_spin.valueChanged.connect(
+            self._on_proximity_thresholds_changed
+        )
+        self._proximity_knee_spin.valueChanged.connect(
+            self._on_proximity_thresholds_changed
+        )
+        self._proximity_saturation_spin.valueChanged.connect(
+            self._on_proximity_thresholds_changed
+        )
+        self._heatmap_proximity_row = proximity_row
+        layout.addWidget(proximity_row)
+
         gain_row = QWidget()
         gain_layout = QHBoxLayout(gain_row)
         gain_layout.setContentsMargins(0, 4, 0, 0)
@@ -309,21 +446,25 @@ class SensorSignalWindow(QWidget):
         self._heatmap_span_slider.setSingleStep(1)
         self._heatmap_span_slider.setPageStep(5)
         self._heatmap_span_slider.setValue(
-            int(round(DEFAULT_HEATMAP_SATURATION_PCT * HEATMAP_SLIDER_SCALE))
+            int(round(self._heatmap_saturation_pct * HEATMAP_SLIDER_SCALE))
         )
         self._heatmap_span_slider.setToolTip(
             "Upper end of the heatmap. Cells whose |raw − cal|/|cal|×100\n"
             "reaches this value are full deep-red.  Lower value = saturate\n"
-            "sooner (more sensitive).  Default 5.0 %."
+            "sooner (more sensitive).  This setting is shared with the 3D heatmap."
         )
         self._heatmap_span_slider.valueChanged.connect(self._on_heatmap_span_changed)
+        self._heatmap_span_slider.sliderReleased.connect(
+            lambda: self._publish_heatmap_settings_to_sensor(save_current_sensor=True)
+        )
         gain_layout.addWidget(self._heatmap_span_slider, stretch=1)
         self._heatmap_span_value_label = QLabel(
-            f"{DEFAULT_HEATMAP_SATURATION_PCT:.1f} %"
+            f"{self._heatmap_saturation_pct:.1f} %"
         )
         self._heatmap_span_value_label.setMinimumWidth(48)
         self._heatmap_span_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         gain_layout.addWidget(self._heatmap_span_value_label)
+        self._heatmap_gain_row = gain_row
         layout.addWidget(gain_row)
 
         floor_row = QWidget()
@@ -339,24 +480,30 @@ class SensorSignalWindow(QWidget):
         self._heatmap_floor_slider.setSingleStep(1)
         self._heatmap_floor_slider.setPageStep(5)
         self._heatmap_floor_slider.setValue(
-            int(round(DEFAULT_HEATMAP_NOISE_FLOOR_PCT * HEATMAP_SLIDER_SCALE))
+            int(round(self._heatmap_noise_floor_pct * HEATMAP_SLIDER_SCALE))
         )
         self._heatmap_floor_slider.setToolTip(
             "Lower edge of the heatmap.  Cells whose % change is below this\n"
             "value are forced to plain white (kills idle / breathing noise).\n"
-            "Above this floor the colour grows from pale pink to deep red."
+            "Above this floor the colour grows from pale pink to deep red.\n"
+            "This setting is shared with the 3D heatmap."
         )
         self._heatmap_floor_slider.valueChanged.connect(self._on_heatmap_floor_changed)
+        self._heatmap_floor_slider.sliderReleased.connect(
+            lambda: self._publish_heatmap_settings_to_sensor(save_current_sensor=True)
+        )
         floor_layout.addWidget(self._heatmap_floor_slider, stretch=1)
         self._heatmap_floor_value_label = QLabel(
-            f"{DEFAULT_HEATMAP_NOISE_FLOOR_PCT:.1f} %"
+            f"{self._heatmap_noise_floor_pct:.1f} %"
         )
         self._heatmap_floor_value_label.setMinimumWidth(48)
         self._heatmap_floor_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         floor_layout.addWidget(self._heatmap_floor_value_label)
+        self._heatmap_floor_row = floor_row
         layout.addWidget(floor_row)
 
         layout.addWidget(self._build_toolbar())
+        self._update_heatmap_response_controls()
 
     def _build_toolbar(self):
         info_container = QWidget()
@@ -401,6 +548,7 @@ class SensorSignalWindow(QWidget):
         self._heatmap_saturation_pct = pct
         if hasattr(self, "_heatmap_span_value_label") and self._heatmap_span_value_label:
             self._heatmap_span_value_label.setText(f"{pct:.1f} %")
+        self._publish_heatmap_settings_to_sensor()
         if self._has_sensor_source():
             self.refresh_data()
         else:
@@ -411,10 +559,88 @@ class SensorSignalWindow(QWidget):
         self._heatmap_noise_floor_pct = pct
         if hasattr(self, "_heatmap_floor_value_label") and self._heatmap_floor_value_label:
             self._heatmap_floor_value_label.setText(f"{pct:.1f} %")
+        self._publish_heatmap_settings_to_sensor()
         if self._has_sensor_source():
             self.refresh_data()
         else:
             self.table.viewport().update()
+
+    def _update_heatmap_response_controls(self):
+        enhanced = (
+            normalize_heatmap_response_mode(self._heatmap_response_mode)
+            == HEATMAP_RESPONSE_PROXIMITY_ENHANCED
+        )
+        proximity_row = getattr(self, "_heatmap_proximity_row", None)
+        gain_row = getattr(self, "_heatmap_gain_row", None)
+        floor_row = getattr(self, "_heatmap_floor_row", None)
+        if proximity_row is not None:
+            proximity_row.setVisible(enhanced)
+        if gain_row is not None:
+            gain_row.setVisible(not enhanced)
+        if floor_row is not None:
+            floor_row.setVisible(not enhanced)
+
+    def _on_heatmap_response_mode_changed(self, *_args):
+        self._heatmap_response_mode = normalize_heatmap_response_mode(
+            self._heatmap_response_combo.currentData()
+        )
+        self._update_heatmap_response_controls()
+        self._last_cell_states = {}
+        self._publish_heatmap_settings_to_sensor(save_current_sensor=True)
+        if self._has_sensor_source():
+            self.refresh_data()
+
+    def _on_proximity_thresholds_changed(self, *_args):
+        floor = float(self._proximity_floor_spin.value())
+        knee = max(floor + 0.1, float(self._proximity_knee_spin.value()))
+        saturation = max(
+            knee + 0.1, float(self._proximity_saturation_spin.value())
+        )
+        for spin, value in (
+            (self._proximity_knee_spin, knee),
+            (self._proximity_saturation_spin, saturation),
+        ):
+            if abs(float(spin.value()) - value) > 1e-9:
+                spin.blockSignals(True)
+                spin.setValue(value)
+                spin.blockSignals(False)
+        self._proximity_noise_floor = floor
+        self._proximity_knee = knee
+        self._proximity_saturation = saturation
+        self._last_cell_states = {}
+        self._publish_heatmap_settings_to_sensor(save_current_sensor=True)
+        if self._has_sensor_source():
+            self.refresh_data()
+
+    def _publish_heatmap_settings_to_sensor(self, save_current_sensor=False):
+        sensor_functions = self._resolve_sensor_functions()
+        set_settings = getattr(sensor_functions, "set_heatmap_settings", None)
+        if not callable(set_settings):
+            return False
+        try:
+            settings = {
+                "palette_3d": getattr(
+                    self, "_heatmap_3d_palette", DEFAULT_HEATMAP_3D_PALETTE
+                ),
+                "response_mode": self._heatmap_response_mode,
+                "saturation_pct": self._heatmap_saturation_pct,
+                "noise_floor_pct": self._heatmap_noise_floor_pct,
+                "proximity_noise_floor": self._proximity_noise_floor,
+                "proximity_knee": self._proximity_knee,
+                "proximity_saturation": self._proximity_saturation,
+                "color_gain_3d": getattr(
+                    self,
+                    "_heatmap_3d_color_gain",
+                    DEFAULT_HEATMAP_3D_COLOR_GAIN,
+                ),
+            }
+            if save_current_sensor:
+                return bool(
+                    set_settings(settings, save_current_sensor=True)
+                )
+            return bool(set_settings(settings))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Screenshot export
@@ -460,7 +686,18 @@ class SensorSignalWindow(QWidget):
 
         rows = max(1, int(self.table_rows))
         columns = max(1, int(self.table_columns))
+        diff_list = self._build_diff_list(raw_list)
         percent_list = self._build_percent_list(raw_list)
+        heatmap_list = (
+            self._read_shared_heatmap_list()
+            if self._using_shared_sensor_data
+            else []
+        )
+        if len(heatmap_list) != n:
+            heatmap_list = [
+                self._heatmap_value(diff_list[i], percent_list[i])
+                for i in range(n)
+            ]
         zero_mask = self._get_zero_mask_matrix(rows, columns)
 
         # Prefer a project-local screenshots folder so saved PNGs are easy to
@@ -533,8 +770,10 @@ class SensorSignalWindow(QWidget):
                         bool(zero_mask[row, col]) if zero_mask is not None else False
                     )
                     if not is_masked:
-                        pct = percent_list[idx] if idx < len(percent_list) else 0.0
-                        colour = self._color_for_cell(pct)
+                        heatmap_value = (
+                            heatmap_list[idx] if idx < len(heatmap_list) else 0.0
+                        )
+                        colour = self._color_for_cell(heatmap_value)
                         painter.fillRect(
                             col * cell_px,
                             row * cell_px,
@@ -625,6 +864,7 @@ class SensorSignalWindow(QWidget):
         self.table_rows = max(1, n_row)
         self.table_columns = max(1, n_col)
         self._sync_shared_calibration()
+        self._publish_heatmap_settings_to_sensor()
         self.info_label.setText("Using live sensor stream")
         return True
 
@@ -671,6 +911,39 @@ class SensorSignalWindow(QWidget):
         if cal_values and cal_values != self.calibration_data:
             self.calibration_data = cal_values
             self.cells_remaining_for_threshold = len(self.calibration_data)
+
+    def _publish_heatmap_baseline_to_sensor(self):
+        if not self._using_shared_sensor_data or not self.calibration_data:
+            return False
+        sensor_functions = self._get_shared_sensor_functions()
+        setter = getattr(
+            sensor_functions, "set_heatmap_calibration_baseline", None
+        )
+        if not callable(setter):
+            return False
+        try:
+            return bool(
+                setter(
+                    self.calibration_data,
+                    n_row=self.table_rows,
+                    n_col=self.table_columns,
+                )
+            )
+        except Exception:
+            return False
+
+    def _read_shared_heatmap_list(self):
+        sensor_functions = self._get_shared_sensor_functions()
+        getter = getattr(sensor_functions, "get_heatmap_sensor_matrix", None)
+        if not callable(getter):
+            return []
+        try:
+            matrix = getter()
+        except Exception:
+            return []
+        return self._flatten_sensor_matrix_column_major(
+            matrix, self.table_rows, self.table_columns
+        )
 
     def _read_shared_raw_list(self):
         sensor_functions = self._get_shared_sensor_functions()
@@ -725,7 +998,10 @@ class SensorSignalWindow(QWidget):
 
         try:
             from phd.dependence.sensor_api import ArduinoCommander
-            self.sensor_api = ArduinoCommander(serial_port=port, baud_rate=9600)
+            self.sensor_api = ArduinoCommander(
+                serial_port=port,
+                baud_rate=DEFAULT_SENSOR_BAUD_RATE,
+            )
         except Exception as exc:
             QMessageBox.critical(
                 self,
@@ -864,6 +1140,7 @@ class SensorSignalWindow(QWidget):
                     return
                 self.calibration_data = raw_list
                 self._shared_calibration_overridden = True
+                self._publish_heatmap_baseline_to_sensor()
                 self.initial_diffs.clear()
                 self.threshold_max.clear()
                 self.cells_remaining_for_threshold = len(self.calibration_data)
@@ -940,6 +1217,9 @@ class SensorSignalWindow(QWidget):
         if not self._has_sensor_source():
             return
 
+        if self._using_shared_sensor_data:
+            self._publish_heatmap_settings_to_sensor()
+
         raw_list = list(self._current_raw_list() or [])
         if not raw_list:
             return
@@ -948,6 +1228,16 @@ class SensorSignalWindow(QWidget):
 
         diff_list = self._build_diff_list(raw_list)
         percent_list = self._build_percent_list(raw_list)
+        heatmap_list = (
+            self._read_shared_heatmap_list()
+            if self._using_shared_sensor_data
+            else []
+        )
+        if len(heatmap_list) != n:
+            heatmap_list = [
+                self._heatmap_value(diff_list[i], percent_list[i])
+                for i in range(n)
+            ]
         self._update_thresholds(diff_list)
 
         if self.display_mode == "diff":
@@ -957,7 +1247,9 @@ class SensorSignalWindow(QWidget):
         else:
             display_list = list(raw_list)
 
-        self._render_table(display_list, diff_list, percent_list, n)
+        self._render_table(
+            display_list, diff_list, percent_list, n, heatmap_list=heatmap_list
+        )
 
     def _build_diff_list(self, raw_list):
         n = len(raw_list)
@@ -1006,7 +1298,9 @@ class SensorSignalWindow(QWidget):
                     if self.cells_remaining_for_threshold == 0:
                         self.update_cal_button.setStyleSheet("background-color: lightgreen;")
 
-    def _render_table(self, display_list, diff_list, percent_list, n):
+    def _render_table(
+        self, display_list, diff_list, percent_list, n, heatmap_list=None
+    ):
         rows, columns = self.table_rows, self.table_columns
         if self.table.rowCount() != rows or self.table.columnCount() != columns:
             self.table.setRowCount(rows)
@@ -1040,9 +1334,20 @@ class SensorSignalWindow(QWidget):
                             else None
                         )
                         pct = percent_list[idx] if idx < len(percent_list) else 0.0
-                        # Quantize the heat percentage so imperceptible color
-                        # changes do not force a repaint.
-                        state = (display_list[idx], cal, round(pct, 1))
+                        diff_value = diff_list[idx] if idx < len(diff_list) else 0.0
+                        if heatmap_list is not None and idx < len(heatmap_list):
+                            heat_value = heatmap_list[idx]
+                        else:
+                            heat_value = self._heatmap_value(diff_value, pct)
+                        colour = self._color_for_cell(heat_value)
+                        state = (
+                            display_list[idx],
+                            cal,
+                            colour.red(),
+                            colour.green(),
+                            colour.blue(),
+                            self._heatmap_response_mode,
+                        )
 
                     if self._last_cell_states.get((row, col)) == state:
                         idx += 1
@@ -1065,7 +1370,9 @@ class SensorSignalWindow(QWidget):
                     else:
                         item.setData(Qt.DisplayRole, state[0])
                         item.setData(CALIBRATION_ROLE, state[1])
-                        item.setBackground(QBrush(self._color_for_cell(state[2])))
+                        item.setBackground(
+                            QBrush(QColor(state[2], state[3], state[4]))
+                        )
                 else:
                     if self._last_cell_states.get((row, col)) != ("empty",):
                         self._last_cell_states[(row, col)] = ("empty",)
@@ -1147,45 +1454,42 @@ class SensorSignalWindow(QWidget):
                     return sf
         return self.sensor_functions
 
-    def _color_for_cell(self, percent: float) -> QColor:
-        """Smooth pale-pink → deep-red ramp keyed to the *relative* change
-        ``|raw−cal|/|cal|×100``.
+    def _heatmap_value(self, absolute_difference, relative_percent):
+        if (
+            normalize_heatmap_response_mode(self._heatmap_response_mode)
+            == HEATMAP_RESPONSE_PROXIMITY_ENHANCED
+        ):
+            return abs(float(absolute_difference))
+        return abs(float(relative_percent))
 
-        Two user knobs control the response:
-          * noise-floor %  — anything below stays white (no colour at all),
-          * gain %         — value at which the ramp reaches full deep red.
-        Between the two the colour grows continuously, so small changes show
-        up as light pink instead of jumping straight to red.
-        """
-        abs_pct = abs(float(percent))
-        span_pct = max(
-            1e-6,
-            float(
-                getattr(self, "_heatmap_saturation_pct", DEFAULT_HEATMAP_SATURATION_PCT)
+    def _color_for_cell(self, heatmap_value: float) -> QColor:
+        """Return the selected shared heatmap color for one sensor value."""
+        rgb = heatmap_rgb(
+            float(heatmap_value),
+            response_mode=getattr(
+                self, "_heatmap_response_mode", DEFAULT_HEATMAP_RESPONSE_MODE
+            ),
+            saturation_pct=getattr(
+                self,
+                "_heatmap_saturation_pct",
+                DEFAULT_HEATMAP_SATURATION_PCT,
+            ),
+            noise_floor_pct=getattr(
+                self,
+                "_heatmap_noise_floor_pct",
+                DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
+            ),
+            proximity_noise_floor=getattr(
+                self, "_proximity_noise_floor", DEFAULT_PROXIMITY_NOISE_FLOOR
+            ),
+            proximity_knee=getattr(
+                self, "_proximity_knee", DEFAULT_PROXIMITY_KNEE
+            ),
+            proximity_saturation=getattr(
+                self, "_proximity_saturation", DEFAULT_PROXIMITY_SATURATION
             ),
         )
-        floor_pct = max(
-            0.0,
-            float(
-                getattr(
-                    self,
-                    "_heatmap_noise_floor_pct",
-                    DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
-                )
-            ),
-        )
-        # Stay pure white below the noise floor.
-        if abs_pct <= floor_pct:
-            return QColor(255, 255, 255)
-
-        # If the user dragged the floor at or above the gain, treat anything
-        # above the floor as full red — otherwise we'd divide by ~0.
-        usable_span = max(1e-6, span_pct - floor_pct)
-        # 0 at the floor → 1 at the gain (clamped).
-        red_strength = max(0.0, min(1.0, (abs_pct - floor_pct) / usable_span))
-        # Same colour family as the 3D plotter: red stays 255, green/blue drop.
-        g = int(round(255.0 * (1.0 - red_strength)))
-        return QColor(255, g, g)
+        return QColor(int(rgb[0]), int(rgb[1]), int(rgb[2]))
 
     def _show_error_cell(self, message):
         self.table.setRowCount(1)
@@ -1215,6 +1519,17 @@ class SensorSignalWindow(QWidget):
         if self.timer.isActive():
             self.timer.stop()
         self._stop_reader_worker()
+
+        if self._using_shared_sensor_data and self._shared_calibration_overridden:
+            sensor_functions = self._get_shared_sensor_functions()
+            setter = getattr(
+                sensor_functions, "set_heatmap_calibration_baseline", None
+            )
+            if callable(setter):
+                try:
+                    setter(None)
+                except Exception:
+                    pass
 
         if self.sensor_api and hasattr(self.sensor_api, "shutdown"):
             try:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -32,15 +33,77 @@ class RobotSensorControlsMixin:
     def disable_robot_controls(self, disable: bool):
         return None
 
+    def _get_selected_sensor_port_path(self):
+        port_list = getattr(self, "serial_channel", None)
+        if port_list is None:
+            return None
+
+        selected_items = list(port_list.selectedItems() or [])
+        if not selected_items:
+            return None
+        current_item = port_list.currentItem()
+        item = current_item if current_item in selected_items else selected_items[0]
+        port_name = str(item.text() or "").strip()
+        if not port_name:
+            return None
+        if os.path.isabs(port_name):
+            return port_name
+        return os.path.join("/dev", port_name)
+
+    def _prepare_selected_sensor_api(self):
+        port_path = self._get_selected_sensor_port_path()
+        if not port_path:
+            self.log_display.append(
+                "Select a serial port in Sensor > Send Operation first."
+            )
+            return None
+        if not self.ensure_sensor_api(serial_port=port_path):
+            self.log_display.append(f"Could not open selected sensor port: {port_path}")
+            return None
+        return port_path
+
     def _on_sensor_api_read_raw(self):
-        if self.ensure_sensor_api():
-            self.log_display.append(f"API raw data: {self.sensor_api.read_raw()}")
-        else:
-            self.log_display.append("Sensor API is not ready yet.")
+        port_path = self._get_selected_sensor_port_path()
+        if not port_path:
+            self.log_display.append(
+                "Select a serial port in Sensor > Send Operation first."
+            )
+            return
+
+        sensor = getattr(self, "sensor_functions", None)
+        reader_running = bool(
+            sensor is not None
+            and getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+        )
+        if reader_running:
+            getter = getattr(sensor, "get_last_sensor_api_payload", None)
+            payload = getter(port_path) if callable(getter) else None
+            if payload is None:
+                self.log_display.append(
+                    f"API raw data ({port_path}): waiting for a live sensor frame."
+                )
+            else:
+                self.log_display.append(
+                    f"API raw data ({port_path}, live): {payload}"
+                )
+            return
+
+        port_path = self._prepare_selected_sensor_api()
+        if port_path:
+            self.log_display.append(
+                f"API raw data ({port_path}): {self.sensor_api.read_raw()}"
+            )
 
     def _on_sensor_api_read_raw_hz(self):
         if getattr(self, "_sensor_hz_measurement_running", False):
             self.log_display.append("Sensor Hz measurement is already in progress.")
+            return
+
+        port_path = self._get_selected_sensor_port_path()
+        if not port_path:
+            self.log_display.append(
+                "Select a serial port in Sensor > Send Operation first."
+            )
             return
 
         # While the live visualization is streaming, the serial port belongs to
@@ -48,12 +111,15 @@ class RobotSensorControlsMixin:
         # both streams (and can close the shared port, freezing the display),
         # so measure the rate passively from the frames that already arrive.
         sensor = getattr(self, "sensor_functions", None)
-        if sensor is not None and getattr(sensor, "_sensor_reader_is_running", lambda: False)():
+        reader_is_running = getattr(
+            sensor, "_sensor_reader_is_running", lambda: False
+        )
+        if sensor is not None and reader_is_running():
             self._measure_stream_hz(sensor)
             return
 
-        if not self.ensure_sensor_api():
-            self.log_display.append("Sensor API is not ready yet.")
+        if not self.ensure_sensor_api(serial_port=port_path):
+            self.log_display.append(f"Could not open selected sensor port: {port_path}")
             return
         self._measure_direct_hz()
 
@@ -128,10 +194,20 @@ class RobotSensorControlsMixin:
         )
 
     def _on_sensor_api_channel_check(self):
-        if self.ensure_sensor_api():
-            self.log_display.append(f"Sensor channel data: {self.sensor_api.channel_check()}")
-        else:
-            self.log_display.append("Sensor API is not ready yet.")
+        sensor = getattr(self, "sensor_functions", None)
+        if sensor is not None and getattr(
+            sensor, "_sensor_reader_is_running", lambda: False
+        )():
+            self.log_display.append(
+                "Stop the live sensor stream before running Sensor API Channel."
+            )
+            return
+        port_path = self._prepare_selected_sensor_api()
+        if port_path:
+            self.log_display.append(
+                f"Sensor channel data ({port_path}): "
+                f"{self.sensor_api.channel_check()}"
+            )
 
     def _on_sensor_update(self):
         if self.ensure_sensor_api():

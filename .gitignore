@@ -10,6 +10,14 @@ venv/
 .idea/
 .pytest_cache/
 
+# ROS/Python build output
+build/
+install/
+log/
+*.egg-info/
+.coverage
+htmlcov/
+
 # Large ML datasets and checkpoints (clone repo then restore or use LFS)
 phd/resource/ai/data/
 phd/resource/ai/models/

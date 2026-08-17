@@ -17,6 +17,8 @@ from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QDoubleSpinBox,
+    QFormLayout,
+    QCheckBox,
 )
 import time
 from phd.dependence.paths import resource_path, robot_resource_path
@@ -77,6 +79,18 @@ class MyMeshLab():
         self.counter = 0
 
         self.joints = [0.0] * 6  # Initialize joint angles
+        self._robot_dialog_admittance_active = False
+        self._robot_dialog_admittance_confirmed = False
+        self._robot_dialog_admittance_velocity_mode_on = False
+        self._robot_dialog_admittance_filtered_velocity = np.zeros(3, dtype=float)
+        self._admittance_source = None
+        self._admittance_pending_start = False
+        self._admittance_mapping_config = None
+        self._robot_dialog_admittance_timer = QTimer(self.parent)
+        self._robot_dialog_admittance_timer.setInterval(33)
+        self._robot_dialog_admittance_timer.timeout.connect(
+            self._robot_dialog_admittance_tick
+        )
 
     def saveCameraPara(self):
         self.camera_pos = self.plotter.camera.position
@@ -346,7 +360,9 @@ class MyMeshLab():
         dialog instead of creating a duplicate (and re-loading hundreds of MB
         of OBJ data). The window starts at joints = [0]*6 and exposes a
         "Real-time Live" toggle that polls ``robot_api.get_current_positions()``
-        periodically and re-poses the displayed links.
+        periodically and re-poses the displayed links. It starts from the
+        latest available joint feedback and enables this read-only live follow
+        automatically, so the model and Link 5 frame represent the real pose.
         """
         # Re-use existing window if it's still alive AND its VTK resources
         # haven't been torn down. After a previous close the dialog widget
@@ -431,6 +447,82 @@ class MyMeshLab():
         btn_home.setToolTip("Pose the model at joints = 0 (does NOT move the real robot).")
         toolbar.addWidget(btn_home)
 
+        btn_robot_sensor_stream = QPushButton("Start Sensor")
+        btn_robot_sensor_stream.setCheckable(True)
+        btn_robot_sensor_stream.setToolTip(
+            "Build, calibrate and read the selected sensor for this robot viewer only.\n"
+            "The same single serial reader is used; main-UI sensor rendering is disabled."
+        )
+        btn_robot_sensor_stream.setStyleSheet(
+            "QPushButton{padding:4px 12px;}"
+            "QPushButton:checked{background-color:#356aa0;color:white;font-weight:bold;}"
+        )
+        toolbar.addWidget(btn_robot_sensor_stream)
+
+        btn_map_sensor = QPushButton("Map Sensor")
+        btn_map_sensor.setCheckable(True)
+        btn_map_sensor.setToolTip(
+            "Overlay the current built sensor, or preview the selected sensor model, on a robot link.\n"
+            "Use 'Sensor Mount...' to tune and save the link-to-sensor transform."
+        )
+        btn_map_sensor.setStyleSheet(
+            "QPushButton{padding:4px 12px;}"
+            "QPushButton:checked{background-color:#2f8f72;color:white;font-weight:bold;}"
+        )
+        toolbar.addWidget(btn_map_sensor)
+
+        btn_sensor_mount = QPushButton("Sensor Mount…")
+        btn_sensor_mount.setToolTip(
+            "Choose the parent link and adjust sensor XYZ / RPY / scale / opacity."
+        )
+        toolbar.addWidget(btn_sensor_mount)
+
+        btn_sensor_signal = QPushButton("Live Signal")
+        btn_sensor_signal.setCheckable(True)
+        btn_sensor_signal.setChecked(True)
+        btn_sensor_signal.setToolTip(
+            "Colour the mapped sensor from live diffPerDataAve values. "
+            "Turn off to restore the row/column orientation colours."
+        )
+        btn_sensor_signal.setStyleSheet(
+            "QPushButton{padding:4px 12px;}"
+            "QPushButton:checked{background-color:#a34b3f;color:white;font-weight:bold;}"
+        )
+        toolbar.addWidget(btn_sensor_signal)
+
+        v.addLayout(toolbar)
+
+        motion_toolbar = QHBoxLayout()
+        motion_toolbar.setContentsMargins(8, 0, 8, 6)
+        motion_toolbar.setSpacing(8)
+
+        btn_admittance = QPushButton("Pressure Admittance")
+        btn_admittance.setCheckable(True)
+        btn_admittance.setToolTip(
+            "Yield along the mapped sensor normal using pressure-controlled "
+            "base-frame TCP velocity. This commands the real robot."
+        )
+        btn_admittance.setStyleSheet(
+            "QPushButton{padding:4px 12px;}"
+            "QPushButton:checked{background-color:#b76a20;color:white;font-weight:bold;}"
+        )
+        btn_admittance.setChecked(
+            bool(getattr(self, "_robot_dialog_admittance_active", False))
+        )
+        motion_toolbar.addWidget(btn_admittance)
+
+        btn_link5_frame = QPushButton("Link 5 Frame")
+        btn_link5_frame.setCheckable(True)
+        btn_link5_frame.setChecked(True)
+        btn_link5_frame.setToolTip(
+            "Show the exact link-5 kinematic frame origin and its local XYZ axes."
+        )
+        btn_link5_frame.setStyleSheet(
+            "QPushButton{padding:4px 12px;}"
+            "QPushButton:checked{background-color:#3977a8;color:white;font-weight:bold;}"
+        )
+        motion_toolbar.addWidget(btn_link5_frame)
+
         btn_drag_vel = QPushButton("✥ Drag (Velocity)")
         btn_drag_vel.setCheckable(True)
         btn_drag_vel.setToolTip(
@@ -442,7 +534,7 @@ class MyMeshLab():
             "QPushButton{padding:4px 12px;}"
             "QPushButton:checked{background-color:#d68e1d;color:white;font-weight:bold;}"
         )
-        toolbar.addWidget(btn_drag_vel)
+        motion_toolbar.addWidget(btn_drag_vel)
 
         btn_drag_ptp = QPushButton("✥ Drag (PTP)")
         btn_drag_ptp.setCheckable(True)
@@ -455,15 +547,16 @@ class MyMeshLab():
             "QPushButton{padding:4px 12px;}"
             "QPushButton:checked{background-color:#1d8ed6;color:white;font-weight:bold;}"
         )
-        toolbar.addWidget(btn_drag_ptp)
+        motion_toolbar.addWidget(btn_drag_ptp)
 
-        toolbar.addStretch(1)
+        motion_toolbar.addStretch(1)
 
         status_label = QLabel("Idle")
         status_label.setStyleSheet("color:#aaaaaa;")
-        toolbar.addWidget(status_label)
+        status_label.setMaximumWidth(300)
+        motion_toolbar.addWidget(status_label)
 
-        v.addLayout(toolbar)
+        v.addLayout(motion_toolbar)
 
         # ------------------------------------------------------------------
         # Plotter
@@ -518,8 +611,19 @@ class MyMeshLab():
         except Exception as exc:
             print(f"[RobotDialog] Error reading OBJ files: {exc}")
 
-        zero_joints = [0.0] * 6
-        applied = self._compute_kinematic_chain(zero_joints)
+        initial_joints = [0.0] * 6
+        api = getattr(self.parent, "robot_api", None)
+        if api is not None and hasattr(api, "get_current_positions"):
+            try:
+                feedback = api.get_current_positions()
+                if feedback is not None and len(feedback) >= 6:
+                    candidate = [float(value) for value in feedback[:6]]
+                    if np.all(np.isfinite(candidate)):
+                        initial_joints = candidate
+            except Exception:
+                pass
+
+        applied = self._compute_kinematic_chain(initial_joints)
         for idx, M in enumerate(applied):
             if M is None or idx >= len(meshes):
                 continue
@@ -533,6 +637,7 @@ class MyMeshLab():
                 mesh,
                 show_edges=False,
                 color='#d8d8dc',
+                opacity=0.34,
                 specular=0.5,
                 specular_power=15,
                 smooth_shading=True,
@@ -551,11 +656,39 @@ class MyMeshLab():
         self._robot_dialog_plotter = plotter
         self._robot_dialog_meshes = meshes
         self._robot_dialog_applied = applied            # what's currently shown
-        self._robot_dialog_current_joints = list(zero_joints)
+        self._robot_dialog_current_joints = list(initial_joints)
         self._robot_dialog_status = status_label
         self._robot_dialog_live_btn = btn_live
+        self._robot_dialog_sensor_stream_btn = btn_robot_sensor_stream
+        self._robot_dialog_map_sensor_btn = btn_map_sensor
+        self._robot_dialog_sensor_mount_btn = btn_sensor_mount
+        self._robot_dialog_sensor_signal_btn = btn_sensor_signal
+        self._robot_dialog_admittance_btn = btn_admittance
+        self._robot_dialog_link5_frame_btn = btn_link5_frame
         self._robot_dialog_drag_vel_btn = btn_drag_vel
         self._robot_dialog_drag_ptp_btn = btn_drag_ptp
+        self._robot_dialog_sensor_actor = None
+        self._robot_dialog_sensor_mesh = None
+        self._robot_dialog_sensor_local_mesh = None
+        self._robot_dialog_sensor_preview_model = None
+        self._robot_dialog_sensor_preview_key = None
+        self._robot_dialog_sensor_last_frame = None
+        self._robot_dialog_sensor_stream_owned = False
+        self._robot_dialog_sensor_stream_state = "idle"
+        self._robot_dialog_previous_main_visualization_enabled = None
+        self._robot_dialog_sensor_mapping_config = None
+        self._robot_dialog_sensor_mapping_dialog = None
+        self._robot_dialog_link5_frame_visible = False
+        self._robot_dialog_link5_origin_mesh = None
+        self._robot_dialog_link5_origin_actor = None
+        self._robot_dialog_link5_axis_meshes = []
+        self._robot_dialog_link5_axis_actors = []
+        self._robot_dialog_link5_label_points = None
+        self._robot_dialog_link5_label_actor = None
+        self._robot_dialog_control_center_mesh = None
+        self._robot_dialog_control_center_actor = None
+        self._robot_dialog_control_center_label_points = None
+        self._robot_dialog_control_center_label_actor = None
         self._robot_dialog_drag_active = False
         self._robot_dialog_drag_mode = None  # 'velocity' | 'ptp' | None
         self._robot_dialog_drag_anchor = None
@@ -578,6 +711,13 @@ class MyMeshLab():
         live_timer.setInterval(100)  # 10 Hz live follow
         live_timer.timeout.connect(self._robot_dialog_live_tick)
         self._robot_dialog_live_timer = live_timer
+
+        sensor_signal_timer = QTimer(dialog)
+        sensor_signal_timer.setInterval(50)  # Up to 20 Hz; frame-gated below.
+        sensor_signal_timer.timeout.connect(self._robot_dialog_sensor_signal_tick)
+        self._robot_dialog_sensor_signal_timer = sensor_signal_timer
+
+        admittance_timer = self._ensure_pressure_admittance_timer()
 
         def _on_live_toggled(checked: bool):
             if checked:
@@ -634,7 +774,33 @@ class MyMeshLab():
 
         btn_home.clicked.connect(_on_home)
 
+        btn_robot_sensor_stream.toggled.connect(
+            self._toggle_robot_dialog_sensor_stream
+        )
+
+        def _on_map_sensor_toggled(checked: bool):
+            if self._toggle_robot_dialog_sensor_mapping(checked):
+                return
+            if checked:
+                btn_map_sensor.blockSignals(True)
+                btn_map_sensor.setChecked(False)
+                btn_map_sensor.blockSignals(False)
+
+        btn_map_sensor.toggled.connect(_on_map_sensor_toggled)
+        btn_sensor_mount.clicked.connect(self._open_robot_dialog_sensor_mapping_dialog)
+        btn_sensor_signal.toggled.connect(
+            self._set_robot_dialog_sensor_signal_enabled
+        )
+        btn_admittance.toggled.connect(self._toggle_robot_dialog_admittance)
+        btn_link5_frame.toggled.connect(
+            self._set_robot_dialog_link5_frame_visible
+        )
+
         def _on_drag_vel_toggled(checked: bool):
+            if checked and getattr(self, "_robot_dialog_admittance_active", False):
+                self._teardown_robot_dialog_admittance(
+                    status_text="Pressure admittance stopped for velocity drag."
+                )
             if checked and btn_drag_ptp.isChecked():
                 btn_drag_ptp.blockSignals(True)
                 btn_drag_ptp.setChecked(False)
@@ -644,6 +810,10 @@ class MyMeshLab():
             self._toggle_robot_dialog_drag(checked, mode='velocity')
 
         def _on_drag_ptp_toggled(checked: bool):
+            if checked and getattr(self, "_robot_dialog_admittance_active", False):
+                self._teardown_robot_dialog_admittance(
+                    status_text="Pressure admittance stopped for PTP drag."
+                )
             if checked and btn_drag_vel.isChecked():
                 btn_drag_vel.blockSignals(True)
                 btn_drag_vel.setChecked(False)
@@ -671,6 +841,34 @@ class MyMeshLab():
             except Exception:
                 pass
             try:
+                sensor_signal_timer.stop()
+            except Exception:
+                pass
+            try:
+                if getattr(self, "_admittance_source", None) == "robot_dialog":
+                    self._teardown_robot_dialog_admittance(update_status=False)
+            except Exception:
+                pass
+            try:
+                if getattr(self, "_admittance_source", None) == "robot_dialog":
+                    admittance_timer.stop()
+            except Exception:
+                pass
+            try:
+                stopped = self._stop_robot_dialog_sensor_stream(restore_main=True)
+                if not stopped:
+                    sensor = getattr(self.parent, "sensor_functions", None)
+                    previous_main = getattr(
+                        self,
+                        "_robot_dialog_previous_main_visualization_enabled",
+                        True,
+                    )
+                    self._stop_sensor_stream_after_calibration(
+                        sensor, bool(previous_main)
+                    )
+            except Exception:
+                pass
+            try:
                 if getattr(self, "_robot_dialog_drag_active", False):
                     self._teardown_robot_dialog_drag()
             except Exception:
@@ -681,6 +879,21 @@ class MyMeshLab():
                 pass
             try:
                 main_keepalive_timer.stop()
+            except Exception:
+                pass
+            mapping_dialog = getattr(self, "_robot_dialog_sensor_mapping_dialog", None)
+            if mapping_dialog is not None:
+                try:
+                    mapping_dialog.close()
+                except Exception:
+                    pass
+
+            try:
+                self._hide_robot_dialog_link5_frame(render=False)
+            except Exception:
+                pass
+            try:
+                self._hide_robot_dialog_control_center(render=False)
             except Exception:
                 pass
 
@@ -714,8 +927,37 @@ class MyMeshLab():
             self._robot_dialog_current_joints = None
             self._robot_dialog_status = None
             self._robot_dialog_live_btn = None
+            self._robot_dialog_sensor_stream_btn = None
+            self._robot_dialog_map_sensor_btn = None
+            self._robot_dialog_sensor_mount_btn = None
+            self._robot_dialog_sensor_signal_btn = None
+            self._robot_dialog_admittance_btn = None
+            self._robot_dialog_link5_frame_btn = None
             self._robot_dialog_drag_vel_btn = None
             self._robot_dialog_drag_ptp_btn = None
+            self._robot_dialog_sensor_actor = None
+            self._robot_dialog_sensor_mesh = None
+            self._robot_dialog_sensor_local_mesh = None
+            self._robot_dialog_sensor_preview_model = None
+            self._robot_dialog_sensor_preview_key = None
+            self._robot_dialog_sensor_last_frame = None
+            self._robot_dialog_sensor_stream_owned = False
+            self._robot_dialog_sensor_stream_state = "idle"
+            self._robot_dialog_previous_main_visualization_enabled = None
+            self._robot_dialog_sensor_mapping_config = None
+            self._robot_dialog_sensor_mapping_dialog = None
+            self._robot_dialog_sensor_signal_timer = None
+            self._robot_dialog_link5_frame_visible = False
+            self._robot_dialog_link5_origin_mesh = None
+            self._robot_dialog_link5_origin_actor = None
+            self._robot_dialog_link5_axis_meshes = []
+            self._robot_dialog_link5_axis_actors = []
+            self._robot_dialog_link5_label_points = None
+            self._robot_dialog_link5_label_actor = None
+            self._robot_dialog_control_center_mesh = None
+            self._robot_dialog_control_center_actor = None
+            self._robot_dialog_control_center_label_points = None
+            self._robot_dialog_control_center_label_actor = None
             self._robot_dialog_drag_active = False
             self._robot_dialog_drag_mode = None
             self._robot_dialog_drag_target = None
@@ -734,11 +976,2399 @@ class MyMeshLab():
         dialog.finished.connect(_on_finished)
 
         dialog.show()
+        self._set_robot_dialog_link5_frame_visible(True)
+        # This only reads joint feedback; it never commands the robot. Keep
+        # the model, mounted sensor and Link 5 frame synchronized by default.
+        btn_live.setChecked(True)
 
         # After showing the new dialog, give VTK a moment to settle and then
         # force a render on the main plotter so it re-paints itself.
         for ms in (50, 150, 350, 700):
             QTimer.singleShot(ms, self._poke_main_plotters)
+
+    # ------------------------------------------------------------------
+    # Robot-dialog link-frame overlay
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _link_frame_origin_and_axes(transform):
+        matrix = np.asarray(transform, dtype=float)
+        if matrix.shape != (4, 4) or not np.all(np.isfinite(matrix)):
+            return None, None
+        origin = np.array(matrix[:3, 3], dtype=float, copy=True)
+        axes = np.array(matrix[:3, :3], dtype=float, copy=True)
+        for index in range(3):
+            norm = float(np.linalg.norm(axes[:, index]))
+            if norm <= 1e-9:
+                return None, None
+            axes[:, index] /= norm
+        return origin, axes
+
+    def _robot_dialog_link5_transform(self):
+        applied = getattr(self, "_robot_dialog_applied", None)
+        if not isinstance(applied, (list, tuple)) or len(applied) <= 5:
+            return None
+        return applied[5]
+
+    def _set_robot_dialog_link5_frame_visible(self, enabled):
+        button = getattr(self, "_robot_dialog_link5_frame_btn", None)
+        self._set_checked_without_signal(button, bool(enabled))
+        if not bool(enabled):
+            self._hide_robot_dialog_link5_frame(render=True)
+            status = getattr(self, "_robot_dialog_status", None)
+            if status is not None:
+                status.setText("Link 5 frame hidden")
+            return
+
+        self._robot_dialog_link5_frame_visible = True
+        if not self._update_robot_dialog_link5_frame(render=True):
+            self._robot_dialog_link5_frame_visible = False
+            self._set_checked_without_signal(button, False)
+            return
+
+        origin, _axes = self._link_frame_origin_and_axes(
+            self._robot_dialog_link5_transform()
+        )
+        status = getattr(self, "_robot_dialog_status", None)
+        if status is not None and origin is not None:
+            status.setText(
+                "Link 5 origin: ({0:+.3f}, {1:+.3f}, {2:+.3f}) m".format(
+                    float(origin[0]), float(origin[1]), float(origin[2])
+                )
+            )
+
+    def _update_robot_dialog_link5_frame(self, render=False):
+        if not getattr(self, "_robot_dialog_link5_frame_visible", False):
+            return False
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        transform = self._robot_dialog_link5_transform()
+        origin, axes = self._link_frame_origin_and_axes(transform)
+        if plotter is None or origin is None or axes is None:
+            return False
+
+        axis_length = 0.11
+        axis_colours = ("#ff4040", "#45d96b", "#4385ff")
+        origin_mesh = getattr(self, "_robot_dialog_link5_origin_mesh", None)
+        axis_meshes = list(
+            getattr(self, "_robot_dialog_link5_axis_meshes", None) or []
+        )
+        if origin_mesh is None or len(axis_meshes) != 3:
+            origin_mesh = pv.Sphere(radius=0.014, center=origin)
+            origin_actor = plotter.add_mesh(
+                origin_mesh,
+                color="#ffd447",
+                smooth_shading=True,
+                lighting=False,
+                pickable=False,
+            )
+            axis_meshes = []
+            axis_actors = []
+            for index, colour in enumerate(axis_colours):
+                axis_mesh = pv.Arrow(
+                    start=origin,
+                    direction=axes[:, index],
+                    scale=axis_length,
+                    tip_length=0.22,
+                    tip_radius=0.11,
+                    shaft_radius=0.035,
+                )
+                axis_meshes.append(axis_mesh)
+                axis_actors.append(
+                    plotter.add_mesh(
+                        axis_mesh,
+                        color=colour,
+                        lighting=False,
+                        pickable=False,
+                    )
+                )
+
+            label_points = pv.PolyData(np.asarray([origin], dtype=float))
+            label_actor = plotter.add_point_labels(
+                label_points,
+                ["Link 5 frame origin"],
+                font_size=15,
+                text_color="#ffffff",
+                show_points=True,
+                point_color="#ffd447",
+                point_size=16,
+                shape="rect",
+                shape_color="#20242a",
+                shape_opacity=0.82,
+                render_points_as_spheres=True,
+                always_visible=True,
+                reset_camera=False,
+                render=False,
+            )
+            self._robot_dialog_link5_origin_mesh = origin_mesh
+            self._robot_dialog_link5_origin_actor = origin_actor
+            self._robot_dialog_link5_axis_meshes = axis_meshes
+            self._robot_dialog_link5_axis_actors = axis_actors
+            self._robot_dialog_link5_label_points = label_points
+            self._robot_dialog_link5_label_actor = label_actor
+        else:
+            origin_mesh.copy_from(pv.Sphere(radius=0.014, center=origin))
+            for index, axis_mesh in enumerate(axis_meshes):
+                axis_mesh.copy_from(
+                    pv.Arrow(
+                        start=origin,
+                        direction=axes[:, index],
+                        scale=axis_length,
+                        tip_length=0.22,
+                        tip_radius=0.11,
+                        shaft_radius=0.035,
+                    )
+                )
+            label_points = getattr(
+                self, "_robot_dialog_link5_label_points", None
+            )
+            if label_points is not None:
+                label_points.points = np.asarray([origin], dtype=float)
+                label_points.Modified()
+
+        if render:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+        return True
+
+    def _hide_robot_dialog_link5_frame(self, render=True):
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        actors = [
+            getattr(self, "_robot_dialog_link5_origin_actor", None),
+            *(getattr(self, "_robot_dialog_link5_axis_actors", None) or []),
+            getattr(self, "_robot_dialog_link5_label_actor", None),
+        ]
+        if plotter is not None:
+            for actor in actors:
+                if actor is None:
+                    continue
+                try:
+                    plotter.remove_actor(actor, reset_camera=False, render=False)
+                except Exception:
+                    pass
+        self._robot_dialog_link5_frame_visible = False
+        self._robot_dialog_link5_origin_mesh = None
+        self._robot_dialog_link5_origin_actor = None
+        self._robot_dialog_link5_axis_meshes = []
+        self._robot_dialog_link5_axis_actors = []
+        self._robot_dialog_link5_label_points = None
+        self._robot_dialog_link5_label_actor = None
+        if render and plotter is not None:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Robot-dialog sensor mounting / mapping preview
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _set_checked_without_signal(button, checked):
+        if button is None:
+            return
+        button.blockSignals(True)
+        button.setChecked(bool(checked))
+        button.blockSignals(False)
+
+    def _update_robot_dialog_sensor_stream_state(self):
+        button = getattr(self, "_robot_dialog_sensor_stream_btn", None)
+        sensor = getattr(self.parent, "sensor_functions", None)
+        if button is None or sensor is None or not button.isChecked():
+            return
+
+        calibrating = bool(
+            getattr(sensor, "_sensor_calibration_in_progress", False)
+        )
+        running = bool(
+            getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+            and getattr(sensor, "is_connected", False)
+        )
+        status = getattr(self, "_robot_dialog_status", None)
+        previous = getattr(self, "_robot_dialog_sensor_stream_state", "idle")
+        error_detail = ""
+        if calibrating:
+            state = "calibrating"
+            button.setText("Calibrating…")
+        elif running:
+            state = "running"
+            button.setText("Stop Sensor")
+        else:
+            state = "failed"
+            if hasattr(sensor, "get_last_sensor_stream_error"):
+                error_detail = sensor.get_last_sensor_stream_error()
+            if previous in {"starting", "calibrating"}:
+                self._stop_robot_dialog_sensor_stream(restore_main=True)
+            button.setText("Start Sensor")
+            self._set_checked_without_signal(button, False)
+
+        if state != previous and status is not None:
+            if state == "calibrating":
+                status.setText("Sensor: calibrating for robot viewer…")
+                status.setToolTip("")
+            elif state == "running":
+                status.setText("Sensor: robot-viewer stream active")
+                status.setToolTip("")
+            else:
+                status.setText("Sensor failed (hover for details)")
+                status.setToolTip(
+                    error_detail or "No valid sensor frame was received."
+                )
+        if state == "failed" and error_detail:
+            button.setToolTip(error_detail)
+        self._robot_dialog_sensor_stream_state = state
+
+    def _toggle_robot_dialog_sensor_stream(self, enabled):
+        button = getattr(self, "_robot_dialog_sensor_stream_btn", None)
+        sensor = getattr(self.parent, "sensor_functions", None)
+        status = getattr(self, "_robot_dialog_status", None)
+        if sensor is None or not hasattr(
+            sensor, "start_external_visualization_stream"
+        ):
+            self._set_checked_without_signal(button, False)
+            QMessageBox.warning(
+                getattr(self, "_robot_dialog", None),
+                "Robot Sensor Stream",
+                "Sensor functions are unavailable.",
+            )
+            return
+
+        if not bool(enabled):
+            self._stop_robot_dialog_sensor_stream(restore_main=True)
+            return
+
+        self._robot_dialog_previous_main_visualization_enabled = bool(
+            getattr(sensor, "main_visualization_enabled", True)
+        )
+        already_running = bool(
+            getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+            and getattr(sensor, "is_connected", False)
+        )
+        if already_running:
+            self._robot_dialog_sensor_stream_owned = False
+            sensor.set_main_visualization_enabled(False, render=True)
+            started = True
+        else:
+            started = bool(sensor.start_external_visualization_stream())
+            self._robot_dialog_sensor_stream_owned = started
+
+        if not started:
+            error_detail = ""
+            if hasattr(sensor, "get_last_sensor_stream_error"):
+                error_detail = sensor.get_last_sensor_stream_error()
+            self._set_checked_without_signal(button, False)
+            if button is not None:
+                button.setText("Start Sensor")
+                if error_detail:
+                    button.setToolTip(error_detail)
+            if status is not None:
+                status.setText("Sensor could not start (hover for details)")
+                status.setToolTip(
+                    error_detail or "Select a valid sensor serial port."
+                )
+            QMessageBox.information(
+                getattr(self, "_robot_dialog", None),
+                "Robot Sensor Stream",
+                "The sensor stream could not start.\n\n"
+                + (error_detail or "Select a valid sensor serial port.")
+                + "\n\nSelect the sensor model and serial port in the Sensor "
+                "tab, then press Start Sensor here.",
+            )
+            return
+
+        self._robot_dialog_sensor_stream_state = "starting"
+        if button is not None:
+            button.setText("Calibrating…" if not already_running else "Stop Sensor")
+
+        # Rebuild the overlay from the actual selected model, then enable live
+        # signal rendering. No second serial/API reader is created.
+        self._robot_dialog_sensor_preview_model = None
+        self._robot_dialog_sensor_preview_key = None
+        self._robot_dialog_sensor_local_mesh = None
+        map_button = getattr(self, "_robot_dialog_map_sensor_btn", None)
+        if map_button is not None and not map_button.isChecked():
+            map_button.setChecked(True)
+        else:
+            self._refresh_robot_dialog_sensor_overlay(render=True)
+        signal_button = getattr(self, "_robot_dialog_sensor_signal_btn", None)
+        if signal_button is not None and not signal_button.isChecked():
+            signal_button.setChecked(True)
+        else:
+            self._set_robot_dialog_sensor_signal_enabled(True)
+        self._update_robot_dialog_sensor_stream_state()
+
+    def _stop_robot_dialog_sensor_stream(self, restore_main=True):
+        button = getattr(self, "_robot_dialog_sensor_stream_btn", None)
+        sensor = getattr(self.parent, "sensor_functions", None)
+        status = getattr(self, "_robot_dialog_status", None)
+        owned = bool(getattr(self, "_robot_dialog_sensor_stream_owned", False))
+
+        if (
+            getattr(self, "_robot_dialog_admittance_active", False)
+            and getattr(self, "_admittance_source", None) == "robot_dialog"
+        ):
+            self._teardown_robot_dialog_admittance(update_status=False)
+
+        stopped = True
+        if sensor is not None and owned:
+            stopped = bool(sensor.stop_external_visualization_stream())
+        if not stopped:
+            if status is not None:
+                status.setText("Sensor: wait for calibration before stopping")
+            self._set_checked_without_signal(button, True)
+            return False
+
+        previous = getattr(
+            self, "_robot_dialog_previous_main_visualization_enabled", None
+        )
+        if sensor is not None and bool(restore_main) and previous is not None:
+            sensor.set_main_visualization_enabled(bool(previous), render=True)
+        self._robot_dialog_sensor_stream_owned = False
+        self._robot_dialog_previous_main_visualization_enabled = None
+        self._robot_dialog_sensor_stream_state = "idle"
+        self._set_checked_without_signal(button, False)
+        if button is not None:
+            button.setText("Start Sensor")
+        if status is not None:
+            status.setText("Sensor: stopped")
+        return True
+
+    def _stop_sensor_stream_after_calibration(
+        self, sensor, restore_main_enabled, attempts=0
+    ):
+        """Finish closing a robot-owned stream if its calibration was in flight."""
+        if sensor is None:
+            return
+        if bool(getattr(sensor, "_sensor_calibration_in_progress", False)):
+            if int(attempts) < 80:
+                QTimer.singleShot(
+                    250,
+                    lambda: self._stop_sensor_stream_after_calibration(
+                        sensor, restore_main_enabled, int(attempts) + 1
+                    ),
+                )
+            return
+        try:
+            sensor.stop_external_visualization_stream()
+        except Exception:
+            pass
+        try:
+            sensor.set_main_visualization_enabled(
+                bool(restore_main_enabled), render=True
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _robot_sensor_mapping_config_path():
+        return Path(resource_path("config", "robot_sensor_mapping.json"))
+
+    @staticmethod
+    def _default_robot_sensor_mapping_config():
+        return {
+            "link_index": 5,
+            "translation_m": [0.0, 0.0, 0.0],
+            "rotation_deg": [0.0, 0.0, 0.0],
+            "scale": 1.0,
+            "horizontal_scale": 1.0,
+            "vertical_scale": 1.0,
+            "opacity": 0.82,
+            "admittance_max_speed_mps": 0.03,
+            "admittance_contact_threshold_pct": 3.0,
+            "admittance_full_scale_pct": 12.0,
+            "admittance_smoothing_alpha": 0.35,
+            "admittance_reverse_direction": False,
+            "admittance_direction_mode": "surface_normal",
+            "admittance_control_center_m": [0.0, 0.0, 0.0],
+        }
+
+    @classmethod
+    def _normalize_robot_sensor_mapping_config(cls, config):
+        default = cls._default_robot_sensor_mapping_config()
+        if not isinstance(config, dict):
+            config = {}
+
+        try:
+            link_index = int(config.get("link_index", default["link_index"]))
+        except Exception:
+            link_index = default["link_index"]
+        link_index = int(np.clip(link_index, 0, 7))
+
+        def _vector3(name, fallback, minimum, maximum):
+            value = config.get(name, fallback)
+            if not isinstance(value, (list, tuple, np.ndarray)) or len(value) < 3:
+                value = fallback
+            result = []
+            for index in range(3):
+                try:
+                    result.append(float(np.clip(float(value[index]), minimum, maximum)))
+                except Exception:
+                    result.append(float(fallback[index]))
+            return result
+
+        translation_m = _vector3(
+            "translation_m", default["translation_m"], -2.0, 2.0
+        )
+        rotation_deg = _vector3(
+            "rotation_deg", default["rotation_deg"], -180.0, 180.0
+        )
+        try:
+            scale = float(np.clip(float(config.get("scale", default["scale"])), 0.001, 100.0))
+        except Exception:
+            scale = default["scale"]
+        try:
+            horizontal_scale = float(
+                np.clip(
+                    float(
+                        config.get(
+                            "horizontal_scale", default["horizontal_scale"]
+                        )
+                    ),
+                    0.001,
+                    100.0,
+                )
+            )
+        except Exception:
+            horizontal_scale = default["horizontal_scale"]
+        try:
+            vertical_scale = float(
+                np.clip(
+                    float(
+                        config.get("vertical_scale", default["vertical_scale"])
+                    ),
+                    0.001,
+                    100.0,
+                )
+            )
+        except Exception:
+            vertical_scale = default["vertical_scale"]
+        try:
+            opacity = float(np.clip(float(config.get("opacity", default["opacity"])), 0.05, 1.0))
+        except Exception:
+            opacity = default["opacity"]
+
+        def _number(name, minimum, maximum):
+            try:
+                return float(
+                    np.clip(float(config.get(name, default[name])), minimum, maximum)
+                )
+            except Exception:
+                return float(default[name])
+
+        admittance_max_speed_mps = _number(
+            "admittance_max_speed_mps", 0.001, 0.1
+        )
+        admittance_contact_threshold_pct = _number(
+            "admittance_contact_threshold_pct", 0.1, 99.0
+        )
+        admittance_full_scale_pct = _number(
+            "admittance_full_scale_pct", 0.2, 100.0
+        )
+        admittance_full_scale_pct = max(
+            admittance_contact_threshold_pct + 0.1,
+            admittance_full_scale_pct,
+        )
+        admittance_smoothing_alpha = _number(
+            "admittance_smoothing_alpha", 0.01, 1.0
+        )
+        admittance_reverse_direction = bool(
+            config.get(
+                "admittance_reverse_direction",
+                default["admittance_reverse_direction"],
+            )
+        )
+        admittance_direction_mode = str(
+            config.get(
+                "admittance_direction_mode",
+                default["admittance_direction_mode"],
+            )
+        ).strip().lower()
+        if admittance_direction_mode not in ("surface_normal", "centre_directed"):
+            admittance_direction_mode = default["admittance_direction_mode"]
+        admittance_control_center_m = _vector3(
+            "admittance_control_center_m",
+            default["admittance_control_center_m"],
+            -2.0,
+            2.0,
+        )
+
+        return {
+            "link_index": link_index,
+            "translation_m": translation_m,
+            "rotation_deg": rotation_deg,
+            "scale": scale,
+            "horizontal_scale": horizontal_scale,
+            "vertical_scale": vertical_scale,
+            "opacity": opacity,
+            "admittance_max_speed_mps": admittance_max_speed_mps,
+            "admittance_contact_threshold_pct": admittance_contact_threshold_pct,
+            "admittance_full_scale_pct": admittance_full_scale_pct,
+            "admittance_smoothing_alpha": admittance_smoothing_alpha,
+            "admittance_reverse_direction": admittance_reverse_direction,
+            "admittance_direction_mode": admittance_direction_mode,
+            "admittance_control_center_m": admittance_control_center_m,
+        }
+
+    def _robot_sensor_mapping_key(self):
+        sensor = getattr(self.parent, "sensor_functions", None)
+        if sensor is None:
+            return "sensor"
+        model = str(getattr(sensor, "current_model_name", "") or "")
+        rows = int(getattr(sensor, "n_row", 0) or 0)
+        cols = int(getattr(sensor, "n_col", 0) or 0)
+        if not model:
+            try:
+                selected_index = int(self.parent.sensor_choice.currentRow())
+                model = str(sensor.get_sensor_model_name_for_index(selected_index))
+                rows, cols = sensor._sensor_shape_for_model(model)
+            except Exception:
+                model = "sensor"
+        return f"{model}_{rows}x{cols}"
+
+    def _load_robot_sensor_mapping_config(self):
+        default = self._default_robot_sensor_mapping_config()
+        path = self._robot_sensor_mapping_config_path()
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            mappings = payload.get("mappings", {}) if isinstance(payload, dict) else {}
+            return self._normalize_robot_sensor_mapping_config(
+                mappings.get(self._robot_sensor_mapping_key(), default)
+            )
+        except FileNotFoundError:
+            return default
+        except Exception as exc:
+            print(f"[RobotSensorMapping] Failed to load {path}: {exc}")
+            return default
+
+    def _save_robot_sensor_mapping_config(self, config):
+        path = self._robot_sensor_mapping_config_path()
+        payload = {"version": 1, "mappings": {}}
+        try:
+            if path.exists():
+                with path.open("r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    payload.update(loaded)
+                if not isinstance(payload.get("mappings"), dict):
+                    payload["mappings"] = {}
+            normalized = self._normalize_robot_sensor_mapping_config(config)
+            payload["mappings"][self._robot_sensor_mapping_key()] = normalized
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, indent=2)
+            return True
+        except Exception as exc:
+            print(f"[RobotSensorMapping] Failed to save {path}: {exc}")
+            return False
+
+    def _build_selected_sensor_preview_model(self):
+        sensor = getattr(self.parent, "sensor_functions", None)
+        if sensor is None:
+            return None
+        try:
+            selected_index = int(self.parent.sensor_choice.currentRow())
+            model_name = str(sensor.get_sensor_model_name_for_index(selected_index))
+            n_row, n_col = sensor._sensor_shape_for_model(model_name)
+        except Exception as exc:
+            print(f"[RobotSensorMapping] Cannot resolve selected sensor: {exc}")
+            return None
+
+        preview_key = f"{model_name}_{int(n_row)}x{int(n_col)}"
+        cached_key = getattr(self, "_robot_dialog_sensor_preview_key", None)
+        cached_model = getattr(self, "_robot_dialog_sensor_preview_model", None)
+        if cached_model is not None and cached_key == preview_key:
+            return cached_model
+
+        try:
+            # Local import avoids coupling the mesh module to sensor startup.
+            from phd.dependence.func_sensor import SensorModelFactory
+
+            if model_name == "2d":
+                model = SensorModelFactory(
+                    n_row=int(n_row),
+                    n_col=int(n_col),
+                    window_size=int(
+                        getattr(sensor, "sensor_average_window_size", 3) or 3
+                    ),
+                    offset_scale=0.0005,
+                ).build()
+
+                geometry = sensor.get_saved_sensor_geometry_config(
+                    model_name, n_row=n_row, n_col=n_col
+                )
+                effective = sensor._effective_sensor_geometry_config(geometry)
+                bent_coarse, _bent_normals = sensor._bend_points_to_cylinder(
+                    model.points_origin,
+                    effective,
+                    return_normals=True,
+                    base_normals=model.normals,
+                )
+                rotation_deg = effective.get("rotation_deg", [0.0, 0.0, 0.0])
+                pivot = sensor._sensor_geometry_rotation_pivot(bent_coarse)
+                fine_points = sensor._bend_points_to_cylinder(
+                    np.asarray(model._2D_map.points, dtype=float),
+                    effective,
+                    return_normals=False,
+                )
+                model._2D_map.points = sensor._rotate_sensor_geometry(
+                    fine_points, rotation_deg, pivot=pivot
+                )
+            else:
+                model_kwargs = dict(sensor.PREDEFINED_SENSOR_MODELS[model_name])
+                model_kwargs["window_size"] = int(
+                    getattr(sensor, "sensor_average_window_size", 3) or 3
+                )
+                model_kwargs = sensor._apply_saved_reorder_logic(model_kwargs)
+                model = SensorModelFactory(**model_kwargs).build()
+
+            model.current_model_name = model_name
+            self._robot_dialog_sensor_preview_key = preview_key
+            self._robot_dialog_sensor_preview_model = model
+            return model
+        except Exception as exc:
+            print(
+                f"[RobotSensorMapping] Failed to build {preview_key} preview: {exc}"
+            )
+            return None
+
+    def _current_built_sensor_geometry(self):
+        sensor = getattr(self.parent, "sensor_functions", None)
+        source = getattr(sensor, "_2D_map", None) if sensor is not None else None
+        if source is not None and int(getattr(source, "n_points", 0) or 0) > 0:
+            return sensor, source
+
+        preview = self._build_selected_sensor_preview_model()
+        source = getattr(preview, "_2D_map", None) if preview is not None else None
+        if source is None or int(getattr(source, "n_points", 0) or 0) <= 0:
+            return None, None
+        return preview, source
+
+    def _build_robot_dialog_sensor_local_mesh(self):
+        sensor, source = self._current_built_sensor_geometry()
+        if sensor is None or source is None:
+            return None
+        try:
+            mesh = source.copy(deep=True)
+            points = np.asarray(mesh.points, dtype=float)
+            if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+                return None
+            finite = np.all(np.isfinite(points), axis=1)
+            if not np.any(finite):
+                return None
+            center = np.mean(points[finite], axis=0)
+            points = np.array(points, dtype=float, copy=True)
+            points[finite] -= center
+            mesh.points = points
+
+            # Mapping-preview colours encode logical taxel orientation rather
+            # than live signal amplitude: red increases with column, green
+            # increases with row. This makes flips / rotations visible even
+            # for the procedural 2D sensor whose normal display is one colour.
+            mapping_colors = np.tile([0.2, 0.2, 0.72, 1.0], (mesh.n_points, 1))
+            array_positions = list(getattr(sensor, "array_positions", None) or [])
+            n_row = int(getattr(sensor, "n_row", 0) or 0)
+            n_col = int(getattr(sensor, "n_col", 0) or 0)
+            if len(array_positions) == n_row * n_col and n_row > 0 and n_col > 0:
+                for taxel_index, fine_indices in enumerate(array_positions):
+                    row = taxel_index % n_row
+                    col = taxel_index // n_row
+                    colour = [
+                        0.2 + 0.8 * col / max(1, n_col - 1),
+                        0.2 + 0.8 * row / max(1, n_row - 1),
+                        0.72,
+                        1.0,
+                    ]
+                    valid_indices = [
+                        int(index)
+                        for index in fine_indices
+                        if 0 <= int(index) < mesh.n_points
+                    ]
+                    if valid_indices:
+                        mapping_colors[valid_indices] = colour
+            else:
+                colors = getattr(sensor, "colors", None)
+                if colors is not None:
+                    colors = np.asarray(colors)
+                    if len(colors) == mesh.n_points:
+                        mapping_colors = np.array(colors, copy=True)
+            mesh.point_data["sensor_mapping_colors"] = mapping_colors
+            return mesh
+        except Exception as exc:
+            print(f"[RobotSensorMapping] Failed to copy sensor geometry: {exc}")
+            return None
+
+    @staticmethod
+    def _robot_sensor_local_transform(config):
+        config = MyMeshLab._normalize_robot_sensor_mapping_config(config)
+        rx, ry, rz = np.radians(config["rotation_deg"])
+        cx, sx = np.cos(rx), np.sin(rx)
+        cy, sy = np.cos(ry), np.sin(ry)
+        cz, sz = np.cos(rz), np.sin(rz)
+        rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+        rot_y = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+        rot_z = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
+
+        overall_scale = float(config["scale"])
+        local_scale = np.diag(
+            [
+                overall_scale * float(config["horizontal_scale"]),
+                overall_scale * float(config["vertical_scale"]),
+                overall_scale,
+            ]
+        )
+
+        transform = np.eye(4, dtype=float)
+        transform[:3, :3] = (rot_z @ rot_y @ rot_x) @ local_scale
+        transform[:3, 3] = np.asarray(config["translation_m"], dtype=float)
+        return transform
+
+    @staticmethod
+    def _robot_sensor_mapping_link_label(link_index):
+        labels = {
+            0: "Base",
+            1: "Link 1",
+            2: "Link 2",
+            3: "Link 3",
+            4: "Link 4",
+            5: "Link 5",
+            6: "Link 6 / flange",
+            7: "Tool visual",
+        }
+        return labels.get(int(link_index), f"Link {int(link_index)}")
+
+    @staticmethod
+    def _robot_sensor_mount_rotation(config):
+        linear = MyMeshLab._robot_sensor_local_transform(config)[:3, :3]
+        rotation = np.array(linear, dtype=float, copy=True)
+        for index in range(3):
+            norm = float(np.linalg.norm(rotation[:, index]))
+            if norm <= 1e-9:
+                return None
+            rotation[:, index] /= norm
+        return rotation
+
+    def _robot_dialog_control_center_base_point(self, config):
+        config = self._normalize_robot_sensor_mapping_config(config)
+        center_sensor = np.asarray(
+            config["admittance_control_center_m"], dtype=float
+        )
+        mount_rotation = self._robot_sensor_mount_rotation(config)
+        if center_sensor.shape != (3,) or mount_rotation is None:
+            return None
+
+        center_link = (
+            mount_rotation @ center_sensor
+            + np.asarray(config["translation_m"], dtype=float)
+        )
+        applied = getattr(self, "_robot_dialog_applied", None)
+        link_index = int(config["link_index"])
+        link_transform = None
+        if isinstance(applied, (list, tuple)) and link_index < len(applied):
+            link_transform = applied[link_index]
+        if link_transform is None:
+            link_transform = np.eye(4, dtype=float)
+        link_transform = np.asarray(link_transform, dtype=float)
+        return link_transform[:3, :3] @ center_link + link_transform[:3, 3]
+
+    def _update_robot_dialog_control_center(self, config=None, render=False):
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        sensor_actor = getattr(self, "_robot_dialog_sensor_actor", None)
+        config = self._normalize_robot_sensor_mapping_config(
+            config
+            or getattr(self, "_robot_dialog_sensor_mapping_config", None)
+            or self._load_robot_sensor_mapping_config()
+        )
+        if (
+            plotter is None
+            or sensor_actor is None
+            or config["admittance_direction_mode"] != "centre_directed"
+        ):
+            self._hide_robot_dialog_control_center(render=render)
+            return False
+
+        center = self._robot_dialog_control_center_base_point(config)
+        if center is None or not np.all(np.isfinite(center)):
+            self._hide_robot_dialog_control_center(render=render)
+            return False
+
+        center_mesh = getattr(self, "_robot_dialog_control_center_mesh", None)
+        if center_mesh is None:
+            center_mesh = pv.Sphere(radius=0.010, center=center)
+            center_actor = plotter.add_mesh(
+                center_mesh,
+                color="#25e6dc",
+                smooth_shading=True,
+                lighting=False,
+                pickable=False,
+            )
+            label_points = pv.PolyData(np.asarray([center], dtype=float))
+            label_actor = plotter.add_point_labels(
+                label_points,
+                ["Admittance control centre"],
+                font_size=14,
+                text_color="#ffffff",
+                show_points=True,
+                point_color="#25e6dc",
+                point_size=14,
+                shape="rect",
+                shape_color="#164d50",
+                shape_opacity=0.84,
+                render_points_as_spheres=True,
+                always_visible=True,
+                reset_camera=False,
+                render=False,
+            )
+            self._robot_dialog_control_center_mesh = center_mesh
+            self._robot_dialog_control_center_actor = center_actor
+            self._robot_dialog_control_center_label_points = label_points
+            self._robot_dialog_control_center_label_actor = label_actor
+        else:
+            center_mesh.copy_from(pv.Sphere(radius=0.010, center=center))
+            label_points = getattr(
+                self, "_robot_dialog_control_center_label_points", None
+            )
+            if label_points is not None:
+                label_points.points = np.asarray([center], dtype=float)
+                label_points.Modified()
+
+        if render:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+        return True
+
+    def _hide_robot_dialog_control_center(self, render=True):
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        for actor in (
+            getattr(self, "_robot_dialog_control_center_actor", None),
+            getattr(self, "_robot_dialog_control_center_label_actor", None),
+        ):
+            if plotter is None or actor is None:
+                continue
+            try:
+                plotter.remove_actor(actor, reset_camera=False, render=False)
+            except Exception:
+                pass
+        self._robot_dialog_control_center_mesh = None
+        self._robot_dialog_control_center_actor = None
+        self._robot_dialog_control_center_label_points = None
+        self._robot_dialog_control_center_label_actor = None
+        if render and plotter is not None:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+
+    def _mapped_robot_dialog_sensor_mesh(self, config):
+        local_mesh = getattr(self, "_robot_dialog_sensor_local_mesh", None)
+        if local_mesh is None:
+            local_mesh = self._build_robot_dialog_sensor_local_mesh()
+            self._robot_dialog_sensor_local_mesh = local_mesh
+        if local_mesh is None:
+            return None
+
+        config = self._normalize_robot_sensor_mapping_config(config)
+        mapped = local_mesh.copy(deep=True)
+        mapped.transform(self._robot_sensor_local_transform(config), inplace=True)
+
+        applied = getattr(self, "_robot_dialog_applied", None)
+        link_index = int(config["link_index"])
+        link_transform = None
+        if isinstance(applied, (list, tuple)) and link_index < len(applied):
+            link_transform = applied[link_index]
+        if link_transform is None:
+            link_transform = np.eye(4, dtype=float)
+        mapped.transform(np.asarray(link_transform, dtype=float), inplace=True)
+        return mapped
+
+    def _refresh_robot_dialog_sensor_overlay(self, config=None, render=True):
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        if plotter is None:
+            return False
+        if config is None:
+            config = getattr(self, "_robot_dialog_sensor_mapping_config", None)
+        config = self._normalize_robot_sensor_mapping_config(
+            config or self._load_robot_sensor_mapping_config()
+        )
+        mapped = self._mapped_robot_dialog_sensor_mesh(config)
+        if mapped is None:
+            return False
+
+        actor = getattr(self, "_robot_dialog_sensor_actor", None)
+        display_mesh = getattr(self, "_robot_dialog_sensor_mesh", None)
+        opacity = float(config["opacity"])
+        if actor is None or display_mesh is None:
+            display_mesh = mapped
+            kwargs = {
+                "opacity": opacity,
+                "show_edges": True,
+                "edge_color": "#111111",
+                "line_width": 1,
+                "lighting": False,
+                "label": "Mapped sensor",
+            }
+            if "sensor_mapping_colors" in display_mesh.point_data:
+                kwargs.update({"scalars": "sensor_mapping_colors", "rgb": True})
+            else:
+                kwargs.update({"color": "#2fd0b5"})
+            try:
+                if int(getattr(display_mesh, "n_faces_strict", 0) or 0) <= 0:
+                    kwargs.update(
+                        {
+                            "style": "points",
+                            "point_size": 7,
+                            "render_points_as_spheres": True,
+                            "show_edges": False,
+                        }
+                    )
+            except Exception:
+                pass
+            actor = plotter.add_mesh(display_mesh, **kwargs)
+            self._robot_dialog_sensor_actor = actor
+            self._robot_dialog_sensor_mesh = display_mesh
+        else:
+            preserved_colors = None
+            signal_button = getattr(self, "_robot_dialog_sensor_signal_btn", None)
+            if signal_button is not None and signal_button.isChecked():
+                try:
+                    preserved_colors = np.array(
+                        display_mesh.point_data["sensor_mapping_colors"],
+                        copy=True,
+                    )
+                except Exception:
+                    preserved_colors = None
+            try:
+                display_mesh.copy_from(mapped)
+            except Exception:
+                display_mesh.points = np.asarray(mapped.points, dtype=float)
+                try:
+                    display_mesh.Modified()
+                except Exception:
+                    pass
+            if (
+                preserved_colors is not None
+                and len(preserved_colors) == display_mesh.n_points
+            ):
+                display_mesh.point_data["sensor_mapping_colors"] = preserved_colors
+            try:
+                actor.GetProperty().SetOpacity(opacity)
+            except Exception:
+                pass
+
+        self._robot_dialog_sensor_mapping_config = config
+        self._update_robot_dialog_control_center(config, render=False)
+        if render:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+        return True
+
+    def _restore_robot_dialog_sensor_orientation_colours(self, render=True):
+        local_mesh = getattr(self, "_robot_dialog_sensor_local_mesh", None)
+        if local_mesh is None:
+            return False
+        colors = local_mesh.point_data.get("sensor_mapping_colors")
+        if colors is None:
+            return False
+        if not self._apply_robot_dialog_sensor_colours(colors):
+            return False
+        display_mesh = getattr(self, "_robot_dialog_sensor_mesh", None)
+        try:
+            display_mesh.Modified()
+        except Exception:
+            pass
+        if render:
+            plotter = getattr(self, "_robot_dialog_plotter", None)
+            if plotter is not None:
+                try:
+                    plotter.render()
+                except Exception:
+                    pass
+        return True
+
+    def _apply_robot_dialog_sensor_colours(self, colors):
+        """Update the mapped mesh's existing RGBA buffer in place."""
+        display_mesh = getattr(self, "_robot_dialog_sensor_mesh", None)
+        if display_mesh is None:
+            return False
+        colors = np.asarray(colors, dtype=float)
+        if colors.shape != (display_mesh.n_points, 4):
+            return False
+
+        try:
+            current = display_mesh.point_data.get("sensor_mapping_colors")
+            if current is not None and np.shape(current) == colors.shape:
+                current[:] = colors
+                vtk_colors = display_mesh.GetPointData().GetArray(
+                    "sensor_mapping_colors"
+                )
+                if vtk_colors is not None:
+                    vtk_colors.Modified()
+            else:
+                display_mesh.point_data["sensor_mapping_colors"] = np.array(
+                    colors, copy=True
+                )
+            display_mesh.set_active_scalars("sensor_mapping_colors")
+            display_mesh.Modified()
+
+            actor = getattr(self, "_robot_dialog_sensor_actor", None)
+            mapper = actor.GetMapper() if actor is not None else None
+            if mapper is not None:
+                mapper.SelectColorArray("sensor_mapping_colors")
+                mapper.Modified()
+                mapper.Update()
+            return True
+        except Exception as exc:
+            print(f"[RobotSensorMapping] Failed to update live colours: {exc}")
+            return False
+
+    def _robot_dialog_live_sensor_colours(self):
+        sensor = getattr(self.parent, "sensor_functions", None)
+        data_obj = getattr(sensor, "_data", None) if sensor is not None else None
+        matrix = (
+            getattr(data_obj, "diffPerDataAve", None)
+            if data_obj is not None
+            else None
+        )
+        if matrix is None:
+            return None, None
+
+        n_row = int(getattr(sensor, "n_row", 0) or 0)
+        n_col = int(getattr(sensor, "n_col", 0) or 0)
+        values = np.asarray(matrix, dtype=float)
+        if values.shape != (n_row, n_col) or n_row <= 0 or n_col <= 0:
+            return None, None
+
+        display_mesh = getattr(self, "_robot_dialog_sensor_mesh", None)
+        if display_mesh is None:
+            return None, None
+        array_positions = list(getattr(sensor, "array_positions", None) or [])
+        if len(array_positions) != n_row * n_col:
+            return None, None
+
+        colors = np.tile([0.3, 0.3, 0.3, 1.0], (display_mesh.n_points, 1))
+        safe_values = np.nan_to_num(
+            values, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        for col in range(n_col):
+            for row in range(n_row):
+                taxel_index = col * n_row + row
+                sensor_value = float(safe_values[row, col])
+                intensity = float(
+                    np.clip(1.0 - abs(sensor_value) * 150.0 / 255.0, 0.0, 1.0)
+                )
+                colour = [1.0, intensity, intensity, 1.0]
+                valid_indices = [
+                    int(index)
+                    for index in array_positions[taxel_index]
+                    if 0 <= int(index) < display_mesh.n_points
+                ]
+                if valid_indices:
+                    colors[valid_indices] = colour
+        return colors, getattr(data_obj, "frame_sequence", None)
+
+    def _robot_dialog_sensor_signal_tick(self):
+        self._update_robot_dialog_sensor_stream_state()
+        dialog = getattr(self, "_robot_dialog", None)
+        actor = getattr(self, "_robot_dialog_sensor_actor", None)
+        button = getattr(self, "_robot_dialog_sensor_signal_btn", None)
+        if (
+            dialog is None
+            or not dialog.isVisible()
+            or actor is None
+            or button is None
+            or not button.isChecked()
+        ):
+            return
+
+        colors, frame_sequence = self._robot_dialog_live_sensor_colours()
+        if colors is None:
+            return
+        if (
+            frame_sequence is not None
+            and frame_sequence == getattr(
+                self, "_robot_dialog_sensor_last_frame", None
+            )
+        ):
+            return
+
+        display_mesh = getattr(self, "_robot_dialog_sensor_mesh", None)
+        if display_mesh is None or len(colors) != display_mesh.n_points:
+            return
+        if not self._apply_robot_dialog_sensor_colours(colors):
+            return
+        self._robot_dialog_sensor_last_frame = frame_sequence
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        if plotter is not None:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+
+    def _set_robot_dialog_sensor_signal_enabled(self, enabled):
+        timer = getattr(self, "_robot_dialog_sensor_signal_timer", None)
+        actor = getattr(self, "_robot_dialog_sensor_actor", None)
+        self._robot_dialog_sensor_last_frame = None
+        if bool(enabled) and actor is not None:
+            if timer is not None:
+                timer.start()
+            self._robot_dialog_sensor_signal_tick()
+            return
+        if timer is not None:
+            timer.stop()
+        self._restore_robot_dialog_sensor_orientation_colours(render=True)
+
+    def _hide_robot_dialog_sensor_mapping(self):
+        if (
+            getattr(self, "_robot_dialog_admittance_active", False)
+            and getattr(self, "_admittance_source", None) == "robot_dialog"
+        ):
+            self._teardown_robot_dialog_admittance(update_status=False)
+        plotter = getattr(self, "_robot_dialog_plotter", None)
+        actor = getattr(self, "_robot_dialog_sensor_actor", None)
+        timer = getattr(self, "_robot_dialog_sensor_signal_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._hide_robot_dialog_control_center(render=False)
+        if plotter is not None and actor is not None:
+            try:
+                plotter.remove_actor(actor, reset_camera=False)
+            except Exception:
+                pass
+        self._robot_dialog_sensor_actor = None
+        self._robot_dialog_sensor_mesh = None
+        self._robot_dialog_sensor_local_mesh = None
+        self._robot_dialog_sensor_last_frame = None
+        if plotter is not None:
+            try:
+                plotter.render()
+            except Exception:
+                pass
+
+    def _toggle_robot_dialog_sensor_mapping(self, enabled):
+        if not bool(enabled):
+            self._hide_robot_dialog_sensor_mapping()
+            status = getattr(self, "_robot_dialog_status", None)
+            if status is not None:
+                status.setText("Sensor mapping hidden")
+            return True
+
+        sensor, _source = self._current_built_sensor_geometry()
+        if sensor is None:
+            QMessageBox.information(
+                getattr(self, "_robot_dialog", None),
+                "Map Sensor",
+                "The selected sensor geometry could not be created.\n\n"
+                "Check the selected sensor model and its mesh/signal resources.",
+            )
+            return False
+
+        self._robot_dialog_sensor_local_mesh = None
+        config = self._load_robot_sensor_mapping_config()
+        if not self._refresh_robot_dialog_sensor_overlay(config=config, render=True):
+            QMessageBox.warning(
+                getattr(self, "_robot_dialog", None),
+                "Map Sensor",
+                "The current sensor geometry could not be mapped.",
+            )
+            return False
+
+        status = getattr(self, "_robot_dialog_status", None)
+        if status is not None:
+            status.setText(
+                f"Sensor mapped to {self._robot_sensor_mapping_link_label(config['link_index'])}"
+            )
+        signal_button = getattr(self, "_robot_dialog_sensor_signal_btn", None)
+        if signal_button is not None:
+            self._set_robot_dialog_sensor_signal_enabled(
+                signal_button.isChecked()
+            )
+        return True
+
+    def _open_robot_dialog_sensor_mapping_dialog(self):
+        parent_dialog = getattr(self, "_robot_dialog", None)
+        if parent_dialog is None:
+            return
+        sensor, _source = self._current_built_sensor_geometry()
+        if sensor is None:
+            QMessageBox.information(
+                parent_dialog,
+                "Sensor Mount",
+                "The selected sensor geometry could not be created.",
+            )
+            return
+
+        existing = getattr(self, "_robot_dialog_sensor_mapping_dialog", None)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                self._robot_dialog_sensor_mapping_dialog = None
+
+        config = self._normalize_robot_sensor_mapping_config(
+            getattr(self, "_robot_dialog_sensor_mapping_config", None)
+            or self._load_robot_sensor_mapping_config()
+        )
+        dialog = QDialog(parent_dialog)
+        dialog.setWindowTitle(
+            f"Sensor Mount Mapping — {self._robot_sensor_mapping_key()}"
+        )
+        dialog.setModal(False)
+        dialog.resize(520, 760)
+        layout = QVBoxLayout(dialog)
+        description = QLabel(
+            "Tune the transform from the selected robot link to the center of the "
+            "currently built sensor. Units: metres and degrees. In the preview, "
+            "red increases by sensor column and green increases by sensor row."
+        )
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        form = QFormLayout()
+        link_combo = QComboBox(dialog)
+        for link_index in range(8):
+            link_combo.addItem(
+                self._robot_sensor_mapping_link_label(link_index), link_index
+            )
+        selected = link_combo.findData(int(config["link_index"]))
+        link_combo.setCurrentIndex(max(0, selected))
+        form.addRow("Parent link:", link_combo)
+
+        def _spin(value, minimum, maximum, step, decimals):
+            widget = QDoubleSpinBox(dialog)
+            widget.setRange(float(minimum), float(maximum))
+            widget.setDecimals(int(decimals))
+            widget.setSingleStep(float(step))
+            widget.setValue(float(value))
+            return widget
+
+        tx, ty, tz = config["translation_m"]
+        rx, ry, rz = config["rotation_deg"]
+        tx_spin = _spin(tx, -2.0, 2.0, 0.005, 4)
+        ty_spin = _spin(ty, -2.0, 2.0, 0.005, 4)
+        tz_spin = _spin(tz, -2.0, 2.0, 0.005, 4)
+        rx_spin = _spin(rx, -180.0, 180.0, 1.0, 2)
+        ry_spin = _spin(ry, -180.0, 180.0, 1.0, 2)
+        rz_spin = _spin(rz, -180.0, 180.0, 1.0, 2)
+        scale_spin = _spin(config["scale"], 0.001, 100.0, 0.05, 4)
+        horizontal_scale_spin = _spin(
+            config["horizontal_scale"], 0.001, 100.0, 0.05, 4
+        )
+        vertical_scale_spin = _spin(
+            config["vertical_scale"], 0.001, 100.0, 0.05, 4
+        )
+        horizontal_scale_spin.setToolTip(
+            "Stretch the sensor along its local horizontal X direction."
+        )
+        vertical_scale_spin.setToolTip(
+            "Stretch the sensor along its local vertical Y direction."
+        )
+        opacity_spin = _spin(config["opacity"], 0.05, 1.0, 0.05, 2)
+        admittance_speed_spin = _spin(
+            config["admittance_max_speed_mps"], 0.001, 0.1, 0.005, 3
+        )
+        admittance_threshold_spin = _spin(
+            config["admittance_contact_threshold_pct"], 0.1, 99.0, 0.5, 2
+        )
+        admittance_full_scale_spin = _spin(
+            config["admittance_full_scale_pct"], 0.2, 100.0, 0.5, 2
+        )
+        admittance_smoothing_spin = _spin(
+            config["admittance_smoothing_alpha"], 0.01, 1.0, 0.05, 2
+        )
+        admittance_mode_combo = QComboBox(dialog)
+        admittance_mode_combo.addItem("Surface Normal", "surface_normal")
+        admittance_mode_combo.addItem("Centre-Directed", "centre_directed")
+        selected_mode = admittance_mode_combo.findData(
+            config["admittance_direction_mode"]
+        )
+        admittance_mode_combo.setCurrentIndex(max(0, selected_mode))
+        center_x, center_y, center_z = config["admittance_control_center_m"]
+        center_x_spin = _spin(center_x, -2.0, 2.0, 0.005, 4)
+        center_y_spin = _spin(center_y, -2.0, 2.0, 0.005, 4)
+        center_z_spin = _spin(center_z, -2.0, 2.0, 0.005, 4)
+        btn_geometry_center = QPushButton("Use Geometry Centre", dialog)
+        admittance_reverse_check = QCheckBox("Reverse motion direction", dialog)
+        admittance_reverse_check.setChecked(
+            bool(config["admittance_reverse_direction"])
+        )
+        admittance_speed_spin.setToolTip(
+            "Safety-limited maximum linear TCP speed. Hard limit: 0.1 m/s."
+        )
+        admittance_threshold_spin.setToolTip(
+            "Peak sensor pressure below this value is treated as no contact."
+        )
+        admittance_full_scale_spin.setToolTip(
+            "Peak pressure that reaches the configured maximum speed."
+        )
+        admittance_smoothing_spin.setToolTip(
+            "New-command weight from 0.01 (smooth) to 1.0 (immediate)."
+        )
+        admittance_mode_combo.setToolTip(
+            "Surface Normal follows the contacted taxel normal. Centre-Directed "
+            "moves from the pressure centroid toward the configured control centre."
+        )
+        for center_spin, axis in zip(
+            (center_x_spin, center_y_spin, center_z_spin), "XYZ"
+        ):
+            center_spin.setToolTip(
+                f"Control-centre {axis} coordinate in mapped sensor-local metres, "
+                "after sensor scaling and before mount rotation."
+            )
+        btn_geometry_center.setToolTip(
+            "Estimate the cylinder/surface centre from the current sensor points "
+            "and normals. The value remains editable before Apply or Save."
+        )
+        admittance_reverse_check.setToolTip(
+            "Default motion follows an inward push (-surface normal). "
+            "Enable this if the mapped sensor normal points the other way."
+        )
+
+        form.addRow("X (m):", tx_spin)
+        form.addRow("Y (m):", ty_spin)
+        form.addRow("Z (m):", tz_spin)
+        form.addRow("Roll / Rx (deg):", rx_spin)
+        form.addRow("Pitch / Ry (deg):", ry_spin)
+        form.addRow("Yaw / Rz (deg):", rz_spin)
+        form.addRow("Overall scale:", scale_spin)
+        form.addRow("Horizontal stretch (X):", horizontal_scale_spin)
+        form.addRow("Vertical stretch (Y):", vertical_scale_spin)
+        form.addRow("Opacity:", opacity_spin)
+        form.addRow(QLabel("Pressure Admittance"))
+        form.addRow("Direction mode:", admittance_mode_combo)
+        form.addRow("Control centre X (m):", center_x_spin)
+        form.addRow("Control centre Y (m):", center_y_spin)
+        form.addRow("Control centre Z (m):", center_z_spin)
+        form.addRow("Centre helper:", btn_geometry_center)
+        form.addRow("Maximum speed (m/s):", admittance_speed_spin)
+        form.addRow("Contact threshold (%):", admittance_threshold_spin)
+        form.addRow("Full-speed pressure (%):", admittance_full_scale_spin)
+        form.addRow("Velocity smoothing:", admittance_smoothing_spin)
+        form.addRow("Direction:", admittance_reverse_check)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        btn_apply = QPushButton("Apply", dialog)
+        btn_save = QPushButton("Save", dialog)
+        btn_reset_mapping = QPushButton("Reset", dialog)
+        btn_close = QPushButton("Close", dialog)
+        buttons.addWidget(btn_apply)
+        buttons.addWidget(btn_save)
+        buttons.addWidget(btn_reset_mapping)
+        buttons.addStretch(1)
+        buttons.addWidget(btn_close)
+        layout.addLayout(buttons)
+
+        def _widget_config():
+            return self._normalize_robot_sensor_mapping_config(
+                {
+                    "link_index": link_combo.currentData(),
+                    "translation_m": [
+                        tx_spin.value(),
+                        ty_spin.value(),
+                        tz_spin.value(),
+                    ],
+                    "rotation_deg": [
+                        rx_spin.value(),
+                        ry_spin.value(),
+                        rz_spin.value(),
+                    ],
+                    "scale": scale_spin.value(),
+                    "horizontal_scale": horizontal_scale_spin.value(),
+                    "vertical_scale": vertical_scale_spin.value(),
+                    "opacity": opacity_spin.value(),
+                    "admittance_max_speed_mps": admittance_speed_spin.value(),
+                    "admittance_contact_threshold_pct": admittance_threshold_spin.value(),
+                    "admittance_full_scale_pct": admittance_full_scale_spin.value(),
+                    "admittance_smoothing_alpha": admittance_smoothing_spin.value(),
+                    "admittance_reverse_direction": admittance_reverse_check.isChecked(),
+                    "admittance_direction_mode": admittance_mode_combo.currentData(),
+                    "admittance_control_center_m": [
+                        center_x_spin.value(),
+                        center_y_spin.value(),
+                        center_z_spin.value(),
+                    ],
+                }
+            )
+
+        def _use_geometry_center():
+            suggestion_config = _widget_config()
+            suggested = self._suggest_robot_sensor_control_center_m(
+                sensor, suggestion_config
+            )
+            for widget, value in zip(
+                (center_x_spin, center_y_spin, center_z_spin), suggested
+            ):
+                widget.setValue(float(value))
+
+        def _on_mode_changed(_index):
+            center_values = np.array(
+                [
+                    center_x_spin.value(),
+                    center_y_spin.value(),
+                    center_z_spin.value(),
+                ],
+                dtype=float,
+            )
+            if (
+                admittance_mode_combo.currentData() == "centre_directed"
+                and float(np.linalg.norm(center_values)) <= 1e-9
+            ):
+                _use_geometry_center()
+
+        def _ensure_button_checked():
+            button = getattr(self, "_robot_dialog_map_sensor_btn", None)
+            if button is not None and not button.isChecked():
+                button.blockSignals(True)
+                button.setChecked(True)
+                button.blockSignals(False)
+
+        def _apply():
+            new_config = _widget_config()
+            if getattr(self, "_robot_dialog_admittance_active", False):
+                self._teardown_robot_dialog_admittance(
+                    status_text="Pressure admittance stopped: mapping changed"
+                )
+            self._robot_dialog_sensor_mapping_config = new_config
+            self._robot_dialog_sensor_local_mesh = None
+            if self._refresh_robot_dialog_sensor_overlay(new_config, render=True):
+                _ensure_button_checked()
+                signal_button = getattr(
+                    self, "_robot_dialog_sensor_signal_btn", None
+                )
+                if signal_button is not None:
+                    self._set_robot_dialog_sensor_signal_enabled(
+                        signal_button.isChecked()
+                    )
+                status = getattr(self, "_robot_dialog_status", None)
+                if status is not None:
+                    status.setText(
+                        "Sensor preview: "
+                        + self._robot_sensor_mapping_link_label(
+                            new_config["link_index"]
+                        )
+                    )
+
+        def _save():
+            _apply()
+            new_config = _widget_config()
+            if self._save_robot_sensor_mapping_config(new_config):
+                status = getattr(self, "_robot_dialog_status", None)
+                if status is not None:
+                    status.setText(
+                        f"Sensor mapping saved: {self._robot_sensor_mapping_key()}"
+                    )
+            else:
+                QMessageBox.warning(dialog, "Sensor Mount", "Failed to save mapping.")
+
+        def _reset():
+            reset_config = self._default_robot_sensor_mapping_config()
+            link_combo.setCurrentIndex(link_combo.findData(reset_config["link_index"]))
+            for widget, value in zip(
+                (tx_spin, ty_spin, tz_spin), reset_config["translation_m"]
+            ):
+                widget.setValue(value)
+            for widget, value in zip(
+                (rx_spin, ry_spin, rz_spin), reset_config["rotation_deg"]
+            ):
+                widget.setValue(value)
+            scale_spin.setValue(reset_config["scale"])
+            horizontal_scale_spin.setValue(reset_config["horizontal_scale"])
+            vertical_scale_spin.setValue(reset_config["vertical_scale"])
+            opacity_spin.setValue(reset_config["opacity"])
+            admittance_speed_spin.setValue(
+                reset_config["admittance_max_speed_mps"]
+            )
+            admittance_threshold_spin.setValue(
+                reset_config["admittance_contact_threshold_pct"]
+            )
+            admittance_full_scale_spin.setValue(
+                reset_config["admittance_full_scale_pct"]
+            )
+            admittance_smoothing_spin.setValue(
+                reset_config["admittance_smoothing_alpha"]
+            )
+            admittance_reverse_check.setChecked(
+                reset_config["admittance_reverse_direction"]
+            )
+            admittance_mode_combo.setCurrentIndex(
+                admittance_mode_combo.findData(
+                    reset_config["admittance_direction_mode"]
+                )
+            )
+            for widget, value in zip(
+                (center_x_spin, center_y_spin, center_z_spin),
+                reset_config["admittance_control_center_m"],
+            ):
+                widget.setValue(value)
+            _apply()
+
+        btn_geometry_center.clicked.connect(_use_geometry_center)
+        admittance_mode_combo.currentIndexChanged.connect(_on_mode_changed)
+        _on_mode_changed(admittance_mode_combo.currentIndex())
+        btn_apply.clicked.connect(_apply)
+        btn_save.clicked.connect(_save)
+        btn_reset_mapping.clicked.connect(_reset)
+        btn_close.clicked.connect(dialog.close)
+        dialog.finished.connect(
+            lambda _result: setattr(
+                self, "_robot_dialog_sensor_mapping_dialog", None
+            )
+        )
+
+        self._robot_dialog_sensor_mapping_dialog = dialog
+        dialog.show()
+        _apply()
+
+    # ------------------------------------------------------------------
+    # Pressure-based normal admittance
+    # ------------------------------------------------------------------
+    def _ensure_pressure_admittance_timer(self):
+        timer = getattr(self, "_robot_dialog_admittance_timer", None)
+        if timer is not None:
+            try:
+                timer.isActive()
+                return timer
+            except RuntimeError:
+                pass
+        timer = QTimer(self.parent)
+        timer.setInterval(33)
+        timer.timeout.connect(self._robot_dialog_admittance_tick)
+        self._robot_dialog_admittance_timer = timer
+        return timer
+
+    def _set_pressure_admittance_status(self, text):
+        message = str(text or "")
+        robot_status = getattr(self, "_robot_dialog_status", None)
+        if robot_status is not None:
+            try:
+                robot_status.setText(message)
+            except RuntimeError:
+                pass
+        ai_status = getattr(self.parent, "admittance_control_status_label", None)
+        if ai_status is not None:
+            ai_status.setText(message)
+
+    def _sync_pressure_admittance_buttons(self, active, pending=False):
+        checked = bool(active or pending)
+        self.parent._admittance_control_active = bool(active)
+        robot_button = getattr(self, "_robot_dialog_admittance_btn", None)
+        self._set_checked_without_signal(robot_button, checked)
+
+        ai_button = getattr(self.parent, "admittance_control_button", None)
+        self._set_checked_without_signal(ai_button, checked)
+        if ai_button is not None:
+            ai_button.setText(
+                "Starting Admittance Control..."
+                if pending
+                else (
+                    "Stop Admittance Control"
+                    if active
+                    else "Start Admittance Control"
+                )
+            )
+            set_active = getattr(self.parent, "_set_button_active", None)
+            if callable(set_active):
+                set_active(ai_button, checked)
+
+    def is_pressure_admittance_active(self):
+        return bool(getattr(self, "_robot_dialog_admittance_active", False))
+
+    @staticmethod
+    def _admittance_speed_from_pressure(
+        peak_pressure, contact_threshold, full_scale_pressure, max_speed
+    ):
+        """Map peak sensor pressure to a bounded linear speed."""
+        try:
+            peak = max(0.0, float(peak_pressure))
+            threshold = max(0.0, float(contact_threshold))
+            full_scale = max(threshold + 1e-6, float(full_scale_pressure))
+            speed_limit = float(np.clip(float(max_speed), 0.0, 0.1))
+        except Exception:
+            return 0.0
+        ratio = float(np.clip((peak - threshold) / (full_scale - threshold), 0.0, 1.0))
+        return speed_limit * ratio
+
+    def _robot_dialog_other_velocity_control_name(self):
+        """Return the name of another live robot-motion source, if any."""
+        if getattr(self, "_robot_dialog_drag_active", False):
+            return "3D robot drag control"
+
+        parent = getattr(self, "parent", None)
+        if parent is not None and bool(getattr(parent, "_direct_finger_active", False)):
+            return "Direct Finger Motion"
+        if parent is not None and bool(
+            getattr(parent, "_ai_direct_finger_robot_active", False)
+        ):
+            return "AI DFM recording with robot motion"
+
+        main_window = None
+        if parent is not None:
+            try:
+                main_window = parent.window()
+            except Exception:
+                main_window = None
+        if main_window is not None and bool(
+            getattr(main_window, "_keyboard_tool_velocity_enabled", False)
+        ):
+            return "keyboard tool velocity"
+
+        sensor = getattr(parent, "sensor_functions", None)
+        helper_specs = (
+            ("direct_finger_motion_class", "Direct Finger Motion", "is_running"),
+            ("console_control_class", "console sensor control", "is_running"),
+            ("proximity_control_class", "proximity control", "is_running"),
+            (
+                "threelevel_hierarchical_transformer_class",
+                "three-level robot control",
+                "is_recognizing_gesture",
+            ),
+        )
+        for attr_name, label, state_name in helper_specs:
+            helper = getattr(sensor, attr_name, None) if sensor is not None else None
+            if helper is None or helper.__class__.__name__.startswith("_"):
+                continue
+            if bool(getattr(helper, state_name, False)):
+                return label
+
+        ai_record = (
+            getattr(sensor, "ai_direct_finger_motion_class", None)
+            if sensor is not None
+            else None
+        )
+        if (
+            ai_record is not None
+            and not ai_record.__class__.__name__.startswith("_")
+            and bool(getattr(ai_record, "is_running", False))
+            and bool(getattr(ai_record, "send_robot_commands", False))
+        ):
+            return "AI DFM recording with robot motion"
+
+        ai_execute = (
+            getattr(sensor, "ai_direct_finger_motion_execution_class", None)
+            if sensor is not None
+            else None
+        )
+        if (
+            ai_execute is not None
+            and not ai_execute.__class__.__name__.startswith("_")
+            and bool(getattr(ai_execute, "is_running", False))
+            and not bool(getattr(ai_execute, "dry_run_predictions_only", True))
+        ):
+            return "AI Direct Finger Motion execution"
+        return None
+
+    @staticmethod
+    def _interpolate_sensor_grid_vector(vectors, n_row, n_col, estimate):
+        values = np.asarray(vectors, dtype=float)
+        if values.shape != (int(n_row) * int(n_col), 3):
+            return None
+        try:
+            center_row = float(
+                np.clip(float(estimate["center_row"]), 0.0, int(n_row) - 1)
+            )
+            center_col = float(
+                np.clip(float(estimate["center_col"]), 0.0, int(n_col) - 1)
+            )
+        except Exception:
+            return None
+
+        row0 = int(np.floor(center_row))
+        col0 = int(np.floor(center_col))
+        row1 = min(row0 + 1, int(n_row) - 1)
+        col1 = min(col0 + 1, int(n_col) - 1)
+        row_fraction = center_row - row0
+        col_fraction = center_col - col0
+
+        def _at(row, col):
+            return values[col * int(n_row) + row]
+
+        result = (
+            _at(row0, col0)
+            * (1.0 - row_fraction)
+            * (1.0 - col_fraction)
+            + _at(row1, col0) * row_fraction * (1.0 - col_fraction)
+            + _at(row0, col1) * (1.0 - row_fraction) * col_fraction
+            + _at(row1, col1) * row_fraction * col_fraction
+        )
+        if not np.all(np.isfinite(result)):
+            return None
+        return np.asarray(result, dtype=float)
+
+    @staticmethod
+    def _sensor_geometry_visual_center(sensor):
+        source = getattr(sensor, "_2D_map", None)
+        points = np.asarray(getattr(source, "points", None), dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            points = np.asarray(getattr(sensor, "points_origin", None), dtype=float)
+        if points.ndim != 2 or points.shape[1] != 3 or len(points) == 0:
+            return None
+        finite = points[np.all(np.isfinite(points), axis=1)]
+        if len(finite) == 0:
+            return None
+        return np.mean(finite, axis=0)
+
+    def _robot_dialog_contact_point_sensor_m(self, sensor, estimate, config):
+        n_row = int(getattr(sensor, "n_row", 0) or 0)
+        n_col = int(getattr(sensor, "n_col", 0) or 0)
+        point = self._interpolate_sensor_grid_vector(
+            getattr(sensor, "points_origin", None), n_row, n_col, estimate
+        )
+        visual_center = self._sensor_geometry_visual_center(sensor)
+        if point is None or visual_center is None:
+            return None
+
+        config = self._normalize_robot_sensor_mapping_config(config)
+        scale = float(config["scale"])
+        local_scale = np.diag(
+            [
+                scale * float(config["horizontal_scale"]),
+                scale * float(config["vertical_scale"]),
+                scale,
+            ]
+        )
+        return local_scale @ (point - visual_center)
+
+    def _suggest_robot_sensor_control_center_m(self, sensor, config):
+        points = np.asarray(getattr(sensor, "points_origin", None), dtype=float)
+        normals = np.asarray(getattr(sensor, "normals", None), dtype=float)
+        visual_center = self._sensor_geometry_visual_center(sensor)
+        if (
+            points.ndim != 2
+            or points.shape[1] != 3
+            or normals.shape != points.shape
+            or visual_center is None
+        ):
+            return np.zeros(3, dtype=float)
+
+        normal_norms = np.linalg.norm(normals, axis=1)
+        valid = (
+            np.all(np.isfinite(points), axis=1)
+            & np.all(np.isfinite(normals), axis=1)
+            & np.isfinite(normal_norms)
+            & (normal_norms > 1e-9)
+        )
+        if not np.any(valid):
+            return np.zeros(3, dtype=float)
+
+        valid_points = points[valid]
+        valid_normals = normals[valid] / normal_norms[valid, None]
+        matrix = np.zeros((3, 3), dtype=float)
+        vector = np.zeros(3, dtype=float)
+        identity = np.eye(3, dtype=float)
+        for point, normal in zip(valid_points, valid_normals):
+            projection = identity - np.outer(normal, normal)
+            matrix += projection
+            vector += projection @ point
+
+        if np.linalg.matrix_rank(matrix, tol=1e-8) >= 3:
+            raw_center = np.linalg.lstsq(matrix, vector, rcond=None)[0]
+        else:
+            mean_normal = np.mean(valid_normals, axis=0)
+            mean_norm = float(np.linalg.norm(mean_normal))
+            if mean_norm <= 1e-9:
+                mean_normal = np.array([0.0, 0.0, 1.0], dtype=float)
+            else:
+                mean_normal /= mean_norm
+            spans = np.ptp(valid_points, axis=0)
+            positive_spans = spans[spans > 1e-6]
+            depth = (
+                0.5 * float(np.min(positive_spans))
+                if len(positive_spans)
+                else 0.05
+            )
+            raw_center = visual_center - mean_normal * depth
+
+        config = self._normalize_robot_sensor_mapping_config(config)
+        scale = float(config["scale"])
+        local_scale = np.diag(
+            [
+                scale * float(config["horizontal_scale"]),
+                scale * float(config["vertical_scale"]),
+                scale,
+            ]
+        )
+        suggested = local_scale @ (raw_center - visual_center)
+        if not np.all(np.isfinite(suggested)):
+            return np.zeros(3, dtype=float)
+        return suggested
+
+    def _robot_dialog_centre_direction_base(self, sensor, estimate, joints, config):
+        config = self._normalize_robot_sensor_mapping_config(config)
+        contact_sensor = self._robot_dialog_contact_point_sensor_m(
+            sensor, estimate, config
+        )
+        if contact_sensor is None:
+            return None
+        center_sensor = np.asarray(
+            config["admittance_control_center_m"], dtype=float
+        )
+        direction_sensor = center_sensor - contact_sensor
+        direction_norm = float(np.linalg.norm(direction_sensor))
+        if direction_norm <= 1e-9 or not np.all(np.isfinite(direction_sensor)):
+            return None
+        direction_sensor /= direction_norm
+
+        joints_array = np.asarray(list(joints)[:6], dtype=float)
+        if joints_array.shape != (6,) or not np.all(np.isfinite(joints_array)):
+            return None
+        chain = self._compute_kinematic_chain(joints_array)
+        link_transform = chain[int(config["link_index"])]
+        if link_transform is None:
+            link_transform = np.eye(4, dtype=float)
+        mount_rotation = self._robot_sensor_mount_rotation(config)
+        if mount_rotation is None:
+            return None
+        base_direction = (
+            np.asarray(link_transform, dtype=float)[:3, :3]
+            @ mount_rotation
+            @ direction_sensor
+        )
+        base_norm = float(np.linalg.norm(base_direction))
+        if base_norm <= 1e-9 or not np.all(np.isfinite(base_direction)):
+            return None
+        return base_direction / base_norm
+
+    def _robot_dialog_admittance_direction_base(
+        self, sensor, estimate, joints, config
+    ):
+        config = self._normalize_robot_sensor_mapping_config(config)
+        mode = config["admittance_direction_mode"]
+        if mode == "centre_directed":
+            direction = self._robot_dialog_centre_direction_base(
+                sensor, estimate, joints, config
+            )
+        else:
+            surface_normal = self._robot_dialog_contact_surface_normal_base(
+                sensor, estimate, joints, config
+            )
+            direction = None if surface_normal is None else -surface_normal
+        if direction is None:
+            return None
+        if config["admittance_reverse_direction"]:
+            direction = -direction
+        return direction
+
+    def _robot_dialog_contact_surface_normal_base(self, sensor, estimate, joints, config):
+        """Transform the contacted taxel's surface normal into the base frame."""
+        n_row = int(getattr(sensor, "n_row", 0) or 0)
+        n_col = int(getattr(sensor, "n_col", 0) or 0)
+        normals = np.asarray(getattr(sensor, "normals", None), dtype=float)
+        if n_row <= 0 or n_col <= 0 or normals.shape != (n_row * n_col, 3):
+            return None
+
+        try:
+            center_row = float(
+                np.clip(float(estimate["center_row"]), 0.0, n_row - 1)
+            )
+            center_col = float(
+                np.clip(float(estimate["center_col"]), 0.0, n_col - 1)
+            )
+            row0 = int(np.floor(center_row))
+            col0 = int(np.floor(center_col))
+            row1 = min(row0 + 1, n_row - 1)
+            col1 = min(col0 + 1, n_col - 1)
+            row_fraction = center_row - row0
+            col_fraction = center_col - col0
+
+            def _normal_at(row, col):
+                return normals[col * n_row + row]
+
+            local_normal = (
+                _normal_at(row0, col0)
+                * (1.0 - row_fraction)
+                * (1.0 - col_fraction)
+                + _normal_at(row1, col0)
+                * row_fraction
+                * (1.0 - col_fraction)
+                + _normal_at(row0, col1)
+                * (1.0 - row_fraction)
+                * col_fraction
+                + _normal_at(row1, col1) * row_fraction * col_fraction
+            )
+            if not np.all(np.isfinite(local_normal)):
+                return None
+            local_norm = float(np.linalg.norm(local_normal))
+            if local_norm <= 1e-9:
+                return None
+            local_normal /= local_norm
+
+            joints_array = np.asarray(list(joints)[:6], dtype=float)
+            if joints_array.shape != (6,) or not np.all(np.isfinite(joints_array)):
+                return None
+            chain = self._compute_kinematic_chain(joints_array)
+            config = self._normalize_robot_sensor_mapping_config(config)
+            link_index = int(config["link_index"])
+            link_transform = chain[link_index]
+            if link_transform is None:
+                link_transform = np.eye(4, dtype=float)
+            mount_linear = self._robot_sensor_local_transform(config)[:3, :3]
+            combined_linear = np.asarray(link_transform, dtype=float)[:3, :3] @ mount_linear
+            base_normal = np.linalg.inv(combined_linear).T @ local_normal
+            base_norm = float(np.linalg.norm(base_normal))
+            if base_norm <= 1e-9 or not np.all(np.isfinite(base_normal)):
+                return None
+            return base_normal / base_norm
+        except Exception:
+            return None
+
+    def _send_robot_dialog_admittance_velocity(self, velocity):
+        api = getattr(self.parent, "robot_api", None)
+        if api is None:
+            return False
+        linear = [float(value) for value in np.asarray(velocity, dtype=float)[:3]]
+        try:
+            if hasattr(api, "send_end_effector_velocity_in_frame"):
+                return bool(
+                    api.send_end_effector_velocity_in_frame(
+                        linear,
+                        (0.0, 0.0, 0.0),
+                        frame="base",
+                        ensure_mode=False,
+                    )
+                )
+            command = linear + [0.0, 0.0, 0.0]
+            if hasattr(api, "send_end_effector_velocity"):
+                return bool(api.send_end_effector_velocity(command, ensure_mode=False))
+            if hasattr(api, "send_request") and hasattr(
+                api, "set_end_effector_velocity"
+            ):
+                return bool(api.send_request(api.set_end_effector_velocity(command)))
+        except Exception as exc:
+            print(f"[PressureAdmittance] Velocity send failed: {exc}")
+        return False
+
+    def _toggle_robot_dialog_admittance(
+        self,
+        enabled,
+        require_visual_mapping=True,
+        source="robot_dialog",
+        dialog_parent=None,
+    ):
+        button = (
+            getattr(self, "_robot_dialog_admittance_btn", None)
+            if source == "robot_dialog"
+            else getattr(self.parent, "admittance_control_button", None)
+        )
+        dialog = dialog_parent or getattr(self, "_robot_dialog", None) or self.parent
+        if not bool(enabled):
+            self._teardown_robot_dialog_admittance()
+            return
+
+        sensor = getattr(self.parent, "sensor_functions", None)
+        sensor_running = bool(
+            sensor is not None
+            and getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+            and getattr(sensor, "is_connected", False)
+        )
+        map_button = getattr(self, "_robot_dialog_map_sensor_btn", None)
+        if not sensor_running:
+            self._set_checked_without_signal(button, False)
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                "Pressure admittance: sensor is not calibrated"
+            )
+            QMessageBox.information(
+                dialog,
+                "Pressure Admittance",
+                "Start and calibrate the selected sensor before enabling admittance control.",
+            )
+            return
+        if (
+            require_visual_mapping
+            and (
+                map_button is None
+                or not map_button.isChecked()
+                or getattr(self, "_robot_dialog_sensor_actor", None) is None
+            )
+        ):
+            self._set_checked_without_signal(button, False)
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                "Pressure admittance: sensor mapping is not active"
+            )
+            QMessageBox.information(
+                dialog,
+                "Pressure Admittance",
+                "Map the sensor to the correct robot link before enabling motion.",
+            )
+            return
+
+        conflict = self._robot_dialog_other_velocity_control_name()
+        if conflict:
+            self._set_checked_without_signal(button, False)
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                f"Pressure admittance: stop {conflict} first"
+            )
+            QMessageBox.warning(
+                dialog,
+                "Pressure Admittance",
+                f"Stop {conflict} before enabling pressure admittance.",
+            )
+            return
+
+        api = getattr(self.parent, "robot_api", None)
+        required = bool(
+            api is not None
+            and hasattr(api, "get_current_positions")
+            and hasattr(api, "enter_end_effector_velocity_mode")
+            and hasattr(api, "exit_end_effector_velocity_mode")
+            and (
+                hasattr(api, "send_end_effector_velocity_in_frame")
+                or hasattr(api, "send_end_effector_velocity")
+            )
+        )
+        if not required:
+            self._set_checked_without_signal(button, False)
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                "Pressure admittance: robot velocity API unavailable"
+            )
+            return
+
+        if not getattr(self, "_robot_dialog_admittance_confirmed", False):
+            config = self._normalize_robot_sensor_mapping_config(
+                (
+                    getattr(self, "_robot_dialog_sensor_mapping_config", None)
+                    if source == "robot_dialog"
+                    else None
+                )
+                or self._load_robot_sensor_mapping_config()
+            )
+            box = QMessageBox(dialog)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Pressure Admittance: real robot will move")
+            direction_label = (
+                "Centre-Directed"
+                if config["admittance_direction_mode"] == "centre_directed"
+                else "Surface Normal"
+            )
+            box.setText(
+                "Touching the mapped sensor will command the REAL robot in velocity mode.\n\n"
+                f"Direction mode: {direction_label}\n"
+                f"Maximum speed: {config['admittance_max_speed_mps']:.3f} m/s\n"
+                "No contact sends zero velocity immediately. Keep an emergency stop ready."
+            )
+            box.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            box.setDefaultButton(QMessageBox.Cancel)
+            if box.exec_() != QMessageBox.Ok:
+                self._set_checked_without_signal(button, False)
+                self._sync_pressure_admittance_buttons(False)
+                self._set_pressure_admittance_status(
+                    "Pressure admittance: cancelled"
+                )
+                return
+            self._robot_dialog_admittance_confirmed = True
+
+        try:
+            entered = api.enter_end_effector_velocity_mode(suspend_existing=True)
+        except Exception as exc:
+            entered = False
+            print(f"[PressureAdmittance] Could not enter velocity mode: {exc}")
+        if not entered:
+            self._set_checked_without_signal(button, False)
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                "Pressure admittance: velocity mode failed"
+            )
+            return
+
+        self._admittance_mapping_config = self._normalize_robot_sensor_mapping_config(
+            (
+                getattr(self, "_robot_dialog_sensor_mapping_config", None)
+                if source == "robot_dialog"
+                else None
+            )
+            or self._load_robot_sensor_mapping_config()
+        )
+        self._admittance_source = str(source)
+        self._admittance_pending_start = False
+        self._robot_dialog_admittance_velocity_mode_on = True
+        self._robot_dialog_admittance_active = True
+        self._robot_dialog_admittance_filtered_velocity = np.zeros(3, dtype=float)
+        self._ensure_pressure_admittance_timer().start()
+        if source == "robot_dialog":
+            live_button = getattr(self, "_robot_dialog_live_btn", None)
+            if live_button is not None and not live_button.isChecked():
+                live_button.setChecked(True)
+        self._sync_pressure_admittance_buttons(True)
+        self._set_pressure_admittance_status(
+            "Pressure admittance: active, waiting for contact"
+        )
+        self._robot_dialog_admittance_tick()
+
+    def set_ai_admittance_control_enabled(self, enabled):
+        """Start/stop admittance from the AI tab without opening a 3D view."""
+        if not bool(enabled):
+            self._admittance_pending_start = False
+            self._teardown_robot_dialog_admittance(
+                status_text="Pressure admittance: idle"
+            )
+            return
+
+        if self.is_pressure_admittance_active():
+            self._sync_pressure_admittance_buttons(True)
+            return
+
+        sensor = getattr(self.parent, "sensor_functions", None)
+        if sensor is None:
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                "Pressure admittance: sensor functions unavailable"
+            )
+            return
+
+        running = bool(
+            getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+            and getattr(sensor, "is_connected", False)
+        )
+        if running:
+            self._toggle_robot_dialog_admittance(
+                True,
+                require_visual_mapping=False,
+                source="ai_tab",
+                dialog_parent=self.parent,
+            )
+            return
+
+        if not hasattr(sensor, "start_external_visualization_stream"):
+            self._sync_pressure_admittance_buttons(False)
+            self._set_pressure_admittance_status(
+                "Pressure admittance: sensor auto-start unavailable"
+            )
+            return
+
+        self._admittance_pending_start = True
+        self._sync_pressure_admittance_buttons(False, pending=True)
+        self._set_pressure_admittance_status(
+            "Pressure admittance: starting and calibrating sensor..."
+        )
+        try:
+            started = bool(sensor.start_external_visualization_stream())
+            if started and hasattr(sensor, "set_main_visualization_enabled"):
+                sensor.set_main_visualization_enabled(True, render=True)
+        except Exception as exc:
+            started = False
+            print(f"[PressureAdmittance] Sensor auto-start failed: {exc}")
+        if not started:
+            self._admittance_pending_start = False
+            self._sync_pressure_admittance_buttons(False)
+            detail = (
+                sensor.get_last_sensor_stream_error()
+                if hasattr(sensor, "get_last_sensor_stream_error")
+                else ""
+            )
+            self._set_pressure_admittance_status(
+                detail or "Pressure admittance: sensor could not start"
+            )
+            return
+        self._finish_ai_admittance_sensor_start(attempt=0)
+
+    def _finish_ai_admittance_sensor_start(self, attempt=0):
+        if not getattr(self, "_admittance_pending_start", False):
+            return
+        sensor = getattr(self.parent, "sensor_functions", None)
+        running = bool(
+            sensor is not None
+            and getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+            and getattr(sensor, "is_connected", False)
+        )
+        if running:
+            self._admittance_pending_start = False
+            self._toggle_robot_dialog_admittance(
+                True,
+                require_visual_mapping=False,
+                source="ai_tab",
+                dialog_parent=self.parent,
+            )
+            return
+
+        calibrating = bool(
+            sensor is not None
+            and getattr(sensor, "_sensor_calibration_in_progress", False)
+        )
+        if (calibrating and int(attempt) < 300) or int(attempt) < 5:
+            QTimer.singleShot(
+                100,
+                lambda: self._finish_ai_admittance_sensor_start(int(attempt) + 1),
+            )
+            return
+
+        self._admittance_pending_start = False
+        self._sync_pressure_admittance_buttons(False)
+        detail = (
+            sensor.get_last_sensor_stream_error()
+            if sensor is not None and hasattr(sensor, "get_last_sensor_stream_error")
+            else ""
+        )
+        self._set_pressure_admittance_status(
+            detail or "Pressure admittance: sensor calibration failed"
+        )
+
+    def _teardown_robot_dialog_admittance(self, status_text=None, update_status=True):
+        self._admittance_pending_start = False
+        timer = getattr(self, "_robot_dialog_admittance_timer", None)
+        if timer is not None and timer.isActive():
+            timer.stop()
+
+        was_active = bool(
+            getattr(self, "_robot_dialog_admittance_active", False)
+            or getattr(self, "_robot_dialog_admittance_velocity_mode_on", False)
+        )
+        self._robot_dialog_admittance_active = False
+        api = getattr(self.parent, "robot_api", None)
+        if api is not None and getattr(
+            self, "_robot_dialog_admittance_velocity_mode_on", False
+        ):
+            try:
+                api.exit_end_effector_velocity_mode(send_zero=True)
+            except Exception as exc:
+                print(f"[PressureAdmittance] Velocity teardown failed: {exc}")
+        self._robot_dialog_admittance_velocity_mode_on = False
+        self._robot_dialog_admittance_filtered_velocity = np.zeros(3, dtype=float)
+        self._admittance_source = None
+        self._admittance_mapping_config = None
+        self._sync_pressure_admittance_buttons(False)
+        if update_status and (was_active or status_text):
+            self._set_pressure_admittance_status(
+                status_text or "Pressure admittance: stopped"
+            )
+
+    def _robot_dialog_admittance_tick(self):
+        if not getattr(self, "_robot_dialog_admittance_active", False):
+            return
+
+        conflict = self._robot_dialog_other_velocity_control_name()
+        if conflict:
+            self._teardown_robot_dialog_admittance(
+                status_text=f"Pressure admittance stopped: {conflict} became active"
+            )
+            return
+
+        sensor = getattr(self.parent, "sensor_functions", None)
+        running = bool(
+            sensor is not None
+            and getattr(sensor, "_sensor_reader_is_running", lambda: False)()
+            and getattr(sensor, "is_connected", False)
+        )
+        if not running:
+            self._teardown_robot_dialog_admittance(
+                status_text="Pressure admittance stopped: sensor stream lost"
+            )
+            return
+
+        config = self._normalize_robot_sensor_mapping_config(
+            getattr(self, "_admittance_mapping_config", None)
+            or getattr(self, "_robot_dialog_sensor_mapping_config", None)
+            or self._load_robot_sensor_mapping_config()
+        )
+        data_obj = getattr(sensor, "_data", None)
+        raw_matrix = getattr(data_obj, "diffPerData", None)
+        averaged_matrix = getattr(data_obj, "diffPerDataAve", None)
+        try:
+            raw_estimate = sensor._estimate_contact_force_signal(
+                raw_matrix,
+                peak_threshold=config["admittance_contact_threshold_pct"],
+            )
+            estimate = (
+                sensor._estimate_contact_force_signal(
+                    averaged_matrix,
+                    peak_threshold=config["admittance_contact_threshold_pct"],
+                )
+                if raw_estimate is not None
+                else None
+            )
+            if estimate is None:
+                estimate = raw_estimate
+        except Exception:
+            estimate = None
+
+        if estimate is None:
+            self._robot_dialog_admittance_filtered_velocity = np.zeros(3, dtype=float)
+            if not self._send_robot_dialog_admittance_velocity(np.zeros(3, dtype=float)):
+                self._teardown_robot_dialog_admittance(
+                    status_text="Pressure admittance stopped: velocity send failed"
+                )
+                return
+            self._set_pressure_admittance_status(
+                "Pressure admittance: active, no contact"
+            )
+            return
+
+        api = getattr(self.parent, "robot_api", None)
+        try:
+            joints = api.get_current_positions()
+        except Exception:
+            joints = None
+        if joints is None or len(joints) < 6:
+            self._robot_dialog_admittance_filtered_velocity = np.zeros(3, dtype=float)
+            self._send_robot_dialog_admittance_velocity(np.zeros(3, dtype=float))
+            self._set_pressure_admittance_status(
+                "Pressure admittance: waiting for joint feedback"
+            )
+            return
+
+        motion_direction = self._robot_dialog_admittance_direction_base(
+            sensor, estimate, joints, config
+        )
+        if motion_direction is None:
+            self._robot_dialog_admittance_filtered_velocity = np.zeros(3, dtype=float)
+            self._send_robot_dialog_admittance_velocity(np.zeros(3, dtype=float))
+            self._set_pressure_admittance_status(
+                "Pressure admittance: invalid mapped direction"
+            )
+            return
+
+        speed = self._admittance_speed_from_pressure(
+            estimate["peak_pressure"],
+            config["admittance_contact_threshold_pct"],
+            config["admittance_full_scale_pct"],
+            config["admittance_max_speed_mps"],
+        )
+        target_velocity = speed * motion_direction
+        alpha = float(config["admittance_smoothing_alpha"])
+        previous = np.asarray(
+            getattr(
+                self,
+                "_robot_dialog_admittance_filtered_velocity",
+                np.zeros(3, dtype=float),
+            ),
+            dtype=float,
+        )
+        filtered = previous + alpha * (target_velocity - previous)
+        filtered_norm = float(np.linalg.norm(filtered))
+        max_speed = float(config["admittance_max_speed_mps"])
+        if filtered_norm > max_speed:
+            filtered *= max_speed / filtered_norm
+        self._robot_dialog_admittance_filtered_velocity = filtered
+
+        if not self._send_robot_dialog_admittance_velocity(filtered):
+            self._teardown_robot_dialog_admittance(
+                status_text="Pressure admittance stopped: velocity send failed"
+            )
+            return
+        mode_label = (
+            "Centre"
+            if config["admittance_direction_mode"] == "centre_directed"
+            else "Normal"
+        )
+        self._set_pressure_admittance_status(
+            "Admittance {0}: p={1:.1f}% |v|={2:.3f} m/s "
+            "d=({3:+.2f},{4:+.2f},{5:+.2f})".format(
+                mode_label,
+                float(estimate["peak_pressure"]),
+                float(np.linalg.norm(filtered)),
+                float(motion_direction[0]),
+                float(motion_direction[1]),
+                float(motion_direction[2]),
+            )
+        )
 
     # ------------------------------------------------------------------
     # Drag-to-PTP support
@@ -1155,6 +3785,10 @@ class MyMeshLab():
 
         self._robot_dialog_applied = applied
         self._robot_dialog_current_joints = list(joints[:6])
+        if getattr(self, "_robot_dialog_sensor_actor", None) is not None:
+            self._refresh_robot_dialog_sensor_overlay(render=False)
+        if getattr(self, "_robot_dialog_link5_frame_visible", False):
+            self._update_robot_dialog_link5_frame(render=False)
         try:
             plotter.render()
         except Exception:
@@ -1194,10 +3828,17 @@ class MyMeshLab():
 
         self._apply_robot_dialog_joints(joints)
         if status_label is not None:
-            deg = [j * 180.0 / np.pi for j in joints[:6]]
-            status_label.setText(
-                "Live: J=[{0:+6.1f}, {1:+6.1f}, {2:+6.1f}, {3:+6.1f}, {4:+6.1f}, {5:+6.1f}]°".format(*deg)
+            origin, _axes = self._link_frame_origin_and_axes(
+                self._robot_dialog_link5_transform()
             )
+            if origin is not None:
+                status_label.setText(
+                    "Live | L5=({0:+.3f}, {1:+.3f}, {2:+.3f}) m".format(
+                        float(origin[0]), float(origin[1]), float(origin[2])
+                    )
+                )
+            else:
+                status_label.setText("Live: following robot")
 
     def update_robot_joints(self, new_angles):
         if len(new_angles) != 6:

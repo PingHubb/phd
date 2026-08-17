@@ -1,8 +1,46 @@
-Hello everyone :)
+# PingLab Tactile Robot Interface
 
-I hope you have a good day. This is a framework for 3D and 2D demonstration.
+PingLab is a ROS 2 application for tactile-sensor acquisition, 2D/3D signal
+visualization, learned and rule-based robot control, dexterous-hand control,
+and experiment recording. The desktop interface is built with PyQt5 and
+PyVista.
 
-The framework is mainly based on PyQt5 and Pyvista. 
+## Run
+
+From a sourced ROS 2 workspace:
+
+```bash
+ros2 run phd phd_ui
+```
+
+The primary sensor controller currently uses the `readRaw` serial protocol at
+9600 baud. Select one serial device in the Sensor tab before building or
+updating a sensor scene.
+
+## Development
+
+Run the package tests from this repository:
+
+```bash
+python3 -m pytest -q test
+```
+
+Build only this ROS package and its required dependencies:
+
+```bash
+colcon build --packages-up-to phd
+```
+
+Important modules are grouped by responsibility:
+
+- `phd/dependence/sensor_api.py`: synchronous sensor command API.
+- `phd/dependence/sensor_protocol.py`: serial protocol defaults and parsing.
+- `phd/dependence/sensor_serial.py`: non-blocking Qt sensor reader.
+- `phd/dependence/sensor_data.py`: calibrated frames and rolling averages.
+- `phd/dependence/func_sensor.py`: sensor scene and live visualization.
+- `phd/dependence/robot_api.py`: ROS robot commands and velocity safety.
+- `phd/dependence/gesture/`: rule-based and learned control policies.
+- `phd/ui/`: Qt views, controls, and experiment workflows.
 
 ## External AI assets
 
@@ -30,20 +68,3 @@ export PINGLAB_RESOURCE_ROOT=/home/ping2/phd_assets
 ```
 
 `PINGLAB_AI_RESOURCE_ROOT` takes priority when both variables are set.
-
-I would like to add more functions here to make it more helpful to you.
-
-The plan is described below:
-
-1. A 3D demo widget with a model tree to set the visibility of features for the models
-
-2. A 2D combo widget for knitting map demonstration.
-
-3. A tool to fully automatically generate the scene for the blender.
-
-4. A robot simulation and real-time controller
-
-5. A library to govern the topology of different geometries.
-
-6. ...
-Please let me know if you have any suggestions, hopefully, we can make a earth-shake framework!

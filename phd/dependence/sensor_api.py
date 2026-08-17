@@ -1,5 +1,11 @@
 import time
 
+from phd.dependence.sensor_protocol import (
+    DEFAULT_SENSOR_BAUD_RATE,
+    DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
+    parse_serial_ints,
+)
+
 try:
     import serial
 except ImportError:
@@ -9,12 +15,19 @@ except ImportError:
 class ArduinoCommander:
     """Safe serial wrapper for the tactile sensor controller."""
 
-    def __init__(self, serial_port="/dev/ttyACM0", baud_rate=9600, timeout=0.1):
+    def __init__(
+        self,
+        serial_port="/dev/ttyACM0",
+        baud_rate=DEFAULT_SENSOR_BAUD_RATE,
+        timeout=DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
+        connect_immediately=True,
+    ):
         self.serial_port = serial_port
         self.baud_rate = baud_rate
         self.timeout = timeout
         self.ser = None
-        self._connect()
+        if bool(connect_immediately):
+            self._connect()
 
     # ------------------------------------------------------------------
     # Connection / lifecycle
@@ -44,6 +57,21 @@ class ArduinoCommander:
     def reconnect(self):
         self.close()
         return self._connect()
+
+    def set_serial_port(self, serial_port, reconnect=True):
+        """Select a serial device and optionally connect to it immediately."""
+        serial_port = str(serial_port or "").strip()
+        if not serial_port:
+            return False
+
+        port_changed = serial_port != self.serial_port
+        if port_changed:
+            self.close()
+            self.serial_port = serial_port
+
+        if not bool(reconnect):
+            return True
+        return self.is_connected() or self._connect()
 
     def is_connected(self):
         return self.ser is not None and getattr(self.ser, "is_open", False)
@@ -102,13 +130,7 @@ class ArduinoCommander:
 
     @staticmethod
     def _parse_ints(text):
-        values = []
-        for token in text.split():
-            try:
-                values.append(int(token))
-            except ValueError:
-                continue
-        return values
+        return parse_serial_ints(text)
 
     # ------------------------------------------------------------------
     # Command API
@@ -186,8 +208,20 @@ class ArduinoCommander:
             data_list = self._parse_ints(response)
 
             if command in {"readRaw", "readCal", "updateCal"}:
-                return data_list[2:-2] if len(data_list) >= 4 else data_list
+                # USB CDC devices can print a boot/debug line immediately
+                # after the serial port opens.  That text is not the response
+                # to our command, so keep waiting for a framed numeric packet
+                # instead of returning an empty payload and failing sensor
+                # calibration.
+                if len(data_list) <= 4:
+                    continue
+                payload = data_list[2:-2]
+                if not payload:
+                    continue
+                return payload
             if command in {"channelCheck", "stop"}:
+                if not data_list:
+                    continue
                 return data_list
 
         return None

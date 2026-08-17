@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QHeaderView,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -38,6 +39,8 @@ from PyQt5.QtWidgets import (
 from pyvistaqt import QtInteractor
 from phd.dependence.paths import ai_resource_path, resource_path
 from phd.ui import theme
+from phd.ui.force_meter_chart import ForceMeterChartWidget
+from phd.ui.sensor_zero_mask_window import SensorZeroMaskPanel
 from phd.ui.ui_ping_ai_controls import AiControlsMixin
 from phd.ui.ui_ping_camera_control import CameraControlMixin
 from phd.ui.ui_ping_direct_finger_motion import DirectFingerMotionMixin
@@ -278,6 +281,7 @@ class DisabledSensorFunctions:
         return [
             ("point_grid", "Point Grid"),
             ("stereo_field", "Stereo Field"),
+            ("heatmap_3d", "3D Heatmap"),
         ]
 
     def set_sensor_visualization_mode(self, *_args, **_kwargs):
@@ -295,6 +299,23 @@ class DisabledSensorFunctions:
         return None
 
     def set_saved_sensor_stereo_field_config(self, *_args, **_kwargs):
+        return None
+
+    def get_heatmap_settings(self):
+        return {
+            "palette_3d": "white_red",
+            "response_mode": "linear_relative",
+            "saturation_pct": 5.0,
+            "noise_floor_pct": 0.5,
+            "proximity_noise_floor": 20.0,
+            "proximity_knee": 100.0,
+            "proximity_saturation": 1000.0,
+        }
+
+    def set_heatmap_settings(self, *_args, **_kwargs):
+        return None
+
+    def set_saved_sensor_heatmap_config(self, *_args, **_kwargs):
         return None
 
     def set_contact_normal_visualization_enabled(self, *_args, **_kwargs):
@@ -321,6 +342,12 @@ class DisabledSensorFunctions:
     def set_saved_sensor_geometry_config(self, *_args, **_kwargs):
         return None
 
+    def save_current_sensor_perspective(self):
+        return False
+
+    def restore_saved_sensor_perspective(self, *_args, **_kwargs):
+        return False
+
     def get_ai_direct_finger_motion_execution_default_model_path(self):
         return self.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
 
@@ -336,6 +363,9 @@ class NullMeshLab:
         return None
 
     def addDexterousHandInDialog(self):
+        return None
+
+    def set_ai_admittance_control_enabled(self, *_args, **_kwargs):
         return None
 
     def set_secondary_background_reference_enabled(self, *_args, **_kwargs):
@@ -1168,6 +1198,13 @@ class UI(
         self.connect_function()
         self.adjust_splitter_sizes()
         self._apply_startup_feature_state()
+        self._runtime_availability_timer = QTimer(self)
+        self._runtime_availability_timer.setInterval(1000)
+        self._runtime_availability_timer.timeout.connect(
+            self._refresh_runtime_feature_state
+        )
+        self._refresh_runtime_feature_state()
+        self._runtime_availability_timer.start()
         self._init_ai_toggle_states()
         self._install_keyboard_shortcuts()
 
@@ -1207,8 +1244,16 @@ class UI(
         self.robot_api = self._safe_create(RobotController, NullRobotApi(), 'robot_driver', 'Robot API')
         self.gripper = self._safe_create(GripperHelper, NullGripper(), 'gripper_driver', 'Gripper API')
 
+        availability = {}
+        refresh_availability = getattr(self.robot_api, 'refresh_availability', None)
+        if callable(refresh_availability):
+            try:
+                availability = refresh_availability()
+            except Exception:
+                availability = {}
         self.features['robot_ready'] = bool(
-            getattr(self.robot_api, 'service_ok', False)
+            availability.get('robot', False)
+            or getattr(self.robot_api, 'service_ok', False)
             or getattr(self.robot_api, 'script_ok', False)
         )
         hand_services_ready = False
@@ -1223,8 +1268,54 @@ class UI(
             hand_tactile_ready = False
         self.features['hand_ready'] = bool(hand_services_ready or hand_tactile_ready)
         self.features['sensor_ready'] = bool(self.features['sensor_module'])
-        self.features['gripper_ready'] = bool(self.features['gripper_driver'])
+        self.features['gripper_ready'] = bool(
+            self.features['gripper_driver']
+            and getattr(self.gripper, 'is_available', False)
+        )
         self.features['camera_ready'] = bool(self.features['camera_driver'])
+
+    def _refresh_runtime_feature_state(self):
+        if self._is_shutting_down:
+            return
+        api = getattr(self, 'robot_api', None)
+        availability = {}
+        refresh = getattr(api, 'refresh_availability', None)
+        if callable(refresh):
+            try:
+                availability = refresh()
+            except Exception:
+                availability = {}
+
+        robot_ready = bool(availability.get('robot', False))
+        hand_ready = bool(
+            availability.get('hand_commands', False)
+            or availability.get('hand_tactile', False)
+        )
+        gripper = getattr(self, 'gripper', None)
+        gripper_ready = bool(
+            self.features.get('gripper_driver', False)
+            and getattr(gripper, 'is_available', False)
+        )
+        self.features['robot_ready'] = robot_ready
+        self.features['hand_ready'] = hand_ready
+        self.features['gripper_ready'] = gripper_ready
+
+        if hasattr(self, 'robots_sub_tabs'):
+            self.set_robot_subtab_enabled(robot_ready)
+        if hasattr(self, 'auto_center_button'):
+            self.auto_center_button.setEnabled(
+                robot_ready and self.features.get('camera_ready', False)
+            )
+        if hasattr(self, 'hand_tab_index') and hasattr(self, 'tab_widget'):
+            self.tab_widget.setTabEnabled(int(self.hand_tab_index), hand_ready)
+        if all(
+            hasattr(self, name)
+            for name in ('gripper_slider', 'btn_grip_open', 'btn_grip_close')
+        ):
+            self._set_widgets_enabled(
+                [self.gripper_slider, self.btn_grip_open, self.btn_grip_close],
+                gripper_ready,
+            )
 
     def _get_default_ai_execution_model_path(self) -> str:
         helper = getattr(self, "sensor_functions", None)
@@ -1240,10 +1331,32 @@ class UI(
             return path.strip()
         return DisabledSensorFunctions.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
 
-    def ensure_sensor_api(self) -> bool:
+    def ensure_sensor_api(
+        self,
+        connect_immediately: bool = True,
+        serial_port: str | None = None,
+    ) -> bool:
         """Create the sensor API only when it is first needed."""
-        if self.sensor_api is not None and not isinstance(self.sensor_api, NullSensorApi):
-            return True
+        if self.sensor_api is not None and not isinstance(
+            self.sensor_api, NullSensorApi
+        ):
+            if serial_port:
+                set_serial_port = getattr(self.sensor_api, "set_serial_port", None)
+                if callable(set_serial_port):
+                    return bool(
+                        set_serial_port(
+                            serial_port,
+                            reconnect=bool(connect_immediately),
+                        )
+                    )
+                self.sensor_api.serial_port = str(serial_port)
+            if not bool(connect_immediately):
+                return True
+            is_connected = getattr(self.sensor_api, "is_connected", None)
+            if callable(is_connected) and is_connected():
+                return True
+            reconnect = getattr(self.sensor_api, "reconnect", None)
+            return bool(reconnect()) if callable(reconnect) else True
 
         if ArduinoCommander is None:
             self.features['sensor_driver'] = False
@@ -1251,9 +1364,15 @@ class UI(
             return False
 
         try:
-            self.sensor_api = ArduinoCommander()
+            self.sensor_api = ArduinoCommander(
+                serial_port=serial_port or "/dev/ttyACM0",
+                connect_immediately=bool(connect_immediately)
+            )
             self.features['sensor_driver'] = True
-            return True
+            if not bool(connect_immediately):
+                return True
+            is_connected = getattr(self.sensor_api, "is_connected", None)
+            return bool(is_connected()) if callable(is_connected) else True
         except Exception as exc:
             self.sensor_api = NullSensorApi()
             self.features['sensor_driver'] = False
@@ -1443,7 +1562,7 @@ class UI(
         send_layout.addWidget(self.sensor_choice)
 
         self.serial_channel = QListWidget(self.widget_func)
-        self.serial_channel.setSelectionMode(QListWidget.MultiSelection)
+        self.serial_channel.setSelectionMode(QListWidget.SingleSelection)
         send_layout.addWidget(self.serial_channel)
 
         self.buildScene = QPushButton("Build Scene", self.widget_func)
@@ -1475,7 +1594,21 @@ class UI(
         self.grid_cols_spin.setValue(10)
         grid_layout.addWidget(self.grid_cols_spin)
 
+        self.serial_channel.currentItemChanged.connect(
+            self._on_sensor_port_selection_changed
+        )
+
         viz_layout.addWidget(grid_container)
+
+        self.sensor_extra_column_checkbox = QCheckBox(
+            "Raw packet includes +1 column"
+        )
+        self.sensor_extra_column_checkbox.setChecked(True)
+        self.sensor_extra_column_checkbox.setToolTip(
+            "Checked: expect rows x (columns + 1) values and ignore the extra "
+            "column. Unchecked: expect exactly rows x columns values."
+        )
+        viz_layout.addWidget(self.sensor_extra_column_checkbox)
 
         # Sensitivity slider
         slider_container = QWidget()
@@ -1503,6 +1636,7 @@ class UI(
         self.sensor_visualization_mode_combo = QComboBox()
         self.sensor_visualization_mode_combo.addItem("Point Grid", "point_grid")
         self.sensor_visualization_mode_combo.addItem("Stereo Field", "stereo_field")
+        self.sensor_visualization_mode_combo.addItem("3D Heatmap", "heatmap_3d")
         self.sensor_visualization_mode_combo.setToolTip(
             "Choose the live sensor rendering style."
         )
@@ -1511,12 +1645,20 @@ class UI(
         visual_mode_layout.addStretch()
         viz_layout.addWidget(visual_mode_container)
 
+        self.sensor_transparent_screenshot_button = QPushButton(
+            "Capture Transparent PNG"
+        )
+        self.sensor_transparent_screenshot_button.setToolTip(
+            "Save the current sensor plotter view as a PNG with a transparent background."
+        )
+        viz_layout.addWidget(self.sensor_transparent_screenshot_button)
+
         normal_vector_container = QWidget()
         normal_vector_layout = QVBoxLayout(normal_vector_container)
         normal_vector_layout.setContentsMargins(0, 0, 0, 0)
         normal_vector_layout.setSpacing(4)
         self.contact_normal_checkbox = QCheckBox("Show Contact Vector")
-        self.contact_normal_checkbox.setChecked(True)
+        self.contact_normal_checkbox.setChecked(False)
         self.contact_normal_checkbox.setToolTip(
             "Show an estimated contact arrow in the sensor scene."
         )
@@ -1550,9 +1692,18 @@ class UI(
         read_group = QGroupBox("Read Operations")
         read_layout = QVBoxLayout()
 
-        self.read_sensor_api_button = QPushButton("Sensor API Raw Data (ADJUST IN API!!)")
+        self.read_sensor_api_button = QPushButton("Sensor API Raw Data")
+        self.read_sensor_api_button.setToolTip(
+            "Read from the port selected in Send Operation."
+        )
         self.read_sensor_api_hz_button = QPushButton("Sensor API Raw Hz")
-        self.read_sensor_channel_button = QPushButton("Sensor API Channel (ADJUST IN API!!)")
+        self.read_sensor_api_hz_button.setToolTip(
+            "Measure the port selected in Send Operation."
+        )
+        self.read_sensor_channel_button = QPushButton("Sensor API Channel")
+        self.read_sensor_channel_button.setToolTip(
+            "Check the port selected in Send Operation."
+        )
         self.read_sensor_raw_button = QPushButton("Sensor Raw Data")
         self.read_sensor_raw_ave_button = QPushButton("Sensor Raw Ave Data")
         self.read_sensor_diff_button = QPushButton("Sensor Diff Data")
@@ -1576,6 +1727,22 @@ class UI(
         self.sensor_sub_tabs.addTab(read_page, "Read Operation")
         layout.addWidget(self.sensor_sub_tabs)
         self._build_sensor_parameters_dialog()
+
+    @staticmethod
+    def _default_sensor_grid_shape_for_port(port_name):
+        name = os.path.basename(str(port_name or "")).lower()
+        if name in ("ttyacm1", "ttyamc1"):
+            return 7, 7
+        return None
+
+    def _on_sensor_port_selection_changed(self, current, _previous=None):
+        port_name = current.text() if current is not None else ""
+        shape = self._default_sensor_grid_shape_for_port(port_name)
+        if shape is None:
+            return
+        self.grid_rows_spin.setValue(shape[0])
+        self.grid_cols_spin.setValue(shape[1])
+        self.sensor_extra_column_checkbox.setChecked(False)
 
     @staticmethod
     def _sensor_reorder_mode_label(mode):
@@ -1609,9 +1776,37 @@ class UI(
         self.sensor_parameters_dialog = QDialog(self)
         self.sensor_parameters_dialog.setWindowTitle("Sensor Parameters")
         self.sensor_parameters_dialog.setModal(False)
-        self.sensor_parameters_dialog.resize(620, 500)
+        self.sensor_parameters_dialog.resize(860, 760)
+        self.sensor_parameters_dialog.setMinimumSize(720, 540)
 
-        layout = QVBoxLayout(self.sensor_parameters_dialog)
+        outer_layout = QVBoxLayout(self.sensor_parameters_dialog)
+        self.sensor_parameters_tabs = QTabWidget(self.sensor_parameters_dialog)
+        sensor_parameters_general_tab = QWidget(self.sensor_parameters_tabs)
+        sensor_parameters_general_layout = QVBoxLayout(
+            sensor_parameters_general_tab
+        )
+        sensor_parameters_general_layout.setContentsMargins(0, 0, 0, 0)
+        sensor_parameters_scroll = QScrollArea(sensor_parameters_general_tab)
+        sensor_parameters_scroll.setWidgetResizable(True)
+        sensor_parameters_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        sensor_parameters_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        sensor_parameters_content = QWidget(sensor_parameters_scroll)
+        layout = QVBoxLayout(sensor_parameters_content)
+        layout.setContentsMargins(8, 8, 8, 8)
+        sensor_parameters_scroll.setWidget(sensor_parameters_content)
+        sensor_parameters_general_layout.addWidget(sensor_parameters_scroll, 1)
+        self.sensor_parameters_tabs.addTab(
+            sensor_parameters_general_tab, "General"
+        )
+        self.sensor_zero_mask_panel = SensorZeroMaskPanel(
+            self.sensor_parameters_tabs,
+            sensor_functions=getattr(self, "sensor_functions", None),
+        )
+        self.sensor_parameters_tabs.addTab(
+            self.sensor_zero_mask_panel, "Zero Mask"
+        )
+        outer_layout.addWidget(self.sensor_parameters_tabs, 1)
+        self.sensor_parameters_scroll = sensor_parameters_scroll
         grid = QGridLayout()
         grid.setHorizontalSpacing(12)
         grid.setVerticalSpacing(8)
@@ -1643,6 +1838,13 @@ class UI(
         self.sensor_parameter_shape_combo = QComboBox(self.sensor_parameters_dialog)
         self.sensor_parameter_shape_combo.addItem("Flat", "flat")
         self.sensor_parameter_shape_combo.addItem("Cylinder Bend", "cylinder")
+        self.sensor_parameter_shape_combo.addItem("Custom Interactive", "custom")
+        self._sensor_parameter_custom_points = []
+        self._sensor_parameter_use_custom_heatmap_shape = False
+        self._sensor_parameter_custom_heatmap_points = []
+        self._sensor_parameter_custom_heatmap_corners = []
+        self._sensor_parameter_use_curved_heatmap_edges = False
+        self._sensor_parameter_custom_heatmap_edge_offsets = []
 
         self.sensor_parameter_bend_axis_combo = QComboBox(self.sensor_parameters_dialog)
         self.sensor_parameter_bend_axis_combo.addItem("Across Columns (X)", "columns")
@@ -1683,6 +1885,21 @@ class UI(
 
         self.sensor_parameter_normal_flip_checkbox = QCheckBox("Flip Normals")
         self.sensor_parameter_use_shape_checkbox = QCheckBox("Use Selected Shape")
+        self.sensor_parameter_heatmap_follows_shape_checkbox = QCheckBox(
+            "3D Heatmap Follows Sensor Shape"
+        )
+        self.sensor_parameter_heatmap_follows_shape_checkbox.setChecked(True)
+        self.sensor_parameter_heatmap_follows_shape_checkbox.setToolTip(
+            "Use the selected flat, cylinder, or custom sensor geometry for the "
+            "3D heatmap. Uncheck this to use the independently edited heatmap shape."
+        )
+        self.sensor_parameter_shape_editor_button = QPushButton(
+            "Edit Custom Shape"
+        )
+        self.sensor_parameter_shape_editor_button.setToolTip(
+            "Open the interactive 3D taxel-grid editor for the currently built "
+            "2D sensor."
+        )
         self.sensor_parameter_stereo_ignore_noise_checkbox = QCheckBox("Ignore Stereo Field Noise")
         self.sensor_parameter_stereo_ignore_noise_checkbox.setChecked(True)
         self.sensor_parameter_stereo_ignore_noise_checkbox.setToolTip(
@@ -1703,6 +1920,93 @@ class UI(
         self.sensor_parameter_stereo_length_spin.setValue(0.35)
         self.sensor_parameter_stereo_length_spin.setToolTip(
             "Stereo field line length relative to the sensor size."
+        )
+        self.sensor_parameter_heatmap_response_combo = QComboBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_heatmap_response_combo.addItem(
+            "Linear Relative (%)", "linear_relative"
+        )
+        self.sensor_parameter_heatmap_response_combo.addItem(
+            "Proximity Enhanced (absolute difference)", "proximity_enhanced"
+        )
+        self.sensor_parameter_heatmap_palette_combo = QComboBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_heatmap_palette_combo.addItem(
+            "Original (White to Red)", "white_red"
+        )
+        self.sensor_parameter_heatmap_palette_combo.addItem(
+            "White, Blue to Deep Red", "white_blue_red"
+        )
+        self.sensor_parameter_heatmap_palette_combo.addItem(
+            "Light Blue to Deep Blue", "light_deep_blue"
+        )
+        self.sensor_parameter_heatmap_palette_combo.setToolTip(
+            "Choose only the 3D heatmap colour progression. Signal response "
+            "thresholds and the 2D signal viewer are unchanged."
+        )
+        self.sensor_parameter_heatmap_saturation_spin = QDoubleSpinBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_heatmap_saturation_spin.setDecimals(2)
+        self.sensor_parameter_heatmap_saturation_spin.setRange(0.1, 50.0)
+        self.sensor_parameter_heatmap_saturation_spin.setSingleStep(0.1)
+        self.sensor_parameter_heatmap_saturation_spin.setValue(5.0)
+        self.sensor_parameter_heatmap_saturation_spin.setSuffix(" %")
+        self.sensor_parameter_heatmap_saturation_spin.setToolTip(
+            "Signal change that produces the strongest selected colour. "
+            "Lower values make the heatmap more sensitive."
+        )
+        self.sensor_parameter_heatmap_floor_spin = QDoubleSpinBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_heatmap_floor_spin.setDecimals(2)
+        self.sensor_parameter_heatmap_floor_spin.setRange(0.0, 20.0)
+        self.sensor_parameter_heatmap_floor_spin.setSingleStep(0.1)
+        self.sensor_parameter_heatmap_floor_spin.setValue(0.5)
+        self.sensor_parameter_heatmap_floor_spin.setSuffix(" %")
+        self.sensor_parameter_heatmap_floor_spin.setToolTip(
+            "Signal changes at or below this value remain at the palette's base colour."
+        )
+
+        def _heatmap_proximity_spin(default_value):
+            spin = QDoubleSpinBox(self.sensor_parameters_dialog)
+            spin.setDecimals(1)
+            spin.setRange(0.0, 1000000.0)
+            spin.setSingleStep(5.0)
+            spin.setValue(float(default_value))
+            spin.setKeyboardTracking(False)
+            return spin
+
+        self.sensor_parameter_heatmap_proximity_floor_spin = (
+            _heatmap_proximity_spin(20.0)
+        )
+        self.sensor_parameter_heatmap_proximity_knee_spin = (
+            _heatmap_proximity_spin(100.0)
+        )
+        self.sensor_parameter_heatmap_proximity_saturation_spin = (
+            _heatmap_proximity_spin(1000.0)
+        )
+        self.sensor_parameter_heatmap_proximity_floor_spin.setToolTip(
+            "Absolute signal difference treated as no-touch noise."
+        )
+        self.sensor_parameter_heatmap_proximity_knee_spin.setToolTip(
+            "End of the emphasized proximity color range."
+        )
+        self.sensor_parameter_heatmap_proximity_saturation_spin.setToolTip(
+            "Absolute signal difference rendered as the strongest selected colour."
+        )
+        self.sensor_parameter_heatmap_3d_color_gain_spin = QDoubleSpinBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_heatmap_3d_color_gain_spin.setDecimals(2)
+        self.sensor_parameter_heatmap_3d_color_gain_spin.setRange(1.0, 3.0)
+        self.sensor_parameter_heatmap_3d_color_gain_spin.setSingleStep(0.1)
+        self.sensor_parameter_heatmap_3d_color_gain_spin.setValue(1.5)
+        self.sensor_parameter_heatmap_3d_color_gain_spin.setToolTip(
+            "Strengthen intermediate 3D heatmap colours without changing "
+            "the proximity baseline or saturation threshold."
         )
 
         grid.addWidget(QLabel("Sensor:"), 0, 0)
@@ -1731,6 +2035,28 @@ class UI(
         self.sensor_parameter_background_reference_checkbox.setChecked(True)
         layout.addWidget(self.sensor_parameter_background_reference_checkbox)
 
+        view_group = QGroupBox("Sensor View")
+        view_layout = QHBoxLayout(view_group)
+        self.sensor_parameter_save_view_button = QPushButton(
+            "Save Current View"
+        )
+        self.sensor_parameter_save_view_button.setToolTip(
+            "Save the current sensor plotter orientation and zoom for this "
+            "sensor model and grid size."
+        )
+        self.sensor_parameter_save_view_button.setEnabled(False)
+        self.sensor_parameter_restore_view_button = QPushButton(
+            "Restore Saved View"
+        )
+        self.sensor_parameter_restore_view_button.setToolTip(
+            "Restore the saved sensor plotter orientation and zoom."
+        )
+        self.sensor_parameter_restore_view_button.setEnabled(False)
+        view_layout.addWidget(self.sensor_parameter_save_view_button)
+        view_layout.addWidget(self.sensor_parameter_restore_view_button)
+        view_layout.addStretch()
+        layout.addWidget(view_group)
+
         stereo_group = QGroupBox("Stereo Field")
         stereo_grid = QGridLayout(stereo_group)
         stereo_grid.setHorizontalSpacing(12)
@@ -1742,6 +2068,37 @@ class UI(
         stereo_grid.addWidget(self.sensor_parameter_stereo_length_spin, 2, 1)
         stereo_grid.setColumnStretch(1, 1)
         layout.addWidget(stereo_group)
+
+        heatmap_group = QGroupBox("3D Heatmap")
+        heatmap_grid = QGridLayout(heatmap_group)
+        heatmap_grid.setHorizontalSpacing(12)
+        heatmap_grid.setVerticalSpacing(8)
+        heatmap_grid.addWidget(QLabel("Colour Scale:"), 0, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_palette_combo, 0, 1)
+        heatmap_grid.addWidget(QLabel("Response:"), 1, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_response_combo, 1, 1)
+        heatmap_grid.addWidget(QLabel("Linear Full Colour At:"), 2, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_saturation_spin, 2, 1)
+        heatmap_grid.addWidget(QLabel("Linear Noise Floor:"), 3, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_floor_spin, 3, 1)
+        heatmap_grid.addWidget(QLabel("Proximity Baseline:"), 4, 0)
+        heatmap_grid.addWidget(
+            self.sensor_parameter_heatmap_proximity_floor_spin, 4, 1
+        )
+        heatmap_grid.addWidget(QLabel("Proximity Knee:"), 5, 0)
+        heatmap_grid.addWidget(
+            self.sensor_parameter_heatmap_proximity_knee_spin, 5, 1
+        )
+        heatmap_grid.addWidget(QLabel("Proximity Saturation:"), 6, 0)
+        heatmap_grid.addWidget(
+            self.sensor_parameter_heatmap_proximity_saturation_spin, 6, 1
+        )
+        heatmap_grid.addWidget(QLabel("3D Colour Strength:"), 7, 0)
+        heatmap_grid.addWidget(
+            self.sensor_parameter_heatmap_3d_color_gain_spin, 7, 1
+        )
+        heatmap_grid.setColumnStretch(1, 1)
+        layout.addWidget(heatmap_group)
 
         geometry_group = QGroupBox("2D Geometry")
         geometry_grid = QGridLayout(geometry_group)
@@ -1761,6 +2118,12 @@ class UI(
         geometry_grid.addWidget(self.sensor_parameter_rotation_y_spin, 6, 1)
         geometry_grid.addWidget(QLabel("Rotation Z:"), 7, 0)
         geometry_grid.addWidget(self.sensor_parameter_rotation_z_spin, 7, 1)
+        geometry_grid.addWidget(
+            self.sensor_parameter_heatmap_follows_shape_checkbox, 8, 0, 1, 2
+        )
+        geometry_grid.addWidget(
+            self.sensor_parameter_shape_editor_button, 9, 0, 1, 2
+        )
         geometry_grid.setColumnStretch(1, 1)
         self.sensor_parameter_geometry_group = geometry_group
         layout.addWidget(geometry_group)
@@ -1780,7 +2143,7 @@ class UI(
 
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.sensor_parameters_dialog.close)
-        layout.addWidget(button_box)
+        outer_layout.addWidget(button_box)
 
         self.sensor_parameter_model_combo.currentIndexChanged.connect(
             self._load_sensor_parameter_reorder_mode
@@ -1790,6 +2153,12 @@ class UI(
         )
         self.sensor_parameter_background_reference_checkbox.toggled.connect(
             self._on_sensor_parameter_background_reference_toggled
+        )
+        self.sensor_parameter_save_view_button.clicked.connect(
+            self._save_sensor_plotter_perspective
+        )
+        self.sensor_parameter_restore_view_button.clicked.connect(
+            self._restore_sensor_plotter_perspective
         )
         self.sensor_parameter_force_scale_spin.valueChanged.connect(
             self._on_sensor_parameter_force_scale_changed
@@ -1809,6 +2178,9 @@ class UI(
         self.sensor_parameter_normal_flip_checkbox.toggled.connect(
             self._on_sensor_parameter_geometry_changed
         )
+        self.sensor_parameter_heatmap_follows_shape_checkbox.toggled.connect(
+            self._on_sensor_parameter_geometry_changed
+        )
         self.sensor_parameter_rotation_x_spin.valueChanged.connect(
             self._on_sensor_parameter_geometry_changed
         )
@@ -1817,6 +2189,9 @@ class UI(
         )
         self.sensor_parameter_rotation_z_spin.valueChanged.connect(
             self._on_sensor_parameter_geometry_changed
+        )
+        self.sensor_parameter_shape_editor_button.clicked.connect(
+            self._open_sensor_shape_editor
         )
         self.sensor_parameter_stereo_ignore_noise_checkbox.toggled.connect(
             self._on_sensor_parameter_stereo_field_changed
@@ -1827,23 +2202,55 @@ class UI(
         self.sensor_parameter_stereo_length_spin.valueChanged.connect(
             self._on_sensor_parameter_stereo_field_changed
         )
+        self.sensor_parameter_heatmap_saturation_spin.valueChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_floor_spin.valueChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_response_combo.currentIndexChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_palette_combo.currentIndexChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_proximity_floor_spin.valueChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_proximity_knee_spin.valueChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_proximity_saturation_spin.valueChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_heatmap_3d_color_gain_spin.valueChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
         self.sensor_parameter_save_button.clicked.connect(
             self._save_sensor_parameter_reorder_mode
         )
         self.sensor_parameter_reload_button.clicked.connect(
-            self._load_sensor_parameter_reorder_mode
+            self._reload_saved_sensor_parameters
         )
 
-    def open_sensor_parameters_dialog(self):
+    def open_sensor_parameters_dialog(self, tab=None):
         if not hasattr(self, "sensor_parameters_dialog"):
             self._build_sensor_parameters_dialog()
         self._refresh_sensor_parameters_dialog()
+        if tab == "zero_mask":
+            self.sensor_parameters_tabs.setCurrentWidget(
+                self.sensor_zero_mask_panel
+            )
+        elif tab == "general":
+            self.sensor_parameters_tabs.setCurrentIndex(0)
         self.sensor_parameters_dialog.show()
         self.sensor_parameters_dialog.raise_()
         self.sensor_parameters_dialog.activateWindow()
 
     def _refresh_sensor_parameters_dialog(self):
         helper = getattr(self, "sensor_functions", None)
+        if hasattr(self, "sensor_zero_mask_panel"):
+            self.sensor_zero_mask_panel.set_sensor_functions(helper)
 
         selected_model = None
         if helper is not None and hasattr(helper, "get_sensor_model_name_for_index"):
@@ -1921,6 +2328,35 @@ class UI(
                 float(self.sensor_parameter_rotation_y_spin.value()),
                 float(self.sensor_parameter_rotation_z_spin.value()),
             ],
+            "custom_points": list(
+                getattr(self, "_sensor_parameter_custom_points", []) or []
+            ),
+            "use_custom_heatmap_shape": bool(
+                not self.sensor_parameter_heatmap_follows_shape_checkbox.isChecked()
+            ),
+            "custom_heatmap_points": list(
+                getattr(self, "_sensor_parameter_custom_heatmap_points", [])
+                or []
+            ),
+            "custom_heatmap_corners": list(
+                getattr(self, "_sensor_parameter_custom_heatmap_corners", [])
+                or []
+            ),
+            "use_curved_heatmap_edges": bool(
+                getattr(
+                    self,
+                    "_sensor_parameter_use_curved_heatmap_edges",
+                    False,
+                )
+            ),
+            "custom_heatmap_edge_offsets": list(
+                getattr(
+                    self,
+                    "_sensor_parameter_custom_heatmap_edge_offsets",
+                    [],
+                )
+                or []
+            ),
         }
 
     @staticmethod
@@ -1987,19 +2423,155 @@ class UI(
         for widget in widgets:
             widget.blockSignals(False)
 
+    def _sensor_parameter_heatmap_from_ui(self):
+        proximity_floor = float(
+            self.sensor_parameter_heatmap_proximity_floor_spin.value()
+        )
+        proximity_knee = max(
+            proximity_floor + 0.1,
+            float(self.sensor_parameter_heatmap_proximity_knee_spin.value()),
+        )
+        proximity_saturation = max(
+            proximity_knee + 0.1,
+            float(self.sensor_parameter_heatmap_proximity_saturation_spin.value()),
+        )
+        return {
+            "palette_3d": str(
+                self.sensor_parameter_heatmap_palette_combo.currentData()
+                or "white_red"
+            ),
+            "response_mode": str(
+                self.sensor_parameter_heatmap_response_combo.currentData()
+                or "linear_relative"
+            ),
+            "saturation_pct": float(
+                self.sensor_parameter_heatmap_saturation_spin.value()
+            ),
+            "noise_floor_pct": float(
+                self.sensor_parameter_heatmap_floor_spin.value()
+            ),
+            "proximity_noise_floor": proximity_floor,
+            "proximity_knee": proximity_knee,
+            "proximity_saturation": proximity_saturation,
+            "color_gain_3d": float(
+                self.sensor_parameter_heatmap_3d_color_gain_spin.value()
+            ),
+        }
+
+    def _set_sensor_parameter_heatmap_controls(self, heatmap):
+        heatmap = heatmap if isinstance(heatmap, dict) else {}
+        response_mode = str(heatmap.get("response_mode", "linear_relative"))
+        if response_mode not in ("linear_relative", "proximity_enhanced"):
+            response_mode = "linear_relative"
+        palette_3d = str(heatmap.get("palette_3d", "white_red"))
+        if palette_3d not in (
+            "white_red",
+            "white_blue_red",
+            "light_deep_blue",
+        ):
+            palette_3d = "white_red"
+        try:
+            saturation_pct = float(heatmap.get("saturation_pct", 5.0))
+        except Exception:
+            saturation_pct = 5.0
+        try:
+            noise_floor_pct = float(heatmap.get("noise_floor_pct", 0.5))
+        except Exception:
+            noise_floor_pct = 0.5
+        try:
+            proximity_floor = float(heatmap.get("proximity_noise_floor", 20.0))
+        except Exception:
+            proximity_floor = 20.0
+        try:
+            proximity_knee = float(heatmap.get("proximity_knee", 100.0))
+        except Exception:
+            proximity_knee = 100.0
+        try:
+            proximity_saturation = float(
+                heatmap.get("proximity_saturation", 1000.0)
+            )
+        except Exception:
+            proximity_saturation = 1000.0
+        try:
+            color_gain_3d = float(heatmap.get("color_gain_3d", 1.5))
+        except Exception:
+            color_gain_3d = 1.5
+        proximity_floor = float(np.clip(proximity_floor, 0.0, 1000000.0))
+        proximity_knee = float(
+            np.clip(proximity_knee, proximity_floor + 0.1, 1000000.0)
+        )
+        proximity_saturation = float(
+            np.clip(proximity_saturation, proximity_knee + 0.1, 1000000.0)
+        )
+
+        widgets = [
+            self.sensor_parameter_heatmap_palette_combo,
+            self.sensor_parameter_heatmap_response_combo,
+            self.sensor_parameter_heatmap_saturation_spin,
+            self.sensor_parameter_heatmap_floor_spin,
+            self.sensor_parameter_heatmap_proximity_floor_spin,
+            self.sensor_parameter_heatmap_proximity_knee_spin,
+            self.sensor_parameter_heatmap_proximity_saturation_spin,
+            self.sensor_parameter_heatmap_3d_color_gain_spin,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self._set_combo_current_data(
+            self.sensor_parameter_heatmap_palette_combo, palette_3d
+        )
+        self._set_combo_current_data(
+            self.sensor_parameter_heatmap_response_combo, response_mode
+        )
+        self.sensor_parameter_heatmap_saturation_spin.setValue(
+            float(np.clip(saturation_pct, 0.1, 50.0))
+        )
+        self.sensor_parameter_heatmap_floor_spin.setValue(
+            float(np.clip(noise_floor_pct, 0.0, 20.0))
+        )
+        self.sensor_parameter_heatmap_proximity_floor_spin.setValue(
+            proximity_floor
+        )
+        self.sensor_parameter_heatmap_proximity_knee_spin.setValue(
+            proximity_knee
+        )
+        self.sensor_parameter_heatmap_proximity_saturation_spin.setValue(
+            proximity_saturation
+        )
+        self.sensor_parameter_heatmap_3d_color_gain_spin.setValue(
+            float(np.clip(color_gain_3d, 1.0, 3.0))
+        )
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._update_sensor_parameter_heatmap_controls()
+
+    def _update_sensor_parameter_heatmap_controls(self):
+        enhanced = (
+            str(self.sensor_parameter_heatmap_response_combo.currentData())
+            == "proximity_enhanced"
+        )
+        self.sensor_parameter_heatmap_saturation_spin.setEnabled(not enhanced)
+        self.sensor_parameter_heatmap_floor_spin.setEnabled(not enhanced)
+        self.sensor_parameter_heatmap_proximity_floor_spin.setEnabled(enhanced)
+        self.sensor_parameter_heatmap_proximity_knee_spin.setEnabled(enhanced)
+        self.sensor_parameter_heatmap_proximity_saturation_spin.setEnabled(enhanced)
+
     def _update_sensor_parameter_geometry_subcontrols(self):
         group_enabled = bool(
             getattr(self, "sensor_parameter_geometry_group", None) is not None
             and self.sensor_parameter_geometry_group.isEnabled()
         )
         shape_enabled = group_enabled and self.sensor_parameter_use_shape_checkbox.isChecked()
-        for widget in (
-            self.sensor_parameter_shape_combo,
-            self.sensor_parameter_bend_axis_combo,
-            self.sensor_parameter_arc_spin,
-            self.sensor_parameter_normal_flip_checkbox,
-        ):
-            widget.setEnabled(shape_enabled)
+        shape = str(self.sensor_parameter_shape_combo.currentData() or "flat")
+        self.sensor_parameter_shape_combo.setEnabled(shape_enabled)
+        self.sensor_parameter_bend_axis_combo.setEnabled(
+            shape_enabled and shape == "cylinder"
+        )
+        self.sensor_parameter_arc_spin.setEnabled(
+            shape_enabled and shape == "cylinder"
+        )
+        self.sensor_parameter_normal_flip_checkbox.setEnabled(shape_enabled)
+        self.sensor_parameter_heatmap_follows_shape_checkbox.setEnabled(group_enabled)
+        self.sensor_parameter_shape_editor_button.setEnabled(group_enabled)
         for widget in (
             self.sensor_parameter_rotation_x_spin,
             self.sensor_parameter_rotation_y_spin,
@@ -2023,6 +2595,36 @@ class UI(
         except Exception:
             arc_deg = 0.0
         normal_flip = bool(geometry.get("normal_flip", False))
+        custom_points = geometry.get("custom_points", [])
+        self._sensor_parameter_custom_points = (
+            list(custom_points) if isinstance(custom_points, list) else []
+        )
+        self._sensor_parameter_use_custom_heatmap_shape = bool(
+            geometry.get("use_custom_heatmap_shape", False)
+        )
+        custom_heatmap_points = geometry.get("custom_heatmap_points", [])
+        self._sensor_parameter_custom_heatmap_points = (
+            list(custom_heatmap_points)
+            if isinstance(custom_heatmap_points, list)
+            else []
+        )
+        custom_heatmap_corners = geometry.get("custom_heatmap_corners", [])
+        self._sensor_parameter_custom_heatmap_corners = (
+            list(custom_heatmap_corners)
+            if isinstance(custom_heatmap_corners, list)
+            else []
+        )
+        self._sensor_parameter_use_curved_heatmap_edges = bool(
+            geometry.get("use_curved_heatmap_edges", False)
+        )
+        custom_heatmap_edge_offsets = geometry.get(
+            "custom_heatmap_edge_offsets", []
+        )
+        self._sensor_parameter_custom_heatmap_edge_offsets = (
+            list(custom_heatmap_edge_offsets)
+            if isinstance(custom_heatmap_edge_offsets, list)
+            else []
+        )
         use_selected_shape = bool(
             geometry.get(
                 "use_selected_shape",
@@ -2037,6 +2639,7 @@ class UI(
             self.sensor_parameter_bend_axis_combo,
             self.sensor_parameter_arc_spin,
             self.sensor_parameter_normal_flip_checkbox,
+            self.sensor_parameter_heatmap_follows_shape_checkbox,
             self.sensor_parameter_rotation_x_spin,
             self.sensor_parameter_rotation_y_spin,
             self.sensor_parameter_rotation_z_spin,
@@ -2048,6 +2651,9 @@ class UI(
         self._set_combo_current_data(self.sensor_parameter_bend_axis_combo, bend_axis)
         self.sensor_parameter_arc_spin.setValue(float(np.clip(arc_deg, -180.0, 180.0)))
         self.sensor_parameter_normal_flip_checkbox.setChecked(normal_flip)
+        self.sensor_parameter_heatmap_follows_shape_checkbox.setChecked(
+            not self._sensor_parameter_use_custom_heatmap_shape
+        )
         self.sensor_parameter_rotation_x_spin.setValue(rotation_deg[0])
         self.sensor_parameter_rotation_y_spin.setValue(rotation_deg[1])
         self.sensor_parameter_rotation_z_spin.setValue(rotation_deg[2])
@@ -2089,6 +2695,14 @@ class UI(
         self._set_sensor_parameter_geometry_controls_enabled(model_name == "2d")
         stereo_field = context.get("stereo_field", {}) or {}
         self._set_sensor_parameter_stereo_field_controls(stereo_field)
+        heatmap = context.get("heatmap", {}) or {}
+        self._set_sensor_parameter_heatmap_controls(heatmap)
+        saved_camera = context.get("camera")
+        selected_is_current = self._sensor_parameter_selected_model_is_current()
+        self.sensor_parameter_save_view_button.setEnabled(selected_is_current)
+        self.sensor_parameter_restore_view_button.setEnabled(
+            selected_is_current and bool(saved_camera)
+        )
         default_logic = context.get("default_logic") or "none"
         effective_logic = context.get("effective_logic") or "none"
         point_labels = "on" if context.get("point_labels_enabled", False) else "off"
@@ -2112,10 +2726,18 @@ class UI(
             f"Effective on next Build Scene: {effective_logic}\n"
             f"Point labels: {point_labels}\n"
             f"Background axes/grid: {background_reference}\n"
+            f"Saved sensor view: {'yes' if saved_camera else 'no'}\n"
             f"Force scale: {force_scale:.6f} N/signal\n"
             f"Stereo field: noise {stereo_noise}, threshold "
             f"{float(stereo_field.get('deadband_pct', 0.35) or 0.0):.2f}, "
             f"length {float(stereo_field.get('length_scale', 0.35) or 0.35):.2f}\n"
+            f"3D heatmap: {heatmap.get('response_mode', 'linear_relative')}, "
+            f"linear full red "
+            f"{float(heatmap.get('saturation_pct', 5.0) or 5.0):.2f}%, "
+            f"floor {float(heatmap.get('noise_floor_pct', 0.5) or 0.0):.2f}%; "
+            f"proximity {float(heatmap.get('proximity_noise_floor', 20.0) or 0.0):.1f}/"
+            f"{float(heatmap.get('proximity_knee', 100.0) or 0.0):.1f}/"
+            f"{float(heatmap.get('proximity_saturation', 1000.0) or 0.0):.1f}\n"
             f"Geometry: {geometry_mode}; {geometry_shape}, {geometry_axis}, "
             f"{geometry_arc:.1f} deg, {geometry_normals}, "
             f"rot XYZ=({geometry_rotation[0]:.1f}, {geometry_rotation[1]:.1f}, "
@@ -2159,6 +2781,77 @@ class UI(
         ):
             helper.set_sensor_contact_force_scale(float(value), save_current_sensor=False)
 
+    def _save_sensor_plotter_perspective(self):
+        helper = getattr(self, "sensor_functions", None)
+        if helper is None or not self._sensor_parameter_selected_model_is_current():
+            self.sensor_parameter_status_label.setText(
+                "Build the selected sensor before saving its current view."
+            )
+            return
+        try:
+            saved = bool(helper.save_current_sensor_perspective())
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(
+                f"Failed to save the sensor view: {exc}"
+            )
+            return
+        if not saved:
+            self.sensor_parameter_status_label.setText(
+                "The current sensor view could not be saved."
+            )
+            return
+        self.sensor_parameter_status_label.setText(
+            f"Current plotter view saved for "
+            f"{helper.get_sensor_reorder_key(helper.current_model_name)}."
+        )
+        self.sensor_parameter_restore_view_button.setEnabled(True)
+
+    def _restore_sensor_plotter_perspective(self):
+        helper = getattr(self, "sensor_functions", None)
+        if helper is None or not self._sensor_parameter_selected_model_is_current():
+            self.sensor_parameter_status_label.setText(
+                "Build the selected sensor before restoring its saved view."
+            )
+            return
+        try:
+            restored = bool(helper.restore_saved_sensor_perspective(render=True))
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(
+                f"Failed to restore the sensor view: {exc}"
+            )
+            return
+        if restored:
+            self.sensor_parameter_status_label.setText(
+                f"Saved plotter view restored for "
+                f"{helper.get_sensor_reorder_key(helper.current_model_name)}."
+            )
+        else:
+            self.sensor_parameter_status_label.setText(
+                "No saved view is available for the current sensor."
+            )
+
+    def _reload_saved_sensor_parameters(self):
+        self._load_sensor_parameter_reorder_mode()
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is None
+            or not self._sensor_parameter_selected_model_is_current()
+            or not self.sensor_parameter_restore_view_button.isEnabled()
+        ):
+            return
+        try:
+            restored = bool(helper.restore_saved_sensor_perspective(render=True))
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(
+                f"Sensor parameters loaded, but the saved view failed: {exc}"
+            )
+            return
+        if restored:
+            self.sensor_parameter_status_label.setText(
+                f"Saved parameters and plotter view restored for "
+                f"{helper.get_sensor_reorder_key(helper.current_model_name)}."
+            )
+
     def _on_sensor_parameter_geometry_changed(self, *_args):
         self._update_sensor_parameter_geometry_subcontrols()
         helper = getattr(self, "sensor_functions", None)
@@ -2173,6 +2866,72 @@ class UI(
                 render=True,
             )
 
+    def _open_sensor_shape_editor(self):
+        helper = getattr(self, "sensor_functions", None)
+        if self._selected_sensor_parameter_model_name() != "2d":
+            self.sensor_parameter_status_label.setText(
+                "The interactive shape editor currently supports the 2D sensor."
+            )
+            return
+        if (
+            helper is None
+            or str(getattr(helper, "current_model_name", "") or "") != "2d"
+            or not hasattr(helper, "get_sensor_geometry_editor_data")
+        ):
+            self.sensor_parameter_status_label.setText(
+                "Build the 2D sensor scene before opening the shape editor."
+            )
+            return
+
+        geometry = self._sensor_parameter_geometry_from_ui()
+        try:
+            editor_data = helper.get_sensor_geometry_editor_data(geometry)
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(
+                f"Could not prepare the shape editor: {exc}"
+            )
+            return
+        if not editor_data:
+            self.sensor_parameter_status_label.setText(
+                "The current 2D sensor geometry is not ready for editing."
+            )
+            return
+
+        try:
+            from phd.ui.sensor_shape_editor import SensorShapeEditorDialog
+
+            dialog = SensorShapeEditorDialog(
+                editor_data,
+                geometry,
+                parent=self.sensor_parameters_dialog,
+            )
+            accepted = dialog.exec_() == QDialog.Accepted
+            if not accepted:
+                return
+            custom_geometry = dialog.result_geometry_config()
+            self._set_sensor_parameter_geometry_controls(custom_geometry)
+            applied = bool(
+                helper.set_sensor_geometry_config(
+                    custom_geometry,
+                    save_current_sensor=True,
+                    render=True,
+                )
+            )
+        except Exception as exc:
+            self.sensor_parameter_status_label.setText(
+                f"Custom shape editor failed: {exc}"
+            )
+            return
+
+        if applied:
+            self.sensor_parameter_status_label.setText(
+                f"Custom shape saved for 2d_{helper.n_row}x{helper.n_col}."
+            )
+        else:
+            self.sensor_parameter_status_label.setText(
+                "The custom shape could not be applied to the current sensor."
+            )
+
     def _on_sensor_parameter_stereo_field_changed(self, *_args):
         self.sensor_parameter_stereo_deadband_spin.setEnabled(
             self.sensor_parameter_stereo_ignore_noise_checkbox.isChecked()
@@ -2185,6 +2944,20 @@ class UI(
         ):
             helper.set_stereo_field_settings(
                 self._sensor_parameter_stereo_field_from_ui(),
+                save_current_sensor=False,
+            )
+
+    def _on_sensor_parameter_heatmap_changed(self, *_args):
+        settings = self._sensor_parameter_heatmap_from_ui()
+        self._set_sensor_parameter_heatmap_controls(settings)
+        helper = getattr(self, "sensor_functions", None)
+        if (
+            helper is not None
+            and hasattr(helper, "set_heatmap_settings")
+            and self._sensor_parameter_selected_model_is_current()
+        ):
+            helper.set_heatmap_settings(
+                settings,
                 save_current_sensor=False,
             )
 
@@ -2232,6 +3005,13 @@ class UI(
                         self._sensor_parameter_stereo_field_from_ui(),
                     )
                 ) and ok
+            if hasattr(helper, "set_saved_sensor_heatmap_config"):
+                ok = bool(
+                    helper.set_saved_sensor_heatmap_config(
+                        model_name,
+                        self._sensor_parameter_heatmap_from_ui(),
+                    )
+                ) and ok
             if (
                 hasattr(helper, "set_sensor_point_labels_enabled")
                 and self._sensor_parameter_selected_model_is_current()
@@ -2274,6 +3054,14 @@ class UI(
                     self._sensor_parameter_stereo_field_from_ui(),
                     save_current_sensor=False,
                 )
+            if (
+                hasattr(helper, "set_heatmap_settings")
+                and self._sensor_parameter_selected_model_is_current()
+            ):
+                helper.set_heatmap_settings(
+                    self._sensor_parameter_heatmap_from_ui(),
+                    save_current_sensor=False,
+                )
             context = helper.get_sensor_reorder_context(model_name)
         except Exception as exc:
             self.sensor_parameter_status_label.setText(f"Failed to save sensor parameters: {exc}")
@@ -2282,6 +3070,8 @@ class UI(
         if ok:
             saved_geometry = context.get("geometry", {}) or {}
             saved_stereo = context.get("stereo_field", {}) or {}
+            saved_heatmap = context.get("heatmap", {}) or {}
+            saved_camera = context.get("camera")
             saved_shape = str(saved_geometry.get("shape", "flat") or "flat")
             saved_arc = float(saved_geometry.get("arc_deg", 0.0) or 0.0)
             saved_rotation = self._sensor_parameter_rotation_from_geometry(saved_geometry)
@@ -2298,11 +3088,21 @@ class UI(
                 f"Effective on next Build Scene: {context.get('effective_logic') or 'none'}\n"
                 f"Point labels: {'on' if context.get('point_labels_enabled', False) else 'off'}\n"
                 f"Background axes/grid: {'on' if context.get('background_reference_enabled', True) else 'off'}\n"
+                f"Saved sensor view: {'yes' if saved_camera else 'no'}\n"
                 f"Force scale: {float(context.get('force_scale_n_per_signal', 0.0) or 0.0):.6f} N/signal\n"
                 f"Stereo field: noise "
                 f"{'ignored' if saved_stereo.get('ignore_noise_enabled', True) else 'raw'}, "
                 f"threshold {float(saved_stereo.get('deadband_pct', 0.35) or 0.0):.2f}, "
                 f"length {float(saved_stereo.get('length_scale', 0.35) or 0.35):.2f}\n"
+                f"3D heatmap: {saved_heatmap.get('response_mode', 'linear_relative')}, "
+                f"palette {saved_heatmap.get('palette_3d', 'white_red')}, "
+                f"linear full red "
+                f"{float(saved_heatmap.get('saturation_pct', 5.0) or 5.0):.2f}%, "
+                f"floor {float(saved_heatmap.get('noise_floor_pct', 0.5) or 0.0):.2f}%; "
+                f"proximity "
+                f"{float(saved_heatmap.get('proximity_noise_floor', 20.0) or 0.0):.1f}/"
+                f"{float(saved_heatmap.get('proximity_knee', 100.0) or 0.0):.1f}/"
+                f"{float(saved_heatmap.get('proximity_saturation', 1000.0) or 0.0):.1f}\n"
                 f"Geometry: {saved_mode}; {saved_shape}, "
                 f"{saved_geometry.get('bend_axis', 'columns')}, "
                 f"{saved_arc:.1f} deg, "
@@ -2560,6 +3360,22 @@ class UI(
         rule_based_layout.setContentsMargins(10, 10, 10, 10)
         rule_based_layout.setSpacing(6)
 
+        admittance_group = QGroupBox("Admittance Control")
+        admittance_layout = QVBoxLayout(admittance_group)
+        admittance_layout.setContentsMargins(10, 10, 10, 10)
+        admittance_layout.setSpacing(6)
+        self.admittance_control_button = QPushButton("Start Admittance Control")
+        self.admittance_control_button.setCheckable(True)
+        self.admittance_control_button.setToolTip(
+            "Start pressure-based robot admittance using the selected sensor and "
+            "its saved robot-link mapping. The 3D robot window is not required."
+        )
+        self.admittance_control_status_label = QLabel("Pressure admittance: idle")
+        self.admittance_control_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        self.admittance_control_status_label.setWordWrap(True)
+        admittance_layout.addWidget(self.admittance_control_button)
+        admittance_layout.addWidget(self.admittance_control_status_label)
+
         self.direct_finger_motion_button = QPushButton("Direct Finger Motion")
         self.console_control_button = QPushButton("Console Control (PS5)")
         self.console_control_sensor_button = QPushButton("Console Control (Sensor)")
@@ -2648,6 +3464,7 @@ class UI(
         ai_based_layout.addWidget(self.ai_direct_finger_motion_execution_button)
         ai_model_layout.addWidget(ai_based_group)
         ai_model_layout.addWidget(rule_based_group)
+        ai_model_layout.addWidget(admittance_group)
         ai_model_layout.addStretch()
 
         # ─── Subtab “Data Training” ───
@@ -2727,6 +3544,98 @@ class UI(
         layout.addWidget(self.ai_sub_tabs)
 
     def setup_tab4(self, layout):
+        # --- HP-200 Force Meter ---
+        force_meter_group = QGroupBox("HP-200 Force Meter")
+        force_meter_layout = QVBoxLayout(force_meter_group)
+
+        connection_grid = QGridLayout()
+        connection_grid.addWidget(QLabel("Serial port"), 0, 0)
+        self.force_meter_port_combo = QComboBox()
+        self.force_meter_port_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLength
+        )
+        self.force_meter_port_combo.setMinimumContentsLength(28)
+        connection_grid.addWidget(self.force_meter_port_combo, 0, 1)
+        self.force_meter_refresh_button = QPushButton("Refresh Ports")
+        connection_grid.addWidget(self.force_meter_refresh_button, 0, 2)
+
+        connection_grid.addWidget(QLabel("Protocol"), 1, 0)
+        self.force_meter_protocol_combo = QComboBox()
+        self.force_meter_protocol_combo.addItem(
+            "HP-200 Modbus RTU (official)", "modbus_rtu"
+        )
+        self.force_meter_protocol_combo.addItem(
+            "Legacy text stream", "text_stream"
+        )
+        connection_grid.addWidget(self.force_meter_protocol_combo, 1, 1, 1, 2)
+
+        connection_grid.addWidget(QLabel("Baud rate"), 2, 0)
+        self.force_meter_baud_combo = QComboBox()
+        for baud_rate in (9600, 19200, 38400, 115200, 4800, 2400):
+            self.force_meter_baud_combo.addItem(str(baud_rate), baud_rate)
+        connection_grid.addWidget(self.force_meter_baud_combo, 2, 1)
+        self.force_meter_connect_button = QPushButton("Connect HP-200")
+        self.force_meter_connect_button.setCheckable(True)
+        connection_grid.addWidget(self.force_meter_connect_button, 2, 2)
+        connection_grid.setColumnStretch(1, 1)
+        force_meter_layout.addLayout(connection_grid)
+
+        reading_row = QHBoxLayout()
+        self.force_meter_value_label = QLabel("+0.0 N")
+        self.force_meter_value_label.setAlignment(Qt.AlignCenter)
+        self.force_meter_value_label.setMinimumWidth(190)
+        self.force_meter_value_label.setStyleSheet(
+            f"color: {theme.TEXT_PRIMARY}; font-size: 24px; font-weight: 600;"
+        )
+        reading_row.addWidget(self.force_meter_value_label)
+
+        reading_details = QVBoxLayout()
+        self.force_meter_native_label = QLabel("Meter: no sample")
+        self.force_meter_native_label.setStyleSheet(theme.INFO_LABEL_STYLE)
+        self.force_meter_stats_label = QLabel("Min -- N   Max -- N   Peak |F| -- N")
+        self.force_meter_stats_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        reading_details.addWidget(self.force_meter_native_label)
+        reading_details.addWidget(self.force_meter_stats_label)
+        reading_row.addLayout(reading_details, stretch=1)
+        force_meter_layout.addLayout(reading_row)
+
+        self.force_meter_chart = ForceMeterChartWidget(time_window_seconds=30.0)
+        force_meter_layout.addWidget(self.force_meter_chart)
+
+        graph_controls = QHBoxLayout()
+        graph_controls.addWidget(QLabel("Graph window"))
+        self.force_meter_graph_window_combo = QComboBox()
+        for window_seconds in (10, 30, 60, 120):
+            self.force_meter_graph_window_combo.addItem(
+                f"{window_seconds} s", window_seconds
+            )
+        self.force_meter_graph_window_combo.setCurrentIndex(1)
+        graph_controls.addWidget(self.force_meter_graph_window_combo)
+        self.force_meter_clear_graph_button = QPushButton("Clear Graph")
+        graph_controls.addWidget(self.force_meter_clear_graph_button)
+        graph_controls.addStretch()
+        force_meter_layout.addLayout(graph_controls)
+
+        force_controls = QHBoxLayout()
+        self.force_meter_zero_button = QPushButton("Zero Display")
+        self.force_meter_zero_button.setEnabled(False)
+        self.force_meter_clear_zero_button = QPushButton("Clear Zero")
+        self.force_meter_clear_zero_button.setEnabled(False)
+        self.force_meter_reset_stats_button = QPushButton("Reset Statistics")
+        force_controls.addWidget(self.force_meter_zero_button)
+        force_controls.addWidget(self.force_meter_clear_zero_button)
+        force_controls.addWidget(self.force_meter_reset_stats_button)
+        force_controls.addStretch()
+        force_meter_layout.addLayout(force_controls)
+
+        self.force_meter_status_label = QLabel("Disconnected")
+        self.force_meter_status_label.setWordWrap(True)
+        self.force_meter_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        force_meter_layout.addWidget(self.force_meter_status_label)
+        layout.addWidget(force_meter_group)
+
+        self._refresh_force_meter_ports()
+
         # --- Gripper Manual Control ---
         gripper_group = QGroupBox("Gripper Manual Control")
         gripper_layout = QVBoxLayout()
@@ -2778,6 +3687,7 @@ class UI(
         camera_layout.addWidget(self.auto_center_button)
         camera_group.setLayout(camera_layout)
         layout.addWidget(camera_group)
+        layout.addStretch()
 
     def setup_tab5(self, layout):
         self.hand_sub_tabs = QTabWidget()
@@ -2965,9 +3875,9 @@ class UI(
         bottom_row = QHBoxLayout()
         self.hand_sliders_live_check = QCheckBox("Live update (drag to send)")
         self.hand_sliders_live_check.setToolTip(
-            "When ticked, dragging a slider continuously streams the new\n"
-            "angle to the hand (throttled). Turn off if you prefer to dial\n"
-            "in the value first and press 'Send' yourself."
+            "When enabled, first synchronize all sliders from the hand's\n"
+            "actual angles, then continuously stream slider changes\n"
+            "(throttled). Turn it off to dial in values without sending."
         )
         bottom_row.addWidget(self.hand_sliders_live_check)
 
@@ -3005,6 +3915,57 @@ class UI(
 
         slider_outer.addLayout(bottom_row)
         hand_motion_layout.addWidget(slider_group)
+
+        pose_group = QGroupBox("Saved Finger Poses")
+        pose_layout = QVBoxLayout(pose_group)
+
+        pose_selection_row = QHBoxLayout()
+        pose_selection_row.addWidget(QLabel("Pose:"))
+        self.hand_pose_preset_combo = QComboBox()
+        self.hand_pose_preset_combo.setEditable(True)
+        self.hand_pose_preset_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.hand_pose_preset_combo.setMinimumWidth(180)
+        self.hand_pose_preset_combo.lineEdit().setMaxLength(64)
+        self.hand_pose_preset_combo.lineEdit().setPlaceholderText(
+            "Enter or select a pose name"
+        )
+        self.hand_pose_preset_combo.setToolTip(
+            "Choose a saved pose, or enter a new name before saving the\n"
+            "current six slider values."
+        )
+        pose_selection_row.addWidget(self.hand_pose_preset_combo, stretch=1)
+
+        self.hand_pose_save_button = QPushButton("Save Current")
+        self.hand_pose_save_button.setToolTip(
+            "Save all six current slider values under the selected name."
+        )
+        pose_selection_row.addWidget(self.hand_pose_save_button)
+        pose_layout.addLayout(pose_selection_row)
+
+        pose_action_row = QHBoxLayout()
+        self.hand_pose_load_button = QPushButton("Load")
+        self.hand_pose_load_button.setToolTip(
+            "Load the saved values into the sliders without moving the hand."
+        )
+        pose_action_row.addWidget(self.hand_pose_load_button)
+
+        self.hand_pose_load_send_button = QPushButton("Load && Send")
+        self.hand_pose_load_send_button.setToolTip(
+            "Load the selected pose and send all six values to the hand."
+        )
+        pose_action_row.addWidget(self.hand_pose_load_send_button)
+
+        self.hand_pose_delete_button = QPushButton("Delete")
+        self.hand_pose_delete_button.setToolTip("Delete the selected saved pose.")
+        pose_action_row.addWidget(self.hand_pose_delete_button)
+
+        self.hand_pose_status_label = QLabel("No saved poses")
+        self.hand_pose_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        pose_action_row.addWidget(self.hand_pose_status_label, stretch=1)
+        pose_layout.addLayout(pose_action_row)
+
+        hand_motion_layout.addWidget(pose_group)
+        self._load_hand_pose_presets()
         hand_motion_layout.addStretch()
 
         self.hand_sub_tabs.addTab(hand_monitor_page, "Tactile / Model")

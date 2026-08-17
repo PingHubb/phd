@@ -1,5 +1,5 @@
 import math
-import subprocess
+import threading
 import time
 import re
 from types import SimpleNamespace
@@ -101,9 +101,9 @@ class RobotController(Node if ROS_AVAILABLE else object):
             return
 
         self._initialize_ros_node()
-        self._start_ros_thread()
         self._setup_service_clients()
         self._setup_feedback_subscriptions()
+        self._start_ros_thread()
 
     # ------------------------------------------------------------------
     # Startup / shutdown
@@ -139,40 +139,19 @@ class RobotController(Node if ROS_AVAILABLE else object):
         self.latest_hand_touch_time = None
         self._end_effector_velocity_mode_active = False
         self._joint_velocity_mode_active = False
+        self._velocity_watchdog_timeout_sec = 0.35
+        self._velocity_watchdog_check_sec = 0.05
+        self._velocity_command_last_at = 0.0
+        self._velocity_command_nonzero = False
+        self._velocity_state_lock = threading.Lock()
+        self._velocity_watchdog_stop = threading.Event()
+        self._velocity_watchdog_thread = None
 
     def _detect_ros_environment(self):
-        if not ROS_AVAILABLE:
-            return False
-
-        try:
-            services = subprocess.check_output(
-                ["ros2", "service", "list"],
-                stderr=subprocess.DEVNULL,
-                timeout=2.0,
-            ).decode()
-        except Exception:
-            return False
-
-        try:
-            topics = subprocess.check_output(
-                ["ros2", "topic", "list"],
-                stderr=subprocess.DEVNULL,
-                timeout=2.0,
-            ).decode()
-        except Exception:
-            topics = ""
-
-        robot_ready = "/set_positions" in services
-        hand_service_ready = any(
-            name in services
-            for name in ("/Setangle", "/Setspeed", "/Setforce", "/Getangleact")
-        )
-        self.hand_topic_commands_detected = any(
-            name in topics
-            for name in ("/set_angle_data", "/set_speed_data", "/set_force_data", "/angle_data")
-        )
-        hand_ready = hand_service_ready or self.hand_topic_commands_detected or "/touch_data" in topics
-        self.use_ros = bool(robot_ready or hand_ready)
+        # Create the ROS node even when drivers start after the UI. Service and
+        # topic readiness is refreshed dynamically instead of being frozen by a
+        # one-shot `ros2 ... list` subprocess during construction.
+        self.use_ros = bool(ROS_AVAILABLE)
         return self.use_ros
 
     def _initialize_ros_node(self):
@@ -185,6 +164,40 @@ class RobotController(Node if ROS_AVAILABLE else object):
     def _start_ros_thread(self):
         self.ros_thread = ROSNodeThread(self)
         self.ros_thread.start()
+        self._start_velocity_watchdog()
+
+    def _start_velocity_watchdog(self):
+        if self._velocity_watchdog_thread is not None and self._velocity_watchdog_thread.is_alive():
+            return
+        self._velocity_watchdog_stop.clear()
+        self._velocity_watchdog_thread = threading.Thread(
+            target=self._velocity_watchdog_loop,
+            name="robot-velocity-watchdog",
+            daemon=True,
+        )
+        self._velocity_watchdog_thread.start()
+
+    def _stop_velocity_watchdog(self):
+        self._velocity_watchdog_stop.set()
+        thread = self._velocity_watchdog_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
+        self._velocity_watchdog_thread = None
+
+    def _velocity_watchdog_loop(self):
+        while not self._velocity_watchdog_stop.wait(self._velocity_watchdog_check_sec):
+            with self._velocity_state_lock:
+                active = self._end_effector_velocity_mode_active
+                nonzero = self._velocity_command_nonzero
+                last_at = self._velocity_command_last_at
+            if not active or not nonzero or last_at <= 0.0:
+                continue
+            if (time.monotonic() - last_at) < self._velocity_watchdog_timeout_sec:
+                continue
+            print("[RobotController] Velocity watchdog stopped a stale nonzero command.")
+            self.send_request(self.set_end_effector_velocity([0.0] * 6))
+            self.send_request(self.suspend_end_effector_velocity_mode())
+            self.send_request(self.stop_end_effector_velocity_mode())
 
     def _setup_service_clients(self):
         self.client, self.service_ok = self._create_client_checked(
@@ -215,13 +228,11 @@ class RobotController(Node if ROS_AVAILABLE else object):
         self.hand_set_force_client = self.create_client(Setforce, "/Setforce")
         self.hand_get_angle_client = self.create_client(Getangleact, "/Getangleact")
 
-        ok_angle = self.hand_set_angle_client.wait_for_service(timeout_sec=0.3)
-        ok_speed = self.hand_set_speed_client.wait_for_service(timeout_sec=0.3)
-        ok_force = self.hand_set_force_client.wait_for_service(timeout_sec=0.3)
-        ok_get = self.hand_get_angle_client.wait_for_service(timeout_sec=0.3)
+        ok_angle = self._client_is_ready(self.hand_set_angle_client)
+        ok_speed = self._client_is_ready(self.hand_set_speed_client)
+        ok_force = self._client_is_ready(self.hand_set_force_client)
+        ok_get = self._client_is_ready(self.hand_get_angle_client)
         self.hand_srv_ok = bool(ok_angle and ok_speed and ok_force and ok_get)
-        if not self.hand_srv_ok:
-            self.get_logger().warning("RH56F1 service API unavailable; checking topic command interface.")
 
     def _setup_hand_topic_interfaces(self):
         if not HAND_TOPIC_CMDS_AVAILABLE:
@@ -243,10 +254,60 @@ class RobotController(Node if ROS_AVAILABLE else object):
 
     def _create_client_checked(self, srv_type, service_name, warning_text):
         client = self.create_client(srv_type, service_name)
-        ok = client.wait_for_service(timeout_sec=0.5)
-        if not ok:
-            self.get_logger().warning(warning_text)
+        ok = self._client_is_ready(client)
         return client, ok
+
+    @staticmethod
+    def _client_is_ready(client):
+        if client is None:
+            return False
+        try:
+            return bool(client.service_is_ready())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _publisher_has_subscribers(publisher):
+        if publisher is None:
+            return False
+        try:
+            return int(publisher.get_subscription_count()) > 0
+        except Exception:
+            return False
+
+    def refresh_availability(self):
+        """Refresh ROS graph readiness without blocking the UI."""
+        if not (self.use_ros and self._node_started):
+            return {
+                "robot": False,
+                "position_service": False,
+                "script_service": False,
+                "hand_commands": False,
+                "hand_tactile": False,
+            }
+
+        self.service_ok = self._client_is_ready(self.client)
+        self.script_ok = self._client_is_ready(self.send_script_client)
+        self.event_ok = self._client_is_ready(self.event_client)
+        hand_clients = (
+            self.hand_set_angle_client,
+            self.hand_set_speed_client,
+            self.hand_set_force_client,
+            self.hand_get_angle_client,
+        )
+        self.hand_srv_ok = bool(
+            HAND_SRVS_AVAILABLE
+            and all(self._client_is_ready(client) for client in hand_clients)
+        )
+        topic_commands = self._hand_topic_commands_available(refresh=False)
+        tactile = self.hand_tactile_publisher_count() > 0
+        return {
+            "robot": bool(self.service_ok or self.script_ok),
+            "position_service": bool(self.service_ok),
+            "script_service": bool(self.script_ok),
+            "hand_commands": bool(self.hand_srv_ok or topic_commands),
+            "hand_tactile": bool(tactile),
+        }
 
     def _setup_feedback_subscriptions(self):
         self.create_subscription(
@@ -264,6 +325,12 @@ class RobotController(Node if ROS_AVAILABLE else object):
 
     def shutdown(self):
         """Stop the spin thread and tear down the ROS node cleanly."""
+        if self._end_effector_velocity_mode_active:
+            try:
+                self.exit_end_effector_velocity_mode(send_zero=True)
+            except Exception:
+                pass
+        self._stop_velocity_watchdog()
         self.enable_hand_tactile_subscription(False)
         self._set_hand_angle_subscription_enabled(False)
         if self.ros_thread is not None:
@@ -286,7 +353,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
 
     @property
     def is_available(self):
-        return bool(self.use_ros and self._node_started)
+        return bool(self.refresh_availability().get("robot", False))
 
     def __del__(self):
         try:
@@ -312,6 +379,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
         command must start from the exact joint configuration (e.g. an explicit
         J6 unwrap inserted by Task 1 to avoid the J6 ±270° wrap-around limit).
         """
+        self.refresh_availability()
         if not (self.use_ros and self.service_ok and self.client):
             return False
 
@@ -329,6 +397,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
 
     def ensure_position_mode_ready(self, wait_sec=0.08):
         """Leave ContinueVLine/ContinueVJog before sending position commands."""
+        self.refresh_availability()
         if not (self.use_ros and self.script_ok and self.send_script_client):
             return False
         self.send_request(self.suspend_end_effector_velocity_mode())
@@ -349,6 +418,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
         fine_goal=False,
     ):
         """Send a tool-space PTP via SetPositions service."""
+        self.refresh_availability()
         if not (self.use_ros and self.service_ok and self.client):
             return False
 
@@ -379,7 +449,13 @@ class RobotController(Node if ROS_AVAILABLE else object):
 
     def send_request(self, command: str):
         """Send an arbitrary script command via SendScript service."""
+        if self.use_ros and self._node_started:
+            self.script_ok = self._client_is_ready(self.send_script_client)
         if not command or not (self.use_ros and self.script_ok and self.send_script_client):
+            if str(command or "").strip().startswith("SetContinueVLine("):
+                with self._velocity_state_lock:
+                    self._end_effector_velocity_mode_active = False
+                    self._velocity_command_nonzero = False
             return False
 
         req = SendScript.Request()
@@ -392,14 +468,28 @@ class RobotController(Node if ROS_AVAILABLE else object):
     def _note_script_mode_transition(self, command: str):
         text = str(command or "").strip()
         if text.startswith("ContinueVLine("):
-            self._end_effector_velocity_mode_active = True
-            self._joint_velocity_mode_active = False
+            with self._velocity_state_lock:
+                self._end_effector_velocity_mode_active = True
+                self._joint_velocity_mode_active = False
         elif text.startswith("ContinueVJog("):
-            self._joint_velocity_mode_active = True
-            self._end_effector_velocity_mode_active = False
+            with self._velocity_state_lock:
+                self._joint_velocity_mode_active = True
+                self._end_effector_velocity_mode_active = False
+                self._velocity_command_nonzero = False
         elif text.startswith("SuspendContinueVmode") or text.startswith("StopContinueVmode"):
-            self._end_effector_velocity_mode_active = False
-            self._joint_velocity_mode_active = False
+            with self._velocity_state_lock:
+                self._end_effector_velocity_mode_active = False
+                self._joint_velocity_mode_active = False
+                self._velocity_command_nonzero = False
+        elif text.startswith("SetContinueVLine("):
+            payload = text[len("SetContinueVLine(") :].split(")", 1)[0]
+            try:
+                values = [float(value.strip()) for value in payload.split(",")]
+            except ValueError:
+                values = []
+            with self._velocity_state_lock:
+                self._velocity_command_last_at = time.monotonic()
+                self._velocity_command_nonzero = any(abs(value) > 1e-9 for value in values)
 
     def enter_end_effector_velocity_mode(self, suspend_existing=False):
         """Enter TM ContinueVLine once, then keep streaming SetContinueVLine."""
@@ -436,22 +526,50 @@ class RobotController(Node if ROS_AVAILABLE else object):
     # Dexterous hand helpers (RH56F1 via service_interfaces)
     # ------------------------------------------------------------------
     def _hand_service_commands_available(self):
-        return bool(self.use_ros and self.hand_srv_ok and HAND_SRVS_AVAILABLE)
+        if not (self.use_ros and self._node_started and HAND_SRVS_AVAILABLE):
+            return False
+        clients = (
+            self.hand_set_angle_client,
+            self.hand_set_speed_client,
+            self.hand_set_force_client,
+            self.hand_get_angle_client,
+        )
+        self.hand_srv_ok = all(self._client_is_ready(client) for client in clients)
+        return bool(self.hand_srv_ok)
 
-    def _hand_topic_commands_available(self):
-        return bool(self.use_ros and self._node_started and self.hand_topic_ok and HAND_TOPIC_CMDS_AVAILABLE)
+    def _hand_topic_commands_available(self, refresh=True):
+        if not (
+            self.use_ros
+            and self._node_started
+            and self.hand_topic_ok
+            and HAND_TOPIC_CMDS_AVAILABLE
+        ):
+            return False
+        publishers = (
+            self.hand_set_angle_pub,
+            self.hand_set_speed_pub,
+            self.hand_set_force_pub,
+        )
+        available = any(self._publisher_has_subscribers(pub) for pub in publishers)
+        if refresh:
+            self.hand_topic_commands_detected = bool(available)
+        return bool(available)
 
     def hand_services_available(self):
         return bool(self._hand_service_commands_available() or self._hand_topic_commands_available())
 
     def hand_tactile_available(self):
-        return bool(self.use_ros and self._node_started and HAND_TOUCH_AVAILABLE)
+        return bool(
+            self.use_ros
+            and self._node_started
+            and HAND_TOUCH_AVAILABLE
+            and self.hand_tactile_publisher_count() > 0
+        )
 
     def enable_hand_tactile_subscription(self, enabled=True):
-        if not self.hand_tactile_available():
-            return False
-
         if enabled:
+            if not self.hand_tactile_available():
+                return False
             if self.hand_touch_subscription is None:
                 self.hand_touch_subscription = self.create_subscription(
                     TouchData1,
@@ -564,7 +682,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
         return output
 
     def _publish_hand_angles_topic(self, angles):
-        if not self._hand_topic_commands_available() or self.hand_set_angle_pub is None:
+        if not self._publisher_has_subscribers(self.hand_set_angle_pub):
             return None
         msg = SetAngle1()
         msg.finger_ids = [1, 2, 3, 4, 5, 6]
@@ -573,7 +691,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
         return {"mode": "topic", "topic": "/set_angle_data", "angles": list(msg.angles)}
 
     def _publish_hand_speed_topic(self, speed):
-        if not self._hand_topic_commands_available() or self.hand_set_speed_pub is None:
+        if not self._publisher_has_subscribers(self.hand_set_speed_pub):
             return None
         msg = SetSpeed1()
         msg.finger_ids = [1, 2, 3, 4, 5, 6]
@@ -582,7 +700,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
         return {"mode": "topic", "topic": "/set_speed_data", "speeds": list(msg.speeds)}
 
     def _publish_hand_force_topic(self, forces):
-        if not self._hand_topic_commands_available() or self.hand_set_force_pub is None:
+        if not self._publisher_has_subscribers(self.hand_set_force_pub):
             return None
         msg = SetForce1()
         msg.finger_ids = [1, 2, 3, 4, 5, 6]
@@ -681,7 +799,22 @@ class RobotController(Node if ROS_AVAILABLE else object):
             req.status = "get_angleact"
             req.hand_id = int(hand_id)
             fut = self.hand_get_angle_client.call_async(req)
-            return self._wait_future(fut, timeout_sec=timeout_sec)
+            response = self._wait_future(fut, timeout_sec=timeout_sec)
+            values = self._msg_sequence(
+                getattr(response, "curangleact", None)
+                if response is not None
+                else None
+            )
+            if len(values) < 6:
+                return None
+            return SimpleNamespace(
+                angle0=int(values[0]),
+                angle1=int(values[1]),
+                angle2=int(values[2]),
+                angle3=int(values[3]),
+                angle4=int(values[4]),
+                angle5=int(values[5]),
+            )
 
         if not self._hand_topic_commands_available():
             return None

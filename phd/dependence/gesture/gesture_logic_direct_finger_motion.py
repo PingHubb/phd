@@ -57,6 +57,8 @@ class DirectFingerMotion:
         self._velocity_mode_enabled = False
         self.robot_command_output_enabled = True
         self.last_robot_velocity_cmd = None
+        self._last_velocity_send_time = 0.0
+        self._last_velocity_send_failure_log_time = 0.0
         self.last_teacher_velocity_pre_flip = self._zero_velocity()
         self.current_motion_mode = "stop"
         self._smoothed_velocity = [0.0] * 6
@@ -101,6 +103,8 @@ class DirectFingerMotion:
             "two_finger_swipe_enable_vertical": True,
             "two_finger_release_grace_frames": 3,
             "sensor_frame_timeout_sec": 0.2,
+            "motion_command_keepalive_sec": 0.1,
+            "zero_command_keepalive_sec": 0.25,
             "frame_interval_ms": 0,
             "debug_output": False,
             "motion_ratio_log_enabled": False,
@@ -212,6 +216,8 @@ class DirectFingerMotion:
         self._two_finger_swipe_axis_lock = None
         self._two_finger_swipe_axis_lock_remaining = 0
         self.last_robot_velocity_cmd = None
+        self._last_velocity_send_time = 0.0
+        self._last_velocity_send_failure_log_time = 0.0
         self.last_teacher_velocity_pre_flip = self._zero_velocity()
         self.current_motion_mode = "stop"
         self._smoothed_velocity = [0.0] * 6
@@ -629,11 +635,11 @@ class DirectFingerMotion:
         self._send_robot_velocity(smoothed)
         self._log_motion_ratio(mode, smoothed)
 
-    def _apply_stop_output(self):
+    def _apply_stop_output(self, force_send=False):
         zero = self._zero_velocity()
         self._smoothed_velocity = list(zero)
         self._set_teacher_output("stop", zero)
-        self._send_robot_velocity(zero)
+        self._send_robot_velocity(zero, force_send=force_send)
         self._log_motion_ratio("stop", zero)
 
     def _apply_velocity_smoothing(self, target_velocity):
@@ -843,41 +849,65 @@ class DirectFingerMotion:
         self.current_motion_mode = str(mode)
         self.last_teacher_velocity_pre_flip = [float(v) for v in velocity]
 
-    def _send_robot_velocity(self, velocity):
+    def _send_robot_velocity(self, velocity, force_send=False):
         velocity = [float(v) for v in velocity]
         velocity = [-velocity[0], -velocity[1], -velocity[2], velocity[3], velocity[4], velocity[5]]
+        now = time.monotonic()
+        is_zero_cmd = all(abs(value) < 1e-9 for value in velocity)
+        keepalive_sec = (
+            float(getattr(self, "zero_command_keepalive_sec", 0.25))
+            if is_zero_cmd
+            else float(getattr(self, "motion_command_keepalive_sec", 0.1))
+        )
 
-        if self.last_robot_velocity_cmd == velocity:
-            return
+        if (
+            not force_send
+            and self.last_robot_velocity_cmd == velocity
+            and (now - self._last_velocity_send_time) < max(0.0, keepalive_sec)
+        ):
+            return True
 
         if not bool(getattr(self, "robot_command_output_enabled", True)):
             self.last_robot_velocity_cmd = velocity
+            self._last_velocity_send_time = now
             self._debug_print(f"Virtual robot velocity command ({self._get_requested_frame()}): {velocity}")
-            return
+            return True
 
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if robot_api is None:
-            return
+            return False
         if not self._ensure_robot_velocity_mode():
-            return
+            return False
 
         frame = self._get_requested_frame()
-
+        sent = False
         if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
-            robot_api.send_end_effector_velocity_in_frame(
-                velocity[:3],
-                velocity[3:],
-                frame=frame,
-                ensure_mode=False,
+            sent = bool(
+                robot_api.send_end_effector_velocity_in_frame(
+                    velocity[:3],
+                    velocity[3:],
+                    frame=frame,
+                    ensure_mode=False,
+                )
             )
         else:
             try:
                 cmd = robot_api.set_end_effector_velocity_in_frame(velocity[:3], velocity[3:], frame=frame)
             except Exception:
                 cmd = robot_api.set_end_effector_velocity(velocity)
-            robot_api.send_request(cmd)
+            sent = bool(robot_api.send_request(cmd))
+
+        if not sent:
+            self._velocity_mode_enabled = False
+            if (now - self._last_velocity_send_failure_log_time) >= 1.0:
+                self._last_velocity_send_failure_log_time = now
+                print(f"[DFM] WARNING: robot velocity command was not accepted ({frame}).")
+            return False
+
         self.last_robot_velocity_cmd = velocity
+        self._last_velocity_send_time = now
         self._debug_print(f"Robot velocity command ({frame}): {velocity}")
+        return True
 
     def _two_peak_pinch_is_pull(self):
         curr = self.current_two_peak_state
@@ -1007,7 +1037,7 @@ class DirectFingerMotion:
         self.last_two_peak_state = None
         if stop_mode:
             self._smoothed_velocity = [0.0] * 6
-        self._apply_stop_output()
+        self._apply_stop_output(force_send=bool(stop_mode))
 
         if stop_mode and self._velocity_mode_enabled:
             robot_api = getattr(self.ros_splitter, "robot_api", None)
@@ -1535,6 +1565,8 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.device = None
         self.model = None
         self.model_loaded = False
+        self.loaded_model_checkpoint_path = None
+        self._loaded_model_signature = None
         self.model_kind = "unknown"
         self.model_checkpoint_path = self.DEFAULT_MODEL_CHECKPOINT
         self.model_conf_threshold = 0.55
@@ -1571,7 +1603,10 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.last_prediction_time = 0.0
         self._prev_diff_for_frame_diff = None
         self.zero_keepalive_sec = 0.5
+        self.motion_keepalive_sec = 0.1
         self.idle_reenable_sec = 1.0
+        self.move_confirmation_frames = 2
+        self.min_motion_command_speed = 0.005
         # Background inference (keeps torch forward passes off the GUI
         # thread). The robustness benchmark sets this to False because it
         # drives run_step() synchronously and reads last_prediction directly.
@@ -1600,39 +1635,20 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.frame_buffer = []
         self.aux_buffer = []
         self._prev_diff_for_frame_diff = None
-        # Invalidate any in-flight background inference.
-        self._inference_epoch += 1
-        self._pending_inference = None
+        self._cancel_pending_inference()
 
     def _reset_execution_runtime_state(self):
         self.last_robot_velocity_cmd = None
         self._velocity_mode_enabled = False
         self._last_velocity_send_time = 0.0
         self._last_nonzero_command_time = 0.0
+        self._pending_predicted_mode = None
+        self._pending_predicted_mode_frames = 0
+        self._active_predicted_mode = "stop"
 
     def toggle_ai_direct_finger_motion_execution(self, model_checkpoint_path=None):
-        self.is_running = not self.is_running
         if self.is_running:
-            if model_checkpoint_path:
-                self.model_checkpoint_path = model_checkpoint_path
-            if not self.model_loaded:
-                self.load_model(self.model_checkpoint_path)
-            if not self.model_loaded:
-                self.is_running = False
-                print("AI direct finger motion execution failed to start: model is not loaded.")
-                return
-            self._reset_state()
-            self._reset_execution_buffers()
-            self._reset_execution_runtime_state()
-            if not self.dry_run_predictions_only:
-                self._ensure_robot_velocity_mode()
-            self.control_timer.start(self.prediction_interval_ms)
-            mode_text = "DRY RUN" if self.dry_run_predictions_only else "ROBOT MOTION ENABLED"
-            print(
-                f"AI direct finger motion execution STARTED ({mode_text}) | "
-                f"model={self.model_checkpoint_path}"
-            )
-        else:
+            self.is_running = False
             self.control_timer.stop()
             if self.dry_run_predictions_only:
                 self._set_teacher_output("stop", self._zero_velocity())
@@ -1642,13 +1658,80 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             self._reset_execution_buffers()
             self._reset_execution_runtime_state()
             print("AI direct finger motion execution STOPPED")
+            return False
+
+        if model_checkpoint_path:
+            self.model_checkpoint_path = model_checkpoint_path
+        requested_signature = self._checkpoint_signature(self.model_checkpoint_path)
+        if not self.model_loaded or requested_signature != self._loaded_model_signature:
+            self.load_model(self.model_checkpoint_path)
+        if not self.model_loaded:
+            self.is_running = False
+            print("AI direct finger motion execution failed to start: model is not loaded.")
+            return False
+
+        self.is_running = True
+        self._reset_state()
+        self._reset_execution_buffers()
+        self._reset_execution_runtime_state()
+        if not self.dry_run_predictions_only:
+            self._ensure_robot_velocity_mode()
+        self.control_timer.start(self.prediction_interval_ms)
+        mode_text = "DRY RUN" if self.dry_run_predictions_only else "ROBOT MOTION ENABLED"
+        print(
+            f"AI direct finger motion execution STARTED ({mode_text}) | "
+            f"model={self.loaded_model_checkpoint_path or self.model_checkpoint_path}"
+        )
+        return True
+
+    @staticmethod
+    def _checkpoint_signature(checkpoint_path):
+        path = os.path.realpath(os.path.abspath(os.path.expanduser(str(checkpoint_path))))
+        try:
+            stat = os.stat(path)
+        except OSError:
+            return (path, None, None)
+        return (path, int(stat.st_mtime_ns), int(stat.st_size))
+
+    def shutdown(self, wait=True):
+        if self.is_running:
+            self.toggle_ai_direct_finger_motion_execution()
+        else:
+            self.control_timer.stop()
+            self._cancel_pending_inference()
+        self._shutdown_inference_executor(wait=wait)
+
+    def _shutdown_inference_executor(self, wait=True):
+        executor = self._inference_executor
+        self._inference_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=bool(wait), cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=bool(wait))
+
+    def _cancel_pending_inference(self):
+        self._inference_epoch += 1
+        pending = self._pending_inference
+        self._pending_inference = None
+        if pending is not None:
+            try:
+                pending[1].cancel()
+            except Exception:
+                pass
 
     def load_model(self, checkpoint_path=None):
         checkpoint_path = checkpoint_path or self.model_checkpoint_path
+        resolved_path = os.path.realpath(
+            os.path.abspath(os.path.expanduser(str(checkpoint_path)))
+        )
         try:
+            self._cancel_pending_inference()
+            self._shutdown_inference_executor(wait=True)
             torch = self._load_torch_runtime()
 
-            checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+            checkpoint = torch.load(resolved_path, map_location=self.device, weights_only=False)
             config = checkpoint.get("config", {})
             model_class = str(checkpoint.get("model_class", ""))
             model_family = str(config.get("model_family", ""))
@@ -1660,6 +1743,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             self.model.load_state_dict(state)
             self.model.eval()
             self.model_loaded = True
+            self.model_checkpoint_path = resolved_path
+            self.loaded_model_checkpoint_path = resolved_path
+            self._loaded_model_signature = self._checkpoint_signature(resolved_path)
             print(
                 f"AI_DirectFingerMotion_execution model loaded | kind={self.model_kind} | "
                 f"seq_len={self.seq_len} | channels={self.input_channels} | "
@@ -1668,7 +1754,10 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         except Exception as exc:
             self.model_loaded = False
             self.model = None
+            self.loaded_model_checkpoint_path = None
+            self._loaded_model_signature = None
             print(f"Failed to load AI direct finger motion model: {exc}")
+        return self.model_loaded
 
     def _load_cnn_gru_checkpoint(self, _checkpoint, config):
         from phd.dependence.tactile_models import TactileCNNGRUPolicy
@@ -1985,17 +2074,36 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self._apply_prediction(prediction)
 
     def _discard_pending_predictions(self):
-        self._inference_epoch += 1
-        self._pending_inference = None
+        self._cancel_pending_inference()
 
     def _apply_prediction(self, prediction):
         mode = prediction["mode"]
         mode_conf = float(prediction["mode_conf"])
         finger_idx = int(prediction["finger_idx"])
         velocity_sent = self._clip_velocity6(prediction["velocity_sent"])
-        if mode_conf < self.model_conf_threshold or mode == "stop":
+        has_meaningful_motion = bool(
+            np.max(np.abs(velocity_sent)) >= float(self.min_motion_command_speed)
+        )
+        if mode_conf < self.model_conf_threshold or mode == "stop" or not has_meaningful_motion:
             mode = "stop"
             velocity_sent = np.zeros(6, dtype=np.float32)
+            self._pending_predicted_mode = None
+            self._pending_predicted_mode_frames = 0
+            self._active_predicted_mode = "stop"
+        else:
+            if mode == self._pending_predicted_mode:
+                self._pending_predicted_mode_frames += 1
+            else:
+                self._pending_predicted_mode = mode
+                self._pending_predicted_mode_frames = 1
+            if (
+                mode != self._active_predicted_mode
+                and self._pending_predicted_mode_frames < int(self.move_confirmation_frames)
+            ):
+                mode = "stop"
+                velocity_sent = np.zeros(6, dtype=np.float32)
+            else:
+                self._active_predicted_mode = mode
 
         velocity6_sent = [float(v) for v in velocity_sent[:6]]
         velocity6_pre_flip = [
@@ -2025,45 +2133,54 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
 
     def _send_robot_velocity_execution(self, velocity6_sent):
         if self.dry_run_predictions_only:
-            return
+            return True
         velocity6_sent = [float(v) for v in velocity6_sent]
         robot_api = getattr(self.ros_splitter, "robot_api", None)
         if robot_api is None:
-            return
+            return False
 
-        now = time.time()
+        now = time.monotonic()
         is_zero_cmd = all(abs(v) < 1e-9 for v in velocity6_sent[:3]) and all(abs(v) < 1e-9 for v in velocity6_sent[3:])
         if is_zero_cmd:
             if self.last_robot_velocity_cmd == velocity6_sent and (now - self._last_velocity_send_time) < float(
                 self.zero_keepalive_sec
             ):
-                return
+                return True
         else:
             if (now - self._last_nonzero_command_time) > float(self.idle_reenable_sec):
                 self._velocity_mode_enabled = False
-            if self.last_robot_velocity_cmd == velocity6_sent and (now - self._last_velocity_send_time) < 0.05:
-                return
+            if self.last_robot_velocity_cmd == velocity6_sent and (now - self._last_velocity_send_time) < float(
+                self.motion_keepalive_sec
+            ):
+                return True
 
         if not self._ensure_robot_velocity_mode():
-            return
+            return False
         frame = self._get_requested_frame()
+        sent = False
         if hasattr(robot_api, "send_end_effector_velocity_in_frame"):
-            robot_api.send_end_effector_velocity_in_frame(
-                velocity6_sent[:3],
-                velocity6_sent[3:],
-                frame=frame,
-                ensure_mode=False,
+            sent = bool(
+                robot_api.send_end_effector_velocity_in_frame(
+                    velocity6_sent[:3],
+                    velocity6_sent[3:],
+                    frame=frame,
+                    ensure_mode=False,
+                )
             )
         else:
             try:
                 cmd = robot_api.set_end_effector_velocity_in_frame(velocity6_sent[:3], velocity6_sent[3:], frame=frame)
             except Exception:
                 cmd = robot_api.set_end_effector_velocity(velocity6_sent)
-            robot_api.send_request(cmd)
+            sent = bool(robot_api.send_request(cmd))
+        if not sent:
+            self._velocity_mode_enabled = False
+            return False
         self.last_robot_velocity_cmd = velocity6_sent
         self._last_velocity_send_time = now
         if not is_zero_cmd:
             self._last_nonzero_command_time = now
+        return True
 
     def _stop_robot_motion_execution(self, stop_mode=False):
         zero_velocity = self._zero_velocity()

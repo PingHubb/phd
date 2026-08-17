@@ -73,7 +73,7 @@ class CameraControlMixin:
             self._startup_log(f"⚠️ Failed to stop camera worker cleanly: {exc}")
 
     def _shutdown_toggle_helper(self, attr_name, state_attr, stop_method_name, feature_label):
-        helper = self._get_sensor_helper(attr_name)
+        helper = self._get_initialized_sensor_helper(attr_name)
         if helper is None or not bool(getattr(helper, state_attr, False)):
             return
 
@@ -83,7 +83,7 @@ class CameraControlMixin:
             self._startup_log(f"⚠️ Failed to stop {feature_label} cleanly: {exc}")
 
     def _shutdown_recording_helper(self):
-        helper = self._get_sensor_helper("record_gesture_class")
+        helper = self._get_initialized_sensor_helper("record_gesture_class")
         if helper is None or not bool(getattr(helper, "is_recording", False)):
             return
 
@@ -116,8 +116,22 @@ class CameraControlMixin:
         except Exception as exc:
             self._startup_log(f"⚠️ Failed to close {feature_label} cleanly: {exc}")
 
+    def _shutdown_owned_object(self, attr_name, feature_label):
+        instance = getattr(self, attr_name, None)
+        if instance is None:
+            return
+        shutdown = getattr(instance, "shutdown", None)
+        if not callable(shutdown):
+            shutdown = getattr(instance, "stop", None)
+        if not callable(shutdown):
+            return
+        try:
+            shutdown()
+        except Exception as exc:
+            self._startup_log(f"⚠️ Failed to stop {feature_label} cleanly: {exc}")
+
     def _shutdown_proximity_helper(self):
-        helper = self._get_sensor_helper("proximity_control_class")
+        helper = self._get_initialized_sensor_helper("proximity_control_class")
         if helper is None:
             return
 
@@ -141,7 +155,7 @@ class CameraControlMixin:
                 pass
 
     def _shutdown_console_helper(self):
-        helper = self._get_sensor_helper("console_control_class")
+        helper = self._get_initialized_sensor_helper("console_control_class")
         if helper is None:
             return
         try:
@@ -164,12 +178,24 @@ class CameraControlMixin:
             except Exception:
                 pass
 
+    def _get_initialized_sensor_helper(self, attr_name):
+        sensor_functions = getattr(self, "sensor_functions", None)
+        if sensor_functions is None:
+            return None
+        getter = getattr(sensor_functions, "get_initialized_helper", None)
+        if callable(getter):
+            return getter(attr_name)
+        return getattr(sensor_functions, attr_name, None)
+
     def shutdown(self):
         if self._is_shutting_down:
             return
 
         self._is_shutting_down = True
         self.manual_watchdog_timer.stop()
+        runtime_timer = getattr(self, "_runtime_availability_timer", None)
+        if runtime_timer is not None:
+            runtime_timer.stop()
         self.manual_mode_active = False
         self.is_lifting = False
         self.grab_triggered = False
@@ -177,6 +203,14 @@ class CameraControlMixin:
         self._stop_auto_centering()
         self._stop_yolo_worker()
         self._close_camera_window()
+        self._shutdown_optional_call(
+            "_stop_force_meter",
+            "HP-200 force meter",
+        )
+        self._shutdown_optional_call(
+            "_stop_admittance_control",
+            "Pressure admittance control",
+        )
         self._shutdown_toggle_helper(
             "threelevel_hierarchical_transformer_class",
             "is_recognizing_gesture",
@@ -231,6 +265,15 @@ class CameraControlMixin:
                 sensor_functions.shutdown()
             except Exception as exc:
                 self._startup_log(f"⚠️ Failed to stop sensor reader cleanly: {exc}")
+
+        status_timer = getattr(self, "_ai_direct_execution_status_timer", None)
+        if status_timer is not None:
+            status_timer.stop()
+
+        # These objects own ROS executors/threads and must outlive all control
+        # helpers, but must not outlive the UI itself.
+        self._shutdown_owned_object("gripper", "gripper ROS worker")
+        self._shutdown_owned_object("robot_api", "robot ROS worker")
 
         self._shutdown_dialog("direct_finger_motion_settings_dialog", "Direct Finger Motion settings")
         self._shutdown_dialog("console_control_settings_dialog", "Console Control settings")

@@ -2,10 +2,10 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>phd</name>
-  <version>0.0.0</version>
-  <description>TODO: Package description</description>
+  <version>0.1.0</version>
+  <description>Tactile sensing, visualization, and robot-control research interface</description>
   <maintainer email="lcp123441@gmail.com">ping2</maintainer>
-  <license>TODO: License declaration</license>
+  <license>Proprietary</license>
 
   <depend>rclpy</depend>
   <depend>tm_msgs</depend>

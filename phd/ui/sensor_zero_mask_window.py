@@ -1,8 +1,4 @@
-"""Modal dialog used from the menu bar to choose sensor cells that should
-always read 0. The dialog edits the live `MySensor.cell_zero_mask` so users
-can see the effect immediately, and the same mask can be saved per-sensor
-into ``phd/resource/config/sensor_zero_masks.json``.
-"""
+"""Reusable controls for choosing sensor cells that should always read 0."""
 from __future__ import annotations
 
 import numpy as np
@@ -23,8 +19,8 @@ from PyQt5.QtWidgets import (
 from phd.ui import theme
 
 
-class SensorZeroMaskDialog(QDialog):
-    """Pick which sensor cells should always be forced to 0."""
+class SensorZeroMaskPanel(QWidget):
+    """Embeddable panel for editing the live sensor zero mask."""
 
     CELL_STYLE = (
         "QToolButton {"
@@ -48,19 +44,58 @@ class SensorZeroMaskDialog(QDialog):
 
     def __init__(self, parent=None, *, sensor_functions=None, sensor_key="(unknown)"):
         super().__init__(parent)
-        self.setWindowTitle("Sensor Zero Mask")
         self.setMinimumWidth(380)
-        self._sensor = sensor_functions
-        self._sensor_key = sensor_key
-
-        n_row = int(getattr(sensor_functions, "n_row", 0) or 0)
-        n_col = int(getattr(sensor_functions, "n_col", 0) or 0)
-        self._n_row = n_row
-        self._n_col = n_col
-
+        self._sensor = None
+        self._sensor_key = "(unknown)"
+        self._n_row = 0
+        self._n_col = 0
         self._cell_buttons: list[list[QToolButton]] = []
         self._status_label: QLabel | None = None
+        self._root_layout = QVBoxLayout(self)
+        self._root_layout.setSpacing(10)
+        self.set_sensor_functions(sensor_functions, sensor_key=sensor_key)
 
+    def set_sensor_functions(self, sensor_functions=None, sensor_key=None):
+        """Bind the panel to the currently built sensor and refresh its grid."""
+        n_row = int(getattr(sensor_functions, "n_row", 0) or 0)
+        n_col = int(getattr(sensor_functions, "n_col", 0) or 0)
+        if sensor_key is None and sensor_functions is not None:
+            try:
+                sensor_key = sensor_functions.get_zero_mask_key()
+            except Exception:
+                sensor_key = "(unknown)"
+        sensor_key = str(sensor_key or "(unknown)")
+        geometry_changed = (
+            self._root_layout.count() == 0
+            or sensor_functions is not self._sensor
+            or n_row != self._n_row
+            or n_col != self._n_col
+            or sensor_key != self._sensor_key
+        )
+        self._sensor = sensor_functions
+        self._sensor_key = sensor_key
+        self._n_row = n_row
+        self._n_col = n_col
+        if geometry_changed:
+            self._rebuild_ui()
+        else:
+            self._refresh_from_sensor()
+
+    @staticmethod
+    def _clear_layout(layout):
+        while layout.count():
+            item = layout.takeAt(0)
+            child_layout = item.layout()
+            widget = item.widget()
+            if child_layout is not None:
+                SensorZeroMaskPanel._clear_layout(child_layout)
+            if widget is not None:
+                widget.deleteLater()
+
+    def _rebuild_ui(self):
+        self._clear_layout(self._root_layout)
+        self._cell_buttons = []
+        self._status_label = None
         self._build_ui()
         self._refresh_from_sensor()
 
@@ -68,27 +103,24 @@ class SensorZeroMaskDialog(QDialog):
     # UI construction
     # --------------------------------------------------------------
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setSpacing(10)
+        root = self._root_layout
 
         if self._n_row <= 0 or self._n_col <= 0:
             label = QLabel(
                 "Build a sensor scene first.\n\n"
-                "Steps: Sensor tab → 'Build Scene' → 'Update Sensor', then\n"
-                "re-open this window to choose cells that should be forced to 0."
+                "Use Build Scene and Update Sensor, then reopen Sensor Parameters "
+                "to configure the zero mask."
             )
             label.setAlignment(Qt.AlignCenter)
+            label.setWordWrap(True)
             root.addWidget(label)
-
-            close_btn = QPushButton("Close")
-            close_btn.clicked.connect(self.accept)
-            root.addWidget(close_btn, alignment=Qt.AlignCenter)
+            root.addStretch()
             return
 
         info = QLabel(
             f"Sensor key: <b>{self._sensor_key}</b> &nbsp;&nbsp;"
             f"Grid: {self._n_row} × {self._n_col}<br>"
-            f"<span style='color:{theme.TEXT_MUTED}'>Click a cell to mark it as always 0. "
+            f"<span style='color:{theme.TEXT_MUTED}'>Click a cell to force it to 0 and hide it in the plotter. "
             "Click again to release.<br>'Save to File' stores the mask under the "
             "sensor key so it auto-loads next time you build the same sensor.</span>"
         )
@@ -136,15 +168,10 @@ class SensorZeroMaskDialog(QDialog):
         action_row.addWidget(self._btn_save)
         root.addLayout(action_row)
 
-        # Footer: status text + close button.
-        footer = QHBoxLayout()
+        # Footer status.
         self._status_label = QLabel("")
         self._status_label.setStyleSheet(theme.INFO_LABEL_STYLE)
-        footer.addWidget(self._status_label, stretch=1)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        footer.addWidget(close_btn)
-        root.addLayout(footer)
+        root.addWidget(self._status_label)
 
     # --------------------------------------------------------------
     # Mask <-> UI sync
@@ -183,7 +210,7 @@ class SensorZeroMaskDialog(QDialog):
         if not self._status_label or not self._cell_buttons:
             return
         n_zero = sum(1 for row in self._cell_buttons for btn in row if btn.isChecked())
-        self._set_status(f"{n_zero} cell(s) forced to 0")
+        self._set_status(f"{n_zero} cell(s) forced to 0 and hidden")
 
     def _set_status(self, message: str):
         if self._status_label is not None:
@@ -246,3 +273,22 @@ class SensorZeroMaskDialog(QDialog):
                 "Sensor Zero Mask",
                 "Failed to save mask file. Check the log for details.",
             )
+
+
+class SensorZeroMaskDialog(QDialog):
+    """Backward-compatible standalone wrapper around the embeddable panel."""
+
+    def __init__(self, parent=None, *, sensor_functions=None, sensor_key="(unknown)"):
+        super().__init__(parent)
+        self.setWindowTitle("Sensor Zero Mask")
+        self.setMinimumWidth(380)
+        layout = QVBoxLayout(self)
+        self.panel = SensorZeroMaskPanel(
+            self,
+            sensor_functions=sensor_functions,
+            sensor_key=sensor_key,
+        )
+        layout.addWidget(self.panel, 1)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.accept)
+        layout.addWidget(close_button, alignment=Qt.AlignRight)

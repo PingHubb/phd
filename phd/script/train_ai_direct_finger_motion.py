@@ -295,12 +295,44 @@ def split_episodes(
     *,
     split_each_session: bool = False,
 ) -> tuple[list[Episode], list[Episode]]:
+    train, validation, _test = split_episodes_with_test(
+        episodes,
+        val_trials,
+        test_trials=0,
+        split_each_session=split_each_session,
+    )
+    return train, validation
+
+
+def split_episodes_with_test(
+    episodes: list[Episode],
+    val_trials: int,
+    test_trials: int,
+    *,
+    split_each_session: bool = False,
+) -> tuple[list[Episode], list[Episode], list[Episode]]:
     if len(episodes) < 2:
         raise ValueError("Need at least two trials for a train/validation split.")
+
+    def split_group(group: list[Episode]):
+        validation_count = max(1, int(val_trials))
+        test_count = max(0, int(test_trials))
+        reserved = validation_count + test_count
+        if len(group) <= reserved:
+            raise ValueError(
+                f"Need more than {reserved} trials to retain training data "
+                f"with {validation_count} validation and {test_count} test trials."
+            )
+        train_group = group[:-reserved]
+        validation_end = len(group) - test_count if test_count else len(group)
+        validation_group = group[-reserved:validation_end]
+        test_group = group[-test_count:] if test_count else []
+        return train_group, validation_group, test_group
 
     if split_each_session:
         train_episodes: list[Episode] = []
         val_episodes: list[Episode] = []
+        test_episodes: list[Episode] = []
         session_order: list[Path] = []
         by_session: dict[Path, list[Episode]] = {}
         for episode in episodes:
@@ -312,17 +344,18 @@ def split_episodes(
 
         for session_path in session_order:
             session_episodes = by_session[session_path]
-            if len(session_episodes) < 2:
-                raise ValueError(
-                    f"Need at least two trials in {session_path} for per-session validation."
+            try:
+                train_group, validation_group, test_group = split_group(
+                    session_episodes
                 )
-            session_val_trials = max(1, min(int(val_trials), len(session_episodes) - 1))
-            train_episodes.extend(session_episodes[:-session_val_trials])
-            val_episodes.extend(session_episodes[-session_val_trials:])
-        return train_episodes, val_episodes
+            except ValueError as exc:
+                raise ValueError(f"{session_path}: {exc}") from exc
+            train_episodes.extend(train_group)
+            val_episodes.extend(validation_group)
+            test_episodes.extend(test_group)
+        return train_episodes, val_episodes, test_episodes
 
-    val_trials = max(1, min(int(val_trials), len(episodes) - 1))
-    return episodes[:-val_trials], episodes[-val_trials:]
+    return split_group(episodes)
 
 
 def _stack_train_frames(episodes: list[Episode]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -957,9 +990,10 @@ def train(args: argparse.Namespace) -> Path:
         channels=channels,
         aux_features=aux_features,
     )
-    train_episodes, val_episodes = split_episodes(
+    train_episodes, val_episodes, test_episodes = split_episodes_with_test(
         episodes,
         args.val_trials,
+        args.test_trials,
         split_each_session=len(session_paths) > 1,
     )
     normalization = compute_normalization(train_episodes)
@@ -988,8 +1022,21 @@ def train(args: argparse.Namespace) -> Path:
         aux_features=aux_features,
         augment=False,
     )
+    test_dataset = None
+    if test_episodes:
+        test_dataset = SequenceDataset(
+            test_episodes,
+            seq_len=args.seq_len,
+            normalization=normalization,
+            stride=args.stride,
+            channels=channels,
+            aux_features=aux_features,
+            augment=False,
+        )
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise ValueError("Not enough sequence samples for training/validation.")
+    if test_dataset is not None and len(test_dataset) == 0:
+        raise ValueError("Not enough sequence samples in the independent test split.")
 
     stamp = time.strftime("%Y%m%d_%H%M%S")
     if len(session_paths) == 1:
@@ -1008,7 +1055,12 @@ def train(args: argparse.Namespace) -> Path:
     print(f"Device: {device}")
     print(f"Train trials: {[episode.path.name for episode in train_episodes]}")
     print(f"Validation trials: {[episode.path.name for episode in val_episodes]}")
-    print(f"Train samples: {len(train_dataset)} | Validation samples: {len(val_dataset)}")
+    print(f"Test trials: {[episode.path.name for episode in test_episodes]}")
+    print(
+        f"Train samples: {len(train_dataset)} | "
+        f"Validation samples: {len(val_dataset)} | "
+        f"Test samples: {len(test_dataset) if test_dataset is not None else 0}"
+    )
 
     train_loader = DataLoader(
         train_dataset,
@@ -1026,6 +1078,16 @@ def train(args: argparse.Namespace) -> Path:
         pin_memory=device.type == "cuda",
         drop_last=False,
     )
+    test_loader = None
+    if test_dataset is not None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+        )
 
     sample_episode = episodes[0]
     config = {
@@ -1035,6 +1097,7 @@ def train(args: argparse.Namespace) -> Path:
         "dataset_files": [str(episode.path) for episode in episodes],
         "train_files": [str(episode.path) for episode in train_episodes],
         "val_files": [str(episode.path) for episode in val_episodes],
+        "test_files": [str(episode.path) for episode in test_episodes],
         "target_key": args.target_key,
         "seq_len": int(args.seq_len),
         "channels": list(channels),
@@ -1162,6 +1225,22 @@ def train(args: argparse.Namespace) -> Path:
         val_preds,
         active_axis_count=6 if args.allow_rotation_output else LINEAR_AXIS_COUNT,
     )
+    test_preds = None
+    test_metrics = None
+    if test_loader is not None:
+        test_preds = _collect_predictions(
+            model,
+            test_loader,
+            device=device,
+            target_scale=normalization["target_scale"],
+            lock_rotation_axes=not args.allow_rotation_output,
+        )
+        test_metrics = _metrics_from_predictions(
+            test_preds,
+            active_axis_count=(
+                6 if args.allow_rotation_output else LINEAR_AXIS_COUNT
+            ),
+        )
     final_metrics.update(
         {
             "best_epoch": best_epoch,
@@ -1170,6 +1249,9 @@ def train(args: argparse.Namespace) -> Path:
             "val_samples": len(val_dataset),
             "train_trials": len(train_episodes),
             "val_trials": len(val_episodes),
+            "test_samples": len(test_dataset) if test_dataset is not None else 0,
+            "test_trials": len(test_episodes),
+            "test_metrics": test_metrics,
         }
     )
 
@@ -1182,6 +1264,9 @@ def train(args: argparse.Namespace) -> Path:
     (output_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     np.savez_compressed(output_dir / "validation_predictions.npz", **val_preds)
     _save_predictions_csv(output_dir / "validation_predictions.csv", val_preds)
+    if test_preds is not None:
+        np.savez_compressed(output_dir / "test_predictions.npz", **test_preds)
+        _save_predictions_csv(output_dir / "test_predictions.csv", test_preds)
     if not args.no_plots:
         _try_save_plots(output_dir, history, val_preds, final_metrics)
 
@@ -1195,6 +1280,12 @@ def train(args: argparse.Namespace) -> Path:
     print(f"Metrics: {output_dir / 'metrics.json'}")
     print(f"Validation RMSE: {final_metrics['total_rmse']:.6f}")
     print(f"Validation mode accuracy: {final_metrics['mode_accuracy']:.3f}")
+    if test_metrics is not None:
+        print(f"Independent test RMSE: {test_metrics['total_rmse']:.6f}")
+        print(
+            f"Independent test mode accuracy: "
+            f"{test_metrics['mode_accuracy']:.3f}"
+        )
     return output_dir
 
 
@@ -1217,6 +1308,15 @@ def main() -> int:
     parser.add_argument("--channels", default=",".join(DEFAULT_CHANNELS), help="Comma-separated tactile input channels.")
     parser.add_argument("--aux-features", default=",".join(DEFAULT_AUX_FEATURES), help="Comma-separated auxiliary features.")
     parser.add_argument("--val-trials", type=int, default=1, help="Number of final trials reserved for validation.")
+    parser.add_argument(
+        "--test-trials",
+        type=int,
+        default=1,
+        help=(
+            "Number of final trials reserved as an independent test split. "
+            "These trials are never used for optimization or early stopping."
+        ),
+    )
     parser.add_argument("--stride", type=int, default=1, help="Sequence sampling stride.")
     parser.add_argument("--epochs", type=int, default=80)
     parser.add_argument("--batch-size", type=int, default=128)

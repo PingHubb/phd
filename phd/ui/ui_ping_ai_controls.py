@@ -30,6 +30,7 @@ class AiControlsMixin:
         self._ai_direct_finger_active = False
         self._ai_direct_finger_robot_active = False
         self._ai_direct_finger_execution_active = False
+        self._admittance_control_active = False
         self._hier_mode_is_continues = True
 
         self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, False)
@@ -43,6 +44,9 @@ class AiControlsMixin:
         if hasattr(self, "ai_direct_finger_motion_robot_button"):
             self._set_button_active(self.ai_direct_finger_motion_robot_button, False)
         self._set_button_active(self.ai_direct_finger_motion_execution_button, False)
+        if hasattr(self, "admittance_control_button"):
+            self.admittance_control_button.setChecked(False)
+            self._set_button_active(self.admittance_control_button, False)
 
         if all(
             hasattr(self, name)

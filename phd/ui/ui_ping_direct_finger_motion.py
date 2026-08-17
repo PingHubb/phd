@@ -1325,9 +1325,10 @@ class DirectFingerMotionMixin:
             text = str(fallback)
         basename = os.path.basename(text)
         stem, extension = os.path.splitext(basename)
-        if extension.lower() == ".csv" and stem:
-            return stem
-        return basename or text
+        display_label = stem if extension.lower() == ".csv" and stem else basename or text
+        if display_label.strip().lower() == "sensor":
+            return "TaCo"
+        return display_label
 
     def _set_direct_finger_motion_primary_comparison_path(
         self,
@@ -4872,14 +4873,6 @@ class DirectFingerMotionMixin:
             self._set_ai_direct_finger_record_buttons(was_no_robot_active, was_robot_active)
 
     def _on_toggle_ai_direct_finger_motion_execution(self):
-        self._ai_direct_finger_execution_active = not getattr(
-            self, "_ai_direct_finger_execution_active", False
-        )
-        self._set_button_active(
-            self.ai_direct_finger_motion_execution_button,
-            self._ai_direct_finger_execution_active,
-        )
-
         model_path = ""
         if hasattr(self, "ai_direct_execution_model_path_input"):
             model_path = self.ai_direct_execution_model_path_input.text().strip()
@@ -4888,20 +4881,27 @@ class DirectFingerMotionMixin:
             dry_run_predictions_only = bool(self.ai_direct_execution_dry_run_checkbox.isChecked())
 
         try:
+            helper = self._get_ai_direct_finger_motion_execution_helper()
+            if helper is None:
+                raise AttributeError("ai_direct_finger_motion_execution_class is not available")
             if hasattr(self.sensor_functions, "toggle_ai_direct_finger_motion_execution"):
                 self.sensor_functions.toggle_ai_direct_finger_motion_execution(
                     model_checkpoint_path=model_path or None,
                     dry_run_predictions_only=dry_run_predictions_only,
                 )
             else:
-                helper = self._get_ai_direct_finger_motion_execution_helper()
-                if helper is None:
-                    raise AttributeError("ai_direct_finger_motion_execution_class is not available")
                 if hasattr(helper, "set_dry_run_predictions_only"):
                     helper.set_dry_run_predictions_only(dry_run_predictions_only)
                 helper.toggle_ai_direct_finger_motion_execution(
                     model_checkpoint_path=model_path or None
                 )
+            self._ai_direct_finger_execution_active = bool(
+                getattr(helper, "is_running", False)
+            )
+            self._set_button_active(
+                self.ai_direct_finger_motion_execution_button,
+                self._ai_direct_finger_execution_active,
+            )
             self._ensure_ai_direct_execution_status_timer()
             if self._ai_direct_finger_execution_active:
                 self._ai_direct_execution_status_timer.start()
@@ -4910,7 +4910,10 @@ class DirectFingerMotionMixin:
             self._update_ai_direct_execution_prediction_status()
         except Exception as exc:
             print(f"[UI] AI direct finger motion execution toggle failed: {exc}")
-            self._ai_direct_finger_execution_active = not self._ai_direct_finger_execution_active
+            helper = self._get_ai_direct_finger_motion_execution_helper()
+            self._ai_direct_finger_execution_active = bool(
+                getattr(helper, "is_running", False) if helper is not None else False
+            )
             self._set_button_active(
                 self.ai_direct_finger_motion_execution_button,
                 self._ai_direct_finger_execution_active,

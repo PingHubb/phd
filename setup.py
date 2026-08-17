@@ -4,7 +4,7 @@ package_name = 'phd'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='0.1.0',
     packages=find_packages(exclude=['test', 'phd.backup', 'phd.backup.*']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -15,8 +15,8 @@ setup(
     zip_safe=True,
     maintainer='ping2',
     maintainer_email='lcp123441@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='Tactile sensing, visualization, and robot-control research interface',
+    license='Proprietary',
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [

@@ -1,4 +1,7 @@
+import copy
 import os
+import time
+from datetime import datetime
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QTimer, QSize, QEvent
@@ -8,16 +11,24 @@ from PyQt5.QtWidgets import (
     QFrame, QMessageBox, QStyle, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QToolButton, QSizePolicy, QMenu, QDoubleSpinBox, QFormLayout, QSpinBox,
     QCheckBox, QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
+    QFileDialog,
 )
 from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath, QPixmap, QFont
 import numpy as np
 from pyvistaqt import QtInteractor, MainWindow
-from phd.dependence.paths import icon_path, stylesheet_path
+from phd.dependence.paths import icon_path, resource_path, stylesheet_path
 from phd.ui import theme
 from phd.ui.ui_ping import UI
 from phd.ui import experiment_tasks
+from phd.ui.plotter_video_recorder import PlotterVideoRecorder
+from phd.ui.heatmap_signal_recording import (
+    HeatmapSignalPlayback,
+    HeatmapSignalRecorder,
+)
 from phd.dependence.sensor_signal_window import SensorSignalWindow
-from phd.ui.sensor_zero_mask_window import SensorZeroMaskDialog
+
+
+SIGRAPH_HEATMAP_RECORD_FPS = 60.0
 
 
 class Resources:
@@ -412,6 +423,16 @@ class MyMainWindow(MainWindow):
         self._sidebar_active_control_id = None
         self._sensor_capture_result_dialog = None
         self._sidebar_active_task = None  # experiment_tasks.ExperimentTask, set while running
+        self._sigraph_heatmap_recorder = None
+        self._sigraph_heatmap_signal_recorder = None
+        self._sigraph_heatmap_record_timer = None
+        self._sigraph_heatmap_record_started_at = None
+        self._sigraph_heatmap_playback = None
+        self._sigraph_heatmap_playback_sensor = None
+        self._sigraph_heatmap_playback_timer = None
+        self._sigraph_heatmap_playback_started_at = None
+        self._sigraph_heatmap_playback_last_index = -1
+        self._sigraph_heatmap_playback_restore_state = None
 
         # --- Initialize Window Properties ---
         self.setWindowTitle("PingLab")
@@ -473,7 +494,7 @@ class MyMainWindow(MainWindow):
         self.action_keyboard_tool_velocity.setCheckable(True)
         self.action_keyboard_tool_velocity.setToolTip(
             "Keyboard tool-frame velocity (same panel as Robots → Send Tool Velocity).\n"
-            "W/S = ±Y, A/D = ±X, O/P = ±Z, Q/E = ±Rz, T/Y = ±Rx, G/H = ±Ry.\n"
+            "W/S = ±Y, A/D = ±X, O/P = ±Z, Q/E = ±Rz, R/T = ±Rx, Y/U = ±Ry.\n"
             "Hold or press multiple keys to combine (e.g. W+D = +Y and +X). "
             "Release a key to remove that component. Space stops all."
         )
@@ -507,15 +528,6 @@ class MyMainWindow(MainWindow):
         self.action_update_sensor = QAction('Update Sensor', self)
         self.action_update_sensor.setToolTip('Update sensor values (same action used by AI/Sensor tabs before)')
 
-        self.action_sensor_zero_mask = QAction(
-            self.style().standardIcon(QStyle.SP_DialogResetButton),
-            'Sensor Zero Mask',
-            self,
-        )
-        self.action_sensor_zero_mask.setToolTip(
-            'Pick sensor cells that should always read 0 (after Build Scene + Update Sensor)'
-        )
-
         self.action_toggle_controls = QAction(self.resources.get_icon('logo5.png'), 'Show Experiments', self)
         self.action_toggle_controls.setToolTip('Show the experiments sidebar')
 
@@ -544,7 +556,6 @@ class MyMainWindow(MainWindow):
         function_menu = menu.addMenu('Menu')
         function_menu.addAction(self.action_log)
         function_menu.addAction(self.action_sensor_signal)
-        function_menu.addAction(self.action_sensor_zero_mask)
         function_menu.addAction(self.action_ps5_controller_test)
         function_menu.addAction(self.action_sensor_controller_test)
         function_menu.addAction(self.action_keyboard_tool_velocity)
@@ -565,7 +576,6 @@ class MyMainWindow(MainWindow):
         toolbar.addSeparator()
         toolbar.addAction(self.action_log)
         toolbar.addAction(self.action_sensor_signal)
-        toolbar.addAction(self.action_sensor_zero_mask)
         toolbar.addAction(self.action_ps5_controller_test)
         toolbar.addAction(self.action_sensor_controller_test)
         toolbar.addAction(self.action_keyboard_tool_velocity)
@@ -691,18 +701,44 @@ class MyMainWindow(MainWindow):
         self._build_sidebar_task_param_widgets(layout)
         self._update_sidebar_task_param_visibility()
 
-        # Container for Start/Stop buttons
+        # Container for task execution and recording buttons
         btn_container = QWidget()
-        btn_layout = QHBoxLayout(btn_container)
-        btn_layout.addStretch()
+        btn_layout = QVBoxLayout(btn_container)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+
+        run_layout = QHBoxLayout()
+        run_layout.addStretch()
         self.sidebar_btn_start = QPushButton("Start")
         self.sidebar_btn_start.setObjectName("btnStart")
-        btn_layout.addWidget(self.sidebar_btn_start)
+        run_layout.addWidget(self.sidebar_btn_start)
+        self.sigraph_scanning_reverse_button = QPushButton("Reverse Run")
+        self.sigraph_scanning_reverse_button.setObjectName("btnReverse")
+        self.sigraph_scanning_reverse_button.setVisible(False)
+        run_layout.addWidget(self.sigraph_scanning_reverse_button)
         self.sidebar_btn_stop = QPushButton("Stop")
         self.sidebar_btn_stop.setObjectName("btnStop")
-        btn_layout.addWidget(self.sidebar_btn_stop)
-        btn_layout.addStretch()
+        run_layout.addWidget(self.sidebar_btn_stop)
+        run_layout.addStretch()
+        btn_layout.addLayout(run_layout)
+
+        record_layout = QHBoxLayout()
+        record_layout.addStretch()
+        self.sigraph_scanning_run_record_button = QPushButton("Run + Record")
+        self.sigraph_scanning_run_record_button.setObjectName("btnRunRecord")
+        self.sigraph_scanning_run_record_button.setVisible(False)
+        record_layout.addWidget(self.sigraph_scanning_run_record_button)
+        self.sigraph_scanning_reverse_record_button = QPushButton(
+            "Reverse Run + Record"
+        )
+        self.sigraph_scanning_reverse_record_button.setObjectName(
+            "btnReverseRecord"
+        )
+        self.sigraph_scanning_reverse_record_button.setVisible(False)
+        record_layout.addWidget(self.sigraph_scanning_reverse_record_button)
+        record_layout.addStretch()
+        btn_layout.addLayout(record_layout)
         layout.addWidget(btn_container)
+        self._update_sidebar_task_action_labels()
 
         return sidebar
 
@@ -730,8 +766,16 @@ class MyMainWindow(MainWindow):
         self.action_console_control_params.triggered.connect(self.open_console_control_params_window)
         self.action_sensor_params.triggered.connect(self.open_sensor_params_window)
         self.action_update_sensor.triggered.connect(self._trigger_global_sensor_update)
-        self.action_sensor_zero_mask.triggered.connect(self._open_sensor_zero_mask_window)
         self.sidebar_btn_start.clicked.connect(self._start_sidebar_control)
+        self.sigraph_scanning_reverse_button.clicked.connect(
+            self._start_sigraph_scanning_reverse
+        )
+        self.sigraph_scanning_run_record_button.clicked.connect(
+            self._start_sigraph_scanning_run_and_record
+        )
+        self.sigraph_scanning_reverse_record_button.clicked.connect(
+            self._start_sigraph_scanning_reverse_and_record
+        )
         self.sidebar_btn_stop.clicked.connect(self._stop_sidebar_control)
         self.sidebar_task_list.currentItemChanged.connect(self._on_sidebar_task_changed)
 
@@ -750,57 +794,6 @@ class MyMainWindow(MainWindow):
             self.info_process.setText("Sensor update failed")
             if self.ui_ros is not None and hasattr(self.ui_ros, "log_display"):
                 self.ui_ros.log_display.append(f"Sensor update failed: {exc}")
-
-    def _open_sensor_zero_mask_window(self):
-        """Open the dialog that lets the user zero-out specific sensor cells."""
-        if not self._require_ui_ros(
-            "Please wait for Ping Mode to load before configuring the zero mask."
-        ):
-            return
-
-        sensor_functions = getattr(self.ui_ros, "sensor_functions", None)
-        if sensor_functions is None:
-            QMessageBox.warning(
-                self,
-                "Sensor Zero Mask",
-                "Sensor functions are not available.",
-            )
-            return
-
-        n_row = int(getattr(sensor_functions, "n_row", 0) or 0)
-        n_col = int(getattr(sensor_functions, "n_col", 0) or 0)
-        if n_row <= 0 or n_col <= 0:
-            QMessageBox.information(
-                self,
-                "Sensor Zero Mask",
-                "Build the sensor scene first.\n\n"
-                "Steps: Sensor tab → 'Build Scene' → 'Update Sensor',\n"
-                "then re-open this window to choose cells to force to 0.",
-            )
-            return
-
-        if not getattr(sensor_functions, "is_connected", False):
-            reply = QMessageBox.question(
-                self,
-                "Sensor Zero Mask",
-                "The sensor has not been calibrated yet (Update Sensor was not run).\n"
-                "You can still edit the mask, but it only takes effect once data starts flowing.\n\n"
-                "Continue anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if reply != QMessageBox.Yes:
-                return
-
-        try:
-            sensor_key = sensor_functions.get_zero_mask_key()
-        except Exception:
-            sensor_key = "(unknown)"
-
-        dialog = SensorZeroMaskDialog(
-            self, sensor_functions=sensor_functions, sensor_key=sensor_key
-        )
-        dialog.exec_()
 
     def _set_sidebar_visible(self, visible: bool):
         """Updates sidebar visibility and keeps the toggle action text in sync."""
@@ -1015,6 +1008,39 @@ class MyMainWindow(MainWindow):
     def _on_sidebar_task_changed(self, _current=None, _previous=None):
         self._update_sidebar_task_info()
         self._update_sidebar_task_param_visibility()
+        self._update_sidebar_task_action_labels()
+
+    def _update_sidebar_task_action_labels(self):
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if start_button is None:
+            return
+        task = experiment_tasks.get_task(self._current_sidebar_control_id())
+        start_button.setText(
+            str(getattr(task, "start_button_label", "Start") or "Start")
+        )
+        reverse_button = getattr(self, "sigraph_scanning_reverse_button", None)
+        if reverse_button is not None:
+            is_sigraph = getattr(task, "id", None) == "sigraph2026_scanning"
+            reverse_button.setVisible(is_sigraph)
+            reverse_button.setEnabled(
+                is_sigraph
+                and bool(getattr(task, "recorded_points", []))
+                and getattr(task, "_running_index", None) is None
+            )
+        is_sigraph = getattr(task, "id", None) == "sigraph2026_scanning"
+        for button_name in (
+            "sigraph_scanning_run_record_button",
+            "sigraph_scanning_reverse_record_button",
+        ):
+            record_button = getattr(self, button_name, None)
+            if record_button is None:
+                continue
+            record_button.setVisible(is_sigraph)
+            record_button.setEnabled(
+                is_sigraph
+                and bool(getattr(task, "recorded_points", []))
+                and getattr(task, "_running_index", None) is None
+            )
 
     # --- Per-task parameter widgets in the sidebar ----------------------------
     def _build_sidebar_task_param_widgets(self, parent_layout):
@@ -1025,6 +1051,847 @@ class MyMainWindow(MainWindow):
         the currently-selected task is visible at a time.
         """
         self._task_param_widgets: dict = {}
+
+        task = experiment_tasks.get_task("sigraph2026_scanning")
+        if task is None:
+            return
+        panel = QFrame()
+        panel.setFrameShape(QFrame.StyledPanel)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(8, 8, 8, 8)
+        panel_layout.setSpacing(8)
+
+        set_row = QHBoxLayout()
+        set_row.addWidget(QLabel("Point set"))
+        self.sigraph_scanning_set_combo = QComboBox()
+        self.sigraph_scanning_set_combo.setToolTip(
+            "Select which saved group of scanning points to edit or run"
+        )
+        self.sigraph_scanning_new_set_button = QPushButton("New Set")
+        self.sigraph_scanning_new_set_button.setToolTip(
+            "Create and switch to an empty point set; existing sets are kept"
+        )
+        set_row.addWidget(self.sigraph_scanning_set_combo, 1)
+        set_row.addWidget(self.sigraph_scanning_new_set_button)
+        panel_layout.addLayout(set_row)
+
+        self.sigraph_scanning_count_label = QLabel("Recorded points: 0")
+        panel_layout.addWidget(self.sigraph_scanning_count_label)
+        self.sigraph_scanning_point_list = QListWidget()
+        self.sigraph_scanning_point_list.setSelectionMode(
+            QListWidget.SingleSelection
+        )
+        self.sigraph_scanning_point_list.setMinimumHeight(150)
+        panel_layout.addWidget(self.sigraph_scanning_point_list)
+
+        record_row = QHBoxLayout()
+        self.sigraph_scanning_record_button = QPushButton("Record Current Point")
+        self.sigraph_scanning_copy_button = QPushButton("Copy")
+        self.sigraph_scanning_copy_button.setToolTip(
+            "Duplicate the selected point and append it as the latest point"
+        )
+        self.sigraph_scanning_remove_button = QPushButton("Remove")
+        self.sigraph_scanning_clear_button = QPushButton("Clear")
+        record_row.addWidget(self.sigraph_scanning_record_button, 1)
+        record_row.addWidget(self.sigraph_scanning_copy_button)
+        record_row.addWidget(self.sigraph_scanning_remove_button)
+        record_row.addWidget(self.sigraph_scanning_clear_button)
+        panel_layout.addLayout(record_row)
+
+        order_row = QHBoxLayout()
+        self.sigraph_scanning_go_button = QPushButton("Go to Selected")
+        self.sigraph_scanning_up_button = QToolButton()
+        self.sigraph_scanning_up_button.setIcon(
+            self.style().standardIcon(QStyle.SP_ArrowUp)
+        )
+        self.sigraph_scanning_up_button.setToolTip("Move selected point earlier")
+        self.sigraph_scanning_down_button = QToolButton()
+        self.sigraph_scanning_down_button.setIcon(
+            self.style().standardIcon(QStyle.SP_ArrowDown)
+        )
+        self.sigraph_scanning_down_button.setToolTip("Move selected point later")
+        order_row.addWidget(self.sigraph_scanning_go_button, 1)
+        order_row.addStretch()
+        order_row.addWidget(self.sigraph_scanning_up_button)
+        order_row.addWidget(self.sigraph_scanning_down_button)
+        panel_layout.addLayout(order_row)
+
+        settings_form = QFormLayout()
+        self.sigraph_scanning_velocity_spin = QDoubleSpinBox()
+        self.sigraph_scanning_velocity_spin.setRange(0.01, 1.0)
+        self.sigraph_scanning_velocity_spin.setDecimals(2)
+        self.sigraph_scanning_velocity_spin.setSingleStep(0.05)
+        self.sigraph_scanning_velocity_spin.setValue(
+            float(task.velocity_rad_s)
+        )
+        self.sigraph_scanning_velocity_spin.setSuffix(" rad/s")
+        settings_form.addRow("Joint velocity", self.sigraph_scanning_velocity_spin)
+        self.sigraph_scanning_dwell_spin = QDoubleSpinBox()
+        self.sigraph_scanning_dwell_spin.setRange(0.0, 10.0)
+        self.sigraph_scanning_dwell_spin.setDecimals(2)
+        self.sigraph_scanning_dwell_spin.setSingleStep(0.1)
+        self.sigraph_scanning_dwell_spin.setValue(float(task.dwell_sec))
+        self.sigraph_scanning_dwell_spin.setSuffix(" s")
+        settings_form.addRow("Point dwell", self.sigraph_scanning_dwell_spin)
+        panel_layout.addLayout(settings_form)
+
+        self.sigraph_scanning_replay_button = QPushButton(
+            "Replay Heatmap Recording"
+        )
+        self.sigraph_scanning_replay_button.setObjectName("btnReplayHeatmap")
+        self.sigraph_scanning_replay_button.setIcon(
+            self.style().standardIcon(QStyle.SP_MediaPlay)
+        )
+        self.sigraph_scanning_replay_button.setToolTip(
+            "Replay saved tactile frames in the 3D heatmap without moving the robot"
+        )
+        panel_layout.addWidget(self.sigraph_scanning_replay_button)
+
+        self.sigraph_scanning_record_button.clicked.connect(
+            self._record_sigraph_scanning_point
+        )
+        self.sigraph_scanning_set_combo.currentIndexChanged.connect(
+            self._select_sigraph_scanning_point_set
+        )
+        self.sigraph_scanning_new_set_button.clicked.connect(
+            self._create_sigraph_scanning_point_set
+        )
+        self.sigraph_scanning_copy_button.clicked.connect(
+            self._copy_sigraph_scanning_point
+        )
+        self.sigraph_scanning_remove_button.clicked.connect(
+            self._remove_sigraph_scanning_point
+        )
+        self.sigraph_scanning_clear_button.clicked.connect(
+            self._clear_sigraph_scanning_points
+        )
+        self.sigraph_scanning_go_button.clicked.connect(
+            self._go_to_selected_sigraph_scanning_point
+        )
+        self.sigraph_scanning_up_button.clicked.connect(
+            lambda: self._move_sigraph_scanning_point(-1)
+        )
+        self.sigraph_scanning_down_button.clicked.connect(
+            lambda: self._move_sigraph_scanning_point(1)
+        )
+        self.sigraph_scanning_velocity_spin.valueChanged.connect(
+            lambda value: setattr(task, "velocity_rad_s", float(value))
+        )
+        self.sigraph_scanning_dwell_spin.valueChanged.connect(
+            lambda value: setattr(task, "dwell_sec", float(value))
+        )
+        self.sigraph_scanning_replay_button.clicked.connect(
+            self._choose_sigraph_heatmap_recording_for_playback
+        )
+        self._task_param_widgets[task.id] = panel
+        parent_layout.addWidget(panel)
+        self._refresh_sigraph_scanning_points()
+
+    def _sigraph_scanning_task(self):
+        return experiment_tasks.get_task("sigraph2026_scanning")
+
+    def _refresh_sigraph_scanning_points(self, active_index=None):
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        count_label = getattr(self, "sigraph_scanning_count_label", None)
+        set_combo = getattr(self, "sigraph_scanning_set_combo", None)
+        task = self._sigraph_scanning_task()
+        if point_list is None or count_label is None or task is None:
+            return
+        if set_combo is not None:
+            set_combo.blockSignals(True)
+            set_combo.clear()
+            set_combo.addItems(task.point_set_names())
+            if set_combo.count():
+                set_combo.setCurrentIndex(int(task.active_set_index))
+            set_combo.blockSignals(False)
+        previous_row = point_list.currentRow()
+        point_list.clear()
+        for index, point in enumerate(task.recorded_points):
+            joints_deg = np.degrees(
+                np.asarray(point.get("joints", [0.0] * 6), dtype=float)
+            )
+            position = point.get("tool_position")
+            position_text = ""
+            if position is not None and len(position) >= 3:
+                position_mm = np.asarray(position[:3], dtype=float) * 1000.0
+                position_text = (
+                    f" | TCP=({position_mm[0]:.1f}, {position_mm[1]:.1f}, "
+                    f"{position_mm[2]:.1f}) mm"
+                )
+            text = (
+                f"P{index + 1:03d} | "
+                f"J={[round(value, 1) for value in joints_deg]} deg"
+                f"{position_text}"
+            )
+            item = QListWidgetItem(text)
+            item.setToolTip(text)
+            point_list.addItem(item)
+        count_label.setText(
+            f"Recorded points in {task.active_set_name}: "
+            f"{len(task.recorded_points)}"
+        )
+        if active_index is not None and 0 <= int(active_index) < point_list.count():
+            point_list.setCurrentRow(int(active_index))
+        elif 0 <= previous_row < point_list.count():
+            point_list.setCurrentRow(previous_row)
+        elif point_list.count():
+            point_list.setCurrentRow(0)
+        go_button = getattr(self, "sigraph_scanning_go_button", None)
+        if go_button is not None:
+            go_button.setEnabled(
+                point_list.count() > 0 and task._running_index is None
+            )
+        copy_button = getattr(self, "sigraph_scanning_copy_button", None)
+        if copy_button is not None:
+            copy_button.setEnabled(
+                point_list.count() > 0 and task._running_index is None
+            )
+        reverse_button = getattr(self, "sigraph_scanning_reverse_button", None)
+        if reverse_button is not None:
+            reverse_button.setEnabled(
+                point_list.count() > 0 and task._running_index is None
+            )
+        for button_name in (
+            "sigraph_scanning_run_record_button",
+            "sigraph_scanning_reverse_record_button",
+        ):
+            record_button = getattr(self, button_name, None)
+            if record_button is not None:
+                record_button.setEnabled(
+                    point_list.count() > 0 and task._running_index is None
+                )
+
+    def _select_sigraph_scanning_point_set(self, index):
+        task = self._sigraph_scanning_task()
+        if task is None or not task.select_point_set(int(index)):
+            return
+        self._append_sidebar_control_message(
+            f"Selected scanning point set: {task.active_set_name}."
+        )
+        self._refresh_sigraph_scanning_points()
+        self._update_sidebar_task_action_labels()
+
+    def _create_sigraph_scanning_point_set(self):
+        task = self._sigraph_scanning_task()
+        if task is None:
+            return
+        new_index = task.create_point_set()
+        if new_index < 0:
+            self._append_sidebar_control_message(
+                "Stop the scanning replay before creating a new point set."
+            )
+            return
+        self._refresh_sigraph_scanning_points()
+        self._update_sidebar_task_action_labels()
+        self._append_sidebar_control_message(
+            f"Created {task.active_set_name}. Record points into this new set; "
+            "the previous sets are still saved."
+        )
+
+    def _record_sigraph_scanning_point(self):
+        task = self._sigraph_scanning_task()
+        if task is not None:
+            task.capture_current_point(self)
+
+    def _go_to_selected_sigraph_scanning_point(self):
+        task = self._sigraph_scanning_task()
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        if task is None or point_list is None:
+            return
+        task.go_to_point(self, point_list.currentRow())
+
+    def _start_sigraph_scanning_reverse(self):
+        task = self._sigraph_scanning_task()
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        if (
+            task is None
+            or point_list is None
+            or self._current_sidebar_control_id() != task.id
+        ):
+            return
+        task.request_reverse_run(point_list.currentRow())
+        self._start_sidebar_control()
+
+    def _sigraph_heatmap_plotter_for_recording(self):
+        ui_ros = getattr(self, "ui_ros", None)
+        if ui_ros is None:
+            self._append_sidebar_control_message(
+                "Start Ping Mode before recording the 3D heatmap."
+            )
+            return None
+        sensor = getattr(ui_ros, "sensor_functions", None)
+        if sensor is None or not bool(getattr(sensor, "is_connected", False)):
+            self._append_sidebar_control_message(
+                "Build and update the sensor before recording the 3D heatmap."
+            )
+            return None
+
+        combo = getattr(ui_ros, "sensor_visualization_mode_combo", None)
+        if combo is not None:
+            heatmap_index = combo.findData("heatmap_3d")
+            if heatmap_index >= 0:
+                combo.setCurrentIndex(heatmap_index)
+        if hasattr(sensor, "set_main_visualization_enabled"):
+            sensor.set_main_visualization_enabled(True, render=False)
+        if hasattr(sensor, "set_sensor_visualization_mode"):
+            sensor.set_sensor_visualization_mode("heatmap_3d")
+        if getattr(sensor, "heatmapPoly", None) is None:
+            self._append_sidebar_control_message(
+                "The 3D heatmap is not ready; build and update the sensor first."
+            )
+            return None
+
+        plotter = getattr(ui_ros, "plotter_2", None)
+        if plotter is None:
+            self._append_sidebar_control_message(
+                "The 3D sensor plotter is unavailable."
+            )
+            return None
+        try:
+            plotter.render()
+        except Exception:
+            pass
+        return plotter
+
+    def _sigraph_heatmap_record_elapsed(self):
+        started_at = getattr(self, "_sigraph_heatmap_record_started_at", None)
+        if started_at is None:
+            return 0.0
+        return max(0.0, time.perf_counter() - float(started_at))
+
+    def _capture_sigraph_heatmap_frame(
+        self, elapsed_s=None, stop_on_error=True
+    ):
+        recorder = getattr(self, "_sigraph_heatmap_recorder", None)
+        if recorder is None or not recorder.is_recording:
+            return False
+        signal_recorder = getattr(
+            self, "_sigraph_heatmap_signal_recorder", None
+        )
+        elapsed = (
+            self._sigraph_heatmap_record_elapsed()
+            if elapsed_s is None
+            else max(0.0, float(elapsed_s))
+        )
+        frames_due = recorder.frames_due_for_elapsed(elapsed)
+        if frames_due <= 0:
+            return True
+
+        sensor = getattr(getattr(self, "ui_ros", None), "sensor_functions", None)
+        snapshot_getter = getattr(sensor, "get_heatmap_recording_snapshot", None)
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
+        target_frame_count = recorder.frame_count + frames_due
+        if (
+            signal_recorder is None
+            or snapshot is None
+            or not signal_recorder.capture_to_frame_count(
+                snapshot, target_frame_count
+            )
+        ):
+            error = (
+                signal_recorder.last_error
+                if signal_recorder is not None and signal_recorder.last_error
+                else "Could not read a tactile frame for the heatmap recording."
+            )
+            if stop_on_error:
+                self._stop_sigraph_heatmap_recording(
+                    announce=True, capture_final=False
+                )
+            self._append_sidebar_control_message(error)
+            return False
+        if not recorder.capture_frame(repeat_count=frames_due):
+            signal_recorder.discard_last_frames(frames_due)
+            error = recorder.last_error
+            if stop_on_error:
+                self._stop_sigraph_heatmap_recording(
+                    announce=True, capture_final=False
+                )
+            self._append_sidebar_control_message(error)
+            return False
+        return True
+
+    def _stop_sigraph_heatmap_recording(
+        self,
+        announce=True,
+        discard=False,
+        capture_final=True,
+        elapsed_s=None,
+    ):
+        timer = getattr(self, "_sigraph_heatmap_record_timer", None)
+        if timer is not None:
+            timer.stop()
+        recorder = getattr(self, "_sigraph_heatmap_recorder", None)
+        signal_recorder = getattr(
+            self, "_sigraph_heatmap_signal_recorder", None
+        )
+        if recorder is None:
+            self._sigraph_heatmap_record_started_at = None
+            return None
+
+        duration_s = (
+            self._sigraph_heatmap_record_elapsed()
+            if elapsed_s is None
+            else max(0.0, float(elapsed_s))
+        )
+        if bool(capture_final) and not discard and signal_recorder is not None:
+            if not self._capture_sigraph_heatmap_frame(
+                elapsed_s=duration_s, stop_on_error=False
+            ):
+                self._append_sidebar_control_message(
+                    "The final synchronized heatmap frame could not be captured."
+                )
+
+        self._sigraph_heatmap_recorder = None
+        self._sigraph_heatmap_signal_recorder = None
+        self._sigraph_heatmap_record_started_at = None
+
+        output_path = recorder.stop(capture_final=False)
+        if signal_recorder is not None:
+            while signal_recorder.frame_count > recorder.frame_count:
+                signal_recorder.discard_last_frame()
+            signal_recorder.metadata["run_duration_s"] = float(duration_s)
+            signal_recorder.metadata["encoded_duration_s"] = float(
+                recorder.frame_count / recorder.fps
+            )
+            signal_path = signal_recorder.stop(discard=discard)
+        else:
+            signal_path = None
+        if discard and output_path is not None:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+            return None
+        if announce and output_path is not None:
+            self._append_sidebar_control_message(
+                f"3D heatmap recording saved: {output_path} "
+                f"({recorder.frame_count} frames, "
+                f"run {duration_s:.3f} s, "
+                f"video {recorder.frame_count / recorder.fps:.3f} s)"
+            )
+            if signal_path is not None:
+                self._append_sidebar_control_message(
+                    f"Tactile signal recording saved: {signal_path} "
+                    f"({signal_recorder.frame_count} frames)"
+                )
+            elif signal_recorder is not None and signal_recorder.last_error:
+                self._append_sidebar_control_message(signal_recorder.last_error)
+        return output_path
+
+    def _start_sigraph_scanning_run_and_record(self):
+        self._start_sigraph_scanning_recorded_run(reverse=False)
+
+    def _start_sigraph_scanning_reverse_and_record(self):
+        self._start_sigraph_scanning_recorded_run(reverse=True)
+
+    def _start_sigraph_scanning_recorded_run(self, reverse=False):
+        task = self._sigraph_scanning_task()
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        if (
+            task is None
+            or point_list is None
+            or self._current_sidebar_control_id() != task.id
+        ):
+            return
+        if self._sidebar_active_task is not None:
+            self._stop_sidebar_control(
+                show_result=False, message="Control restarted"
+            )
+        selected_index = point_list.currentRow()
+        if not 0 <= selected_index < len(task.recorded_points):
+            self._append_sidebar_control_message(
+                "Select a recorded scanning point before running and recording."
+            )
+            return
+        plotter = self._sigraph_heatmap_plotter_for_recording()
+        if plotter is None:
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        output_directory = resource_path("sigraph2026_scanning_recordings")
+        direction = "reverse" if reverse else "forward"
+        recording_stem = f"sigraph2026_{direction}_heatmap_{timestamp}"
+        output_path = os.path.join(output_directory, f"{recording_stem}.mp4")
+        signal_output_path = os.path.join(
+            output_directory, f"{recording_stem}_sensor.npz"
+        )
+        sensor = getattr(getattr(self, "ui_ros", None), "sensor_functions", None)
+        snapshot_getter = getattr(sensor, "get_heatmap_recording_snapshot", None)
+        metadata_getter = getattr(sensor, "get_heatmap_recording_metadata", None)
+        snapshot = snapshot_getter() if callable(snapshot_getter) else None
+        if snapshot is None:
+            self._append_sidebar_control_message(
+                "The tactile signal is unavailable; update the sensor before recording."
+            )
+            return
+        recorder = PlotterVideoRecorder(fps=SIGRAPH_HEATMAP_RECORD_FPS)
+        if not recorder.start(plotter, output_path):
+            self._append_sidebar_control_message(recorder.last_error)
+            return
+        signal_recorder = HeatmapSignalRecorder(
+            fps=SIGRAPH_HEATMAP_RECORD_FPS
+        )
+        metadata = metadata_getter() if callable(metadata_getter) else {}
+        metadata = dict(metadata or {})
+        metadata.update({
+            "experiment": "Sigraph2026 Scanning",
+            "created_at": datetime.now().astimezone().isoformat(),
+            "point_set": task.active_set_name,
+            "run_direction": direction,
+            "start_point_index": selected_index,
+            "start_point_number": selected_index + 1,
+            "timeline": "monotonic_elapsed_frame_pacing",
+        })
+        if not signal_recorder.start(
+            signal_output_path,
+            snapshot,
+            metadata=metadata,
+            video_path=output_path,
+        ):
+            recorder.stop(capture_final=False)
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+            self._append_sidebar_control_message(signal_recorder.last_error)
+            return
+        self._sigraph_heatmap_recorder = recorder
+        self._sigraph_heatmap_signal_recorder = signal_recorder
+        if self._sigraph_heatmap_record_timer is None:
+            self._sigraph_heatmap_record_timer = QTimer(self)
+            self._sigraph_heatmap_record_timer.setTimerType(Qt.PreciseTimer)
+            self._sigraph_heatmap_record_timer.timeout.connect(
+                self._capture_sigraph_heatmap_frame
+            )
+        self._append_sidebar_control_message(
+            f"3D heatmap and tactile {direction} recording started from "
+            f"point {selected_index + 1}: {output_path}"
+        )
+
+        task.request_run(selected_index, reverse=bool(reverse))
+        self._sigraph_heatmap_record_started_at = time.perf_counter()
+        signal_recorder.align_timeline_start(
+            self._sigraph_heatmap_record_started_at
+        )
+        self._sigraph_heatmap_record_timer.start(
+            max(1, round(1000.0 / SIGRAPH_HEATMAP_RECORD_FPS))
+        )
+        self._start_sidebar_control()
+        if self._sidebar_active_task is not task:
+            self._stop_sigraph_heatmap_recording(
+                announce=False, discard=True
+            )
+            self._append_sidebar_control_message(
+                "Scanning did not start; 3D heatmap recording was discarded."
+            )
+
+    def _choose_sigraph_heatmap_recording_for_playback(self):
+        start_directory = resource_path("sigraph2026_scanning_recordings")
+        file_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Replay 3D Heatmap Recording",
+            start_directory,
+            "Tactile Heatmap Recordings (*_sensor.npz *.npz)",
+        )
+        if file_path:
+            self._start_sigraph_heatmap_playback(file_path)
+
+    def _start_sigraph_heatmap_playback(self, file_path):
+        try:
+            playback = HeatmapSignalPlayback.load(file_path)
+        except Exception as exc:
+            self._append_sidebar_control_message(
+                f"Could not load tactile recording: {exc}"
+            )
+            return False
+
+        ui_ros = getattr(self, "ui_ros", None)
+        sensor = getattr(ui_ros, "sensor_functions", None) if ui_ros else None
+        if sensor is None:
+            self._append_sidebar_control_message(
+                "Start Ping Mode and build the recorded sensor before replaying."
+            )
+            return False
+        current_shape = (
+            int(getattr(sensor, "n_row", 0) or 0),
+            int(getattr(sensor, "n_col", 0) or 0),
+        )
+        if current_shape != playback.frame_shape:
+            self._append_sidebar_control_message(
+                "Build the matching sensor before replay: recording is "
+                f"{playback.frame_shape[0]} x {playback.frame_shape[1]}, "
+                f"current scene is {current_shape[0]} x {current_shape[1]}."
+            )
+            return False
+        recorded_model = str(playback.metadata.get("model", "") or "")
+        current_model = str(getattr(sensor, "current_model_name", "") or "")
+        if recorded_model and recorded_model != current_model:
+            self._append_sidebar_control_message(
+                f"Build the recorded sensor model '{recorded_model}' before replaying."
+            )
+            return False
+
+        if self._sidebar_active_task is not None:
+            self._stop_sidebar_control(
+                show_result=False, message="Control stopped for heatmap replay"
+            )
+        self._stop_sigraph_heatmap_playback(announce=False)
+
+        self._sigraph_heatmap_playback_restore_state = {
+            "mode": str(
+                getattr(sensor, "sensor_visualization_mode", "point_grid")
+            ),
+            "heatmap_settings": copy.deepcopy(
+                sensor.get_heatmap_settings()
+                if hasattr(sensor, "get_heatmap_settings")
+                else None
+            ),
+            "geometry": copy.deepcopy(
+                getattr(sensor, "current_sensor_geometry_config", None)
+            ),
+            "zero_mask": np.array(
+                sensor.get_cell_zero_mask(), dtype=bool, copy=True
+            ),
+        }
+        if hasattr(sensor, "set_main_visualization_enabled"):
+            sensor.set_main_visualization_enabled(True, render=False)
+        if hasattr(sensor, "set_heatmap_playback_active"):
+            sensor.set_heatmap_playback_active(True)
+        if hasattr(sensor, "set_sensor_visualization_mode"):
+            sensor.set_sensor_visualization_mode("heatmap_3d")
+
+        recorded_geometry = playback.metadata.get("geometry")
+        if isinstance(recorded_geometry, dict) and hasattr(
+            sensor, "set_sensor_geometry_config"
+        ):
+            sensor.set_sensor_geometry_config(
+                recorded_geometry, save_current_sensor=False, render=False
+            )
+        recorded_settings = playback.metadata.get("heatmap_settings")
+        if isinstance(recorded_settings, dict) and hasattr(
+            sensor, "set_heatmap_settings"
+        ):
+            recorded_settings = dict(recorded_settings)
+            current_settings = self._sigraph_heatmap_playback_restore_state.get(
+                "heatmap_settings"
+            )
+            if isinstance(current_settings, dict):
+                recorded_settings["palette_3d"] = current_settings.get(
+                    "palette_3d", recorded_settings.get("palette_3d")
+                )
+            sensor.set_heatmap_settings(
+                recorded_settings, save_current_sensor=False
+            )
+        recorded_mask = np.asarray(
+            playback.metadata.get("zero_mask", []), dtype=bool
+        )
+        if recorded_mask.shape == playback.frame_shape and hasattr(
+            sensor, "set_cell_zero_mask"
+        ):
+            sensor.set_cell_zero_mask(recorded_mask)
+
+        combo = getattr(ui_ros, "sensor_visualization_mode_combo", None)
+        if combo is not None:
+            heatmap_index = combo.findData("heatmap_3d")
+            if heatmap_index >= 0:
+                combo.setCurrentIndex(heatmap_index)
+
+        self._sigraph_heatmap_playback = playback
+        self._sigraph_heatmap_playback_sensor = sensor
+        self._sigraph_heatmap_playback_started_at = time.perf_counter()
+        self._sigraph_heatmap_playback_last_index = -1
+        if self._sigraph_heatmap_playback_timer is None:
+            self._sigraph_heatmap_playback_timer = QTimer(self)
+            self._sigraph_heatmap_playback_timer.setTimerType(Qt.PreciseTimer)
+            self._sigraph_heatmap_playback_timer.timeout.connect(
+                self._advance_sigraph_heatmap_playback
+            )
+        self._sigraph_heatmap_playback_timer.start(
+            max(1, round(1000.0 / playback.fps))
+        )
+        self._set_sigraph_scanning_controls_running(True)
+        self._advance_sigraph_heatmap_playback()
+        self._append_sidebar_control_message(
+            f"Replaying tactile heatmap: {playback.path} "
+            f"({playback.frame_count} frames, {playback.fps:.1f} FPS). "
+            "The robot will not move."
+        )
+        return True
+
+    def _advance_sigraph_heatmap_playback(self):
+        playback = getattr(self, "_sigraph_heatmap_playback", None)
+        sensor = getattr(self, "_sigraph_heatmap_playback_sensor", None)
+        started_at = getattr(self, "_sigraph_heatmap_playback_started_at", None)
+        if playback is None or sensor is None or started_at is None:
+            return
+        elapsed = max(0.0, time.perf_counter() - float(started_at))
+        frame_index = playback.frame_index_at(elapsed)
+        if frame_index != self._sigraph_heatmap_playback_last_index:
+            rendered = sensor.render_recorded_heatmap_frame(
+                playback.heatmap_frames[frame_index]
+            )
+            if not rendered:
+                self._append_sidebar_control_message(
+                    "Heatmap replay stopped because the recorded frame could not be rendered."
+                )
+                self._stop_sigraph_heatmap_playback(announce=False)
+                return
+            self._sigraph_heatmap_playback_last_index = frame_index
+        if elapsed >= playback.duration_s + (1.0 / playback.fps):
+            self._stop_sigraph_heatmap_playback(announce=True, completed=True)
+
+    def _stop_sigraph_heatmap_playback(self, announce=True, completed=False):
+        timer = getattr(self, "_sigraph_heatmap_playback_timer", None)
+        if timer is not None:
+            timer.stop()
+        playback = getattr(self, "_sigraph_heatmap_playback", None)
+        sensor = getattr(self, "_sigraph_heatmap_playback_sensor", None)
+        restore = getattr(self, "_sigraph_heatmap_playback_restore_state", None)
+        self._sigraph_heatmap_playback = None
+        self._sigraph_heatmap_playback_sensor = None
+        self._sigraph_heatmap_playback_started_at = None
+        self._sigraph_heatmap_playback_last_index = -1
+        self._sigraph_heatmap_playback_restore_state = None
+        if playback is None:
+            return False
+
+        if sensor is not None and isinstance(restore, dict):
+            geometry = restore.get("geometry")
+            if isinstance(geometry, dict) and hasattr(
+                sensor, "set_sensor_geometry_config"
+            ):
+                sensor.set_sensor_geometry_config(
+                    geometry, save_current_sensor=False, render=False
+                )
+            settings = restore.get("heatmap_settings")
+            if isinstance(settings, dict) and hasattr(
+                sensor, "set_heatmap_settings"
+            ):
+                sensor.set_heatmap_settings(settings, save_current_sensor=False)
+            zero_mask = restore.get("zero_mask")
+            if zero_mask is not None and hasattr(sensor, "set_cell_zero_mask"):
+                sensor.set_cell_zero_mask(zero_mask)
+            previous_mode = str(restore.get("mode", "point_grid"))
+            if hasattr(sensor, "set_sensor_visualization_mode"):
+                sensor.set_sensor_visualization_mode(previous_mode)
+            combo = getattr(
+                getattr(self, "ui_ros", None),
+                "sensor_visualization_mode_combo",
+                None,
+            )
+            if combo is not None:
+                previous_index = combo.findData(previous_mode)
+                if previous_index >= 0:
+                    combo.setCurrentIndex(previous_index)
+        if sensor is not None and hasattr(sensor, "set_heatmap_playback_active"):
+            sensor.set_heatmap_playback_active(False)
+
+        self._set_sigraph_scanning_controls_running(False)
+        self._refresh_sigraph_scanning_points()
+        if announce:
+            status = "complete" if completed else "stopped"
+            self._append_sidebar_control_message(
+                f"Tactile heatmap replay {status}: {playback.path}"
+            )
+        return True
+
+    def _copy_sigraph_scanning_point(self):
+        task = self._sigraph_scanning_task()
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        if task is None or point_list is None:
+            return
+        source_row = point_list.currentRow()
+        copied_row = task.copy_point(source_row)
+        if copied_row < 0:
+            self._append_sidebar_control_message(
+                "Select a scanning point to copy."
+            )
+            return
+        self._append_sidebar_control_message(
+            f"Copied {task.active_set_name} point {source_row + 1} "
+            f"to new point {copied_row + 1}."
+        )
+        self._refresh_sigraph_scanning_points(active_index=copied_row)
+
+    def _remove_sigraph_scanning_point(self):
+        task = self._sigraph_scanning_task()
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        if task is None or point_list is None:
+            return
+        row = point_list.currentRow()
+        if task.remove_point(row):
+            self._append_sidebar_control_message(
+                f"Removed {task.active_set_name} point {row + 1}."
+            )
+            self._refresh_sigraph_scanning_points()
+
+    def _clear_sigraph_scanning_points(self):
+        task = self._sigraph_scanning_task()
+        if task is None:
+            return
+        point_count = len(task.recorded_points)
+        if point_count == 0:
+            self._append_sidebar_control_message(
+                f"{task.active_set_name} is already empty."
+            )
+            return
+        reply = QMessageBox.warning(
+            self,
+            f"Clear {task.active_set_name}?",
+            f"This will permanently remove all {point_count} recorded points "
+            f"from {task.active_set_name}.\n\nDo you want to continue?",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            self._append_sidebar_control_message(
+                f"Clear cancelled; {task.active_set_name} was not changed."
+            )
+            return
+        if task.clear_points():
+            self._append_sidebar_control_message(
+                f"Cleared all scanning points in {task.active_set_name}."
+            )
+            self._refresh_sigraph_scanning_points()
+
+    def _move_sigraph_scanning_point(self, offset):
+        task = self._sigraph_scanning_task()
+        point_list = getattr(self, "sigraph_scanning_point_list", None)
+        if task is None or point_list is None:
+            return
+        row = point_list.currentRow()
+        new_row = task.move_point(row, int(offset))
+        self._refresh_sigraph_scanning_points()
+        if 0 <= new_row < point_list.count():
+            point_list.setCurrentRow(new_row)
+
+    def _set_sigraph_scanning_controls_running(self, running):
+        running = bool(running)
+        for name in (
+            "sidebar_task_list",
+            "sigraph_scanning_set_combo",
+            "sigraph_scanning_new_set_button",
+            "sigraph_scanning_point_list",
+            "sigraph_scanning_record_button",
+            "sigraph_scanning_copy_button",
+            "sigraph_scanning_remove_button",
+            "sigraph_scanning_clear_button",
+            "sigraph_scanning_go_button",
+            "sigraph_scanning_reverse_button",
+            "sigraph_scanning_run_record_button",
+            "sigraph_scanning_reverse_record_button",
+            "sigraph_scanning_replay_button",
+            "sigraph_scanning_up_button",
+            "sigraph_scanning_down_button",
+            "sigraph_scanning_velocity_spin",
+            "sigraph_scanning_dwell_spin",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not running)
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if start_button is not None:
+            start_button.setEnabled(not running)
 
     def _update_sidebar_task_param_visibility(self):
         widgets = getattr(self, "_task_param_widgets", None)
@@ -1081,6 +1948,15 @@ class MyMainWindow(MainWindow):
                 f"No experiment task is registered for id '{action_id}'."
             )
             return
+        if (
+            getattr(task, "id", None) == "sigraph2026_scanning"
+            and not bool(getattr(task, "_run_request_pending", False))
+        ):
+            point_list = getattr(self, "sigraph_scanning_point_list", None)
+            selected_index = (
+                point_list.currentRow() if point_list is not None else -1
+            )
+            task.request_run(selected_index, reverse=False)
 
         self._sidebar_active_task = task
         self._sidebar_active_control_id = action_id
@@ -1111,6 +1987,7 @@ class MyMainWindow(MainWindow):
         self.info_process.setText(f"Control started: {task.label}")
 
     def _stop_sidebar_control(self, show_result=True, message="Control stopped"):
+        recording_elapsed_s = self._sigraph_heatmap_record_elapsed()
         if self._sidebar_control_timer is not None:
             self._sidebar_control_timer.stop()
         task = self._sidebar_active_task
@@ -1125,8 +2002,12 @@ class MyMainWindow(MainWindow):
                 self._append_sidebar_control_message(
                     f"Task '{getattr(task, 'label', task.id)}' stop error: {exc}"
                 )
+        self._stop_sigraph_heatmap_recording(
+            announce=True, elapsed_s=recording_elapsed_s
+        )
+        self._stop_sigraph_heatmap_playback(announce=True)
 
-    # --- Keyboard tool-frame velocity (WASD + O/P + Q/E + T/Y + G/H) ------
+    # --- Keyboard tool-frame velocity (WASD + O/P + Q/E + R/T + Y/U) ------
 
     def _keyboard_velocity_should_capture(self) -> bool:
         """Return False when the user is typing in a text / numeric field."""
@@ -1149,10 +2030,10 @@ class MyMainWindow(MainWindow):
             Qt.Key_E: "e",
             Qt.Key_O: "o",
             Qt.Key_P: "p",
+            Qt.Key_R: "r",
             Qt.Key_T: "t",
             Qt.Key_Y: "y",
-            Qt.Key_G: "g",
-            Qt.Key_H: "h",
+            Qt.Key_U: "u",
         }
         return mapping.get(key)
 
@@ -1211,13 +2092,13 @@ class MyMainWindow(MainWindow):
             vz = lin_spd
         elif token == "p":
             vz = -lin_spd
-        elif token == "t":
+        elif token == "r":
             rx = -ang_spd
-        elif token == "y":
+        elif token == "t":
             rx = ang_spd
-        elif token == "g":
+        elif token == "y":
             ry = -ang_spd
-        elif token == "h":
+        elif token == "u":
             ry = ang_spd
         elif token == "q":
             rz = -ang_spd
@@ -1243,8 +2124,8 @@ class MyMainWindow(MainWindow):
             "w": "+Y", "s": "−Y",
             "a": "−X", "d": "+X",
             "o": "+Z", "p": "−Z",
-            "t": "−Rx", "y": "+Rx",
-            "g": "−Ry", "h": "+Ry",
+            "r": "−Rx", "t": "+Rx",
+            "y": "−Ry", "u": "+Ry",
             "q": "−Rz", "e": "+Rz",
         }
         return labels.get(token, token)
@@ -1314,7 +2195,7 @@ class MyMainWindow(MainWindow):
             self._keyboard_vel_active_tokens = set()
             self._keyboard_vel_timer.start()
             self.info_process.setText(
-                "Keyboard tool velocity: ON (W/S=±Y, A/D=±X, O/P=±Z, T/Y=±Rx, G/H=±Ry, Q/E=±Rz, Space=stop, keys combine)"
+                "Keyboard tool velocity: ON (W/S=±Y, A/D=±X, O/P=±Z, R/T=±Rx, Y/U=±Ry, Q/E=±Rz, Space=stop, keys combine)"
             )
         else:
             self._disable_keyboard_tool_velocity_internal()

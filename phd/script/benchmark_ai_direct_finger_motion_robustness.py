@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import csv
+import hashlib
 import io
 import json
 import sys
@@ -334,8 +335,13 @@ def score(pred: dict, episode: dict) -> dict:
 
     moving_true = np.linalg.norm(target[:, :3], axis=1) > 1e-8
     moving_pred = np.linalg.norm(velocity[:, :3], axis=1) > 0.005
-    stop_false_move = float(np.mean(moving_pred[~moving_true])) if np.any(~moving_true) else 0.0
-    move_false_stop = float(np.mean(~moving_pred[moving_true])) if np.any(moving_true) else 0.0
+    stop_frames = int(np.count_nonzero(~moving_true))
+    move_frames = int(np.count_nonzero(moving_true))
+    stop_false_move_count = int(np.count_nonzero(moving_pred[~moving_true]))
+    move_false_stop_count = int(np.count_nonzero(~moving_pred[moving_true]))
+    stop_false_move = stop_false_move_count / stop_frames if stop_frames else 0.0
+    move_false_stop = move_false_stop_count / move_frames if move_frames else 0.0
+    mode_correct_count = int(sum(p == t for p, t in zip(pred_modes, target_modes)))
 
     return {
         "rmse_linear": rmse,
@@ -346,25 +352,60 @@ def score(pred: dict, episode: dict) -> dict:
         "stop_false_move_rate": stop_false_move,
         "move_false_stop_rate": move_false_stop,
         "frames": int(target.shape[0]),
+        "linear_squared_error_sum": float(np.sum(error**2)),
+        "linear_value_count": int(error.size),
+        "absolute_error_sum": np.sum(np.abs(error), axis=0).astype(float).tolist(),
+        "mode_correct_count": mode_correct_count,
+        "stop_frames": stop_frames,
+        "move_frames": move_frames,
+        "stop_false_move_count": stop_false_move_count,
+        "move_false_stop_count": move_false_stop_count,
     }
 
 
 def combine_scores(per_episode: list[dict]) -> dict:
     total_frames = sum(item["frames"] for item in per_episode)
-    combined = {"frames": total_frames}
-    for key in (
-        "rmse_linear",
-        "mae_vx",
-        "mae_vy",
-        "mae_vz",
-        "mode_agreement",
-        "stop_false_move_rate",
-        "move_false_stop_rate",
-    ):
-        combined[key] = float(
-            sum(item[key] * item["frames"] for item in per_episode) / max(1, total_frames)
-        )
-    return combined
+    squared_error_sum = sum(item["linear_squared_error_sum"] for item in per_episode)
+    linear_value_count = sum(item["linear_value_count"] for item in per_episode)
+    absolute_error_sum = np.sum(
+        [item["absolute_error_sum"] for item in per_episode], axis=0
+    )
+    stop_frames = sum(item["stop_frames"] for item in per_episode)
+    move_frames = sum(item["move_frames"] for item in per_episode)
+    return {
+        "frames": total_frames,
+        "rmse_linear": float(
+            np.sqrt(squared_error_sum / max(1, linear_value_count))
+        ),
+        "mae_vx": float(absolute_error_sum[0] / max(1, total_frames)),
+        "mae_vy": float(absolute_error_sum[1] / max(1, total_frames)),
+        "mae_vz": float(absolute_error_sum[2] / max(1, total_frames)),
+        "mode_agreement": float(
+            sum(item["mode_correct_count"] for item in per_episode)
+            / max(1, total_frames)
+        ),
+        "stop_false_move_rate": float(
+            sum(item["stop_false_move_count"] for item in per_episode)
+            / max(1, stop_frames)
+        ),
+        "move_false_stop_rate": float(
+            sum(item["move_false_stop_count"] for item in per_episode)
+            / max(1, move_frames)
+        ),
+    }
+
+
+def stable_perturbation_seed(
+    sweep_name: str,
+    level: float,
+    episode_index: int,
+    base_seed: int,
+) -> int:
+    payload = (
+        f"{int(base_seed)}|{sweep_name}|{float(level):.9g}|{int(episode_index)}"
+    ).encode("utf-8")
+    digest = hashlib.blake2s(payload, digest_size=4).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False)
 
 
 # ---------------------------------------------------------------------------
@@ -372,15 +413,28 @@ def combine_scores(per_episode: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def default_trials(dataset_root: Path, model_path: Path) -> list[Path]:
-    """Prefer the checkpoint's validation trials (matched by filename); fall
-    back to the last trial of each session."""
+def default_trials(
+    dataset_root: Path,
+    model_path: Path,
+    *,
+    allow_validation_fallback: bool = False,
+) -> list[Path]:
+    """Return the checkpoint's held-out test trials.
+
+    Older checkpoints have no test split. Reusing validation data is allowed
+    only through an explicit exploratory flag so reported robustness numbers
+    cannot silently use data that influenced early stopping.
+    """
+    test_basenames: set[str] = set()
     val_basenames: set[str] = set()
     try:
         import torch
 
         checkpoint = torch.load(model_path, map_location="cpu", weights_only=False)
-        for entry in checkpoint.get("config", {}).get("val_files", []):
+        config = checkpoint.get("config", {})
+        for entry in config.get("test_files", []):
+            test_basenames.add(Path(str(entry)).name)
+        for entry in config.get("val_files", []):
             val_basenames.add(Path(str(entry)).name)
     except Exception:
         pass
@@ -390,15 +444,23 @@ def default_trials(dataset_root: Path, model_path: Path) -> list[Path]:
         for path in dataset_root.glob("session_*")
         if path.is_dir() and not path.name.startswith("_")
     )
-    matched: list[Path] = []
-    fallback: list[Path] = []
+    test_matched: list[Path] = []
+    validation_matched: list[Path] = []
     for session in sessions:
         session_trials = sorted(session.glob("trial_*.npz"))
         if not session_trials:
             continue
-        matched.extend(trial for trial in session_trials if trial.name in val_basenames)
-        fallback.extend(session_trials[-1:])
-    return matched if matched else fallback
+        test_matched.extend(
+            trial for trial in session_trials if trial.name in test_basenames
+        )
+        validation_matched.extend(
+            trial for trial in session_trials if trial.name in val_basenames
+        )
+    if test_matched:
+        return test_matched
+    if allow_validation_fallback:
+        return validation_matched
+    return []
 
 
 def build_sweeps(args: argparse.Namespace, window: int) -> dict[str, list[tuple[float, Perturbation]]]:
@@ -447,9 +509,17 @@ def run_benchmark(args: argparse.Namespace) -> Path:
     if args.trials:
         trial_paths = [Path(trial).expanduser() for trial in args.trials]
     else:
-        trial_paths = default_trials(dataset_root, model_path)
+        trial_paths = default_trials(
+            dataset_root,
+            model_path,
+            allow_validation_fallback=args.allow_validation_fallback,
+        )
     if not trial_paths:
-        raise FileNotFoundError(f"No benchmark trials found under {dataset_root}")
+        raise FileNotFoundError(
+            "No independent checkpoint test trials were found. Supply "
+            "--trials explicitly, train a checkpoint with --test-trials, or "
+            "use --allow-validation-fallback for exploratory analysis only."
+        )
 
     print("Phase 2 robustness benchmark: rules vs AI")
     print(f"Model: {model_path}")
@@ -481,7 +551,12 @@ def run_benchmark(args: argparse.Namespace) -> Path:
             for pipeline_name, replay_fn in (("rules", replay_rules), ("ai", replay_ai)):
                 per_episode = []
                 for episode_idx, episode in enumerate(episodes):
-                    seed = hash((sweep_name, round(float(level), 6), episode_idx)) % (2**32)
+                    seed = stable_perturbation_seed(
+                        sweep_name,
+                        float(level),
+                        episode_idx,
+                        args.seed,
+                    )
                     if pipeline_name == "rules":
                         pred = replay_fn(episode, perturbation, seed)
                     else:
@@ -534,6 +609,7 @@ def run_benchmark(args: argparse.Namespace) -> Path:
         "sanity_check": sanity,
         "results": rows,
         "elapsed_sec": elapsed,
+        "seed": int(args.seed),
     }
     (output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
@@ -596,7 +672,15 @@ def main() -> int:
         "--trials",
         nargs="*",
         default=[],
-        help="Explicit .npz trial paths. Default: checkpoint validation trials (or last trial per session).",
+        help="Explicit independent .npz trial paths. Default: checkpoint test trials.",
+    )
+    parser.add_argument(
+        "--allow-validation-fallback",
+        action="store_true",
+        help=(
+            "Allow old checkpoints to reuse validation trials. Exploratory only; "
+            "do not report these results as an independent test."
+        ),
     )
     parser.add_argument("--output-dir", type=Path, default=default_output)
     parser.add_argument("--max-frames", type=int, default=0, help="Limit frames per trial (0 = all).")
@@ -625,6 +709,12 @@ def main() -> int:
         default=[0.5, 0.7, 0.85, 1.0, 1.15, 1.3],
     )
     parser.add_argument("--no-plots", action="store_true")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=20260623,
+        help="Deterministic base seed for all perturbation trials.",
+    )
     args = parser.parse_args()
 
     run_benchmark(args)

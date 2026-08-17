@@ -209,7 +209,12 @@ class GripperHelper(Node if ROS_AVAILABLE else object):
     # ------------------------------------------------------------------
     @property
     def is_available(self) -> bool:
-        return bool(self._is_online and self._action_client is not None)
+        if not (self._is_online and self._action_client is not None):
+            return False
+        try:
+            return bool(self._action_client.server_is_ready())
+        except Exception:
+            return False
 
     @property
     def is_online(self) -> bool:
