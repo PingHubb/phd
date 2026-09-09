@@ -10,6 +10,9 @@ from phd.dependence.gesture.gesture_logic_direct_finger_motion import (
     AI_DirectFingerMotion_execution,
     DirectFingerMotion,
 )
+from phd.dependence.gesture.gesture_logic_proximity_control import (
+    ProximityControl,
+)
 from phd.dependence.func_sensor import MySensor
 from phd.dependence.robot_api import RobotController
 from phd.script.benchmark_ai_direct_finger_motion_robustness import (
@@ -100,6 +103,28 @@ def test_ai_requires_two_consistent_motion_predictions():
     assert helper.last_prediction["mode"] == "move"
 
 
+def test_ai_execution_velocity_scale_is_adjustable_and_bounded():
+    helper = AI_DirectFingerMotion_execution(_splitter(), _Sensor())
+
+    assert helper.set_velocity_scale(2.5) == 2.5
+    assert helper.set_velocity_scale(100.0) == 20.0
+    assert helper.set_velocity_scale(-1.0) == 0.1
+    assert helper.set_velocity_scale(float("nan")) == 1.0
+
+
+def test_ai_execution_linear_velocity_has_point_three_norm_cap():
+    helper = AI_DirectFingerMotion_execution(_splitter(), _Sensor())
+
+    assert helper.max_linear_speed == 0.30
+    clipped = helper._clip_velocity6(
+        [1.0, -1.0, 1.0, 0.1, 0.1, 0.1]
+    )
+
+    assert np.isclose(np.linalg.norm(clipped[:3]), 0.30)
+    assert np.all(np.abs(clipped[:3]) <= 0.30)
+    np.testing.assert_array_equal(clipped[3:], [0.0, 0.0, 0.0])
+
+
 def test_checkpoint_signature_detects_replaced_model(tmp_path):
     checkpoint = tmp_path / "latest.pt"
     checkpoint.write_bytes(b"first")
@@ -131,6 +156,18 @@ def test_sensor_render_consumes_only_the_latest_pending_snapshot():
     assert sensor.saved_camera == 1
     assert len(sensor.rendered) == 1
     assert sensor._pending_sensor_visualization_matrix is None
+
+
+def test_rule_based_proximity_uses_averaged_percentage_signal():
+    helper = object.__new__(ProximityControl)
+    helper.my_sensor = SimpleNamespace(
+        _data=SimpleNamespace(
+            diffDataAve=np.asarray([[100.0, 200.0]]),
+            diffPerDataAve=np.asarray([[-1.5, 2.5]]),
+        )
+    )
+
+    np.testing.assert_array_equal(helper._get_signal_matrix(), [[1.5, 2.5]])
 
 
 class _ReadyClient:

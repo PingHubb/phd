@@ -10,7 +10,7 @@ import serial
 import serial.tools.list_ports
 import time
 from pyvistaqt import QtInteractor
-from PyQt5.QtCore import QObject, QThread, QTimer
+from PyQt5.QtCore import QObject, QThread, QTimer, Qt
 from PyQt5.QtWidgets import QListWidgetItem
 from tqdm import tqdm
 from phd.dependence.paths import resource_path, sensor_resource_path
@@ -30,6 +30,21 @@ from phd.dependence.sensor_geometry import (
     structured_grid_edges,
 )
 from phd.dependence.sensor_data import SensorDataBuffer
+from phd.dependence.goodix_usb_sensor import (
+    GOODIX_USB_COLUMNS,
+    GOODIX_USB_ROWS,
+    GOODIX_USB_SOURCE_ID,
+    GOODIX_USB_SOURCE_LABEL,
+    GoodixUsbError,
+    GoodixUsbReadWorker,
+    GoodixUsbSensorClient,
+    goodix_usb_connected,
+    is_goodix_usb_source,
+)
+from phd.dependence.humanoid_sensor_registry import (
+    humanoid_sensor_annotation,
+    load_humanoid_device_assignments,
+)
 from phd.dependence.sensor_heatmap import (
     DEFAULT_HEATMAP_3D_COLOR_GAIN,
     DEFAULT_HEATMAP_3D_PALETTE,
@@ -68,6 +83,8 @@ SENSOR_REORDER_LOGIC_FILE = os.path.join(
 
 REORDER_FACTORY_DEFAULT = "factory"
 REORDER_NONE = "none"
+POINT_GRID_RESPONSE_ZERO_CENTERED = "zero_centered"
+POINT_GRID_RESPONSE_LEGACY_OFFSET = "legacy_offset"
 REORDER_LOGIC_OPTIONS = (
     REORDER_FACTORY_DEFAULT,
     REORDER_NONE,
@@ -585,6 +602,14 @@ class MySensor:
         self._heatmap_tile_vertices = None
         self._last_sensor_visualization_matrix = None
         self._pending_sensor_visualization_matrix = None
+        self._pending_multi_port_visualization_matrices = {}
+        self._sensor_data_by_port = {}
+        self._sensor_profiles_by_port = {}
+        self._multi_port_sensor_views = {}
+        self._multi_port_label_actors = []
+        self._primary_sensor_port = None
+        self._calibrated_sensor_ports = set()
+        self._actor_name_prefix = ""
         self._heatmap_calibration_override = None
         self.heatmap_saturation_pct = DEFAULT_HEATMAP_SATURATION_PCT
         self.heatmap_noise_floor_pct = DEFAULT_HEATMAP_NOISE_FLOOR_PCT
@@ -594,6 +619,8 @@ class MySensor:
         self.heatmap_proximity_saturation = DEFAULT_PROXIMITY_SATURATION
         self.heatmap_3d_color_gain = DEFAULT_HEATMAP_3D_COLOR_GAIN
         self.heatmap_3d_palette = DEFAULT_HEATMAP_3D_PALETTE
+        self.visualization_use_absolute_signal = True
+        self.point_grid_response_mode = POINT_GRID_RESPONSE_ZERO_CENTERED
         self._matrix_visual_actor_mode = None
         self._matrix_line_dense_shape = (0, 0)
         self._matrix_line_base_points = None
@@ -626,6 +653,9 @@ class MySensor:
         self.sensor_visual_offset_scale = 0.0
         self._contact_normal_missing_frames = 0
         self.sensorPointLabelActor = None
+        self.sensorSelectionActor = None
+        self.sensorSelectionPoly = None
+        self._selected_sensor_cell = None
         self.n_col = 0
         self.n_row = 0
         self.touch_sensitivity_scale = 0.05
@@ -646,6 +676,8 @@ class MySensor:
         self.contact_motion_max_tilt_deg = 90.0
         self.contact_force_scale_n_per_signal = 0.0
         self.cal_data = []
+        self.sensor_transport = "serial"
+        self._goodix_client = None
         self.sensor_average_window_size = self.SENSOR_AVERAGE_WINDOW_SIZE
         self.visualization_target_hz = self.VISUALIZATION_TARGET_HZ
         self.main_visualization_enabled = True
@@ -872,24 +904,55 @@ class MySensor:
 
     def initChannel(self):
         self.com_options = []
-        ports = serial.tools.list_ports.comports()
+        ports = [
+            port
+            for port in serial.tools.list_ports.comports()
+            if not str(port.name or "").lower().startswith("ttys")
+        ]
         self.ser = None
         self.parent.serial_channel.clear()
         if ports:
+            humanoid_assignments = load_humanoid_device_assignments()
             # Sort ports to have 'ttyACM' first, then others.
             ports = sorted(ports, key=lambda port: (0, int(port.name.replace('ttyACM', ''))) if port.name.startswith(
                 'ttyACM') else (1, port.name))
 
-            for port in ports:
+            acm_ports = [port for port in ports if port.name.startswith("ttyACM")]
+            other_ports = [port for port in ports if not port.name.startswith("ttyACM")]
+            for port in acm_ports:
                 self.com_options.append(port.name)
                 # Create a standard, selectable item (no checkbox).
                 # Selection mode is already handled in ui_ping.py.
-                item = QListWidgetItem(port.name)
+                annotation = humanoid_sensor_annotation(
+                    port,
+                    humanoid_assignments,
+                )
+                label = (
+                    f"{port.name} - {annotation}"
+                    if annotation
+                    else port.name
+                )
+                item = QListWidgetItem(label)
+                item.setData(Qt.UserRole, port.name)
                 self.parent.serial_channel.addItem(item)
-            if self.parent.serial_channel.count() > 0:
-                first_item = self.parent.serial_channel.item(0)
-                self.parent.serial_channel.setCurrentRow(0)
-                first_item.setSelected(True)
+        else:
+            other_ports = []
+        # Keep Goodix immediately after the ACM sensor ports and before other
+        # USB serial adapters.
+        if goodix_usb_connected():
+            self.com_options.append(GOODIX_USB_SOURCE_ID)
+            item = QListWidgetItem(GOODIX_USB_SOURCE_LABEL)
+            item.setData(Qt.UserRole, GOODIX_USB_SOURCE_ID)
+            self.parent.serial_channel.addItem(item)
+        for port in other_ports:
+            self.com_options.append(port.name)
+            item = QListWidgetItem(port.name)
+            item.setData(Qt.UserRole, port.name)
+            self.parent.serial_channel.addItem(item)
+        if self.parent.serial_channel.count() > 0:
+            first_item = self.parent.serial_channel.item(0)
+            self.parent.serial_channel.setCurrentRow(0)
+            first_item.setSelected(True)
         else:
             print("No serial ports found. Please connect the device and retry.")
             return
@@ -996,8 +1059,17 @@ class MySensor:
 
     def set_sensor_average_window_size(self, window_size):
         self.sensor_average_window_size = max(1, int(window_size))
-        data_obj = getattr(self, "_data", None)
-        if data_obj is not None:
+        data_objects = list(
+            getattr(self, "_sensor_data_by_port", {}).values()
+        )
+        primary_data = getattr(self, "_data", None)
+        if primary_data is not None and not data_objects:
+            data_objects.append(primary_data)
+        seen = set()
+        for data_obj in data_objects:
+            if data_obj is None or id(data_obj) in seen:
+                continue
+            seen.add(id(data_obj))
             data_obj.setWindowSize(self.sensor_average_window_size)
 
     def get_visualization_target_hz(self):
@@ -1020,29 +1092,53 @@ class MySensor:
         if bool(getattr(self, "_heatmap_playback_active", False)):
             return
         sensor_matrix = self._pending_sensor_visualization_matrix
-        if sensor_matrix is None:
+        secondary_matrices = dict(
+            getattr(self, "_pending_multi_port_visualization_matrices", {})
+        )
+        if sensor_matrix is None and not secondary_matrices:
             return
         self._pending_sensor_visualization_matrix = None
+        pending_secondary = getattr(
+            self, "_pending_multi_port_visualization_matrices", None
+        )
+        if pending_secondary is not None:
+            pending_secondary.clear()
         self._last_visualization_time = time.perf_counter()
         self.saveCameraPara()
-        self.update_visualization(sensor_matrix)
+        for port_name, matrix in secondary_matrices.items():
+            view = self._multi_port_sensor_views.get(port_name)
+            if view is not None:
+                view.update_visualization(matrix, render=False)
+        if sensor_matrix is not None:
+            self.update_visualization(sensor_matrix)
+        elif secondary_matrices:
+            self.plotter.render()
+
+    def _sensor_actor_name(self, base_name):
+        prefix = str(getattr(self, "_actor_name_prefix", "") or "").strip()
+        return str(base_name) if not prefix else f"{base_name}_{prefix}"
 
     def _ensure_main_sensor_visualization_actors(self):
         """Create main-plotter actors after an external-only scene build."""
+        sensor_map = getattr(self, "_2D_map", None)
         if (
-            self.objActor is None
-            and self._2D_map is not None
-            and int(getattr(self._2D_map, "n_points", 0) or 0) > 0
+            getattr(self, "objActor", None) is None
+            and sensor_map is not None
+            and int(getattr(sensor_map, "n_points", 0) or 0) > 0
         ):
             self.objActor = self.plotter.add_mesh(
-                self._2D_map,
+                sensor_map,
                 show_edges=True,
                 scalars=self.colors,
                 rgb=True,
                 opacity=self.SENSOR_REFERENCE_OPACITY,
+                name=self._sensor_actor_name("sensor_reference"),
             )
 
-        if self.actionMesh is None and self.line_poly is not None:
+        if (
+            getattr(self, "actionMesh", None) is None
+            and getattr(self, "line_poly", None) is not None
+        ):
             self.actionMesh = self.plotter.add_mesh(
                 self.line_poly,
                 scalars=self.colors_3d,
@@ -1050,6 +1146,7 @@ class MySensor:
                 line_width=3,
                 render_points_as_spheres=True,
                 rgb=True,
+                name=self._sensor_actor_name("sensor_point_grid"),
             )
 
         if self.actionMesh is not None or self.matrixLineActor is not None:
@@ -1097,10 +1194,11 @@ class MySensor:
                 getattr(self, "objActor", None),
                 getattr(self, "actionMesh", None),
                 getattr(self, "matrixLineActor", None),
-                getattr(self, "heatmapActor", None),
-                getattr(self, "contactNormalActor", None),
-                getattr(self, "sensorPointLabelActor", None),
-                getattr(self, "actorPlaneXY", None),
+                    getattr(self, "heatmapActor", None),
+                    getattr(self, "contactNormalActor", None),
+                    getattr(self, "sensorPointLabelActor", None),
+                    getattr(self, "sensorSelectionActor", None),
+                    getattr(self, "actorPlaneXY", None),
             ):
                 self._set_actor_visible(actor, False)
             for actor in getattr(self, "referenceAxisActors", []) or []:
@@ -1117,6 +1215,10 @@ class MySensor:
                     )
                 except Exception:
                     pass
+        for view in getattr(self, "_multi_port_sensor_views", {}).values():
+            view.set_replica_visibility(enabled)
+        for actor in getattr(self, "_multi_port_label_actors", []):
+            self._set_actor_visible(actor, enabled)
         if render:
             try:
                 self.plotter.render()
@@ -1181,6 +1283,8 @@ class MySensor:
             if current_matrix is not None:
                 self._update_heatmap_visualization(current_matrix)
         self._refresh_sensor_visualization_mode_actors()
+        for view in getattr(self, "_multi_port_sensor_views", {}).values():
+            view.set_replica_visualization_mode(mode)
         try:
             self.plotter.render()
         except Exception:
@@ -1220,6 +1324,10 @@ class MySensor:
         self._set_actor_visible(getattr(self, "heatmapActor", None), heatmap_mode)
         self._set_actor_visible(
             getattr(self, "heatmapGridActor", None), heatmap_mode
+        )
+        self._set_actor_visible(
+            getattr(self, "sensorSelectionActor", None),
+            enabled and getattr(self, "_selected_sensor_cell", None) is not None,
         )
 
     @staticmethod
@@ -1567,6 +1675,10 @@ class MySensor:
         self.heatmapGridActor = self._remove_actor_safely(
             getattr(self, "heatmapGridActor", None)
         )
+        self.sensorSelectionActor = self._remove_actor_safely(
+            getattr(self, "sensorSelectionActor", None)
+        )
+        self.sensorSelectionPoly = None
         self.heatmapPoly = None
         self.heatmapColors = None
         self.heatmapGridPoly = None
@@ -1590,7 +1702,7 @@ class MySensor:
                 smooth_shading=False,
                 lighting=False,
                 ambient=1.0,
-                name="sensor_heatmap_3d",
+                name=self._sensor_actor_name("sensor_heatmap_3d"),
                 render=False,
             )
         except Exception as exc:
@@ -1630,7 +1742,7 @@ class MySensor:
                 smooth_shading=False,
                 lighting=False,
                 pickable=False,
-                name="sensor_heatmap_grid",
+                name=self._sensor_actor_name("sensor_heatmap_grid"),
                 render=render,
             )
         except Exception as exc:
@@ -1651,17 +1763,27 @@ class MySensor:
         response_mode = normalize_heatmap_response_mode(
             getattr(self, "heatmap_response_mode", DEFAULT_HEATMAP_RESPONSE_MODE)
         )
-        raw_matrix = getattr(data_obj, "rawData", None) if data_obj is not None else None
+        proximity_enhanced = (
+            response_mode == HEATMAP_RESPONSE_PROXIMITY_ENHANCED
+        )
+        raw_attr = "rawData" if proximity_enhanced else "rawDataAve"
+        raw_matrix = (
+            getattr(data_obj, raw_attr, None) if data_obj is not None else None
+        )
         calibration_override = getattr(
             self, "_heatmap_calibration_override", None
         )
         if raw_matrix is not None and calibration_override is not None:
             raw_values = np.asarray(raw_matrix, dtype=float)
             calibration_values = np.asarray(calibration_override, dtype=float)
+            if not proximity_enhanced:
+                # SensorDataBuffer applies this legacy display flip to all
+                # averaged matrices, so align an external baseline with it.
+                calibration_values = np.flipud(calibration_values)
             if raw_values.shape == calibration_values.shape:
                 difference = raw_values - calibration_values
-                if response_mode == HEATMAP_RESPONSE_PROXIMITY_ENHANCED:
-                    return difference
+                if proximity_enhanced:
+                    return np.flipud(difference)
                 relative_difference = np.zeros_like(difference, dtype=float)
                 np.divide(
                     100.0 * difference,
@@ -1671,12 +1793,10 @@ class MySensor:
                 )
                 return relative_difference
 
-        data_attr = (
-            "diffData"
-            if response_mode == HEATMAP_RESPONSE_PROXIMITY_ENHANCED
-            else "diffPerData"
-        )
+        data_attr = "diffData" if proximity_enhanced else "diffPerDataAve"
         matrix = getattr(data_obj, data_attr, None) if data_obj is not None else None
+        if proximity_enhanced and matrix is not None:
+            return np.flipud(np.asarray(matrix))
         return fallback if matrix is None else matrix
 
     def get_heatmap_sensor_matrix(self):
@@ -1820,10 +1940,8 @@ class MySensor:
             else:
                 return
 
-        # The table viewer uses top-down rows; the 3D plot uses bottom-up rows.
-        visual_values = np.flip(values, axis=0)
         rgb = heatmap_3d_rgb(
-            visual_values,
+            values,
             palette=getattr(
                 self, "heatmap_3d_palette", DEFAULT_HEATMAP_3D_PALETTE
             ),
@@ -1853,6 +1971,11 @@ class MySensor:
                 self,
                 "heatmap_3d_color_gain",
                 DEFAULT_HEATMAP_3D_COLOR_GAIN,
+            ),
+            use_absolute_signal=getattr(
+                self,
+                "visualization_use_absolute_signal",
+                True,
             ),
         )
         mask = self._cell_zero_mask_for_plotter()
@@ -2089,7 +2212,7 @@ class MySensor:
                 render_lines_as_tubes=False if mode == "stereo_field" else True,
                 lighting=False,
                 ambient=1.0,
-                name=f"sensor_{mode}",
+                name=self._sensor_actor_name(f"sensor_{mode}"),
                 render=render,
             )
         except Exception as exc:
@@ -2119,7 +2242,13 @@ class MySensor:
         values = np.asarray(sensor_matrix, dtype=float)
         if values.ndim != 2:
             return
-        pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
+        signed_values = np.nan_to_num(
+            values, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        pressure = np.abs(signed_values)
+        dense_signed = self._bilinear_grid_sample(
+            signed_values[..., None], dense_rows, dense_cols
+        )[..., 0]
         dense_pressure = self._bilinear_grid_sample(pressure[..., None], dense_rows, dense_cols)[..., 0]
         if mode == "stereo_field":
             ignore_noise = bool(getattr(self, "stereo_field_ignore_noise_enabled", True))
@@ -2203,9 +2332,29 @@ class MySensor:
                 colors[base_indices, 1] = np.clip(25 + visibility * 70, 0, 255).astype(np.uint8)
                 colors[base_indices, 2] = np.clip(20 + visibility * 55, 0, 255).astype(np.uint8)
                 response = np.clip(np.asarray(color_response, dtype=float), 0.0, 1.0)
-                cool = np.array([25.0, 185.0, 255.0])
-                warm = np.array([255.0, 96.0, 42.0])
-                top_rgb = cool[None, :] * (1.0 - response[:, None]) + warm[None, :] * response[:, None]
+                if bool(
+                    getattr(self, "visualization_use_absolute_signal", True)
+                ):
+                    cool = np.array([25.0, 185.0, 255.0])
+                    warm = np.array([255.0, 96.0, 42.0])
+                    top_rgb = (
+                        cool[None, :] * (1.0 - response[:, None])
+                        + warm[None, :] * response[:, None]
+                    )
+                else:
+                    neutral = np.array([245.0, 245.0, 245.0])
+                    positive = np.array([220.0, 45.0, 45.0])
+                    negative = np.array([35.0, 80.0, 205.0])
+                    sign = np.sign(dense_signed).reshape(-1)
+                    target = np.where(
+                        (sign >= 0.0)[:, None],
+                        positive[None, :],
+                        negative[None, :],
+                    )
+                    top_rgb = (
+                        neutral[None, :] * (1.0 - response[:, None])
+                        + target * response[:, None]
+                    )
                 brightness = np.clip(0.62 + 0.38 * visibility, 0.35, 1.0)
                 top_rgb = np.clip(top_rgb * brightness[:, None], 0, 255)
                 base_rgb = np.clip(top_rgb * 0.32, 0, 255)
@@ -2261,6 +2410,14 @@ class MySensor:
             except Exception as exc:
                 hand_report = f"\nhand_3d_runtime_report_error: {exc}"
 
+        goodix_report = ""
+        goodix_client = getattr(self, "_goodix_client", None)
+        if self.is_goodix_usb_transport() and goodix_client is not None:
+            goodix_report = (
+                "\ngoodix_usb_backend: "
+                f"{goodix_client.backend_status}"
+            )
+
         return (
             f"sensor_update_hz: {self._sensor_update_hz:.2f}\n"
             f"direct_finger_motion_loop_hz: {direct_hz:.2f}\n"
@@ -2268,6 +2425,7 @@ class MySensor:
             f"visualization_actual_hz: {self._visualization_hz:.2f}\n"
             f"sensor_average_window_size: {window_size}\n"
             f"visualization_target_hz: {self.visualization_target_hz:.2f}"
+            f"{goodix_report}"
             f"{hand_report}"
         )
 
@@ -2305,38 +2463,117 @@ class MySensor:
 
     def buildScene(self, show_main_visualization: bool = True):
         self._set_sensor_stream_error("")
-        if not self._ensure_sensor_api_backend():
+        selected_sources = self._get_selected_port_names()
+        if not selected_sources:
+            message = (
+                "No sensor source selected. Highlight a sensor source first."
+            )
+            self._set_sensor_stream_error(message)
+            print(message)
+            return
+        port_profiles = self._resolve_sensor_port_profiles(selected_sources)
+        primary_profile = port_profiles[
+            self._sensor_port_key(selected_sources[0])
+        ]
+        selected_model_name = self.SENSOR_MODEL_NAMES_BY_INDEX.get(
+            int(self.parent.sensor_choice.currentRow())
+        )
+        if selected_model_name != "2d" and len(selected_sources) > 1:
+            model_config = self.PREDEFINED_SENSOR_MODELS.get(
+                str(selected_model_name), {}
+            )
+            expected_shape = (
+                int(model_config.get("n_row", 0) or 0),
+                int(model_config.get("n_col", 0) or 0),
+            )
+            mismatched = [
+                source
+                for source in selected_sources
+                if (
+                    port_profiles[self._sensor_port_key(source)]["n_row"],
+                    port_profiles[self._sensor_port_key(source)]["n_col"],
+                )
+                != expected_shape
+            ]
+            if mismatched:
+                message = (
+                    "Different sensor grid sizes in Multiple Ports mode are "
+                    "supported with the 2D sensor model. Select 2D, or make "
+                    f"every port match {expected_shape[0]}x{expected_shape[1]}."
+                )
+                self._set_sensor_stream_error(message)
+                print(message)
+                return
+        if len(selected_sources) > 1 and any(
+            is_goodix_usb_source(source) for source in selected_sources
+        ):
+            message = (
+                "Goodix USB cannot be combined with serial sensors in "
+                "Multiple Ports mode. Select serial ports only."
+            )
+            self._set_sensor_stream_error(message)
+            print(message)
+            return
+        use_goodix_usb = is_goodix_usb_source(selected_sources[0])
+        if not use_goodix_usb and not self._ensure_sensor_api_backend():
             print(self.get_last_sensor_stream_error())
             return
         self.main_visualization_enabled = bool(show_main_visualization)
         self._reset_scene_build_state()
         self._set_sensor_update_button_enabled(False)
-        self._clear_scene_actors()
-        self._close_serial_ports()
-        self._close_standalone_sensor_api()
-        self.is_connected = False
-
-        selected_ports = self._get_selected_port_names()
-        if not selected_ports:
-            message = "No serial port selected. Highlight a sensor port first."
+        if not self._close_serial_ports():
+            message = (
+                "Could not rebuild the sensor scene because the previous "
+                "reader is still stopping."
+            )
             self._set_sensor_stream_error(message)
+            self._set_sensor_update_button_enabled(True)
             print(message)
             return
+        self._clear_scene_actors()
+        self._close_goodix_client()
+        self._close_standalone_sensor_api()
+        self.is_connected = False
+        self._sensor_profiles_by_port = port_profiles
 
-        self.ser_list = self._open_serial_ports(selected_ports)
-        if not self.ser_list:
-            if not self.get_last_sensor_stream_error():
-                self._set_sensor_stream_error(
-                    "Could not open any of the selected sensor ports."
+        if use_goodix_usb:
+            self.sensor_transport = "goodix_usb"
+            self._goodix_client = GoodixUsbSensorClient(
+                rows=GOODIX_USB_ROWS,
+                columns=GOODIX_USB_COLUMNS,
+            )
+            if not self._goodix_client.is_available:
+                message = (
+                    "Goodix USB sensor support is unavailable. Confirm the sensor "
+                    "is connected and libusb or UsbTouchCore is available."
                 )
-            print("Could not open any of the selected ports.")
-            return
+                self._set_sensor_stream_error(message)
+                print(message)
+                self._close_goodix_client()
+                return
+            self.ser_list = []
+        else:
+            self.sensor_transport = "serial"
+            self.ser_list = self._open_serial_ports(selected_sources)
+            if not self.ser_list:
+                if not self.get_last_sensor_stream_error():
+                    self._set_sensor_stream_error(
+                        "Could not open any of the selected sensor ports."
+                    )
+                print("Could not open any of the selected ports.")
+                return
 
         self.clearParameters()
-        if not self._initialize_selected_sensor_model(self.parent.sensor_choice.currentRow()):
+        if not self._initialize_selected_sensor_model(
+            self.parent.sensor_choice.currentRow(),
+            n_row=primary_profile["n_row"],
+            n_col=primary_profile["n_col"],
+        ):
             self._close_serial_ports()
+            self._close_goodix_client()
             print("Unsupported sensor selection.")
             return
+        self._configure_sensor_port_views()
         self.initialize_ai_helpers()
         self.update_ui_elements()
         if not bool(show_main_visualization):
@@ -2459,6 +2696,7 @@ class MySensor:
         return None
 
     def _clear_scene_actors(self):
+        self._clear_multi_port_views()
         self.objActor = self._remove_actor_safely(self.objActor)
         self.actionMesh = self._remove_actor_safely(self.actionMesh)
         self.matrixLineActor = self._remove_actor_safely(
@@ -2492,13 +2730,309 @@ class MySensor:
         self._clear_sensor_point_label_actor()
 
     def _get_selected_port_names(self):
-        return [item.text() for item in self.parent.serial_channel.selectedItems()]
+        selected = []
+        for item in self.parent.serial_channel.selectedItems():
+            try:
+                port_name = item.data(Qt.UserRole)
+            except (AttributeError, TypeError):
+                port_name = None
+            selected.append(str(port_name or item.text()))
+        return selected
+
+    def _multi_port_display_enabled(self):
+        combo = getattr(self.parent, "sensor_source_mode_combo", None)
+        if combo is None:
+            return False
+        try:
+            return combo.currentData() == "multiple"
+        except Exception:
+            return False
+
+    def is_goodix_usb_transport(self):
+        """Return whether the current scene uses the Goodix USB source."""
+        return getattr(self, "sensor_transport", "serial") == "goodix_usb"
 
     def _close_standalone_sensor_api(self):
         sensor_api = getattr(self.parent, "sensor_api", None)
         close = getattr(sensor_api, "close", None)
         if callable(close):
             close()
+
+    @staticmethod
+    def _sensor_port_key(port_name):
+        text = str(port_name or "").strip()
+        if not text:
+            return ""
+        if is_goodix_usb_source(text):
+            return GOODIX_USB_SOURCE_ID
+        if not os.path.isabs(text):
+            text = os.path.join("/dev", text)
+        try:
+            return os.path.realpath(text)
+        except Exception:
+            return text
+
+    def _normalize_sensor_port_profile(self, profile, fallback=None):
+        fallback = dict(fallback or {})
+        profile = dict(profile or {})
+        try:
+            n_row = int(profile.get("n_row", fallback.get("n_row", self.n_row)))
+        except Exception:
+            n_row = int(fallback.get("n_row", self.n_row))
+        try:
+            n_col = int(profile.get("n_col", fallback.get("n_col", self.n_col)))
+        except Exception:
+            n_col = int(fallback.get("n_col", self.n_col))
+        return {
+            "n_row": max(1, n_row),
+            "n_col": max(1, n_col),
+            "has_extra_column": bool(
+                profile.get(
+                    "has_extra_column",
+                    fallback.get("has_extra_column", True),
+                )
+            ),
+        }
+
+    def _resolve_sensor_port_profiles(self, selected_sources):
+        getter = getattr(self.parent, "get_sensor_port_profile", None)
+        fallback = {
+            "n_row": int(
+                getattr(self.parent.grid_rows_spin, "value", lambda: 10)()
+            ),
+            "n_col": int(
+                getattr(self.parent.grid_cols_spin, "value", lambda: 10)()
+            ),
+            "has_extra_column": self._raw_packet_has_extra_column(),
+        }
+        profiles = {}
+        for source in selected_sources:
+            raw_profile = getter(source) if callable(getter) else fallback
+            profiles[self._sensor_port_key(source)] = (
+                self._normalize_sensor_port_profile(
+                    raw_profile,
+                    fallback=fallback,
+                )
+            )
+        return profiles
+
+    def _sensor_profile_for_port(self, port_name):
+        key = self._sensor_port_key(port_name)
+        profile = getattr(self, "_sensor_profiles_by_port", {}).get(key)
+        if profile is not None:
+            return dict(profile)
+        return {
+            "n_row": int(self.n_row),
+            "n_col": int(self.n_col),
+            "has_extra_column": self._raw_packet_has_extra_column(),
+        }
+
+    @staticmethod
+    def _safe_actor_suffix(port_name):
+        return "".join(
+            character if character.isalnum() else "_"
+            for character in str(port_name or "sensor")
+        ).strip("_") or "sensor"
+
+    def _clear_multi_port_views(self):
+        for view in getattr(self, "_multi_port_sensor_views", {}).values():
+            view.close()
+        self._multi_port_sensor_views = {}
+
+        for actor in getattr(self, "_multi_port_label_actors", []):
+            try:
+                self.plotter.remove_actor(actor, reset_camera=False)
+            except Exception:
+                pass
+        self._multi_port_label_actors = []
+        self._pending_multi_port_visualization_matrices = {}
+        self._sensor_data_by_port = {}
+        self._primary_sensor_port = None
+        self._calibrated_sensor_ports = set()
+
+    def _multi_port_scene_spacing(self):
+        point_sets = [
+            getattr(self, "points_origin", None),
+            getattr(getattr(self, "_2D_map", None), "points", None),
+        ]
+        finite_sets = []
+        for points in point_sets:
+            try:
+                array = np.asarray(points, dtype=float)
+            except (TypeError, ValueError):
+                continue
+            if array.ndim == 2 and array.shape[1] == 3:
+                array = array[np.all(np.isfinite(array), axis=1)]
+                if array.size:
+                    finite_sets.append(array)
+        if not finite_sets:
+            return 1.0
+        combined = np.vstack(finite_sets)
+        span = np.ptp(combined, axis=0)
+        return max(float(np.max(span)) * 1.35, 0.1)
+
+    def _add_multi_port_label(self, port_name, offset):
+        points = np.asarray(self.points_origin, dtype=float) + np.asarray(
+            offset, dtype=float
+        )
+        finite = points[np.all(np.isfinite(points), axis=1)]
+        if not finite.size:
+            return
+        span = max(float(np.max(np.ptp(finite, axis=0))), 0.05)
+        label_position = np.array(
+            [
+                float(np.mean(finite[:, 0])),
+                float(np.max(finite[:, 1]) + span * 0.12),
+                float(np.max(finite[:, 2]) + span * 0.06),
+            ]
+        )
+        try:
+            actor = self.plotter.add_point_labels(
+                pv.PolyData(label_position.reshape(1, 3)),
+                [os.path.basename(str(port_name))],
+                font_size=12,
+                text_color="#ffffff",
+                show_points=False,
+                shape="rounded_rect",
+                shape_color="#263238",
+                shape_opacity=0.9,
+                margin=4,
+                always_visible=True,
+                name=self._sensor_actor_name(
+                    f"multi_port_label_{self._safe_actor_suffix(port_name)}"
+                ),
+                render=False,
+            )
+        except Exception as exc:
+            print(f"[MultiSensor] Could not label {port_name}: {exc}")
+            return
+        self._multi_port_label_actors.append(actor)
+
+    def _build_multi_port_2d_model(self, profile):
+        n_row = int(profile["n_row"])
+        n_col = int(profile["n_col"])
+        mode = self.get_saved_sensor_reorder_mode(
+            "2d",
+            n_row=n_row,
+            n_col=n_col,
+        )
+        reorder_logic = self._reorder_mode_to_logic("2d", mode)
+        model_kwargs = {
+            "n_row": n_row,
+            "n_col": n_col,
+            "offset_scale": 0.0005,
+            "window_size": self.sensor_average_window_size,
+        }
+        if reorder_logic is not None:
+            model_kwargs["reorder_logic"] = reorder_logic
+        return SensorModelFactory(**model_kwargs).build()
+
+    def _configure_sensor_port_views(self):
+        self._clear_multi_port_views()
+        if self.is_goodix_usb_transport():
+            self._primary_sensor_port = GOODIX_USB_SOURCE_ID
+            self._sensor_data_by_port[self._primary_sensor_port] = self._data
+            return
+
+        port_names = [
+            self._sensor_port_key(getattr(ser, "port", ""))
+            for ser in self.ser_list
+        ]
+        port_names = [name for name in port_names if name]
+        if not port_names:
+            return
+
+        self._primary_sensor_port = port_names[0]
+        self._sensor_data_by_port[self._primary_sensor_port] = self._data
+        if not self._multi_port_display_enabled() or len(port_names) <= 1:
+            return
+
+        spacing = self._multi_port_scene_spacing()
+        grid_columns = max(1, int(np.ceil(np.sqrt(len(port_names)))))
+        for display_index, port_name in enumerate(port_names):
+            display_row, display_col = divmod(display_index, grid_columns)
+            offset = np.array(
+                [display_col * spacing, -display_row * spacing, 0.0],
+                dtype=float,
+            )
+            self._add_multi_port_label(port_name, offset)
+            if display_index == 0:
+                continue
+
+            profile = self._sensor_profile_for_port(port_name)
+            replica_model = None
+            if (
+                int(profile["n_row"]) != int(self.n_row)
+                or int(profile["n_col"]) != int(self.n_col)
+            ):
+                replica_model = self._build_multi_port_2d_model(profile)
+                data_obj = replica_model._data
+            else:
+                data_obj = SensorDataBuffer(
+                    int(profile["n_row"]),
+                    int(profile["n_col"]),
+                    window_size=self.sensor_average_window_size,
+                )
+            self._sensor_data_by_port[port_name] = data_obj
+            self._multi_port_sensor_views[port_name] = (
+                _MultiPortSensorReplica.from_owner(
+                    self,
+                    data_obj=data_obj,
+                    port_name=port_name,
+                    offset=offset,
+                    model=replica_model,
+                )
+            )
+
+        try:
+            self.plotter.reset_camera()
+            self.saveCameraPara()
+            self.plotter.render()
+        except Exception:
+            pass
+
+    def _sensor_data_for_port(self, port_name):
+        key = self._sensor_port_key(port_name)
+        return self._sensor_data_by_port.get(key)
+
+    def get_live_sensor_port_profiles(self):
+        """Return active sensor dimensions keyed by normalized source name."""
+        profiles = {}
+        for port_name, data_obj in getattr(
+            self, "_sensor_data_by_port", {}
+        ).items():
+            profile = self._sensor_profile_for_port(port_name)
+            profiles[self._sensor_port_key(port_name)] = {
+                "n_row": int(getattr(data_obj, "n_row", profile["n_row"])),
+                "n_col": int(getattr(data_obj, "n_col", profile["n_col"])),
+                "has_extra_column": bool(
+                    profile["has_extra_column"]
+                ),
+                "is_primary": bool(
+                    self.is_primary_sensor_port(port_name)
+                ),
+            }
+        return profiles
+
+    def is_primary_sensor_port(self, port_name):
+        primary = self._sensor_port_key(
+            getattr(self, "_primary_sensor_port", "")
+        )
+        if not primary:
+            return True
+        candidate = self._sensor_port_key(port_name)
+        if candidate == primary:
+            return True
+        try:
+            return os.path.realpath(candidate) == os.path.realpath(primary)
+        except Exception:
+            return False
+
+    def _close_goodix_client(self):
+        client = getattr(self, "_goodix_client", None)
+        if client is not None:
+            client.close()
+        self._goodix_client = None
 
     def _close_serial_ports(self):
         if not self._stop_sensor_reader_worker():
@@ -2535,7 +3069,17 @@ class MySensor:
         return bool(thread is not None and thread.isRunning())
 
     def _start_sensor_reader_worker(self):
-        if not self.ser_list or self._sensor_reader_is_running():
+        if self._sensor_reader_is_running():
+            return
+
+        if self.is_goodix_usb_transport():
+            if self._goodix_client is None:
+                self._set_sensor_stream_error(
+                    "The Goodix USB reader is not initialized. "
+                    "Build the scene again."
+                )
+                return
+        elif not self.ser_list:
             return
 
         self._latest_sensor_payloads = {}
@@ -2544,7 +3088,32 @@ class MySensor:
         generation = self._sensor_reader_generation
         thread_parent = self.parent if isinstance(self.parent, QObject) else None
         thread = QThread(thread_parent)
-        worker = _SensorReadWorker(self.ser_list, generation=generation)
+        if self.is_goodix_usb_transport():
+            worker = GoodixUsbReadWorker(
+                self._goodix_client,
+                generation=generation,
+            )
+        else:
+            expected_by_port = {}
+            for serial_port in self.ser_list:
+                profile = self._sensor_profile_for_port(
+                    getattr(serial_port, "port", "")
+                )
+                expected_by_port[str(serial_port.port)] = int(
+                    profile["n_row"]
+                ) * (
+                    int(profile["n_col"])
+                    + (1 if profile["has_extra_column"] else 0)
+                )
+            worker = _SensorReadWorker(
+                self.ser_list,
+                generation=generation,
+                expected_payload_values=max(
+                    expected_by_port.values(),
+                    default=int(self.n_row) * (int(self.n_col) + 1),
+                ),
+                expected_payload_values_by_port=expected_by_port,
+            )
         worker.moveToThread(thread)
 
         thread.started.connect(worker.run)
@@ -2609,6 +3178,9 @@ class MySensor:
         if not port_path:
             return list(next(iter(payloads.values())))
 
+        requested_source = str(port_path)
+        if requested_source in payloads:
+            return list(payloads[requested_source])
         requested_path = os.path.realpath(str(port_path))
         for saved_path, payload in payloads.items():
             if os.path.realpath(str(saved_path)) == requested_path:
@@ -2661,6 +3233,7 @@ class MySensor:
                 except Exception as exc:
                     print(f"[{attr_name}] Shutdown failed: {exc}")
         self._close_serial_ports()
+        self._close_goodix_client()
         self._close_standalone_sensor_api()
 
     def _get_2d_grid_shape(self):
@@ -2680,7 +3253,12 @@ class MySensor:
         self.current_model_name = model_name
         self._build_factory_model(**self.PREDEFINED_SENSOR_MODELS[model_name])
 
-    def _initialize_selected_sensor_model(self, sensor_index):
+    def _initialize_selected_sensor_model(
+        self,
+        sensor_index,
+        n_row=None,
+        n_col=None,
+    ):
         model_initializers = {
             "elbow": self.init_elbow_model,
             "kuka": self.init_kuka_model,
@@ -2692,7 +3270,10 @@ class MySensor:
         initializer = model_initializers.get(model_name)
         if initializer is None:
             return False
-        initializer()
+        if model_name == "2d":
+            initializer(n_row=n_row, n_col=n_col)
+        else:
+            initializer()
         return True
 
     # ------------------------------------------------------------------
@@ -2720,6 +3301,8 @@ class MySensor:
         model = str(model_name or self.current_model_name or "sensor")
         if n_row is None or n_col is None:
             n_row, n_col = self._sensor_shape_for_model(model)
+        if self.is_goodix_usb_transport():
+            model = f"goodix_usb_{model}"
         return f"{model}_{int(n_row)}x{int(n_col)}"
 
     def _default_reorder_logic_for_model(self, model_name):
@@ -3212,6 +3795,8 @@ class MySensor:
             "proximity_knee": DEFAULT_PROXIMITY_KNEE,
             "proximity_saturation": DEFAULT_PROXIMITY_SATURATION,
             "color_gain_3d": DEFAULT_HEATMAP_3D_COLOR_GAIN,
+            "use_absolute_signal": True,
+            "point_grid_response_mode": POINT_GRID_RESPONSE_ZERO_CENTERED,
         }
 
     def _normalize_heatmap_config(self, config):
@@ -3265,6 +3850,17 @@ class MySensor:
         proximity_saturation = float(
             np.clip(proximity_saturation, proximity_knee + 0.1, 1e9)
         )
+        point_grid_response_mode = str(
+            config.get(
+                "point_grid_response_mode",
+                default["point_grid_response_mode"],
+            )
+        )
+        if point_grid_response_mode not in (
+            POINT_GRID_RESPONSE_ZERO_CENTERED,
+            POINT_GRID_RESPONSE_LEGACY_OFFSET,
+        ):
+            point_grid_response_mode = default["point_grid_response_mode"]
         return {
             "palette_3d": normalize_heatmap_3d_palette(
                 config.get("palette_3d", default["palette_3d"])
@@ -3278,6 +3874,13 @@ class MySensor:
             "proximity_knee": proximity_knee,
             "proximity_saturation": proximity_saturation,
             "color_gain_3d": float(np.clip(color_gain_3d, 1.0, 3.0)),
+            "use_absolute_signal": bool(
+                config.get(
+                    "use_absolute_signal",
+                    default["use_absolute_signal"],
+                )
+            ),
+            "point_grid_response_mode": point_grid_response_mode,
         }
 
     def get_saved_sensor_heatmap_config(self, model_name=None, n_row=None, n_col=None):
@@ -3339,9 +3942,32 @@ class MySensor:
                 "heatmap_3d_color_gain",
                 DEFAULT_HEATMAP_3D_COLOR_GAIN,
             ),
+            "use_absolute_signal": getattr(
+                self,
+                "visualization_use_absolute_signal",
+                True,
+            ),
+            "point_grid_response_mode": getattr(
+                self,
+                "point_grid_response_mode",
+                POINT_GRID_RESPONSE_ZERO_CENTERED,
+            ),
         })
 
     def set_heatmap_settings(self, config, save_current_sensor: bool = False):
+        config = dict(config) if isinstance(config, dict) else {}
+        config.setdefault(
+            "use_absolute_signal",
+            getattr(self, "visualization_use_absolute_signal", True),
+        )
+        config.setdefault(
+            "point_grid_response_mode",
+            getattr(
+                self,
+                "point_grid_response_mode",
+                POINT_GRID_RESPONSE_ZERO_CENTERED,
+            ),
+        )
         settings = self._normalize_heatmap_config(config)
         previous_settings = self.get_heatmap_settings()
         settings_changed = any(
@@ -3360,6 +3986,12 @@ class MySensor:
             settings["proximity_saturation"]
         )
         self.heatmap_3d_color_gain = float(settings["color_gain_3d"])
+        self.visualization_use_absolute_signal = bool(
+            settings["use_absolute_signal"]
+        )
+        self.point_grid_response_mode = str(
+            settings["point_grid_response_mode"]
+        )
         if settings_changed:
             current_matrix = self._current_heatmap_sensor_matrix(
                 getattr(self, "_last_sensor_visualization_matrix", None)
@@ -3948,12 +4580,147 @@ class MySensor:
                 pass
         return True
 
+    def get_cell_point_label(self, row, col):
+        """Return the user-facing top-down label used by mask and plotter UIs."""
+        row = int(row)
+        col = int(col)
+        point_id = _column_major_idx(int(self.n_row), col, row)
+        return f"P{point_id} r{row} c{col}"
+
+    def _selected_sensor_plotter_location(self):
+        """Map a Signal Viewer cell directly onto the same 3D grid cell."""
+        selected = getattr(self, "_selected_sensor_cell", None)
+        if selected is None:
+            return None
+        try:
+            table_row, col = (int(selected[0]), int(selected[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+        n_row = int(getattr(self, "n_row", 0) or 0)
+        n_col = int(getattr(self, "n_col", 0) or 0)
+        if not (0 <= table_row < n_row and 0 <= col < n_col):
+            return None
+        point_index = _column_major_idx(n_row, col, table_row)
+        return table_row, col, point_index
+
+    def _selected_sensor_marker_position(self):
+        location = self._selected_sensor_plotter_location()
+        if location is None:
+            return None
+        plotter_row, col, point_index = location
+
+        position = None
+        if self._is_heatmap_visualization_mode(
+            getattr(self, "sensor_visualization_mode", "point_grid")
+        ):
+            heatmap_poly = getattr(self, "heatmapPoly", None)
+            tile_vertices = getattr(self, "_heatmap_tile_vertices", None)
+            if heatmap_poly is not None and tile_vertices is not None:
+                try:
+                    vertex_ids = tile_vertices[plotter_row, col]
+                    position = np.mean(
+                        np.asarray(heatmap_poly.points, dtype=float)[vertex_ids],
+                        axis=0,
+                    )
+                except (IndexError, TypeError, ValueError):
+                    position = None
+
+        points = getattr(self, "points", None)
+        if position is None and points is not None:
+            try:
+                position = np.asarray(points, dtype=float)[point_index].copy()
+            except (IndexError, TypeError, ValueError):
+                return None
+        if position is None or not np.all(np.isfinite(position)):
+            return None
+
+        normals = getattr(self, "normals", None)
+        try:
+            normal = self._normalize_vector(
+                np.asarray(normals, dtype=float)[point_index]
+            )
+        except (IndexError, TypeError, ValueError):
+            normal = np.array([0.0, 0.0, 1.0], dtype=float)
+
+        origin = getattr(self, "points_origin", None)
+        try:
+            finite = np.asarray(origin, dtype=float)
+            finite = finite[np.all(np.isfinite(finite), axis=1)]
+            span = float(
+                np.linalg.norm(np.max(finite, axis=0) - np.min(finite, axis=0))
+            )
+        except (TypeError, ValueError):
+            span = 0.0
+        surface_lift = max(span * 0.01, 0.0002)
+        return position + normal * surface_lift
+
+    def _refresh_sensor_selection_actor(self, render=True):
+        position = self._selected_sensor_marker_position()
+        enabled = bool(getattr(self, "main_visualization_enabled", True))
+        if position is None:
+            self._set_actor_visible(
+                getattr(self, "sensorSelectionActor", None), False
+            )
+        else:
+            marker_poly = getattr(self, "sensorSelectionPoly", None)
+            if marker_poly is None:
+                marker_poly = pv.PolyData(np.asarray([position], dtype=float))
+                self.sensorSelectionPoly = marker_poly
+            else:
+                marker_poly.points = np.asarray([position], dtype=float)
+                try:
+                    marker_poly.Modified()
+                except Exception:
+                    pass
+            if getattr(self, "sensorSelectionActor", None) is None:
+                try:
+                    self.sensorSelectionActor = self.plotter.add_mesh(
+                        marker_poly,
+                        color="#00e676",
+                        point_size=22,
+                        render_points_as_spheres=True,
+                        lighting=False,
+                        pickable=False,
+                        name=self._sensor_actor_name("sensor_selected_cell"),
+                        render=False,
+                    )
+                except Exception as exc:
+                    self.sensorSelectionActor = None
+                    print(
+                        "[SensorSelection] Failed to show selected cell: "
+                        f"{exc}"
+                    )
+            self._set_actor_visible(
+                getattr(self, "sensorSelectionActor", None), enabled
+            )
+        if render:
+            try:
+                self.plotter.render()
+            except Exception:
+                pass
+
+    def set_selected_sensor_cell(self, row=None, col=None, render=True):
+        """Highlight one top-down Signal Viewer cell in the 3D plotter."""
+        if row is None or col is None:
+            self._selected_sensor_cell = None
+            self._refresh_sensor_selection_actor(render=render)
+            return True
+        try:
+            row = int(row)
+            col = int(col)
+        except (TypeError, ValueError):
+            return False
+        if not (0 <= row < int(self.n_row) and 0 <= col < int(self.n_col)):
+            return False
+        self._selected_sensor_cell = (row, col)
+        self._refresh_sensor_selection_actor(render=render)
+        return True
+
     def _sensor_point_labels(self):
         labels = []
         for col in range(int(self.n_col)):
             for row in range(int(self.n_row)):
-                idx = _column_major_idx(self.n_row, col, row)
-                labels.append(f"P{idx} r{row} c{col}")
+                labels.append(self.get_cell_point_label(row, col))
         return labels
 
     def _clear_sensor_point_label_actor(self):
@@ -3997,14 +4764,14 @@ class MySensor:
                 shape_opacity=0.92,
                 margin=4,
                 always_visible=True,
-                name="sensor_point_labels",
+                name=self._sensor_actor_name("sensor_point_labels"),
                 render=False,
             )
         except Exception as exc:
             self.sensorPointLabelActor = None
             print(f"[SensorPointLabels] Failed to show point labels: {exc}")
 
-    def _bind_sensor_api_to_port(self, ser):
+    def _bind_sensor_api_to_port(self, ser, profile=None):
         """Reuse the shared sensor API object while switching its active serial port."""
         sensor_api = self.parent.sensor_api
         current_ser = getattr(sensor_api, "ser", None)
@@ -4019,9 +4786,28 @@ class MySensor:
                 pass
         sensor_api.ser = ser
         sensor_api.serial_port = str(getattr(ser, "port", sensor_api.serial_port))
+        sensor_api.baud_rate = int(
+            getattr(ser, "baudrate", DEFAULT_SENSOR_BAUD_RATE)
+        )
+        profile = (
+            self._sensor_profile_for_port(ser.port)
+            if profile is None
+            else self._normalize_sensor_port_profile(profile)
+        )
+        sensor_api.expected_payload_values = int(profile["n_row"]) * (
+            int(profile["n_col"])
+            + (1 if profile["has_extra_column"] else 0)
+        )
         return sensor_api
 
-    def _raw_packet_has_extra_column(self):
+    def _raw_packet_has_extra_column(self, port_name=None):
+        if port_name is not None:
+            key = self._sensor_port_key(port_name)
+            profile = getattr(
+                self, "_sensor_profiles_by_port", {}
+            ).get(key)
+            if profile is not None:
+                return bool(profile.get("has_extra_column", True))
         checkbox = getattr(self.parent, "sensor_extra_column_checkbox", None)
         if checkbox is None:
             return True
@@ -4050,7 +4836,7 @@ class MySensor:
             self._set_sensor_stream_error(message)
             print(f"Error on port {port_name}: No sensor payload received.")
             return None
-        has_extra_column = self._raw_packet_has_extra_column()
+        has_extra_column = self._raw_packet_has_extra_column(port_name)
         packet_columns = n_col + (1 if has_extra_column else 0)
         expected_length = n_row * packet_columns
         data_list = self._trim_sensor_payload(
@@ -4104,10 +4890,15 @@ class MySensor:
             return
         raw_matrix[mask] = cal[mask]
 
-    def _apply_live_raw_overrides(self, raw_values):
+    def _apply_live_raw_overrides(self, raw_values, data_obj=None):
         """Patch known bad channels for specific live sensor layouts."""
-        if self.n_row == 10 and self.n_col == 8:
-            flat_cal_data = _flatten_column_major_view(self._data.calData)
+        data_obj = self._data if data_obj is None else data_obj
+        if (
+            not self.is_goodix_usb_transport()
+            and int(getattr(data_obj, "n_row", 0)) == 10
+            and int(getattr(data_obj, "n_col", 0)) == 8
+        ):
+            flat_cal_data = _flatten_column_major_view(data_obj.calData)
             raw_values[0] = flat_cal_data[0]
             raw_values[1] = flat_cal_data[1]
             raw_values[8] = flat_cal_data[8]
@@ -4126,6 +4917,8 @@ class MySensor:
     def get_zero_mask_key(self):
         """Stable identifier used as the JSON key for the current sensor layout."""
         model = self.current_model_name or "sensor"
+        if self.is_goodix_usb_transport():
+            model = f"goodix_usb_{model}"
         n_row = int(getattr(self, "n_row", 0) or 0)
         n_col = int(getattr(self, "n_col", 0) or 0)
         return f"{model}_{n_row}x{n_col}"
@@ -4144,8 +4937,8 @@ class MySensor:
         return mask
 
     def _cell_zero_mask_for_plotter(self):
-        """Map top-down mask-dialog rows into the plotter's bottom-up rows."""
-        return np.flip(self.get_cell_zero_mask(), axis=0)
+        """Use the same row and column coordinates in the mask and 3D views."""
+        return np.array(self.get_cell_zero_mask(), dtype=bool, copy=True)
 
     def _sensor_points_for_plotter(self, points=None):
         """Return display points with masked taxels made non-renderable."""
@@ -4364,7 +5157,11 @@ class MySensor:
     def _read_port_sensor_values(
         self, ser, read_operation, error_prefix, max_attempts=3
     ):
-        sensor_api = self._bind_sensor_api_to_port(ser)
+        profile = self._sensor_profile_for_port(ser.port)
+        sensor_api = self._bind_sensor_api_to_port(
+            ser,
+            profile=profile,
+        )
         max_attempts = max(1, int(max_attempts))
         sensor_values = None
         for attempt in range(1, max_attempts + 1):
@@ -4378,7 +5175,10 @@ class MySensor:
                 data_list = None
 
             sensor_values = self._extract_sensor_values(
-                data_list, self.n_row, self.n_col, ser.port
+                data_list,
+                profile["n_row"],
+                profile["n_col"],
+                ser.port,
             )
             if sensor_values is not None:
                 return sensor_api, sensor_values
@@ -4391,9 +5191,12 @@ class MySensor:
 
         return sensor_api, None
 
-    def _warm_sensor_window(self, sensor_api, ser):
-        self._data.clearData()
-        for window_index in range(1, self._data.windowSize + 1):
+    def _warm_sensor_window(self, sensor_api, ser, data_obj=None):
+        data_obj = self._data if data_obj is None else data_obj
+        n_row = int(getattr(data_obj, "n_row", self.n_row))
+        n_col = int(getattr(data_obj, "n_col", self.n_col))
+        data_obj.clearData()
+        for window_index in range(1, data_obj.windowSize + 1):
             sensor_api, raw_values = self._read_port_sensor_values(
                 ser,
                 lambda api: api.read_raw(),
@@ -4402,6 +5205,74 @@ class MySensor:
             if raw_values is None:
                 return False
 
+            self._update_data_window(
+                data_obj,
+                raw_values,
+                n_row,
+                n_col,
+                window_index,
+            )
+        return True
+
+    def read_goodix_raw_frame(self):
+        """Read and validate one frame from the selected Goodix USB sensor."""
+        client = getattr(self, "_goodix_client", None)
+        if client is None:
+            raise GoodixUsbError("Build the Goodix USB sensor scene first.")
+        values = client.read_raw()
+        expected = int(self.n_row) * int(self.n_col)
+        if len(values) != expected:
+            raise GoodixUsbError(
+                f"Goodix USB returned {len(values)} values; expected {expected}."
+            )
+        return list(values)
+
+    def measure_goodix_raw_hz(self, duration_sec=1.0):
+        """Measure complete Goodix frame acquisition through the active backend."""
+        client = getattr(self, "_goodix_client", None)
+        if client is None:
+            raise GoodixUsbError("Build the Goodix USB sensor scene first.")
+        return client.measure_read_raw_hz(duration_sec=duration_sec)
+
+    def _calibrate_goodix_usb(self):
+        """Capture a local baseline because this transport has no updateCal command."""
+        baseline_count = max(8, int(self._data.windowSize) * 2)
+        baseline_frames = []
+        for _ in range(baseline_count):
+            if self._sensor_calibration_stop_event.is_set():
+                return False
+            try:
+                baseline_frames.append(self.read_goodix_raw_frame())
+            except GoodixUsbError as exc:
+                self._set_sensor_stream_error(
+                    f"Goodix USB calibration failed: {exc}"
+                )
+                return False
+
+        baseline_values = np.mean(
+            np.asarray(baseline_frames, dtype=float),
+            axis=0,
+        ).tolist()
+        self.cal_data = list(baseline_values)
+        self._data.getCal(
+            self._reshape_sensor_values(
+                baseline_values,
+                self.n_row,
+                self.n_col,
+            )
+        )
+        self._data.clearData()
+
+        for window_index in range(1, self._data.windowSize + 1):
+            if self._sensor_calibration_stop_event.is_set():
+                return False
+            try:
+                raw_values = self.read_goodix_raw_frame()
+            except GoodixUsbError as exc:
+                self._set_sensor_stream_error(
+                    f"Goodix USB warm-up failed: {exc}"
+                )
+                return False
             self._update_data_window(
                 self._data,
                 raw_values,
@@ -4448,9 +5319,23 @@ class MySensor:
                 print(message)
                 return
 
+            if self.is_goodix_usb_transport():
+                calibration_succeeded = self._calibrate_goodix_usb()
+                if calibration_succeeded:
+                    self._calibrated_sensor_ports = {
+                        self._sensor_port_key(self._primary_sensor_port)
+                    }
+                return
+
+            primary_port = self._sensor_port_key(self._primary_sensor_port)
+            successful_ports = set()
             for ser in self.ser_list:
                 if self._sensor_calibration_stop_event.is_set():
                     return
+                port_name = self._sensor_port_key(ser.port)
+                data_obj = self._sensor_data_for_port(port_name)
+                if data_obj is None:
+                    continue
                 sensor_api, cal_data_list = self._read_port_sensor_values(
                     ser,
                     lambda api: api.update_cal(),
@@ -4459,12 +5344,29 @@ class MySensor:
                 if cal_data_list is None:
                     continue
 
-                self.cal_data = cal_data_list
-                self._data.getCal(self._reshape_sensor_values(cal_data_list, self.n_row, self.n_col))
+                if port_name == primary_port:
+                    self.cal_data = cal_data_list
+                port_rows = int(
+                    getattr(data_obj, "n_row", self.n_row)
+                )
+                port_columns = int(
+                    getattr(data_obj, "n_col", self.n_col)
+                )
+                data_obj.getCal(
+                    self._reshape_sensor_values(
+                        cal_data_list,
+                        port_rows,
+                        port_columns,
+                    )
+                )
                 if self._sensor_calibration_stop_event.is_set():
                     return
-                if self._warm_sensor_window(sensor_api, ser):
-                    calibration_succeeded = True
+                if self._warm_sensor_window(
+                    sensor_api, ser, data_obj=data_obj
+                ):
+                    successful_ports.add(port_name)
+            self._calibrated_sensor_ports = successful_ports
+            calibration_succeeded = primary_port in successful_ports
         except Exception as exc:
             self._set_sensor_stream_error(f"Sensor calibration failed: {exc}")
             print(f"Sensor calibration failed: {exc}")
@@ -4509,19 +5411,36 @@ class MySensor:
             return
 
         for port_name, data_list in self._take_latest_sensor_payloads().items():
+            port_name = self._sensor_port_key(port_name)
+            calibrated_ports = getattr(self, "_calibrated_sensor_ports", set())
+            if calibrated_ports and port_name not in calibrated_ports:
+                continue
+            data_obj = self._sensor_data_for_port(port_name)
+            if data_obj is None:
+                continue
+            port_rows = int(getattr(data_obj, "n_row", self.n_row))
+            port_columns = int(
+                getattr(data_obj, "n_col", self.n_col)
+            )
             raw_data_list = self._extract_sensor_values(
                 data_list,
-                self.n_row,
-                self.n_col,
+                port_rows,
+                port_columns,
                 port_name,
             )
             if raw_data_list is None:
                 continue
 
             try:
-                self._apply_live_raw_overrides(raw_data_list)
+                self._apply_live_raw_overrides(
+                    raw_data_list, data_obj=data_obj
+                )
                 self._update_data_window(
-                    self._data, raw_data_list, self.n_row, self.n_col, self._data.windowSize
+                    data_obj,
+                    raw_data_list,
+                    port_rows,
+                    port_columns,
+                    data_obj.windowSize,
                 )
                 self._record_sensor_update_tick()
             except Exception as exc:
@@ -4529,32 +5448,142 @@ class MySensor:
                 continue
 
             if bool(getattr(self, "main_visualization_enabled", True)):
-                self._pending_sensor_visualization_matrix = np.array(
-                    self._data.diffPerDataAve,
+                matrix = np.array(
+                    data_obj.diffPerDataAve,
                     dtype=float,
                     copy=True,
                 )
+                if self.is_primary_sensor_port(port_name):
+                    self._pending_sensor_visualization_matrix = matrix
+                elif port_name in self._multi_port_sensor_views:
+                    self._pending_multi_port_visualization_matrices[
+                        port_name
+                    ] = matrix
 
-    def update_visualization(self, sensor_matrix):
+    @staticmethod
+    def _point_grid_signal_response(
+        sensor_value,
+        *,
+        use_absolute_signal,
+        noise_floor_pct,
+        full_scale_pct,
+    ):
+        """Return a bounded point-grid response in the range [-1, 1]."""
+        try:
+            value = float(sensor_value)
+        except Exception:
+            return 0.0
+        if not np.isfinite(value):
+            return 0.0
+
+        noise_floor = max(0.0, float(noise_floor_pct))
+        full_scale = max(noise_floor + 1e-6, float(full_scale_pct))
+        magnitude = max(0.0, abs(value) - noise_floor)
+        response = float(
+            np.clip(magnitude / (full_scale - noise_floor), 0.0, 1.0)
+        )
+        if bool(use_absolute_signal) or value >= 0.0:
+            return response
+        return -response
+
+    @classmethod
+    def _point_grid_visual_state(
+        cls,
+        sensor_value,
+        *,
+        use_absolute_signal,
+        response_mode,
+        sensitivity_scale,
+        noise_floor_pct,
+        full_scale_pct,
+    ):
+        """Return displacement and RGBA colour for one point-grid taxel."""
+        try:
+            value = float(sensor_value)
+        except Exception:
+            value = 0.0
+        if not np.isfinite(value):
+            value = 0.0
+        sensitivity = max(0.0, float(sensitivity_scale))
+
+        if str(response_mode) == POINT_GRID_RESPONSE_LEGACY_OFFSET:
+            display_value = abs(value) if use_absolute_signal else value
+            displacement = (3.0 - display_value) * sensitivity
+            intensity = float(np.clip(1.0 - abs(value) * 150.0 / 255.0, 0.0, 1.0))
+            if bool(use_absolute_signal) or value >= 0.0:
+                color = [1.0, intensity, intensity, 1.0]
+            else:
+                color = [intensity, intensity, 1.0, 1.0]
+            return displacement, color
+
+        response = cls._point_grid_signal_response(
+            value,
+            use_absolute_signal=use_absolute_signal,
+            noise_floor_pct=noise_floor_pct,
+            full_scale_pct=full_scale_pct,
+        )
+        displacement = response * sensitivity
+        intensity = 1.0 - abs(response)
+        if response >= 0.0:
+            color = [1.0, intensity, intensity, 1.0]
+        else:
+            color = [intensity, intensity, 1.0, 1.0]
+        return displacement, color
+
+    def _sensor_matrix_for_plotter(self, sensor_matrix):
+        """Use the Signal Viewer row and column layout in the 3D plotter."""
+        try:
+            values = np.asarray(sensor_matrix, dtype=float)
+        except (TypeError, ValueError):
+            return None
+        expected_shape = (int(self.n_row), int(self.n_col))
+        if values.shape != expected_shape:
+            return None
+        return np.array(values, dtype=float, copy=True)
+
+    def update_visualization(self, sensor_matrix, render=True):
         self._record_visualization_tick()
         latest_heatmap_matrix = self._current_heatmap_sensor_matrix(sensor_matrix)
         self._last_sensor_visualization_matrix = np.array(
             latest_heatmap_matrix, dtype=float, copy=True
         )
+        plotter_sensor_matrix = self._sensor_matrix_for_plotter(sensor_matrix)
+        if plotter_sensor_matrix is None:
+            return
         for col in range(self.n_col):
             for row in range(self.n_row):
                 idx = _column_major_idx(self.n_row, col, row)
-                sensor_value = sensor_matrix[row][col]
-                # It uses the up-to-date value of self.touch_sensitivity_scale
-                displacement = (3 - abs(sensor_value)) * self.touch_sensitivity_scale
+                sensor_value = plotter_sensor_matrix[row][col]
+                use_absolute = bool(
+                    getattr(self, "visualization_use_absolute_signal", True)
+                )
+                displacement, color = self._point_grid_visual_state(
+                    sensor_value,
+                    use_absolute_signal=use_absolute,
+                    response_mode=getattr(
+                        self,
+                        "point_grid_response_mode",
+                        POINT_GRID_RESPONSE_ZERO_CENTERED,
+                    ),
+                    sensitivity_scale=self.touch_sensitivity_scale,
+                    noise_floor_pct=getattr(
+                        self,
+                        "heatmap_noise_floor_pct",
+                        DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
+                    ),
+                    full_scale_pct=getattr(
+                        self,
+                        "heatmap_saturation_pct",
+                        DEFAULT_HEATMAP_SATURATION_PCT,
+                    ),
+                )
 
                 target_position = self.points_origin[idx] + self.normals[idx] * displacement
                 self.points[idx] += (target_position - self.points[idx]) * 0.3
 
-                intensity = np.clip(1 - abs(sensor_value) * 150 / 255, 0, 1)
-                self.colors_3d[idx] = [1, intensity, intensity, 1]
+                self.colors_3d[idx] = color
                 for k in self.array_positions[idx]:
-                    self.colors[k] = [1, intensity, intensity, 1]
+                    self.colors[k] = color
 
         self._apply_cell_zero_mask_to_visual_colors()
         self.line_poly.points = self._sensor_points_for_plotter(self.points)
@@ -4567,14 +5596,16 @@ class MySensor:
         if self._is_matrix_visualization_mode(
             getattr(self, "sensor_visualization_mode", "point_grid")
         ):
-            self._update_matrix_silhouette_visualization(sensor_matrix)
+            self._update_matrix_silhouette_visualization(plotter_sensor_matrix)
         elif self._is_heatmap_visualization_mode(
             getattr(self, "sensor_visualization_mode", "point_grid")
         ):
             self._update_heatmap_visualization(latest_heatmap_matrix)
+        self._refresh_sensor_selection_actor(render=False)
         self._update_contact_force_status(sensor_matrix)
-        self._update_contact_normal_visualization(sensor_matrix)
-        self.plotter.render()
+        self._update_contact_normal_visualization(plotter_sensor_matrix)
+        if render:
+            self.plotter.render()
 
     @staticmethod
     def _normalize_vector(vector, fallback=None):
@@ -5349,3 +6380,225 @@ class MySensor:
                 self._start_sensor_reader_worker()
 
     # Geneva demo support has been archived to `backup/func_sensor_geneva_archive.py`.
+
+
+class _MultiPortSensorReplica(MySensor):
+    """Render one additional serial sensor without duplicating control state."""
+
+    _SYNCED_VISUAL_ATTRIBUTES = (
+        "touch_sensitivity_scale",
+        "point_grid_response_mode",
+        "visualization_use_absolute_signal",
+        "heatmap_saturation_pct",
+        "heatmap_noise_floor_pct",
+        "heatmap_response_mode",
+        "heatmap_proximity_noise_floor",
+        "heatmap_proximity_knee",
+        "heatmap_proximity_saturation",
+        "heatmap_3d_color_gain",
+        "heatmap_3d_palette",
+        "stereo_field_ignore_noise_enabled",
+        "stereo_field_deadband_pct",
+        "stereo_field_response_scale_pct",
+        "stereo_field_length_scale",
+        "stereo_field_smoothing_alpha",
+    )
+
+    @classmethod
+    def from_owner(
+        cls,
+        owner,
+        data_obj,
+        port_name,
+        offset,
+        model=None,
+    ):
+        replica = cls.__new__(cls)
+        replica.__dict__ = owner.__dict__.copy()
+        source = owner if model is None else model
+        replica._multi_port_owner = owner
+        replica._data = data_obj
+        replica.n_row = int(source.n_row)
+        replica.n_col = int(source.n_col)
+        replica.n_node = int(source.n_node)
+        replica.sensor_visual_offset_scale = float(
+            (
+                getattr(owner, "sensor_visual_offset_scale", 0.0005)
+                if model is None
+                else getattr(model, "offset_scale", 0.0005)
+            )
+            or 0.0005
+        )
+        replica._actor_name_prefix = owner._safe_actor_suffix(port_name)
+        replica.main_visualization_enabled = True
+        replica._heatmap_playback_active = False
+        replica._heatmap_calibration_override = None
+        replica._last_sensor_visualization_matrix = None
+        replica._pending_sensor_visualization_matrix = None
+        replica._pending_multi_port_visualization_matrices = {}
+        replica._multi_port_sensor_views = {}
+        replica._multi_port_label_actors = []
+        replica._selected_sensor_cell = None
+        replica.show_contact_normal_vector = False
+        replica.show_sensor_point_labels = False
+        replica.referenceAxisActors = []
+        replica.actorPlaneXY = None
+        replica.contactNormalActor = None
+        replica.contactNormalMesh = None
+        replica.sensorPointLabelActor = None
+        replica.sensorSelectionActor = None
+        replica.sensorSelectionPoly = None
+
+        offset = np.asarray(offset, dtype=float).reshape(3)
+        replica.points = np.asarray(source.points, dtype=float).copy() + offset
+        replica.points_origin = (
+            np.asarray(source.points_origin, dtype=float).copy() + offset
+        )
+        replica.normals = np.asarray(source.normals, dtype=float).copy()
+        replica.edges = np.asarray(source.edges, dtype=int).copy()
+        replica.colors_3d = np.asarray(source.colors_3d).copy()
+        replica.colors = np.asarray(source.colors).copy()
+        replica.array_positions = copy.deepcopy(source.array_positions)
+
+        replica.line_poly = pv.PolyData(replica.points)
+        replica.line_poly.lines = replica.edges
+        replica.line_poly.point_data.set_scalars(replica.colors_3d)
+        replica._2D_map = source._2D_map.copy(deep=True)
+        replica._2D_map.points = (
+            np.asarray(replica._2D_map.points, dtype=float) + offset
+        )
+        replica._2D_map.point_data.set_scalars(replica.colors)
+
+        if model is None:
+            base_points = getattr(
+                owner, "_sensor_geometry_base_points_origin", None
+            )
+            base_fine_points = getattr(
+                owner, "_sensor_geometry_base_fine_points", None
+            )
+            base_normals = getattr(
+                owner, "_sensor_geometry_base_normals", None
+            )
+        else:
+            base_points = np.asarray(model.points_origin, dtype=float)
+            base_fine_points = np.asarray(
+                model._2D_map.points, dtype=float
+            )
+            base_normals = np.asarray(model.normals, dtype=float)
+        replica._sensor_geometry_base_points_origin = (
+            None
+            if base_points is None
+            else np.asarray(base_points, dtype=float).copy() + offset
+        )
+        replica._sensor_geometry_base_fine_points = (
+            None
+            if base_fine_points is None
+            else np.asarray(base_fine_points, dtype=float).copy() + offset
+        )
+        replica._sensor_geometry_base_normals = (
+            None
+            if base_normals is None
+            else np.asarray(base_normals, dtype=float).copy()
+        )
+
+        replica.objActor = None
+        replica.actionMesh = None
+        replica.matrixLineActor = None
+        replica.matrixLinePoly = None
+        replica.matrixLineColors = None
+        replica._matrix_visual_actor_mode = None
+        replica._matrix_line_dense_shape = (0, 0)
+        replica._matrix_line_base_points = None
+        replica._matrix_line_normals = None
+        replica._matrix_line_base_indices = None
+        replica._matrix_line_top_indices = None
+        replica._matrix_line_field_height = 0.0
+        replica._matrix_line_height_variation = None
+        replica._stereo_field_smoothed_visibility = None
+        replica._stereo_field_smoothed_color_response = None
+        replica.heatmapActor = None
+        replica.heatmapPoly = None
+        replica.heatmapColors = None
+        replica.heatmapGridActor = None
+        replica.heatmapGridPoly = None
+        replica.heatmapGridDisplayPoly = None
+        replica._heatmap_logical_edges = None
+        replica._heatmap_tile_vertices = None
+        owner_mask = np.asarray(owner.cell_zero_mask, dtype=bool)
+        if owner_mask.shape == (replica.n_row, replica.n_col):
+            replica.cell_zero_mask = owner_mask.copy()
+        else:
+            replica.cell_zero_mask = np.zeros(
+                (replica.n_row, replica.n_col),
+                dtype=bool,
+            )
+
+        replica._ensure_main_sensor_visualization_actors()
+        replica._refresh_sensor_visualization_mode_actors()
+        return replica
+
+    def _sync_visual_settings(self):
+        owner = self._multi_port_owner
+        for attr_name in self._SYNCED_VISUAL_ATTRIBUTES:
+            setattr(self, attr_name, getattr(owner, attr_name))
+        owner_mask = np.asarray(owner.cell_zero_mask, dtype=bool)
+        if owner_mask.shape == (self.n_row, self.n_col):
+            self.cell_zero_mask = owner_mask.copy()
+
+    def set_replica_visualization_mode(self, mode):
+        self._sync_visual_settings()
+        valid_modes = {
+            key for key, _label in self.SENSOR_VISUALIZATION_MODE_OPTIONS
+        }
+        self.sensor_visualization_mode = (
+            mode if mode in valid_modes else "point_grid"
+        )
+        if self._is_matrix_visualization_mode(self.sensor_visualization_mode):
+            if self.matrixLineActor is None:
+                self._rebuild_matrix_visualization_actor(render=False)
+        if self._is_heatmap_visualization_mode(self.sensor_visualization_mode):
+            self._ensure_heatmap_visualization_actor(render=False)
+        self._refresh_sensor_visualization_mode_actors()
+
+    def set_replica_visibility(self, enabled):
+        self.main_visualization_enabled = bool(enabled)
+        self._refresh_sensor_visualization_mode_actors()
+
+    def update_visualization(self, sensor_matrix, render=False):
+        self._sync_visual_settings()
+        super().update_visualization(sensor_matrix, render=render)
+
+    def close(self):
+        for actor_name in (
+            "objActor",
+            "actionMesh",
+            "matrixLineActor",
+            "heatmapActor",
+            "heatmapGridActor",
+            "contactNormalActor",
+            "sensorPointLabelActor",
+            "sensorSelectionActor",
+        ):
+            actor = getattr(self, actor_name, None)
+            if actor is None:
+                continue
+            try:
+                self.plotter.remove_actor(actor, reset_camera=False)
+            except Exception:
+                pass
+            setattr(self, actor_name, None)
+
+    def _record_visualization_tick(self):
+        return None
+
+    def _update_contact_force_status(self, sensor_matrix):
+        return None
+
+    def _update_contact_normal_visualization(self, sensor_matrix):
+        return None
+
+    def _refresh_sensor_selection_actor(self, render=True):
+        return None
+
+    def saveCameraPara(self):
+        return None

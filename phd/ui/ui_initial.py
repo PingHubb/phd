@@ -20,6 +20,7 @@ from phd.dependence.paths import icon_path, resource_path, stylesheet_path
 from phd.ui import theme
 from phd.ui.ui_ping import UI
 from phd.ui import experiment_tasks
+from phd.ui.calibration_result_dialog import CalibrationResultDialog
 from phd.ui.plotter_video_recorder import PlotterVideoRecorder
 from phd.ui.heatmap_signal_recording import (
     HeatmapSignalPlayback,
@@ -422,6 +423,7 @@ class MyMainWindow(MainWindow):
         self._startup_requested = False
         self._sidebar_active_control_id = None
         self._sensor_capture_result_dialog = None
+        self._calibration_result_dialog = None
         self._sidebar_active_task = None  # experiment_tasks.ExperimentTask, set while running
         self._sigraph_heatmap_recorder = None
         self._sigraph_heatmap_signal_recorder = None
@@ -785,11 +787,25 @@ class MyMainWindow(MainWindow):
         ):
             return
         try:
+            humanoid_update_requested = False
+            humanoid_viewer = getattr(
+                self.ui_ros,
+                "humanoid_viewer",
+                None,
+            )
+            humanoid_update_requested = bool(
+                humanoid_viewer is not None
+                and humanoid_viewer.request_sensor_update()
+            )
             if hasattr(self.ui_ros, "_on_sensor_update"):
                 self.ui_ros._on_sensor_update()
             elif hasattr(self.ui_ros, "sensor_functions") and hasattr(self.ui_ros.sensor_functions, "updateCal"):
                 self.ui_ros.sensor_functions.updateCal()
-            self.info_process.setText("Sensor updated")
+            self.info_process.setText(
+                "Updating Sensor Plotter and humanoid sensors..."
+                if humanoid_update_requested
+                else "Updating Sensor Plotter..."
+            )
         except Exception as exc:
             self.info_process.setText("Sensor update failed")
             if self.ui_ros is not None and hasattr(self.ui_ros, "log_display"):
@@ -1186,6 +1202,262 @@ class MyMainWindow(MainWindow):
         self._task_param_widgets[task.id] = panel
         parent_layout.addWidget(panel)
         self._refresh_sigraph_scanning_points()
+
+        calibration_task = experiment_tasks.get_task("calibration")
+        if calibration_task is None:
+            return
+        calibration_panel = QFrame()
+        calibration_panel.setFrameShape(QFrame.StyledPanel)
+        calibration_layout = QVBoxLayout(calibration_panel)
+        calibration_layout.setContentsMargins(8, 8, 8, 8)
+        calibration_layout.setSpacing(8)
+
+        self.calibration_initial_position_label = QLabel(
+            "Initial position: not remembered"
+        )
+        self.calibration_initial_position_label.setWordWrap(True)
+        calibration_layout.addWidget(self.calibration_initial_position_label)
+
+        calibration_form = QFormLayout()
+        self.calibration_taxel_spin = QSpinBox()
+        self.calibration_taxel_spin.setRange(0, 79)
+        self.calibration_taxel_spin.setValue(int(calibration_task.taxel_index))
+        self.calibration_taxel_spin.setToolTip(
+            "Top-down, column-major cell index used by the Sensor Signal Viewer"
+        )
+        calibration_form.addRow("Taxel index (8x10)", self.calibration_taxel_spin)
+
+        self.calibration_signal_combo = QComboBox()
+        self.calibration_signal_combo.addItem(
+            "Relative change (%)", "diff_percent_ave"
+        )
+        self.calibration_signal_combo.addItem(
+            "Difference (counts)", "diff_ave"
+        )
+        self.calibration_signal_combo.addItem("Raw value", "raw_ave")
+        signal_index = self.calibration_signal_combo.findData(
+            calibration_task.signal_field
+        )
+        if signal_index >= 0:
+            self.calibration_signal_combo.setCurrentIndex(signal_index)
+        calibration_form.addRow("Plotted signal", self.calibration_signal_combo)
+
+        self.calibration_speed_spin = QDoubleSpinBox()
+        self.calibration_speed_spin.setRange(0.05, 2.0)
+        self.calibration_speed_spin.setDecimals(2)
+        self.calibration_speed_spin.setSingleStep(0.05)
+        self.calibration_speed_spin.setSuffix(" mm/s")
+        self.calibration_speed_spin.setValue(
+            float(calibration_task.approach_speed_m_s) * 1000.0
+        )
+        calibration_form.addRow("Base -Z speed", self.calibration_speed_spin)
+
+        self.calibration_force_threshold_spin = QDoubleSpinBox()
+        self.calibration_force_threshold_spin.setRange(0.01, 5.0)
+        self.calibration_force_threshold_spin.setDecimals(2)
+        self.calibration_force_threshold_spin.setSingleStep(0.05)
+        self.calibration_force_threshold_spin.setSuffix(" N")
+        self.calibration_force_threshold_spin.setValue(
+            float(calibration_task.contact_threshold_n)
+        )
+        self.calibration_force_threshold_spin.setToolTip(
+            "Stop when the absolute force change from the stationary baseline reaches this value"
+        )
+        calibration_form.addRow(
+            "Contact threshold", self.calibration_force_threshold_spin
+        )
+
+        self.calibration_max_travel_spin = QDoubleSpinBox()
+        self.calibration_max_travel_spin.setRange(0.5, 200.0)
+        self.calibration_max_travel_spin.setDecimals(1)
+        self.calibration_max_travel_spin.setSingleStep(0.5)
+        self.calibration_max_travel_spin.setSuffix(" mm")
+        self.calibration_max_travel_spin.setValue(
+            float(calibration_task.max_travel_m) * 1000.0
+        )
+        calibration_form.addRow("Maximum travel", self.calibration_max_travel_spin)
+
+        self.calibration_timeout_spin = QDoubleSpinBox()
+        self.calibration_timeout_spin.setRange(2.0, 1800.0)
+        self.calibration_timeout_spin.setDecimals(1)
+        self.calibration_timeout_spin.setSingleStep(10.0)
+        self.calibration_timeout_spin.setSuffix(" s")
+        self.calibration_timeout_spin.setValue(float(calibration_task.timeout_sec))
+        calibration_form.addRow("Timeout", self.calibration_timeout_spin)
+
+        self.calibration_repeat_spin = QSpinBox()
+        self.calibration_repeat_spin.setRange(1, 1000)
+        self.calibration_repeat_spin.setValue(int(calibration_task.repeat_count))
+        self.calibration_repeat_spin.setToolTip(
+            "After each contact, return to the remembered pose, recalibrate, "
+            "and repeat this many times"
+        )
+        calibration_form.addRow("Repetitions", self.calibration_repeat_spin)
+        calibration_layout.addLayout(calibration_form)
+
+        calibration_note = QLabel(
+            "Requires live HP-200 data and an updated 8x10 sensor. "
+            "Between trials the robot returns to the remembered pose and the "
+            "sensor recalibrates automatically. Stop remains available."
+        )
+        calibration_note.setWordWrap(True)
+        calibration_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        calibration_layout.addWidget(calibration_note)
+
+        self.calibration_progress_label = QLabel("Ready")
+        self.calibration_progress_label.setWordWrap(True)
+        self.calibration_progress_label.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-weight: 600;"
+        )
+        calibration_layout.addWidget(self.calibration_progress_label)
+
+        self.calibration_start_approach_button = QPushButton(
+            "Start Contact Test + Record"
+        )
+        self.calibration_start_approach_button.setObjectName("btnRunRecord")
+        calibration_layout.addWidget(self.calibration_start_approach_button)
+
+        self.calibration_taxel_spin.valueChanged.connect(
+            lambda value: setattr(calibration_task, "taxel_index", int(value))
+        )
+        self.calibration_signal_combo.currentIndexChanged.connect(
+            lambda _index: setattr(
+                calibration_task,
+                "signal_field",
+                str(self.calibration_signal_combo.currentData()),
+            )
+        )
+        self.calibration_speed_spin.valueChanged.connect(
+            lambda value: setattr(
+                calibration_task, "approach_speed_m_s", float(value) / 1000.0
+            )
+        )
+        self.calibration_force_threshold_spin.valueChanged.connect(
+            lambda value: setattr(
+                calibration_task, "contact_threshold_n", float(value)
+            )
+        )
+        self.calibration_max_travel_spin.valueChanged.connect(
+            lambda value: setattr(
+                calibration_task, "max_travel_m", float(value) / 1000.0
+            )
+        )
+        self.calibration_timeout_spin.valueChanged.connect(
+            lambda value: setattr(calibration_task, "timeout_sec", float(value))
+        )
+        self.calibration_repeat_spin.valueChanged.connect(
+            lambda value: setattr(calibration_task, "repeat_count", int(value))
+        )
+        self.calibration_repeat_spin.valueChanged.connect(
+            lambda _value: self._refresh_calibration_progress()
+        )
+        self.calibration_start_approach_button.clicked.connect(
+            self._start_calibration_contact_approach
+        )
+        self._task_param_widgets[calibration_task.id] = calibration_panel
+        parent_layout.addWidget(calibration_panel)
+        self._refresh_calibration_controls()
+        self._refresh_calibration_progress()
+
+    def _calibration_task(self):
+        return experiment_tasks.get_task("calibration")
+
+    def _refresh_calibration_controls(self):
+        task = self._calibration_task()
+        label = getattr(self, "calibration_initial_position_label", None)
+        button = getattr(self, "calibration_start_approach_button", None)
+        if task is None:
+            return
+        initial_position = getattr(task, "initial_position", None)
+        if label is not None:
+            if initial_position is None:
+                label.setText("Initial position: not remembered")
+            else:
+                joints_deg = np.degrees(
+                    np.asarray(initial_position.get("joints_rad", []), dtype=float)
+                )
+                tool_position = initial_position.get("tool_position_m")
+                tcp_text = ""
+                if tool_position is not None and len(tool_position) >= 3:
+                    tcp_mm = np.asarray(tool_position[:3], dtype=float) * 1000.0
+                    tcp_text = (
+                        f"\nTCP: ({tcp_mm[0]:.2f}, {tcp_mm[1]:.2f}, "
+                        f"{tcp_mm[2]:.2f}) mm"
+                    )
+                label.setText(
+                    "Initial position remembered\n"
+                    f"J: {[round(value, 2) for value in joints_deg]} deg"
+                    f"{tcp_text}"
+                )
+        if button is not None:
+            button.setEnabled(
+                initial_position is not None
+                and not bool(getattr(task, "_test_active", False))
+            )
+
+    def _refresh_calibration_progress(
+        self, current=None, total=None, phase=None, detail=""
+    ):
+        task = self._calibration_task()
+        label = getattr(self, "calibration_progress_label", None)
+        if task is None or label is None:
+            return
+        current = int(
+            getattr(task, "_trial_number", 0) if current is None else current
+        )
+        total = int(
+            getattr(task, "repeat_count", 1) if total is None else total
+        )
+        phase = str(getattr(task, "_phase", "idle") if phase is None else phase)
+        phase_labels = {
+            "idle": "Ready",
+            "force_baseline": "Force baseline",
+            "approaching": "Approaching",
+            "returning": "Returning to initial position",
+            "recalibrating": "Updating sensor calibration",
+        }
+        status = str(detail or phase_labels.get(phase, phase.replace("_", " ").title()))
+        if current > 0:
+            label.setText(f"Trial {current}/{max(1, total)} | {status}")
+        else:
+            label.setText(f"Ready | {max(1, total)} repetition(s)")
+
+    def _set_calibration_controls_running(self, running):
+        running = bool(running)
+        for name in (
+            "calibration_taxel_spin",
+            "calibration_signal_combo",
+            "calibration_speed_spin",
+            "calibration_force_threshold_spin",
+            "calibration_max_travel_spin",
+            "calibration_timeout_spin",
+            "calibration_repeat_spin",
+            "calibration_start_approach_button",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not running)
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if start_button is not None:
+            start_button.setEnabled(not running)
+        if not running:
+            self._refresh_calibration_controls()
+
+    def _start_calibration_contact_approach(self):
+        task = self._calibration_task()
+        if task is None or self._current_sidebar_control_id() != task.id:
+            return
+        task.request_contact_approach()
+        self._start_sidebar_control()
+
+    def _show_calibration_result(self, result):
+        dialog = getattr(self, "_calibration_result_dialog", None)
+        if dialog is not None and dialog.isVisible():
+            dialog.close()
+        self._calibration_result_dialog = CalibrationResultDialog(
+            result, parent=self
+        )
+        self._calibration_result_dialog.show()
 
     def _sigraph_scanning_task(self):
         return experiment_tasks.get_task("sigraph2026_scanning")
@@ -2225,32 +2497,41 @@ class MyMainWindow(MainWindow):
                 # toggle in ui_ping_ai_controls) from swallowing our control
                 # keys, so the KeyPress can reach this filter normally.
                 ev = event
-                if not ev.isAutoRepeat() and self._keyboard_velocity_should_capture():
+                if self._keyboard_velocity_should_capture():
                     key = ev.key()
                     if key == Qt.Key_Space or self._keyboard_vel_key_token(key) is not None:
                         ev.accept()
                         return True
             elif et == QEvent.KeyPress:
                 ev = event
-                if not ev.isAutoRepeat() and self._keyboard_velocity_should_capture():
+                if self._keyboard_velocity_should_capture():
                     key = ev.key()
                     if key == Qt.Key_Space:
-                        self._keyboard_vel_active_tokens.clear()
-                        self._keyboard_vel_stop_robot()
-                        self.info_process.setText("Keyboard tool velocity: stopped (Space)")
+                        if not ev.isAutoRepeat():
+                            self._keyboard_vel_active_tokens.clear()
+                            self._keyboard_vel_stop_robot()
+                            self.info_process.setText(
+                                "Keyboard tool velocity: stopped (Space)"
+                            )
                         return True
                     tok = self._keyboard_vel_key_token(key)
                     if tok is not None:
-                        self._keyboard_vel_active_tokens.add(tok)
-                        self._keyboard_vel_apply_active_tokens()
+                        # Auto-repeat events must still be consumed so VTK does
+                        # not interpret W/P/R as wireframe, picking, or camera
+                        # reset shortcuts. Motion is already sustained by the
+                        # 50 ms velocity refresh timer.
+                        if not ev.isAutoRepeat():
+                            self._keyboard_vel_active_tokens.add(tok)
+                            self._keyboard_vel_apply_active_tokens()
                         return True
             elif et == QEvent.KeyRelease:
                 ev = event
-                if not ev.isAutoRepeat() and self._keyboard_velocity_should_capture():
+                if self._keyboard_velocity_should_capture():
                     tok = self._keyboard_vel_key_token(ev.key())
                     if tok is not None:
-                        self._keyboard_vel_active_tokens.discard(tok)
-                        self._keyboard_vel_apply_active_tokens()
+                        if not ev.isAutoRepeat():
+                            self._keyboard_vel_active_tokens.discard(tok)
+                            self._keyboard_vel_apply_active_tokens()
                         return True
         return super().eventFilter(watched, event)
 

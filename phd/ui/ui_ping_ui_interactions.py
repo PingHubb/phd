@@ -119,9 +119,46 @@ class UiInteractionsMixin:
             self.ai_direct_finger_motion_robot_button.pressed.connect(
                 lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=True)
             )
+        self.ai_proximity_environment_record_button.clicked.connect(
+            self._on_toggle_ai_proximity_environment_recording
+        )
         self.ai_direct_finger_motion_execution_button.pressed.connect(
             self._on_toggle_ai_direct_finger_motion_execution
         )
+        self.ai_direct_execution_velocity_scale_spin.valueChanged.connect(
+            self._on_ai_direct_execution_velocity_scale_changed
+        )
+        self.ai_direct_execution_select_model_button.clicked.connect(
+            self._on_select_ai_direct_execution_model
+        )
+        self.ai_direct_execution_use_default_button.clicked.connect(
+            self._on_use_default_ai_direct_execution_model
+        )
+        self.ai_proximity_select_model_button.clicked.connect(
+            self._on_select_ai_proximity_model
+        )
+        self.ai_proximity_use_auto_model_button.clicked.connect(
+            self._on_use_auto_ai_proximity_model
+        )
+        self.ai_proximity_detection_button.clicked.connect(
+            self._on_toggle_ai_proximity_detection
+        )
+        self.ai_proximity_admittance_button.toggled.connect(
+            self._on_toggle_ai_proximity_admittance_control
+        )
+        self.ai_proximity_detection_mode_combo.currentIndexChanged.connect(
+            self._on_ai_proximity_detection_mode_changed
+        )
+        self.ai_proximity_sensitivity_combo.currentIndexChanged.connect(
+            self._on_ai_proximity_sensitivity_changed
+        )
+        self.grid_rows_spin.valueChanged.connect(
+            self._update_ai_dfm_session_placeholder
+        )
+        self.grid_cols_spin.valueChanged.connect(
+            self._update_ai_dfm_session_placeholder
+        )
+        self._update_ai_dfm_session_placeholder()
         self.sensitivity_slider.valueChanged.connect(self._on_sensitivity_changed)
         self.sensor_average_window_spin.valueChanged.connect(self._on_sensor_average_window_changed)
         self.visualization_target_hz_spin.valueChanged.connect(self._on_visualization_target_hz_changed)
@@ -337,6 +374,7 @@ class UiInteractionsMixin:
             return
 
         self._force_meter_last_raw_newtons = None
+        self._force_meter_last_sample_monotonic = None
         self._force_meter_tare_newtons = 0.0
         self._force_meter_min_newtons = None
         self._force_meter_max_newtons = None
@@ -344,7 +382,7 @@ class UiInteractionsMixin:
         self._force_meter_error_message = ""
         self.force_meter_chart.clear()
         self.force_meter_chart.set_tare(0.0)
-        self.force_meter_value_label.setText("+0.0 N")
+        self.force_meter_value_label.setText("+0.0000 N")
         self.force_meter_native_label.setText("Meter: waiting for sample")
         self._update_force_meter_statistics_label()
         self.force_meter_zero_button.setEnabled(False)
@@ -400,6 +438,7 @@ class UiInteractionsMixin:
         if worker is not getattr(self, "_force_meter_worker", None):
             return
         self._force_meter_last_raw_newtons = float(force_newtons)
+        self._force_meter_last_sample_monotonic = time.monotonic()
         tare = float(getattr(self, "_force_meter_tare_newtons", 0.0))
         displayed_force = float(force_newtons) - tare
         self.force_meter_chart.append_sample(float(force_newtons))
@@ -422,7 +461,7 @@ class UiInteractionsMixin:
             absolute_force if current_peak is None else max(current_peak, absolute_force)
         )
 
-        self.force_meter_value_label.setText(f"{displayed_force:+.1f} N")
+        self.force_meter_value_label.setText(f"{displayed_force:+.4f} N")
         self.force_meter_native_label.setText(
             f"Meter: {float(native_value):+.4g} {native_unit}   "
             f"Stream: {float(sample_rate):.1f} Hz"
@@ -487,7 +526,7 @@ class UiInteractionsMixin:
         self._force_meter_tare_newtons = float(raw_force)
         self.force_meter_chart.set_tare(float(raw_force))
         self._reset_force_meter_statistics(include_current=True)
-        self.force_meter_value_label.setText("+0.0 N")
+        self.force_meter_value_label.setText("+0.0000 N")
         self.force_meter_clear_zero_button.setEnabled(True)
         self.force_meter_status_label.setText(
             f"Software zero applied at {float(raw_force):+.1f} N"
@@ -499,7 +538,7 @@ class UiInteractionsMixin:
         self._reset_force_meter_statistics(include_current=True)
         raw_force = getattr(self, "_force_meter_last_raw_newtons", None)
         if raw_force is not None:
-            self.force_meter_value_label.setText(f"{float(raw_force):+.1f} N")
+            self.force_meter_value_label.setText(f"{float(raw_force):+.4f} N")
         self.force_meter_clear_zero_button.setEnabled(False)
         self.force_meter_status_label.setText("Software zero cleared")
 

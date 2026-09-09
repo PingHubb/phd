@@ -1259,6 +1259,11 @@ def train(args: argparse.Namespace) -> Path:
         _checkpoint_payload(model=model, config=config, normalization=normalization, metrics=final_metrics),
         best_path,
     )
+    sensor_rows, sensor_cols = (int(value) for value in config["sensor_shape"])
+    labelled_best_path = output_dir / (
+        f"best_model_{sensor_rows}x{sensor_cols}.pt"
+    )
+    shutil.copy2(best_path, labelled_best_path)
     _save_history_csv(output_dir / "history.csv", history)
     (output_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (output_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
@@ -1272,11 +1277,17 @@ def train(args: argparse.Namespace) -> Path:
 
     if args.update_latest:
         latest_alias = args.output_dir.expanduser() / "latest_cnn_gru_model.pt"
+        shape_alias = args.output_dir.expanduser() / (
+            f"latest_cnn_gru_model_{sensor_rows}x{sensor_cols}.pt"
+        )
         shutil.copy2(best_path, latest_alias)
+        shutil.copy2(best_path, shape_alias)
         print(f"Latest CNN-GRU alias updated: {latest_alias}")
+        print(f"Size-specific CNN-GRU alias updated: {shape_alias}")
 
     print("\nTraining complete")
     print(f"Best model: {best_path}")
+    print(f"Size-labelled model: {labelled_best_path}")
     print(f"Metrics: {output_dir / 'metrics.json'}")
     print(f"Validation RMSE: {final_metrics['total_rmse']:.6f}")
     print(f"Validation mode accuracy: {final_metrics['mode_accuracy']:.3f}")
@@ -1388,7 +1399,10 @@ def main() -> int:
     parser.add_argument(
         "--update-latest",
         action="store_true",
-        help="Also copy the best checkpoint to latest_cnn_gru_model.pt in the output root.",
+        help=(
+            "Also copy the best checkpoint to generic and sensor-size-labelled "
+            "latest_cnn_gru_model aliases in the output root."
+        ),
     )
     args = parser.parse_args()
 

@@ -29,15 +29,28 @@ from PyQt5.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QSplitterHandle,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 from pyvistaqt import QtInteractor
+from phd.dependence.goodix_usb_sensor import (
+    GOODIX_USB_COLUMNS,
+    GOODIX_USB_ROWS,
+    GOODIX_USB_SOURCE_ID,
+    is_goodix_usb_source,
+    set_goodix_desktop_touch_enabled,
+)
 from phd.dependence.paths import ai_resource_path, resource_path
+from phd.dependence.humanoid_sensor_registry import (
+    humanoid_sensor_extra_column_for_device,
+    humanoid_sensor_grid_shape_for_device,
+)
 from phd.ui import theme
 from phd.ui.force_meter_chart import ForceMeterChartWidget
 from phd.ui.sensor_zero_mask_window import SensorZeroMaskPanel
@@ -54,6 +67,16 @@ def _safe_import(module_path: str, symbol: str):
         return getattr(module, symbol), None
     except Exception as exc:
         return None, exc
+
+
+def _sensor_source_from_item(item) -> str:
+    if item is None:
+        return ""
+    try:
+        source = item.data(Qt.UserRole)
+    except (AttributeError, TypeError):
+        source = None
+    return str(source or item.text() or "").strip()
 
 
 ArduinoCommander, _ARDUINO_IMPORT_ERROR = _safe_import('phd.dependence.sensor_api', 'ArduinoCommander')
@@ -218,7 +241,9 @@ class _NoOpToggle:
 
 class DisabledSensorFunctions:
     DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH = ai_resource_path(
-        "models", "ai_direct_finger_motion", "latest_cnn_gru_model.pt"
+        "models",
+        "ai_direct_finger_motion",
+        "latest_cnn_gru_model_10x10.pt",
     )
     DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE = 3
     DEFAULT_VISUALIZATION_TARGET_HZ = 60.0
@@ -367,6 +392,21 @@ class NullMeshLab:
 
     def set_ai_admittance_control_enabled(self, *_args, **_kwargs):
         return None
+
+    def start_ai_proximity_motion(self):
+        return False, "Robot sensor mapping is unavailable"
+
+    def update_ai_proximity_motion(self, *_args, **_kwargs):
+        return {
+            "ok": False,
+            "error": "Robot sensor mapping is unavailable",
+        }
+
+    def stop_ai_proximity_motion(self):
+        return None
+
+    def is_ai_proximity_motion_active(self):
+        return False
 
     def set_secondary_background_reference_enabled(self, *_args, **_kwargs):
         return None
@@ -1144,6 +1184,61 @@ class RobotToolFramePositionWidget(QWidget):
         self.setVisible(not self.isVisible())
 
 
+class _MainControlPanelSplitterHandle(QSplitterHandle):
+    """Outer splitter handle with a centered tabs-panel toggle."""
+
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        self.toggle_button = QToolButton(self)
+        self.toggle_button.setAutoRaise(False)
+        self.toggle_button.setFixedSize(20, 46)
+        self.toggle_button.setCursor(Qt.PointingHandCursor)
+        self.toggle_button.clicked.connect(
+            self._toggle_main_control_panel
+        )
+        self.toggle_button.setStyleSheet(
+            "QToolButton {"
+            f" color: {theme.TEXT_PRIMARY};"
+            f" background-color: {theme.SURFACE_RAISED};"
+            f" border: 1px solid {theme.BORDER_SUBTLE};"
+            " border-radius: 8px;"
+            " font-size: 13px;"
+            " font-weight: 700;"
+            " padding: 0;"
+            "}"
+            "QToolButton:hover {"
+            f" background-color: {theme.ACCENT};"
+            " color: white;"
+            "}"
+        )
+        self.set_panel_visible(True)
+
+    def _toggle_main_control_panel(self):
+        splitter = self.splitter()
+        callback = getattr(
+            splitter,
+            "toggle_main_control_panel",
+            None,
+        )
+        if callable(callback):
+            callback()
+
+    def set_panel_visible(self, visible):
+        visible = bool(visible)
+        self.toggle_button.setText("▶" if visible else "◀")
+        self.toggle_button.setToolTip(
+            "Hide Sensor/Robots/AI panel"
+            if visible
+            else "Show Sensor/Robots/AI panel"
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        x = max(0, (self.width() - self.toggle_button.width()) // 2)
+        y = max(0, (self.height() - self.toggle_button.height()) // 2)
+        self.toggle_button.move(x, y)
+
+
 class UI(
     AiControlsMixin,
     CameraControlMixin,
@@ -1176,6 +1271,9 @@ class UI(
         self.cam_label = None
         self.centering_active = False
         self._is_shutting_down = False
+        self._main_control_panel_collapsed = False
+        self._main_control_panel_last_width = 620
+        self._main_control_panel_state_syncing = False
 
         self.gripper_closed_flag = False
         self.grip_fail_count = 0
@@ -1190,7 +1288,7 @@ class UI(
 
         self._bootstrap_core_services()
 
-        self.setHandleWidth(3)
+        self.setHandleWidth(22)
         self.setup_layout()
         self._bootstrap_ui_services()
         self._flush_startup_messages()
@@ -1316,6 +1414,7 @@ class UI(
                 [self.gripper_slider, self.btn_grip_open, self.btn_grip_close],
                 gripper_ready,
             )
+        self._refresh_ai_proximity_model_preview()
 
     def _get_default_ai_execution_model_path(self) -> str:
         helper = getattr(self, "sensor_functions", None)
@@ -1440,6 +1539,62 @@ class UI(
                 False,
             )
 
+    def createHandle(self):
+        return _MainControlPanelSplitterHandle(
+            self.orientation(),
+            self,
+        )
+
+    def _sync_main_control_panel_handle(self):
+        handle = self.handle(1)
+        if hasattr(handle, "set_panel_visible"):
+            handle.set_panel_visible(
+                not self._main_control_panel_collapsed
+            )
+
+    def _set_main_control_panel_visible(self, visible):
+        visible = bool(visible)
+        sizes = self.sizes()
+        total_width = max(
+            int(sum(sizes)),
+            int(self.width()),
+            1,
+        )
+        if len(sizes) > 1 and int(sizes[1]) > 0:
+            self._main_control_panel_last_width = int(sizes[1])
+        self._main_control_panel_collapsed = not visible
+        self._main_control_panel_state_syncing = True
+        self.splitter_2.setVisible(True)
+        if visible:
+            restore_width = max(
+                360,
+                int(self._main_control_panel_last_width),
+            )
+            self.setSizes(
+                [max(total_width - restore_width, 1), restore_width]
+            )
+        else:
+            self.setSizes([total_width, 0])
+        self._main_control_panel_state_syncing = False
+        self._sync_main_control_panel_handle()
+
+    def toggle_main_control_panel(self):
+        self._set_main_control_panel_visible(
+            self._main_control_panel_collapsed
+        )
+
+    def _on_main_control_splitter_moved(self, *_args):
+        if self._main_control_panel_state_syncing:
+            return
+        sizes = self.sizes()
+        if len(sizes) < 2:
+            return
+        panel_width = int(sizes[1])
+        self._main_control_panel_collapsed = panel_width <= 0
+        if panel_width > 0:
+            self._main_control_panel_last_width = panel_width
+        self._sync_main_control_panel_handle()
+
     def setup_layout(self):
         self.widget_plotter = PlotterWidget()
         layout_plotter = QGridLayout(self.widget_plotter)
@@ -1497,6 +1652,11 @@ class UI(
         self.splitter_2.addWidget(self.widget_func)
         self.addWidget(self.splitter_1)
         self.addWidget(self.splitter_2)
+        self.setCollapsible(1, True)
+        self.splitterMoved.connect(
+            self._on_main_control_splitter_moved
+        )
+        self._sync_main_control_panel_handle()
 
     def setup_tabs(self):
         # Tab 1: Sensor
@@ -1517,8 +1677,32 @@ class UI(
         self.setup_tab2(robot_layout)
         self.robots_sub_tabs.addTab(robot_page, "TM Robot")
 
+        # The humanoid controls are constructed only when this subtab is opened.
+        # The G1 scene is loaded explicitly into the existing sensor viewport.
+        self.humanoid_page = QWidget()
+        self.humanoid_layout = QVBoxLayout(self.humanoid_page)
+        self.humanoid_layout.setContentsMargins(0, 0, 0, 0)
+        self.humanoid_viewer = None
+        self._humanoid_viewer_loading = False
+        self._humanoid_viewport_active = False
+        self._humanoid_previous_sensor_visibility = None
+        self.humanoid_placeholder = QLabel(
+            "Open this tab to load the humanoid URDF and sensor signals."
+        )
+        self.humanoid_placeholder.setAlignment(Qt.AlignCenter)
+        self.humanoid_placeholder.setWordWrap(True)
+        self.humanoid_placeholder.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        self.humanoid_layout.addWidget(self.humanoid_placeholder)
+        self.humanoid_tab_index = self.robots_sub_tabs.addTab(
+            self.humanoid_page,
+            "Humanoid",
+        )
+        self.robots_sub_tabs.currentChanged.connect(
+            self._on_robot_subtab_changed
+        )
+
         robots_layout.addWidget(self.robots_sub_tabs)
-        self.tab_widget.addTab(robots_tab, "Robots")
+        self.robots_tab_index = self.tab_widget.addTab(robots_tab, "Robots")
 
         # Tab 3: AI
         tab3 = QWidget()
@@ -1537,6 +1721,103 @@ class UI(
         tab5_layout = QVBoxLayout(tab5)
         self.setup_tab4(tab5_layout)
         self.tab_widget.addTab(tab5, "Extra")
+        self.tab_widget.currentChanged.connect(self._on_main_tab_changed)
+
+    def _on_robot_subtab_changed(self, index):
+        if int(index) != int(getattr(self, "humanoid_tab_index", -1)):
+            self._release_humanoid_viewport()
+            return
+        QTimer.singleShot(0, self._ensure_humanoid_viewer)
+
+    def _on_main_tab_changed(self, index):
+        if int(index) != int(getattr(self, "robots_tab_index", -1)):
+            self._release_humanoid_viewport()
+            return
+        if int(self.robots_sub_tabs.currentIndex()) == int(
+            getattr(self, "humanoid_tab_index", -1)
+        ):
+            QTimer.singleShot(0, self._ensure_humanoid_viewer)
+
+    def _ensure_humanoid_viewer(self):
+        if self._is_shutting_down:
+            return
+        if self._humanoid_viewer_loading:
+            return
+        if self.humanoid_viewer is not None:
+            self.humanoid_viewer.restore_scene(reset_camera=False)
+            return
+        self._humanoid_viewer_loading = True
+        self.humanoid_placeholder.setText("Loading humanoid viewer...")
+        try:
+            # Keep this import lazy so normal phd_ui startup does not initialize
+            # another PyVista render window or inspect the large G1 asset tree.
+            from phd.ui.humanoid_viewer import HumanoidViewerWidget
+
+            viewer = HumanoidViewerWidget(
+                self.humanoid_page,
+                plotter=self.plotter_2,
+                sensor_functions=getattr(
+                    self,
+                    "sensor_functions",
+                    None,
+                ),
+                before_scene_load=self._activate_humanoid_viewport,
+            )
+            self.humanoid_layout.replaceWidget(
+                self.humanoid_placeholder,
+                viewer,
+            )
+            self.humanoid_placeholder.hide()
+            self.humanoid_viewer = viewer
+        except Exception as exc:
+            self.humanoid_placeholder.setText(
+                "Humanoid viewer could not be loaded.\n\n"
+                f"{exc}\n\n"
+                "Switch away and return to this tab to retry."
+            )
+            self._startup_log(f"Humanoid viewer unavailable: {exc}")
+        finally:
+            self._humanoid_viewer_loading = False
+
+    def _activate_humanoid_viewport(self):
+        if self._humanoid_viewport_active:
+            return
+        sensor = getattr(self, "sensor_functions", None)
+        if sensor is not None:
+            self._humanoid_previous_sensor_visibility = bool(
+                getattr(sensor, "main_visualization_enabled", True)
+            )
+            sensor.set_main_visualization_enabled(False, render=False)
+        self._humanoid_viewport_active = True
+        self.widget_plotter_2.setVisible(True)
+
+    def _release_humanoid_viewport(self):
+        if not bool(getattr(self, "_humanoid_viewport_active", False)):
+            return
+        viewer = getattr(self, "humanoid_viewer", None)
+        if viewer is not None:
+            viewer.release_scene(render=False)
+        sensor = getattr(self, "sensor_functions", None)
+        previous = getattr(
+            self,
+            "_humanoid_previous_sensor_visibility",
+            None,
+        )
+        if sensor is not None and previous is not None:
+            sensor.set_main_visualization_enabled(bool(previous), render=False)
+        self._humanoid_previous_sensor_visibility = None
+        self._humanoid_viewport_active = False
+        try:
+            self.plotter_2.render()
+        except Exception:
+            pass
+
+    def _shutdown_humanoid_viewer(self):
+        self._release_humanoid_viewport()
+        viewer = getattr(self, "humanoid_viewer", None)
+        self.humanoid_viewer = None
+        if viewer is not None:
+            viewer.shutdown()
 
     def setup_tab1(self, layout):
         self.sensor_sub_tabs = QTabWidget()
@@ -1561,9 +1842,43 @@ class UI(
         self.sensor_choice.setCurrentRow(0)
         send_layout.addWidget(self.sensor_choice)
 
+        sensor_source_mode_layout = QHBoxLayout()
+        sensor_source_mode_layout.addWidget(QLabel("Sensor display:"))
+        self.sensor_source_mode_combo = QComboBox(self.widget_func)
+        self.sensor_source_mode_combo.addItem("Single Sensor", "single")
+        self.sensor_source_mode_combo.addItem("Multiple Ports", "multiple")
+        self.sensor_source_mode_combo.setToolTip(
+            "Single Sensor uses one selected source. Multiple Ports displays "
+            "all selected serial sensors together. Grid rows, columns, and "
+            "+1-column format are configured independently for each port; "
+            "the first selected port is used by AI and robot-control features."
+        )
+        sensor_source_mode_layout.addWidget(self.sensor_source_mode_combo, 1)
+        send_layout.addLayout(sensor_source_mode_layout)
+
+        self._sensor_port_profiles = {}
+        self._sensor_port_profile_updating = False
         self.serial_channel = QListWidget(self.widget_func)
         self.serial_channel.setSelectionMode(QListWidget.SingleSelection)
         send_layout.addWidget(self.serial_channel)
+
+        self.sensor_source_mode_combo.currentIndexChanged.connect(
+            self._on_sensor_source_mode_changed
+        )
+
+        self.goodix_disable_desktop_touch_checkbox = QCheckBox(
+            "Disable Goodix desktop touch"
+        )
+        self.goodix_disable_desktop_touch_checkbox.setChecked(True)
+        self.goodix_disable_desktop_touch_checkbox.setEnabled(False)
+        self.goodix_disable_desktop_touch_checkbox.setToolTip(
+            "Prevent this USB sensor from moving or clicking the X11 desktop. "
+            "Raw tactile-matrix reading remains enabled."
+        )
+        self.goodix_disable_desktop_touch_checkbox.toggled.connect(
+            self._on_goodix_desktop_touch_toggled
+        )
+        send_layout.addWidget(self.goodix_disable_desktop_touch_checkbox)
 
         self.buildScene = QPushButton("Build Scene", self.widget_func)
         send_layout.addWidget(self.buildScene)
@@ -1597,8 +1912,21 @@ class UI(
         self.serial_channel.currentItemChanged.connect(
             self._on_sensor_port_selection_changed
         )
+        self.grid_rows_spin.valueChanged.connect(
+            self._on_sensor_port_profile_controls_changed
+        )
+        self.grid_cols_spin.valueChanged.connect(
+            self._on_sensor_port_profile_controls_changed
+        )
 
         viz_layout.addWidget(grid_container)
+        port_profile_hint = QLabel(
+            "In Multiple Ports mode, these grid settings apply only to the "
+            "currently highlighted port."
+        )
+        port_profile_hint.setWordWrap(True)
+        port_profile_hint.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        viz_layout.addWidget(port_profile_hint)
 
         self.sensor_extra_column_checkbox = QCheckBox(
             "Raw packet includes +1 column"
@@ -1607,6 +1935,9 @@ class UI(
         self.sensor_extra_column_checkbox.setToolTip(
             "Checked: expect rows x (columns + 1) values and ignore the extra "
             "column. Unchecked: expect exactly rows x columns values."
+        )
+        self.sensor_extra_column_checkbox.toggled.connect(
+            self._on_sensor_port_profile_controls_changed
         )
         viz_layout.addWidget(self.sensor_extra_column_checkbox)
 
@@ -1620,6 +1951,10 @@ class UI(
         self.sensitivity_slider.setValue(50)
         self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
         self.sensitivity_slider.setTickInterval(10)
+        self.sensitivity_slider.setToolTip(
+            "Maximum point-grid displacement when the signal reaches the "
+            "configured full-colour level."
+        )
 
         self.sensitivity_value_label = QLabel("0.050")
         self.sensitivity_value_label.setFixedWidth(48)
@@ -1653,33 +1988,25 @@ class UI(
         )
         viz_layout.addWidget(self.sensor_transparent_screenshot_button)
 
-        normal_vector_container = QWidget()
-        normal_vector_layout = QVBoxLayout(normal_vector_container)
-        normal_vector_layout.setContentsMargins(0, 0, 0, 0)
-        normal_vector_layout.setSpacing(4)
-        self.contact_normal_checkbox = QCheckBox("Show Contact Vector")
-        self.contact_normal_checkbox.setChecked(False)
-        self.contact_normal_checkbox.setToolTip(
-            "Show an estimated contact arrow in the sensor scene."
+        normal_vector_status_container = QWidget()
+        normal_vector_status_layout = QVBoxLayout(
+            normal_vector_status_container
         )
-        self.contact_normal_estimator_combo = QComboBox()
-        self.contact_normal_estimator_combo.addItem("Motion Direction (V3)", "motion_direction_v3")
-        self.contact_normal_estimator_combo.addItem("Touch Anchor Direction (V4)", "touch_anchor_v4")
-        self.contact_normal_estimator_combo.setCurrentIndex(1)
-        self.contact_normal_estimator_combo.setToolTip(
-            "Choose whether the arrow shows pressure-derived normal tilt or contact motion direction."
-        )
+        normal_vector_status_layout.setContentsMargins(0, 0, 0, 0)
+        normal_vector_status_layout.setSpacing(4)
         self.contact_normal_status_label = QLabel("Normal vector: waiting for contact")
         self.contact_normal_status_label.setWordWrap(True)
         self.contact_normal_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
         self.contact_force_status_label = QLabel("Contact force: waiting for contact")
         self.contact_force_status_label.setWordWrap(True)
         self.contact_force_status_label.setStyleSheet(theme.INFO_LABEL_STYLE)
-        normal_vector_layout.addWidget(self.contact_normal_checkbox)
-        normal_vector_layout.addWidget(self.contact_normal_estimator_combo)
-        normal_vector_layout.addWidget(self.contact_normal_status_label)
-        normal_vector_layout.addWidget(self.contact_force_status_label)
-        viz_layout.addWidget(normal_vector_container)
+        normal_vector_status_layout.addWidget(
+            self.contact_normal_status_label
+        )
+        normal_vector_status_layout.addWidget(
+            self.contact_force_status_label
+        )
+        viz_layout.addWidget(normal_vector_status_container)
 
         send_page_layout.addWidget(send_group)
         send_page_layout.addWidget(viz_group)
@@ -1730,19 +2057,170 @@ class UI(
 
     @staticmethod
     def _default_sensor_grid_shape_for_port(port_name):
+        if is_goodix_usb_source(port_name):
+            return GOODIX_USB_ROWS, GOODIX_USB_COLUMNS
+        humanoid_shape = humanoid_sensor_grid_shape_for_device(port_name)
+        if humanoid_shape is not None:
+            return humanoid_shape
         name = os.path.basename(str(port_name or "")).lower()
+        if name == "ttyacm0":
+            return 10, 10
         if name in ("ttyacm1", "ttyamc1"):
-            return 7, 7
+            return 8, 10
         return None
 
-    def _on_sensor_port_selection_changed(self, current, _previous=None):
-        port_name = current.text() if current is not None else ""
+    @staticmethod
+    def _sensor_port_profile_key(port_name):
+        text = str(port_name or "").strip()
+        if is_goodix_usb_source(text):
+            return GOODIX_USB_SOURCE_ID
+        return os.path.basename(text).lower()
+
+    def _default_sensor_port_profile(self, port_name):
         shape = self._default_sensor_grid_shape_for_port(port_name)
         if shape is None:
+            shape = (
+                int(self.grid_rows_spin.value()),
+                int(self.grid_cols_spin.value()),
+            )
+        port_basename = os.path.basename(str(port_name or "")).lower()
+        recognized_extra_column = (
+            humanoid_sensor_extra_column_for_device(port_name)
+        )
+        has_extra_column = (
+            bool(recognized_extra_column)
+            if recognized_extra_column is not None
+            else port_basename == "ttyacm0"
+        )
+        return {
+            "n_row": int(shape[0]),
+            "n_col": int(shape[1]),
+            "has_extra_column": has_extra_column,
+        }
+
+    def _save_sensor_port_profile_from_controls(self, port_name):
+        if getattr(self, "_sensor_port_profile_updating", False):
             return
-        self.grid_rows_spin.setValue(shape[0])
-        self.grid_cols_spin.setValue(shape[1])
-        self.sensor_extra_column_checkbox.setChecked(False)
+        key = self._sensor_port_profile_key(port_name)
+        if not key:
+            return
+        self._sensor_port_profiles[key] = {
+            "n_row": int(self.grid_rows_spin.value()),
+            "n_col": int(self.grid_cols_spin.value()),
+            "has_extra_column": bool(
+                self.sensor_extra_column_checkbox.isChecked()
+            ),
+        }
+
+    def get_sensor_port_profile(self, port_name):
+        key = self._sensor_port_profile_key(port_name)
+        current = self.serial_channel.currentItem()
+        if (
+            current is not None
+            and self._sensor_port_profile_key(
+                _sensor_source_from_item(current)
+            ) == key
+        ):
+            self._save_sensor_port_profile_from_controls(
+                _sensor_source_from_item(current)
+            )
+        profile = self._sensor_port_profiles.get(key)
+        if profile is None:
+            profile = self._default_sensor_port_profile(port_name)
+            self._sensor_port_profiles[key] = dict(profile)
+        return dict(profile)
+
+    def _load_sensor_port_profile_into_controls(self, port_name):
+        key = self._sensor_port_profile_key(port_name)
+        profile = self._sensor_port_profiles.get(key)
+        if profile is None:
+            profile = self._default_sensor_port_profile(port_name)
+            self._sensor_port_profiles[key] = dict(profile)
+        widgets = (
+            self.grid_rows_spin,
+            self.grid_cols_spin,
+            self.sensor_extra_column_checkbox,
+        )
+        self._sensor_port_profile_updating = True
+        for widget in widgets:
+            widget.blockSignals(True)
+        try:
+            self.grid_rows_spin.setValue(int(profile["n_row"]))
+            self.grid_cols_spin.setValue(int(profile["n_col"]))
+            self.sensor_extra_column_checkbox.setChecked(
+                bool(profile["has_extra_column"])
+            )
+        finally:
+            for widget in widgets:
+                widget.blockSignals(False)
+            self._sensor_port_profile_updating = False
+
+    def _on_sensor_port_profile_controls_changed(self, *_args):
+        if getattr(self, "_sensor_port_profile_updating", False):
+            return
+        current = self.serial_channel.currentItem()
+        if current is not None:
+            self._save_sensor_port_profile_from_controls(
+                _sensor_source_from_item(current)
+            )
+
+    def _on_sensor_port_selection_changed(self, current, previous=None):
+        if previous is not None:
+            self._save_sensor_port_profile_from_controls(
+                _sensor_source_from_item(previous)
+            )
+        port_name = _sensor_source_from_item(current)
+        is_goodix = is_goodix_usb_source(port_name)
+        checkbox = getattr(
+            self,
+            "goodix_disable_desktop_touch_checkbox",
+            None,
+        )
+        if checkbox is not None:
+            checkbox.setEnabled(is_goodix)
+        if current is None:
+            return
+        self._load_sensor_port_profile_into_controls(port_name)
+        if is_goodix and checkbox is not None and checkbox.isChecked():
+            self._set_goodix_desktop_touch_enabled(False)
+
+    def _on_sensor_source_mode_changed(self, *_args):
+        port_list = getattr(self, "serial_channel", None)
+        combo = getattr(self, "sensor_source_mode_combo", None)
+        if port_list is None or combo is None:
+            return
+
+        multiple = combo.currentData() == "multiple"
+        port_list.setSelectionMode(
+            QListWidget.MultiSelection
+            if multiple
+            else QListWidget.SingleSelection
+        )
+        if multiple:
+            return
+
+        current = port_list.currentItem()
+        if current is None:
+            selected = list(port_list.selectedItems() or [])
+            current = selected[0] if selected else None
+        for index in range(port_list.count()):
+            item = port_list.item(index)
+            item.setSelected(item is current)
+
+    def _set_goodix_desktop_touch_enabled(self, enabled):
+        succeeded, message = set_goodix_desktop_touch_enabled(enabled)
+        log_display = getattr(self, "log_display", None)
+        if log_display is not None:
+            log_display.append(message)
+        return succeeded
+
+    def _on_goodix_desktop_touch_toggled(self, disable_touch):
+        current = self.serial_channel.currentItem()
+        if current is None or not is_goodix_usb_source(
+            _sensor_source_from_item(current)
+        ):
+            return
+        self._set_goodix_desktop_touch_enabled(not bool(disable_touch))
 
     @staticmethod
     def _sensor_reorder_mode_label(mode):
@@ -1921,6 +2399,34 @@ class UI(
         self.sensor_parameter_stereo_length_spin.setToolTip(
             "Stereo field line length relative to the sensor size."
         )
+        self.sensor_parameter_signal_mode_combo = QComboBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_signal_mode_combo.addItem(
+            "Magnitude (Red = |signal|)", True
+        )
+        self.sensor_parameter_signal_mode_combo.addItem(
+            "Signed (Blue = negative, Red = positive)", False
+        )
+        self.sensor_parameter_signal_mode_combo.setToolTip(
+            "Controls Point Grid, Stereo Field, and 3D Heatmap. Magnitude "
+            "matches the original abs() display. Signed mode shows negative "
+            "values in blue and positive values in red."
+        )
+        self.sensor_parameter_point_grid_response_combo = QComboBox(
+            self.sensor_parameters_dialog
+        )
+        self.sensor_parameter_point_grid_response_combo.addItem(
+            "Zero-Centred (Recommended)", "zero_centered"
+        )
+        self.sensor_parameter_point_grid_response_combo.addItem(
+            "Legacy Offset", "legacy_offset"
+        )
+        self.sensor_parameter_point_grid_response_combo.setToolTip(
+            "Choose how Point Grid height and colour respond to the signal. "
+            "Zero-Centred keeps idle points on the sensor surface and bounds "
+            "their motion. Legacy Offset reproduces the previous display."
+        )
         self.sensor_parameter_heatmap_response_combo = QComboBox(
             self.sensor_parameters_dialog
         )
@@ -2057,6 +2563,45 @@ class UI(
         view_layout.addStretch()
         layout.addWidget(view_group)
 
+        contact_vector_group = QGroupBox("Contact Vector")
+        contact_vector_layout = QGridLayout(contact_vector_group)
+        contact_vector_layout.setHorizontalSpacing(12)
+        contact_vector_layout.setVerticalSpacing(8)
+        self.contact_normal_checkbox = QCheckBox("Show Contact Vector")
+        self.contact_normal_checkbox.setChecked(False)
+        self.contact_normal_checkbox.setToolTip(
+            "Show an estimated contact arrow in the 3D sensor scene."
+        )
+        self.contact_normal_estimator_combo = QComboBox()
+        self.contact_normal_estimator_combo.addItem(
+            "Motion Direction (V3)",
+            "motion_direction_v3",
+        )
+        self.contact_normal_estimator_combo.addItem(
+            "Touch Anchor Direction (V4)",
+            "touch_anchor_v4",
+        )
+        self.contact_normal_estimator_combo.setCurrentIndex(1)
+        self.contact_normal_estimator_combo.setToolTip(
+            "Choose whether the arrow follows contact motion or the "
+            "touch-anchor direction."
+        )
+        contact_vector_layout.addWidget(
+            self.contact_normal_checkbox,
+            0,
+            0,
+            1,
+            2,
+        )
+        contact_vector_layout.addWidget(QLabel("Vector Type:"), 1, 0)
+        contact_vector_layout.addWidget(
+            self.contact_normal_estimator_combo,
+            1,
+            1,
+        )
+        contact_vector_layout.setColumnStretch(1, 1)
+        layout.addWidget(contact_vector_group)
+
         stereo_group = QGroupBox("Stereo Field")
         stereo_grid = QGridLayout(stereo_group)
         stereo_grid.setHorizontalSpacing(12)
@@ -2069,33 +2614,39 @@ class UI(
         stereo_grid.setColumnStretch(1, 1)
         layout.addWidget(stereo_group)
 
-        heatmap_group = QGroupBox("3D Heatmap")
+        heatmap_group = QGroupBox("3D Signal / Heatmap")
         heatmap_grid = QGridLayout(heatmap_group)
         heatmap_grid.setHorizontalSpacing(12)
         heatmap_grid.setVerticalSpacing(8)
-        heatmap_grid.addWidget(QLabel("Colour Scale:"), 0, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_palette_combo, 0, 1)
-        heatmap_grid.addWidget(QLabel("Response:"), 1, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_response_combo, 1, 1)
-        heatmap_grid.addWidget(QLabel("Linear Full Colour At:"), 2, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_saturation_spin, 2, 1)
-        heatmap_grid.addWidget(QLabel("Linear Noise Floor:"), 3, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_floor_spin, 3, 1)
-        heatmap_grid.addWidget(QLabel("Proximity Baseline:"), 4, 0)
+        heatmap_grid.addWidget(QLabel("Signal Sign:"), 0, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_signal_mode_combo, 0, 1)
+        heatmap_grid.addWidget(QLabel("Point Grid Response:"), 1, 0)
         heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_proximity_floor_spin, 4, 1
+            self.sensor_parameter_point_grid_response_combo, 1, 1
         )
-        heatmap_grid.addWidget(QLabel("Proximity Knee:"), 5, 0)
+        heatmap_grid.addWidget(QLabel("Colour Scale:"), 2, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_palette_combo, 2, 1)
+        heatmap_grid.addWidget(QLabel("Response:"), 3, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_response_combo, 3, 1)
+        heatmap_grid.addWidget(QLabel("Linear Full Colour At:"), 4, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_saturation_spin, 4, 1)
+        heatmap_grid.addWidget(QLabel("Linear Noise Floor:"), 5, 0)
+        heatmap_grid.addWidget(self.sensor_parameter_heatmap_floor_spin, 5, 1)
+        heatmap_grid.addWidget(QLabel("Proximity Baseline:"), 6, 0)
         heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_proximity_knee_spin, 5, 1
+            self.sensor_parameter_heatmap_proximity_floor_spin, 6, 1
         )
-        heatmap_grid.addWidget(QLabel("Proximity Saturation:"), 6, 0)
+        heatmap_grid.addWidget(QLabel("Proximity Knee:"), 7, 0)
         heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_proximity_saturation_spin, 6, 1
+            self.sensor_parameter_heatmap_proximity_knee_spin, 7, 1
         )
-        heatmap_grid.addWidget(QLabel("3D Colour Strength:"), 7, 0)
+        heatmap_grid.addWidget(QLabel("Proximity Saturation:"), 8, 0)
         heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_3d_color_gain_spin, 7, 1
+            self.sensor_parameter_heatmap_proximity_saturation_spin, 8, 1
+        )
+        heatmap_grid.addWidget(QLabel("3D Colour Strength:"), 9, 0)
+        heatmap_grid.addWidget(
+            self.sensor_parameter_heatmap_3d_color_gain_spin, 9, 1
         )
         heatmap_grid.setColumnStretch(1, 1)
         layout.addWidget(heatmap_group)
@@ -2133,17 +2684,17 @@ class UI(
         self.sensor_parameter_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
         layout.addWidget(self.sensor_parameter_status_label)
 
-        button_row = QHBoxLayout()
         self.sensor_parameter_save_button = QPushButton("Save for Sensor")
         self.sensor_parameter_reload_button = QPushButton("Reload Saved")
-        button_row.addWidget(self.sensor_parameter_save_button)
-        button_row.addWidget(self.sensor_parameter_reload_button)
-        button_row.addStretch()
-        layout.addLayout(button_row)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
         button_box.rejected.connect(self.sensor_parameters_dialog.close)
-        outer_layout.addWidget(button_box)
+        footer_layout = QHBoxLayout()
+        footer_layout.addStretch()
+        footer_layout.addWidget(self.sensor_parameter_save_button)
+        footer_layout.addWidget(self.sensor_parameter_reload_button)
+        footer_layout.addWidget(button_box)
+        outer_layout.addLayout(footer_layout)
 
         self.sensor_parameter_model_combo.currentIndexChanged.connect(
             self._load_sensor_parameter_reorder_mode
@@ -2212,6 +2763,12 @@ class UI(
             self._on_sensor_parameter_heatmap_changed
         )
         self.sensor_parameter_heatmap_palette_combo.currentIndexChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_signal_mode_combo.currentIndexChanged.connect(
+            self._on_sensor_parameter_heatmap_changed
+        )
+        self.sensor_parameter_point_grid_response_combo.currentIndexChanged.connect(
             self._on_sensor_parameter_heatmap_changed
         )
         self.sensor_parameter_heatmap_proximity_floor_spin.valueChanged.connect(
@@ -2436,6 +2993,13 @@ class UI(
             float(self.sensor_parameter_heatmap_proximity_saturation_spin.value()),
         )
         return {
+            "use_absolute_signal": bool(
+                self.sensor_parameter_signal_mode_combo.currentData()
+            ),
+            "point_grid_response_mode": str(
+                self.sensor_parameter_point_grid_response_combo.currentData()
+                or "zero_centered"
+            ),
             "palette_3d": str(
                 self.sensor_parameter_heatmap_palette_combo.currentData()
                 or "white_red"
@@ -2460,6 +3024,14 @@ class UI(
 
     def _set_sensor_parameter_heatmap_controls(self, heatmap):
         heatmap = heatmap if isinstance(heatmap, dict) else {}
+        use_absolute_signal = bool(
+            heatmap.get("use_absolute_signal", True)
+        )
+        point_grid_response_mode = str(
+            heatmap.get("point_grid_response_mode", "zero_centered")
+        )
+        if point_grid_response_mode not in ("zero_centered", "legacy_offset"):
+            point_grid_response_mode = "zero_centered"
         response_mode = str(heatmap.get("response_mode", "linear_relative"))
         if response_mode not in ("linear_relative", "proximity_enhanced"):
             response_mode = "linear_relative"
@@ -2503,8 +3075,9 @@ class UI(
         proximity_saturation = float(
             np.clip(proximity_saturation, proximity_knee + 0.1, 1000000.0)
         )
-
         widgets = [
+            self.sensor_parameter_signal_mode_combo,
+            self.sensor_parameter_point_grid_response_combo,
             self.sensor_parameter_heatmap_palette_combo,
             self.sensor_parameter_heatmap_response_combo,
             self.sensor_parameter_heatmap_saturation_spin,
@@ -2516,6 +3089,14 @@ class UI(
         ]
         for widget in widgets:
             widget.blockSignals(True)
+        self._set_combo_current_data(
+            self.sensor_parameter_signal_mode_combo,
+            use_absolute_signal,
+        )
+        self._set_combo_current_data(
+            self.sensor_parameter_point_grid_response_combo,
+            point_grid_response_mode,
+        )
         self._set_combo_current_data(
             self.sensor_parameter_heatmap_palette_combo, palette_3d
         )
@@ -2545,9 +3126,15 @@ class UI(
         self._update_sensor_parameter_heatmap_controls()
 
     def _update_sensor_parameter_heatmap_controls(self):
+        use_absolute_signal = bool(
+            self.sensor_parameter_signal_mode_combo.currentData()
+        )
         enhanced = (
             str(self.sensor_parameter_heatmap_response_combo.currentData())
             == "proximity_enhanced"
+        )
+        self.sensor_parameter_heatmap_palette_combo.setEnabled(
+            use_absolute_signal
         )
         self.sensor_parameter_heatmap_saturation_spin.setEnabled(not enhanced)
         self.sensor_parameter_heatmap_floor_spin.setEnabled(not enhanced)
@@ -2680,6 +3267,23 @@ class UI(
             bool(context.get("point_labels_enabled", False))
         )
         self.sensor_parameter_point_labels_checkbox.blockSignals(False)
+        self.contact_normal_checkbox.blockSignals(True)
+        self.contact_normal_checkbox.setChecked(
+            bool(getattr(helper, "show_contact_normal_vector", False))
+        )
+        self.contact_normal_checkbox.blockSignals(False)
+        self.contact_normal_estimator_combo.blockSignals(True)
+        self._set_combo_current_data(
+            self.contact_normal_estimator_combo,
+            str(
+                getattr(
+                    helper,
+                    "contact_normal_estimator_mode",
+                    "touch_anchor_v4",
+                )
+            ),
+        )
+        self.contact_normal_estimator_combo.blockSignals(False)
         self.sensor_parameter_background_reference_checkbox.blockSignals(True)
         self.sensor_parameter_background_reference_checkbox.setChecked(
             bool(context.get("background_reference_enabled", True))
@@ -2706,6 +3310,18 @@ class UI(
         default_logic = context.get("default_logic") or "none"
         effective_logic = context.get("effective_logic") or "none"
         point_labels = "on" if context.get("point_labels_enabled", False) else "off"
+        contact_vector = (
+            "on"
+            if bool(getattr(helper, "show_contact_normal_vector", False))
+            else "off"
+        )
+        contact_vector_type = str(
+            getattr(
+                helper,
+                "contact_normal_estimator_mode",
+                "touch_anchor_v4",
+            )
+        )
         background_reference = "on" if context.get("background_reference_enabled", True) else "off"
         force_scale = float(context.get("force_scale_n_per_signal", 0.0) or 0.0)
         geometry_shape = str(geometry.get("shape", "flat") or "flat")
@@ -2725,6 +3341,7 @@ class UI(
             f"Saved mode: {self._sensor_reorder_mode_label(saved_mode)}\n"
             f"Effective on next Build Scene: {effective_logic}\n"
             f"Point labels: {point_labels}\n"
+            f"Contact vector: {contact_vector}; {contact_vector_type}\n"
             f"Background axes/grid: {background_reference}\n"
             f"Saved sensor view: {'yes' if saved_camera else 'no'}\n"
             f"Force scale: {force_scale:.6f} N/signal\n"
@@ -2732,6 +3349,7 @@ class UI(
             f"{float(stereo_field.get('deadband_pct', 0.35) or 0.0):.2f}, "
             f"length {float(stereo_field.get('length_scale', 0.35) or 0.35):.2f}\n"
             f"3D heatmap: {heatmap.get('response_mode', 'linear_relative')}, "
+            f"{'magnitude |signal|' if heatmap.get('use_absolute_signal', True) else 'signed blue-/red+'}, "
             f"linear full red "
             f"{float(heatmap.get('saturation_pct', 5.0) or 5.0):.2f}%, "
             f"floor {float(heatmap.get('noise_floor_pct', 0.5) or 0.0):.2f}%; "
@@ -3095,6 +3713,7 @@ class UI(
                 f"threshold {float(saved_stereo.get('deadband_pct', 0.35) or 0.0):.2f}, "
                 f"length {float(saved_stereo.get('length_scale', 0.35) or 0.35):.2f}\n"
                 f"3D heatmap: {saved_heatmap.get('response_mode', 'linear_relative')}, "
+                f"{'magnitude |signal|' if saved_heatmap.get('use_absolute_signal', True) else 'signed blue-/red+'}, "
                 f"palette {saved_heatmap.get('palette_3d', 'white_red')}, "
                 f"linear full red "
                 f"{float(saved_heatmap.get('saturation_pct', 5.0) or 5.0):.2f}%, "
@@ -3148,6 +3767,10 @@ class UI(
         # ─── Subtab “AI Model” ───
         ai_model_page = QWidget()
         ai_model_layout = QVBoxLayout(ai_model_page)
+
+        # Keep deterministic controls separate from learned-policy controls.
+        rule_based_page = QWidget()
+        rule_based_page_layout = QVBoxLayout(rule_based_page)
 
         self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict (ThreeLevel)")
         self.btn_toggle_3lvl_latch = QPushButton("3-Level: Latch OFF")
@@ -3350,10 +3973,21 @@ class UI(
         self._update_ai_frame_buttons()
         ai_model_layout.addWidget(frame_row)
 
-        ai_based_group = QGroupBox("AI-Based")
-        ai_based_layout = QVBoxLayout(ai_based_group)
-        ai_based_layout.setContentsMargins(10, 10, 10, 10)
-        ai_based_layout.setSpacing(6)
+        tactile_ai_group = QGroupBox("Tactile")
+        tactile_ai_layout = QVBoxLayout(tactile_ai_group)
+        tactile_ai_layout.setContentsMargins(10, 10, 10, 10)
+        tactile_ai_layout.setSpacing(6)
+
+        proximity_ai_group = QGroupBox("Proximity")
+        proximity_ai_layout = QVBoxLayout(proximity_ai_group)
+        proximity_ai_layout.setContentsMargins(10, 10, 10, 10)
+        proximity_ai_layout.setSpacing(6)
+
+        hybrid_ai_group = QGroupBox("Hybrid")
+        hybrid_ai_group.setMinimumHeight(72)
+        hybrid_ai_layout = QVBoxLayout(hybrid_ai_group)
+        hybrid_ai_layout.setContentsMargins(10, 10, 10, 10)
+        hybrid_ai_layout.addStretch()
 
         rule_based_group = QGroupBox("Rule-Based")
         rule_based_layout = QVBoxLayout(rule_based_group)
@@ -3386,18 +4020,114 @@ class UI(
         self.ai_direct_finger_motion_button = QPushButton("AI DFM Record (No Robot)")
         self.ai_direct_finger_motion_robot_button = QPushButton("AI DFM Record + Robot")
         self.ai_direct_finger_motion_execution_button = QPushButton("AI Direct Finger Motion (Execute)")
+        self.ai_proximity_detection_button = QPushButton("AI Proximity Detection")
+        self.ai_proximity_detection_button.setCheckable(True)
+        self.ai_proximity_admittance_button = QPushButton(
+            "Proximity Admittance Control"
+        )
+        self.ai_proximity_admittance_button.setCheckable(True)
+        self.ai_proximity_admittance_button.setChecked(False)
+        self.ai_proximity_admittance_button.setEnabled(False)
+        self.ai_proximity_admittance_button.setToolTip(
+            "Arm robot retreat and return-to-start motion after AI Proximity "
+            "Detection is running."
+        )
+        self.ai_proximity_detection_mode_combo = QComboBox()
+        self.ai_proximity_detection_mode_combo.addItem("Hybrid", "hybrid")
+        self.ai_proximity_detection_mode_combo.addItem(
+            "CNN-GRU Only",
+            "cnn_gru",
+        )
+        self.ai_proximity_detection_mode_combo.addItem(
+            "Localized Only",
+            "localized",
+        )
+        self.ai_proximity_detection_mode_combo.setCurrentIndex(0)
+        self.ai_proximity_detection_mode_combo.setToolTip(
+            "Choose whether detection uses the CNN-GRU, the localized "
+            "statistical detector, or both."
+        )
+        self.ai_proximity_sensitivity_combo = QComboBox()
+        self.ai_proximity_sensitivity_combo.addItem("Robust", 1.0)
+        self.ai_proximity_sensitivity_combo.addItem("Sensitive", 0.85)
+        self.ai_proximity_sensitivity_combo.addItem("Very sensitive", 0.70)
+        self.ai_proximity_sensitivity_combo.setCurrentIndex(1)
+        self.ai_proximity_sensitivity_combo.setToolTip(
+            "Lower detection thresholds respond sooner to weak local changes "
+            "but can produce more false detections."
+        )
+        self.ai_proximity_detection_status = QLabel("Proximity AI: idle")
+        self.ai_proximity_detection_status.setWordWrap(True)
+        self.ai_proximity_detection_status.setStyleSheet(
+            theme.MUTED_LABEL_STYLE
+        )
+        self.ai_proximity_model_status = QLabel(
+            "Model: automatic selection from sensor size"
+        )
+        self.ai_proximity_model_status.setWordWrap(True)
+        self.ai_proximity_model_status.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+        self.ai_proximity_model_status.setStyleSheet(
+            theme.MUTED_LABEL_STYLE
+        )
+        self.ai_proximity_model_status.setToolTip(
+            "The size-specific proximity checkpoint selected when detection "
+            "starts."
+        )
+        self.ai_proximity_select_model_button = QPushButton("Select Model")
+        self.ai_proximity_select_model_button.setToolTip(
+            "Manually choose the proximity checkpoint used the next time "
+            "detection starts."
+        )
+        self.ai_proximity_use_auto_model_button = QPushButton("Use Auto")
+        self.ai_proximity_use_auto_model_button.setEnabled(False)
+        self.ai_proximity_use_auto_model_button.setToolTip(
+            "Return to automatic model selection based on sensor size."
+        )
 
         model_row = QWidget()
         model_row_layout = QHBoxLayout(model_row)
         model_row_layout.setContentsMargins(0, 0, 0, 0)
-        model_row_layout.addWidget(QLabel("Model Path:"))
-        self.ai_direct_execution_model_path_input = QLineEdit()
+        self.ai_direct_execution_model_path_input = QLineEdit(model_row)
         self.ai_direct_execution_model_path_input.setPlaceholderText(
             DisabledSensorFunctions.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
         )
         default_ai_model_path = self._get_default_ai_execution_model_path()
         self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
-        model_row_layout.addWidget(self.ai_direct_execution_model_path_input)
+        self.ai_direct_execution_model_path_input.setVisible(False)
+        self.ai_direct_execution_model_status = QLabel()
+        self.ai_direct_execution_model_status.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+        self.ai_direct_execution_select_model_button = QPushButton(
+            "Select Model"
+        )
+        self.ai_direct_execution_select_model_button.setToolTip(
+            "Choose the PyTorch checkpoint used the next time AI Direct "
+            "Finger Motion execution starts."
+        )
+        self.ai_direct_execution_use_default_button = QPushButton(
+            "Use Default"
+        )
+        self.ai_direct_execution_use_default_button.setToolTip(
+            "Restore the current latest_cnn_gru_model_10x10.pt checkpoint."
+        )
+        model_row_layout.addWidget(QLabel("Model:"))
+        model_row_layout.addWidget(
+            self.ai_direct_execution_model_status,
+            1,
+        )
+        model_row_layout.addWidget(
+            self.ai_direct_execution_select_model_button
+        )
+        model_row_layout.addWidget(
+            self.ai_direct_execution_use_default_button
+        )
+        self._set_ai_direct_execution_model_path(
+            default_ai_model_path,
+            is_default=True,
+        )
 
         execute_safety_row = QWidget()
         execute_safety_layout = QHBoxLayout(execute_safety_row)
@@ -3413,6 +4143,35 @@ class UI(
         execute_safety_layout.addWidget(self.ai_direct_execution_prediction_status)
         execute_safety_layout.addStretch()
 
+        execute_action_row = QWidget()
+        execute_action_layout = QHBoxLayout(execute_action_row)
+        execute_action_layout.setContentsMargins(0, 0, 0, 0)
+        execute_action_layout.setSpacing(6)
+        execute_action_layout.addWidget(
+            self.ai_direct_finger_motion_execution_button,
+            1,
+        )
+        execute_action_layout.addWidget(QLabel("Velocity scale:"))
+        self.ai_direct_execution_velocity_scale_spin = QDoubleSpinBox()
+        self.ai_direct_execution_velocity_scale_spin.setRange(0.10, 20.00)
+        self.ai_direct_execution_velocity_scale_spin.setDecimals(2)
+        self.ai_direct_execution_velocity_scale_spin.setSingleStep(0.10)
+        self.ai_direct_execution_velocity_scale_spin.setValue(1.00)
+        self.ai_direct_execution_velocity_scale_spin.setSuffix("x")
+        self.ai_direct_execution_velocity_scale_spin.setToolTip(
+            "Multiply the AI-predicted velocity. The execution safety limit "
+            "still caps each XYZ component at 0.05 m/s."
+        )
+        execute_action_layout.addWidget(
+            self.ai_direct_execution_velocity_scale_spin
+        )
+        self.ai_direct_execution_speed_cap_label = QLabel(
+            "Safety velocity cap: 0.30 m/s (total XYZ)"
+        )
+        self.ai_direct_execution_speed_cap_label.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-size: 11px;"
+        )
+
         threelevel_row = QWidget()
         threelevel_row_layout = QHBoxLayout(threelevel_row)
         threelevel_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -3424,7 +4183,7 @@ class UI(
             1,
         )
         threelevel_row_layout.addWidget(self.btn_toggle_3lvl_latch, 1)
-        ai_based_layout.addWidget(threelevel_row)
+        tactile_ai_layout.addWidget(threelevel_row)
         proximity_row = QWidget()
         proximity_row_layout = QHBoxLayout(proximity_row)
         proximity_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -3459,13 +4218,62 @@ class UI(
         rule_based_layout.addWidget(tool_pose_row)
         self._build_direct_finger_motion_settings_dialog()
         self._build_console_control_settings_dialog()
-        ai_based_layout.addWidget(model_row)
-        ai_based_layout.addWidget(execute_safety_row)
-        ai_based_layout.addWidget(self.ai_direct_finger_motion_execution_button)
-        ai_model_layout.addWidget(ai_based_group)
-        ai_model_layout.addWidget(rule_based_group)
-        ai_model_layout.addWidget(admittance_group)
+        ai_proximity_row = QWidget()
+        ai_proximity_row_layout = QHBoxLayout(ai_proximity_row)
+        ai_proximity_row_layout.setContentsMargins(0, 0, 0, 0)
+        ai_proximity_row_layout.setSpacing(6)
+        ai_proximity_row_layout.addWidget(
+            self.ai_proximity_detection_button,
+            1,
+        )
+        ai_proximity_row_layout.addWidget(
+            self.ai_proximity_admittance_button,
+            1,
+        )
+        proximity_ai_layout.addWidget(ai_proximity_row)
+        ai_proximity_options_row = QWidget()
+        ai_proximity_options_layout = QHBoxLayout(
+            ai_proximity_options_row
+        )
+        ai_proximity_options_layout.setContentsMargins(0, 0, 0, 0)
+        ai_proximity_options_layout.setSpacing(6)
+        ai_proximity_options_layout.addWidget(QLabel("Mode:"))
+        ai_proximity_options_layout.addWidget(
+            self.ai_proximity_detection_mode_combo
+        )
+        ai_proximity_options_layout.addWidget(QLabel("Sensitivity:"))
+        ai_proximity_options_layout.addWidget(
+            self.ai_proximity_sensitivity_combo
+        )
+        ai_proximity_options_layout.addStretch()
+        proximity_ai_layout.addWidget(ai_proximity_options_row)
+        ai_proximity_model_row = QWidget()
+        ai_proximity_model_layout = QHBoxLayout(ai_proximity_model_row)
+        ai_proximity_model_layout.setContentsMargins(0, 0, 0, 0)
+        ai_proximity_model_layout.setSpacing(6)
+        ai_proximity_model_layout.addWidget(
+            self.ai_proximity_model_status,
+            1,
+        )
+        ai_proximity_model_layout.addWidget(
+            self.ai_proximity_select_model_button
+        )
+        ai_proximity_model_layout.addWidget(
+            self.ai_proximity_use_auto_model_button
+        )
+        proximity_ai_layout.addWidget(ai_proximity_model_row)
+        proximity_ai_layout.addWidget(self.ai_proximity_detection_status)
+        tactile_ai_layout.addWidget(model_row)
+        tactile_ai_layout.addWidget(execute_safety_row)
+        tactile_ai_layout.addWidget(execute_action_row)
+        tactile_ai_layout.addWidget(self.ai_direct_execution_speed_cap_label)
+        ai_model_layout.addWidget(tactile_ai_group)
+        ai_model_layout.addWidget(proximity_ai_group)
+        ai_model_layout.addWidget(hybrid_ai_group)
         ai_model_layout.addStretch()
+        rule_based_page_layout.addWidget(rule_based_group)
+        rule_based_page_layout.addWidget(admittance_group)
+        rule_based_page_layout.addStretch()
 
         # ─── Subtab “Data Training” ───
         training_page = QWidget()
@@ -3481,14 +4289,35 @@ class UI(
         training_layout.addWidget(self.set_trigger_button)
 
         first_row_layout = QHBoxLayout()
-        gesture_label = QLabel("Enter Gesture Number:")
+        gesture_label = QLabel("Legacy Gesture Label:")
         self.gesture_number_input = QLineEdit()
-        self.gesture_number_input.setFixedSize(50, 40)
+        self.gesture_number_input.setMinimumWidth(160)
+        self.gesture_number_input.setToolTip(
+            "Label used only by the legacy Record button."
+        )
         first_row_layout.addWidget(gesture_label)
         first_row_layout.addWidget(self.gesture_number_input)
+        first_row_layout.addStretch()
         self.record_gesture_button = QPushButton("Record")
         training_layout.addLayout(first_row_layout)
         training_layout.addWidget(self.record_gesture_button)
+
+        ai_dfm_session_row = QWidget()
+        ai_dfm_session_layout = QHBoxLayout(ai_dfm_session_row)
+        ai_dfm_session_layout.setContentsMargins(0, 0, 0, 0)
+        ai_dfm_session_layout.setSpacing(6)
+        ai_dfm_session_layout.addWidget(QLabel("AI-DFM Dataset Session:"))
+        self.ai_dfm_session_input = QLineEdit()
+        self.ai_dfm_session_input.setPlaceholderText(
+            "Auto: ai_dfm_10x10_v1"
+        )
+        self.ai_dfm_session_input.setToolTip(
+            "Optional custom dataset session. Leave blank to group trials "
+            "automatically by sensor size."
+        )
+        ai_dfm_session_layout.addWidget(self.ai_dfm_session_input, 1)
+        training_layout.addWidget(ai_dfm_session_row)
+
         ai_dfm_record_row = QWidget()
         ai_dfm_record_row_layout = QHBoxLayout(ai_dfm_record_row)
         ai_dfm_record_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -3498,6 +4327,36 @@ class UI(
         ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_button, 1)
         ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_robot_button, 1)
         training_layout.addWidget(ai_dfm_record_row)
+
+        environment_record_group = QGroupBox(
+            "AI Proximity Environment Data"
+        )
+        environment_record_layout = QVBoxLayout(environment_record_group)
+        environment_record_layout.setContentsMargins(10, 10, 10, 10)
+        environment_record_layout.setSpacing(6)
+        self.ai_proximity_environment_record_button = QPushButton(
+            f"Record {self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} x "
+            "1-Minute Environment Trials"
+        )
+        self.ai_proximity_environment_record_button.setCheckable(True)
+        self.ai_proximity_environment_record_button.setToolTip(
+            "Automatically record ten separate one-minute normal-environment "
+            "trials without sending robot commands."
+        )
+        self.ai_proximity_environment_record_status = QLabel(
+            "Ready | Session will match the active sensor dimensions"
+        )
+        self.ai_proximity_environment_record_status.setWordWrap(True)
+        self.ai_proximity_environment_record_status.setStyleSheet(
+            theme.MUTED_LABEL_STYLE
+        )
+        environment_record_layout.addWidget(
+            self.ai_proximity_environment_record_button
+        )
+        environment_record_layout.addWidget(
+            self.ai_proximity_environment_record_status
+        )
+        training_layout.addWidget(environment_record_group)
 
         self.ai_teaching_label_group = QGroupBox("AI Teaching Label")
         teaching_grid = QGridLayout(self.ai_teaching_label_group)
@@ -3540,7 +4399,11 @@ class UI(
         training_layout.addStretch()
 
         self.ai_sub_tabs.addTab(ai_model_page, "AI Model")
-        self.ai_sub_tabs.addTab(training_page, "Data Training")
+        self.ai_sub_tabs.addTab(rule_based_page, "Rule Based")
+        self.ai_data_training_tab_index = self.ai_sub_tabs.addTab(
+            training_page,
+            "Data Training",
+        )
         layout.addWidget(self.ai_sub_tabs)
 
     def setup_tab4(self, layout):
@@ -3581,7 +4444,7 @@ class UI(
         force_meter_layout.addLayout(connection_grid)
 
         reading_row = QHBoxLayout()
-        self.force_meter_value_label = QLabel("+0.0 N")
+        self.force_meter_value_label = QLabel("+0.0000 N")
         self.force_meter_value_label.setAlignment(Qt.AlignCenter)
         self.force_meter_value_label.setMinimumWidth(190)
         self.force_meter_value_label.setStyleSheet(

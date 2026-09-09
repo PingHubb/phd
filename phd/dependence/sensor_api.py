@@ -2,8 +2,11 @@ import time
 
 from phd.dependence.sensor_protocol import (
     DEFAULT_SENSOR_BAUD_RATE,
+    DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
     DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
     parse_serial_ints,
+    read_complete_serial_line,
+    sensor_response_timeout_for_values,
 )
 
 try:
@@ -25,6 +28,8 @@ class ArduinoCommander:
         self.serial_port = serial_port
         self.baud_rate = baud_rate
         self.timeout = timeout
+        self.response_timeout = 2.0
+        self.expected_payload_values = None
         self.ser = None
         if bool(connect_immediately):
             self._connect()
@@ -35,7 +40,10 @@ class ArduinoCommander:
     def _connect(self):
         """Try to open the serial connection. Safe to call multiple times."""
         if serial is None:
-            print("[SensorAPI] pyserial is not installed. Sensor API is unavailable.")
+            print(
+                "[SensorAPI] pyserial is not installed. "
+                "Sensor API is unavailable."
+            )
             self.ser = None
             return False
 
@@ -50,7 +58,10 @@ class ArduinoCommander:
             )
             return True
         except serial.SerialException as exc:
-            print(f"[SensorAPI] Serial port {self.serial_port} not available: {exc}")
+            print(
+                f"[SensorAPI] Serial port {self.serial_port} "
+                f"not available: {exc}"
+            )
             self.ser = None
             return False
 
@@ -117,12 +128,16 @@ class ArduinoCommander:
             self.close()
             return False
 
-    def _read_line(self):
+    def _read_line(self, timeout=None):
         if not self.is_connected():
             return ""
 
         try:
-            return self.ser.readline().decode("utf-8", errors="ignore").rstrip()
+            line_timeout = self.timeout if timeout is None else timeout
+            return read_complete_serial_line(
+                self.ser,
+                timeout=max(0.0, float(line_timeout)),
+            )
         except Exception as exc:
             print(f"[SensorAPI] Failed to read from sensor serial port: {exc}")
             self.close()
@@ -131,6 +146,29 @@ class ArduinoCommander:
     @staticmethod
     def _parse_ints(text):
         return parse_serial_ints(text)
+
+    @staticmethod
+    def _extract_sensor_frame(data_list):
+        """Extract the latest complete 55555...44444 framed payload."""
+        values = list(data_list or [])
+        frames = []
+        index = 0
+        while index + 3 < len(values):
+            if values[index:index + 2] != [55555, 55555]:
+                index += 1
+                continue
+            end = index + 2
+            while end + 1 < len(values):
+                if values[end:end + 2] == [44444, 44444]:
+                    payload = values[index + 2:end]
+                    if payload:
+                        frames.append(payload)
+                    index = end + 2
+                    break
+                end += 1
+            else:
+                break
+        return frames[-1] if frames else None
 
     # ------------------------------------------------------------------
     # Command API
@@ -186,37 +224,42 @@ class ArduinoCommander:
     # ------------------------------------------------------------------
     # Response parsing
     # ------------------------------------------------------------------
-    def read_response(self, command, timeout=2):
+    def read_response(self, command, timeout=None):
         if not self.is_connected():
             return None
 
-        start_time = time.time()
+        sensor_frame_command = command in {"readRaw", "readCal", "updateCal"}
+        if timeout is None:
+            timeout = self.response_timeout
+            if sensor_frame_command:
+                timeout = sensor_response_timeout_for_values(
+                    self.expected_payload_values or 0,
+                    baud_rate=getattr(self.ser, "baudrate", self.baud_rate),
+                    minimum=max(
+                        DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
+                        float(timeout),
+                    ),
+                )
+        timeout = max(0.05, float(timeout))
+        deadline = time.perf_counter() + timeout
 
-        while (time.time() - start_time) < timeout:
-            try:
-                if self.ser.in_waiting <= 0:
-                    time.sleep(0.01)
-                    continue
-            except Exception:
-                self.close()
-                return None
-
-            response = self._read_line()
+        while time.perf_counter() < deadline:
+            response = self._read_line(
+                timeout=max(0.0, deadline - time.perf_counter())
+            )
             if not response:
                 continue
 
             data_list = self._parse_ints(response)
 
-            if command in {"readRaw", "readCal", "updateCal"}:
+            if sensor_frame_command:
                 # USB CDC devices can print a boot/debug line immediately
                 # after the serial port opens.  That text is not the response
                 # to our command, so keep waiting for a framed numeric packet
                 # instead of returning an empty payload and failing sensor
                 # calibration.
-                if len(data_list) <= 4:
-                    continue
-                payload = data_list[2:-2]
-                if not payload:
+                payload = self._extract_sensor_frame(data_list)
+                if payload is None:
                     continue
                 return payload
             if command in {"channelCheck", "stop"}:

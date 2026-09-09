@@ -42,6 +42,10 @@ Important modules are grouped by responsibility:
 - `phd/dependence/gesture/`: rule-based and learned control policies.
 - `phd/ui/`: Qt views, controls, and experiment workflows.
 
+Detailed sensor row/column conventions, AI compatibility constraints, and
+known legacy layout issues are documented in
+[`docs/SENSOR_DATA_LAYOUT_AND_COMPATIBILITY.md`](../docs/SENSOR_DATA_LAYOUT_AND_COMPATIBILITY.md).
+
 ## External AI assets
 
 Large AI datasets and checkpoints should live outside the Python package.  By

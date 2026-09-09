@@ -660,7 +660,12 @@ def _save_plots(output_dir: Path, detail: dict[str, dict]) -> None:
 
 def main() -> int:
     default_model = (
-        PACKAGE_ROOT / "resource" / "ai" / "models" / "ai_direct_finger_motion" / "latest_cnn_gru_model.pt"
+        PACKAGE_ROOT
+        / "resource"
+        / "ai"
+        / "models"
+        / "ai_direct_finger_motion"
+        / "latest_cnn_gru_model_10x10.pt"
     )
     default_dataset = PACKAGE_ROOT / "resource" / "ai" / "data" / "ai_direct_finger_motion"
     default_output = PACKAGE_ROOT / "resource" / "ai" / "models" / "ai_direct_finger_motion"

@@ -22,7 +22,10 @@ from phd.dependence.sensor_heatmap import (
     heatmap_3d_rgb,
     heatmap_rgb,
 )
-from phd.dependence.sensor_signal_window import SensorSignalWindow
+from phd.dependence.sensor_signal_window import (
+    SensorSignalHistoryChart,
+    SensorSignalWindow,
+)
 
 
 class _Actor:
@@ -117,6 +120,164 @@ def test_original_3d_palette_keeps_existing_white_to_red_colors():
     np.testing.assert_array_equal(heatmap_3d_rgb(values), expected)
 
 
+def test_signed_3d_heatmap_uses_blue_negative_and_red_positive():
+    values = np.asarray([-5.0, -2.75, 0.0, 2.75, 5.0])
+
+    colors = heatmap_3d_rgb(
+        values,
+        saturation_pct=5.0,
+        noise_floor_pct=0.0,
+        color_gain=1.0,
+        use_absolute_signal=False,
+    )
+
+    np.testing.assert_array_equal(colors[0], [0, 0, 255])
+    assert colors[1, 2] > colors[1, 0]
+    np.testing.assert_array_equal(colors[2], [255, 255, 255])
+    assert colors[3, 0] > colors[3, 2]
+    np.testing.assert_array_equal(colors[4], [255, 0, 0])
+
+
+def test_point_grid_response_is_zero_centered_bounded_and_signed():
+    response = MySensor._point_grid_signal_response
+
+    assert response(
+        0.0,
+        use_absolute_signal=False,
+        noise_floor_pct=0.5,
+        full_scale_pct=5.0,
+    ) == 0.0
+    assert response(
+        -0.5,
+        use_absolute_signal=False,
+        noise_floor_pct=0.5,
+        full_scale_pct=5.0,
+    ) == 0.0
+    assert np.isclose(
+        response(
+            2.75,
+            use_absolute_signal=False,
+            noise_floor_pct=0.5,
+            full_scale_pct=5.0,
+        ),
+        0.5,
+    )
+    assert np.isclose(
+        response(
+            -2.75,
+            use_absolute_signal=False,
+            noise_floor_pct=0.5,
+            full_scale_pct=5.0,
+        ),
+        -0.5,
+    )
+    assert response(
+        -100.0,
+        use_absolute_signal=True,
+        noise_floor_pct=0.5,
+        full_scale_pct=5.0,
+    ) == 1.0
+    assert response(
+        100.0,
+        use_absolute_signal=False,
+        noise_floor_pct=0.5,
+        full_scale_pct=5.0,
+    ) == 1.0
+
+
+def test_point_grid_legacy_response_reproduces_previous_formula_and_color():
+    displacement, color = MySensor._point_grid_visual_state(
+        -5.0,
+        use_absolute_signal=False,
+        response_mode="legacy_offset",
+        sensitivity_scale=0.05,
+        noise_floor_pct=0.5,
+        full_scale_pct=5.0,
+    )
+
+    assert np.isclose(displacement, 0.4)
+    np.testing.assert_allclose(color, [0.0, 0.0, 1.0, 1.0])
+
+    displacement, color = MySensor._point_grid_visual_state(
+        0.0,
+        use_absolute_signal=True,
+        response_mode="legacy_offset",
+        sensitivity_scale=0.05,
+        noise_floor_pct=0.5,
+        full_scale_pct=5.0,
+    )
+
+    assert np.isclose(displacement, 0.15)
+    np.testing.assert_allclose(color, [1.0, 1.0, 1.0, 1.0])
+
+
+def test_signal_viewer_selection_maps_to_matching_3d_plotter_point():
+    sensor = _heatmap_sensor(rows=2, cols=3)
+    sensor.points = np.array(sensor.points_origin, copy=True)
+    sensor.sensor_visualization_mode = "point_grid"
+    sensor.main_visualization_enabled = True
+
+    assert sensor.set_selected_sensor_cell(0, 2, render=False)
+
+    selected_point = np.asarray(sensor.sensorSelectionPoly.points[0])
+    np.testing.assert_allclose(selected_point[:2], [2.0, 0.0])
+    assert selected_point[2] > 0.0
+    assert sensor.sensorSelectionActor.visible
+
+    assert sensor.set_selected_sensor_cell(None, None, render=False)
+    assert not sensor.sensorSelectionActor.visible
+
+
+def test_point_grid_strong_signal_and_viewer_selection_use_same_point():
+    sensor = _heatmap_sensor(rows=2, cols=2)
+    sensor.points = np.array(sensor.points_origin, copy=True)
+    sensor.colors_3d = np.ones((4, 4), dtype=float)
+    sensor.colors = np.ones((4, 4), dtype=float)
+    sensor.array_positions = [[0], [1], [2], [3]]
+    sensor.line_poly = pv.PolyData(sensor.points)
+    sensor._2D_map = pv.PolyData(sensor.points)
+    sensor.sensor_visualization_mode = "point_grid"
+    sensor.main_visualization_enabled = True
+    sensor.touch_sensitivity_scale = 0.05
+    sensor.visualization_use_absolute_signal = True
+    sensor.point_grid_response_mode = "zero_centered"
+    sensor.sensorSelectionActor = None
+    sensor.sensorSelectionPoly = None
+    sensor._selected_sensor_cell = None
+    sensor._data = SimpleNamespace(
+        diffPerDataAve=np.asarray([[5.0, 0.0], [0.0, 0.0]])
+    )
+    sensor._record_visualization_tick = lambda: None
+    sensor._update_contact_force_status = lambda _matrix: None
+    sensor._update_contact_normal_visualization = lambda _matrix: None
+
+    sensor.update_visualization(sensor._data.diffPerDataAve)
+    assert sensor.set_selected_sensor_cell(0, 0, render=False)
+
+    selected_plotter_index = 0
+    assert sensor.colors_3d[selected_plotter_index, 0] == 1.0
+    assert sensor.colors_3d[selected_plotter_index, 1] == 0.0
+    np.testing.assert_allclose(
+        sensor.sensorSelectionPoly.points[0, :2],
+        sensor.points[selected_plotter_index, :2],
+    )
+    assert sensor.points[selected_plotter_index, 2] > 0.0
+    assert sensor.points[1, 2] == 0.0
+
+
+def test_signal_viewer_forwards_selected_cell_to_shared_3d_sensor():
+    received = []
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer._using_shared_sensor_data = True
+    viewer._shared_sensor_functions_ref = SimpleNamespace(
+        set_selected_sensor_cell=lambda row, col: received.append((row, col)) or True
+    )
+    viewer._resolve_sensor_functions = lambda: viewer._shared_sensor_functions_ref
+
+    assert viewer._set_3d_selected_cell(3, 4)
+    assert received == [(3, 4)]
+
+
 def test_white_blue_red_3d_palette_avoids_cyan_yellow_and_orange():
     values = np.linspace(0.5, 5.0, 101)
     colors = heatmap_3d_rgb(
@@ -165,6 +326,65 @@ def test_signal_viewer_and_3d_heatmap_return_identical_colors():
         )
         actual = viewer._color_for_cell(value)
         assert (actual.red(), actual.green(), actual.blue()) == tuple(expected)
+
+
+def test_signal_tracker_preserves_positive_and_negative_difference():
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer.calibration_data = [100.0, 200.0, 300.0]
+
+    signed = viewer._build_signed_diff_list([110.0, 180.0, 300.0])
+
+    assert signed == [10.0, -20.0, 0.0]
+    assert viewer._build_diff_list([110.0, 180.0, 300.0]) == [
+        10.0,
+        20.0,
+        0.0,
+    ]
+
+
+def test_signal_viewer_diff_per_data_is_signed_percentage():
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer.calibration_data = [100.0, 200.0, 0.0]
+
+    values = viewer._build_signed_percent_list([110.0, 180.0, 50.0])
+
+    np.testing.assert_allclose(values, [10.0, -10.0, 0.0])
+
+
+def test_signal_viewer_mode_cycle_includes_diff_per_data():
+    labels = []
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer.display_mode = "diff"
+    viewer.toggle_mode_button = SimpleNamespace(setText=labels.append)
+    viewer.refresh_data = lambda: None
+
+    expected = [
+        ("cal", "Show Raw Values"),
+        ("raw", "Show diffPerData (%)"),
+        ("diff_per", "Show Differences"),
+        ("diff", "Show Calibration"),
+    ]
+    for mode, label in expected:
+        viewer.on_toggle_mode()
+        assert viewer.display_mode == mode
+        assert labels[-1] == label
+
+
+def test_signal_viewer_diff_per_data_uses_five_decimal_places():
+    values = SensorSignalWindow._format_diff_per_values(
+        [1.234567, -0.5, 0.0]
+    )
+
+    assert values == ["1.23457", "-0.50000", "0.00000"]
+
+
+def test_signal_tracker_y_axis_is_symmetric_around_zero():
+    limit = SensorSignalHistoryChart._symmetric_limit(
+        [-2.0, 1.0, 6.0]
+    )
+
+    assert limit >= 6.0
+    assert SensorSignalHistoryChart._symmetric_limit([0.0]) == 1.0
 
 
 def test_signal_viewer_publishes_its_settings_to_3d_heatmap():
@@ -326,8 +546,8 @@ def test_heatmap_uses_same_top_down_row_mapping_as_signal_viewer():
 
     sensor._update_heatmap_visualization(values)
 
-    top_viewer_tile = sensor._heatmap_tile_vertices[1, 1]
-    opposite_tile = sensor._heatmap_tile_vertices[0, 1]
+    top_viewer_tile = sensor._heatmap_tile_vertices[0, 1]
+    opposite_tile = sensor._heatmap_tile_vertices[1, 1]
     np.testing.assert_array_equal(
         sensor.heatmapColors[top_viewer_tile, :3],
         np.tile([255, 0, 0], (4, 1)),
@@ -338,9 +558,12 @@ def test_heatmap_uses_same_top_down_row_mapping_as_signal_viewer():
     )
 
 
-def test_3d_heatmap_uses_latest_frame_instead_of_averaged_frame():
+def test_linear_3d_heatmap_uses_averaged_percentage_frame():
     sensor = _heatmap_sensor(rows=1, cols=1)
-    sensor._data = SimpleNamespace(diffPerData=np.asarray([[4.0]]))
+    sensor._data = SimpleNamespace(
+        diffPerData=np.asarray([[4.0]]),
+        diffPerDataAve=np.asarray([[1.0]]),
+    )
     sensor.sensor_visualization_mode = "heatmap_3d"
     sensor.touch_sensitivity_scale = 0.05
     sensor.points = np.array(sensor.points_origin, copy=True)
@@ -359,8 +582,8 @@ def test_3d_heatmap_uses_latest_frame_instead_of_averaged_frame():
 
     sensor.update_visualization(np.asarray([[1.0]]))
 
-    np.testing.assert_array_equal(received[0], [[4.0]])
-    np.testing.assert_array_equal(sensor._last_sensor_visualization_matrix, [[4.0]])
+    np.testing.assert_array_equal(received[0], [[1.0]])
+    np.testing.assert_array_equal(sensor._last_sensor_visualization_matrix, [[1.0]])
 
 
 def test_heatmap_recording_snapshot_preserves_display_raw_and_calibration_values():
@@ -369,12 +592,13 @@ def test_heatmap_recording_snapshot_preserves_display_raw_and_calibration_values
         rawData=np.asarray([[101.0, 102.0], [103.0, 104.0]]),
         calData=np.full((2, 2), 100.0),
         diffPerData=np.asarray([[1.0, 2.0], [3.0, 4.0]]),
+        diffPerDataAve=np.asarray([[0.5, 1.0], [1.5, 2.0]]),
     )
 
     snapshot = sensor.get_heatmap_recording_snapshot()
 
     np.testing.assert_array_equal(
-        snapshot["heatmap_values"], [[1.0, 2.0], [3.0, 4.0]]
+        snapshot["heatmap_values"], [[0.5, 1.0], [1.5, 2.0]]
     )
     np.testing.assert_array_equal(
         snapshot["raw_values"], [[101.0, 102.0], [103.0, 104.0]]
@@ -401,14 +625,36 @@ def test_recorded_heatmap_frame_uses_existing_live_heatmap_actor():
 
 
 def test_proximity_heatmap_uses_absolute_difference_frame():
-    sensor = _heatmap_sensor(rows=1, cols=1)
+    sensor = _heatmap_sensor(rows=2, cols=2)
     sensor.heatmap_response_mode = HEATMAP_RESPONSE_PROXIMITY_ENHANCED
     sensor._data = SimpleNamespace(
-        diffPerData=np.asarray([[4.0]]),
-        diffData=np.asarray([[60.0]]),
+        diffPerData=np.zeros((2, 2)),
+        diffData=np.asarray([[10.0, 20.0], [30.0, 40.0]]),
     )
 
-    np.testing.assert_array_equal(sensor._current_heatmap_sensor_matrix(), [[60.0]])
+    np.testing.assert_array_equal(
+        sensor._current_heatmap_sensor_matrix(),
+        [[30.0, 40.0], [10.0, 20.0]],
+    )
+
+
+def test_signal_viewer_baseline_is_averaged_for_linear_3d_heatmap():
+    sensor = _heatmap_sensor(rows=2, cols=2)
+    sensor._data = SimpleNamespace(
+        rawData=np.asarray([[120.0, 220.0], [330.0, 440.0]]),
+        rawDataAve=np.asarray([[330.0, 440.0], [110.0, 220.0]]),
+        diffPerData=np.zeros((2, 2)),
+        diffPerDataAve=np.zeros((2, 2)),
+    )
+
+    assert sensor.set_heatmap_calibration_baseline(
+        [100.0, 300.0, 200.0, 400.0], n_row=2, n_col=2
+    )
+
+    np.testing.assert_allclose(
+        sensor.get_heatmap_sensor_matrix(),
+        [[10.0, 10.0], [10.0, 10.0]],
+    )
 
 
 def test_signal_viewer_baseline_is_used_by_3d_proximity_heatmap():
@@ -426,7 +672,54 @@ def test_signal_viewer_baseline_is_used_by_3d_proximity_heatmap():
 
     np.testing.assert_array_equal(
         sensor.get_heatmap_sensor_matrix(),
-        [[30.0, 40.0], [20.0, 100.0]],
+        [[20.0, 100.0], [30.0, 40.0]],
+    )
+
+
+def test_signal_viewer_shared_numbers_match_top_down_heatmap_rows():
+    sensor_functions = SimpleNamespace(
+        n_row=2,
+        n_col=2,
+        _data=SimpleNamespace(
+            rawData=np.asarray([[10.0, 20.0], [30.0, 40.0]]),
+            calData=np.asarray([[1.0, 2.0], [3.0, 4.0]]),
+        ),
+    )
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer.table_rows = 2
+    viewer.table_columns = 2
+    viewer.calibration_data = []
+    viewer.cells_remaining_for_threshold = None
+    viewer._shared_calibration_overridden = False
+    viewer._shared_sensor_functions_ref = sensor_functions
+    viewer._resolve_sensor_functions = lambda: sensor_functions
+
+    raw_values = viewer._read_shared_raw_list()
+
+    assert raw_values == [30.0, 10.0, 40.0, 20.0]
+    assert viewer.calibration_data == [3.0, 1.0, 4.0, 2.0]
+
+
+def test_signal_viewer_publishes_top_down_baseline_in_source_orientation():
+    received = []
+    sensor_functions = SimpleNamespace(
+        _data=SimpleNamespace(),
+        set_heatmap_calibration_baseline=lambda values, **_kwargs: (
+            received.append(np.asarray(values, dtype=float)) or True
+        ),
+    )
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer._using_shared_sensor_data = True
+    viewer._shared_sensor_functions_ref = sensor_functions
+    viewer._resolve_sensor_functions = lambda: sensor_functions
+    viewer.table_rows = 2
+    viewer.table_columns = 2
+    viewer.calibration_data = [30.0, 10.0, 40.0, 20.0]
+
+    assert viewer._publish_heatmap_baseline_to_sensor()
+    np.testing.assert_array_equal(
+        received[0],
+        [[10.0, 20.0], [30.0, 40.0]],
     )
 
 
@@ -452,7 +745,7 @@ def test_heatmap_zero_mask_hides_the_matching_display_tile():
 
     sensor._update_heatmap_visualization(np.full((2, 3), 5.0))
 
-    hidden_tile = sensor._heatmap_tile_vertices[1, 2]
+    hidden_tile = sensor._heatmap_tile_vertices[0, 2]
     assert np.all(sensor.heatmapColors[hidden_tile, 3] == 0)
     assert np.count_nonzero(sensor.heatmapColors[:, 3] == 0) == 4
 
@@ -481,6 +774,8 @@ def test_heatmap_sensitivity_setting_recolors_current_frame_immediately():
         "proximity_knee": DEFAULT_PROXIMITY_KNEE,
         "proximity_saturation": DEFAULT_PROXIMITY_SATURATION,
         "color_gain_3d": DEFAULT_HEATMAP_3D_COLOR_GAIN,
+        "use_absolute_signal": True,
+        "point_grid_response_mode": "zero_centered",
     }
 
 
@@ -499,6 +794,7 @@ def test_heatmap_sensitivity_is_saved_per_sensor_layout():
         {
             "saturation_pct": 12.0,
             "noise_floor_pct": 0.1,
+            "use_absolute_signal": False,
         },
         n_row=7,
         n_col=7,
@@ -513,6 +809,8 @@ def test_heatmap_sensitivity_is_saved_per_sensor_layout():
         "proximity_knee": DEFAULT_PROXIMITY_KNEE,
         "proximity_saturation": DEFAULT_PROXIMITY_SATURATION,
         "color_gain_3d": DEFAULT_HEATMAP_3D_COLOR_GAIN,
+        "use_absolute_signal": False,
+        "point_grid_response_mode": "zero_centered",
     }
     assert sensor.get_saved_sensor_heatmap_config("2d", n_row=7, n_col=7) == {
         "palette_3d": DEFAULT_HEATMAP_3D_PALETTE,
@@ -523,6 +821,8 @@ def test_heatmap_sensitivity_is_saved_per_sensor_layout():
         "proximity_knee": DEFAULT_PROXIMITY_KNEE,
         "proximity_saturation": DEFAULT_PROXIMITY_SATURATION,
         "color_gain_3d": DEFAULT_HEATMAP_3D_COLOR_GAIN,
+        "use_absolute_signal": False,
+        "point_grid_response_mode": "zero_centered",
     }
 
 

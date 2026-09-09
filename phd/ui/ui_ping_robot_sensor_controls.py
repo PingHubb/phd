@@ -6,6 +6,14 @@ import time
 
 from PyQt5 import QtCore
 
+from phd.dependence.goodix_usb_sensor import (
+    GOODIX_USB_COLUMNS,
+    GOODIX_USB_ROWS,
+    GOODIX_USB_SOURCE_ID,
+    GoodixUsbError,
+    is_goodix_usb_source,
+)
+
 
 class _SensorHzResultBridge(QtCore.QObject):
     """Delivers a background Hz measurement result back to the GUI thread."""
@@ -43,9 +51,15 @@ class RobotSensorControlsMixin:
             return None
         current_item = port_list.currentItem()
         item = current_item if current_item in selected_items else selected_items[0]
-        port_name = str(item.text() or "").strip()
+        try:
+            stored_port = item.data(QtCore.Qt.UserRole)
+        except (AttributeError, TypeError):
+            stored_port = None
+        port_name = str(stored_port or item.text() or "").strip()
         if not port_name:
             return None
+        if is_goodix_usb_source(port_name):
+            return GOODIX_USB_SOURCE_ID
         if os.path.isabs(port_name):
             return port_name
         return os.path.join("/dev", port_name)
@@ -57,6 +71,8 @@ class RobotSensorControlsMixin:
                 "Select a serial port in Sensor > Send Operation first."
             )
             return None
+        if is_goodix_usb_source(port_path):
+            return port_path
         if not self.ensure_sensor_api(serial_port=port_path):
             self.log_display.append(f"Could not open selected sensor port: {port_path}")
             return None
@@ -88,6 +104,17 @@ class RobotSensorControlsMixin:
                 )
             return
 
+        if is_goodix_usb_source(port_path):
+            try:
+                payload = sensor.read_goodix_raw_frame()
+            except (AttributeError, GoodixUsbError) as exc:
+                self.log_display.append(f"Goodix USB raw read failed: {exc}")
+            else:
+                self.log_display.append(
+                    f"API raw data ({GOODIX_USB_SOURCE_ID}): {payload}"
+                )
+            return
+
         port_path = self._prepare_selected_sensor_api()
         if port_path:
             self.log_display.append(
@@ -116,6 +143,16 @@ class RobotSensorControlsMixin:
         )
         if sensor is not None and reader_is_running():
             self._measure_stream_hz(sensor)
+            return
+
+        if is_goodix_usb_source(port_path):
+            client = getattr(sensor, "_goodix_client", None)
+            if client is None:
+                self.log_display.append(
+                    "Build the Goodix USB sensor scene before measuring its rate."
+                )
+                return
+            self._measure_direct_hz(api=client, label="Goodix USB raw Hz")
             return
 
         if not self.ensure_sensor_api(serial_port=port_path):
@@ -156,13 +193,13 @@ class RobotSensorControlsMixin:
 
         QtCore.QTimer.singleShot(int(duration_ms), finish)
 
-    def _measure_direct_hz(self):
+    def _measure_direct_hz(self, api=None, label="Sensor API raw Hz"):
         self._set_sensor_hz_measurement_running(True)
-        self.log_display.append("Measuring sensor API raw Hz over 1s (background)...")
+        self.log_display.append(f"Measuring {label} over 1s (background)...")
 
         bridge = _SensorHzResultBridge(self)
         bridge.finished.connect(self._on_sensor_hz_measured)
-        api = self.sensor_api
+        api = api or self.sensor_api
 
         def worker():
             try:
@@ -186,14 +223,34 @@ class RobotSensorControlsMixin:
         if not result:
             self.log_display.append("Sensor API raw Hz measurement failed.")
             return
+        backend = str(result.get("backend", "") or "").strip()
+        backend_text = f" | backend={backend}" if backend else ""
         self.log_display.append(
             "Sensor API raw Hz: "
             f"{result['hz']:.2f} | "
             f"success={result['success_count']} / attempts={result['total_attempts']} | "
             f"elapsed={result['elapsed_sec']:.2f}s"
+            f"{backend_text}"
         )
 
     def _on_sensor_api_channel_check(self):
+        port_path = self._get_selected_sensor_port_path()
+        if is_goodix_usb_source(port_path):
+            sensor = getattr(self, "sensor_functions", None)
+            client = getattr(sensor, "_goodix_client", None)
+            backend = (
+                f" Backend: {client.backend_status}."
+                if client is not None
+                else ""
+            )
+            self.log_display.append(
+                "Goodix USB channels: "
+                f"{GOODIX_USB_ROWS} rows x {GOODIX_USB_COLUMNS} columns = "
+                f"{GOODIX_USB_ROWS * GOODIX_USB_COLUMNS} taxels "
+                "(drv_num=8, sen_num=10)."
+                f"{backend}"
+            )
+            return
         sensor = getattr(self, "sensor_functions", None)
         if sensor is not None and getattr(
             sensor, "_sensor_reader_is_running", lambda: False
@@ -210,6 +267,14 @@ class RobotSensorControlsMixin:
             )
 
     def _on_sensor_update(self):
+        sensor = getattr(self, "sensor_functions", None)
+        if sensor is not None and getattr(
+            sensor,
+            "is_goodix_usb_transport",
+            lambda: False,
+        )():
+            sensor.updateCal()
+            return
         if self.ensure_sensor_api():
             self.sensor_functions.updateCal()
         else:

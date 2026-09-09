@@ -1,6 +1,11 @@
 import os
 import sys
 import time
+import math
+import csv
+from collections import deque
+
+import numpy as np
 
 try:
     import serial
@@ -8,7 +13,7 @@ try:
 except ImportError:
     serial = None
 
-from PyQt5.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import QObject, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
@@ -30,7 +35,16 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QWidget,
 )
-from PyQt5.QtGui import QBrush, QColor, QFont, QImage, QPainter
+from PyQt5.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+)
+from phd.ui import theme
 from phd.dependence.sensor_heatmap import (
     DEFAULT_HEATMAP_3D_COLOR_GAIN,
     DEFAULT_HEATMAP_3D_PALETTE,
@@ -77,14 +91,14 @@ class _SensorSignalReadWorker(QObject):
         self,
         sensor_api,
         generation=0,
-        interval_ms=REFRESH_INTERVAL_MS,
+        interval_ms=0,
         response_timeout=DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
         idle_sleep_sec=DEFAULT_SENSOR_IDLE_SLEEP_SEC,
     ):
         super().__init__()
         self.sensor_api = sensor_api
         self.generation = int(generation)
-        self.interval_sec = max(0.001, float(interval_ms) / 1000.0)
+        self.interval_sec = max(0.0, float(interval_ms) / 1000.0)
         self.response_timeout = max(0.05, float(response_timeout))
         self.idle_sleep_sec = max(0.0, float(idle_sleep_sec))
         self._running = False
@@ -159,28 +173,56 @@ class CellDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index):
         painter.save()
 
+        is_selected = bool(
+            self.window is not None
+            and getattr(self.window, "selected_index", None)
+            == index.column() * int(getattr(self.window, "table_rows", 0))
+            + index.row()
+        )
         background_brush = index.data(Qt.BackgroundRole)
         if background_brush:
             painter.fillRect(option.rect, background_brush)
 
         if self.window and self.window.hide_numbers:
+            if is_selected:
+                selected_pen = QPen(QColor(theme.SUCCESS_HOVER), 3)
+                painter.setPen(selected_pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawRect(option.rect.adjusted(2, 2, -3, -3))
             painter.restore()
             return
 
         main_text = index.data(Qt.DisplayRole)
         if main_text is not None:
-            painter.setFont(option.font)
-            painter.setPen(QColor(Qt.black))
+            main_font = QFont(option.font)
+            main_font.setBold(is_selected)
+            painter.setFont(main_font)
+            painter.setPen(
+                QColor(theme.SUCCESS_HOVER)
+                if is_selected
+                else QColor(Qt.black)
+            )
             painter.drawText(option.rect, Qt.AlignCenter, str(main_text))
 
         cal_text = index.data(CALIBRATION_ROLE)
         if cal_text is not None:
             cal_font = QFont(option.font)
             cal_font.setPointSize(7)
+            cal_font.setBold(is_selected)
             painter.setFont(cal_font)
-            painter.setPen(QColor(Qt.darkGray))
+            painter.setPen(
+                QColor(theme.SUCCESS)
+                if is_selected
+                else QColor(Qt.darkGray)
+            )
             text_rect = option.rect.adjusted(3, 3, -3, -3)
             painter.drawText(text_rect, Qt.AlignTop | Qt.AlignLeft, str(cal_text))
+
+        if is_selected:
+            selected_pen = QPen(QColor(theme.SUCCESS_HOVER), 3)
+            painter.setPen(selected_pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRect(option.rect.adjusted(2, 2, -3, -3))
 
         painter.restore()
 
@@ -248,6 +290,636 @@ class SerialPortDialog(QDialog):
         return self.selected_port
 
 
+class SensorSignalHistoryChart(QWidget):
+    """Rolling signed-difference chart with zero fixed at the vertical centre."""
+
+    MAX_HISTORY_SECONDS = 600.0
+
+    def __init__(self, parent=None, time_window_seconds=30.0):
+        super().__init__(parent)
+        self._samples = deque()
+        self._time_window_seconds = max(1.0, float(time_window_seconds))
+        self._paused = False
+        self.setMinimumHeight(340)
+
+    @property
+    def sample_count(self):
+        return len(self._samples)
+
+    @property
+    def paused(self):
+        return self._paused
+
+    @staticmethod
+    def _nice_step(value):
+        value = max(float(value), 1e-12)
+        magnitude = 10.0 ** math.floor(math.log10(value))
+        normalized = value / magnitude
+        for candidate in (1.0, 2.0, 2.5, 5.0, 10.0):
+            if normalized <= candidate:
+                return candidate * magnitude
+        return 10.0 * magnitude
+
+    @classmethod
+    def _symmetric_limit(cls, values):
+        max_abs = max((abs(float(value)) for value in values), default=0.0)
+        if max_abs <= 1e-12:
+            return 1.0
+        padded = max_abs * 1.15
+        step = cls._nice_step(padded / 3.0)
+        return max(step, math.ceil(padded / step) * step)
+
+    @staticmethod
+    def _format_value(value):
+        value = float(value)
+        if abs(value) >= 1000.0:
+            return f"{value:.0f}"
+        if abs(value) >= 10.0:
+            return f"{value:.1f}"
+        return f"{value:.3f}"
+
+    def set_time_window(self, seconds):
+        self._time_window_seconds = max(1.0, float(seconds))
+        self.update()
+
+    def set_paused(self, paused):
+        self._paused = bool(paused)
+
+    def append_sample(self, value, filtered_value=None, timestamp=None):
+        timestamp = time.monotonic() if timestamp is None else float(timestamp)
+        value = float(value)
+        filtered_value = (
+            value if filtered_value is None else float(filtered_value)
+        )
+        if not (
+            math.isfinite(timestamp)
+            and math.isfinite(value)
+            and math.isfinite(filtered_value)
+        ):
+            return
+        self._samples.append((timestamp, value, filtered_value))
+        cutoff = timestamp - self.MAX_HISTORY_SECONDS
+        while self._samples and self._samples[0][0] < cutoff:
+            self._samples.popleft()
+
+    def visible_samples(self):
+        if not self._samples:
+            return []
+        latest_time = self._samples[-1][0]
+        earliest_time = latest_time - self._time_window_seconds
+        return [
+            sample for sample in self._samples
+            if sample[0] >= earliest_time
+        ]
+
+    def statistics(self):
+        visible = self.visible_samples()
+        if not visible:
+            return None
+        raw_values = np.asarray(
+            [sample[1] for sample in visible], dtype=float
+        )
+        duration = max(
+            0.0,
+            float(visible[-1][0]) - float(visible[0][0]),
+        )
+        sample_rate = (
+            (len(visible) - 1) / duration
+            if len(visible) > 1 and duration > 1e-9
+            else 0.0
+        )
+        return {
+            "current": float(raw_values[-1]),
+            "filtered_current": float(visible[-1][2]),
+            "minimum": float(np.min(raw_values)),
+            "maximum": float(np.max(raw_values)),
+            "mean": float(np.mean(raw_values)),
+            "std": float(np.std(raw_values)),
+            "rms": float(np.sqrt(np.mean(np.square(raw_values)))),
+            "sample_rate": float(sample_rate),
+            "sample_count": int(len(visible)),
+        }
+
+    def recompute_filtered(self, window_size):
+        window_size = max(1, int(window_size))
+        recent = deque(maxlen=window_size)
+        rebuilt = deque()
+        for timestamp, raw_value, _filtered_value in self._samples:
+            recent.append(float(raw_value))
+            rebuilt.append(
+                (
+                    timestamp,
+                    raw_value,
+                    float(sum(recent) / len(recent)),
+                )
+            )
+        self._samples = rebuilt
+        self.update()
+
+    def clear(self):
+        self._samples.clear()
+        self.update()
+
+    def paintEvent(self, _event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor(theme.INPUT_BG))
+
+        plot_rect = self.rect().adjusted(76, 30, -22, -48)
+        if plot_rect.width() <= 20 or plot_rect.height() <= 20:
+            return
+
+        middle_y = plot_rect.center().y()
+        positive_fill = QColor(theme.DANGER)
+        positive_fill.setAlpha(20)
+        negative_fill = QColor(theme.INFO)
+        negative_fill.setAlpha(20)
+        painter.fillRect(
+            QRectF(
+                plot_rect.left(),
+                plot_rect.top(),
+                plot_rect.width(),
+                plot_rect.height() / 2.0,
+            ),
+            positive_fill,
+        )
+        painter.fillRect(
+            QRectF(
+                plot_rect.left(),
+                middle_y,
+                plot_rect.width(),
+                plot_rect.height() / 2.0,
+            ),
+            negative_fill,
+        )
+
+        painter.setPen(QPen(QColor(theme.BORDER), 1))
+        painter.drawRect(plot_rect)
+
+        if not self._samples:
+            painter.setPen(QColor(theme.TEXT_MUTED))
+            painter.drawText(
+                plot_rect,
+                Qt.AlignCenter,
+                "Waiting for signed difference samples",
+            )
+            self._draw_axis_titles(painter, plot_rect)
+            return
+
+        latest_time = self._samples[-1][0]
+        earliest_time = latest_time - self._time_window_seconds
+        visible = self.visible_samples()
+        if not visible:
+            return
+
+        raw_values = [sample[1] for sample in visible]
+        filtered_values = [sample[2] for sample in visible]
+        limit = self._symmetric_limit(raw_values + filtered_values)
+
+        grid_pen = QPen(QColor(theme.BORDER_SUBTLE), 1)
+        grid_pen.setStyle(Qt.DashLine)
+        painter.setPen(grid_pen)
+        for index in range(5):
+            ratio = index / 4.0
+            x = plot_rect.left() + ratio * plot_rect.width()
+            painter.drawLine(int(x), plot_rect.top(), int(x), plot_rect.bottom())
+            relative_seconds = -self._time_window_seconds * (1.0 - ratio)
+            label = "0" if index == 4 else f"{relative_seconds:.0f}"
+            painter.setPen(QColor(theme.TEXT_MUTED))
+            painter.drawText(
+                QRectF(x - 28, plot_rect.bottom() + 6, 56, 18),
+                Qt.AlignHCenter | Qt.AlignTop,
+                label,
+            )
+            painter.setPen(grid_pen)
+
+        for ratio in (0.25, 0.75):
+            y = plot_rect.top() + ratio * plot_rect.height()
+            painter.drawLine(plot_rect.left(), int(y), plot_rect.right(), int(y))
+
+        zero_pen = QPen(QColor(theme.TEXT_PRIMARY), 2)
+        painter.setPen(zero_pen)
+        painter.drawLine(
+            plot_rect.left(),
+            int(middle_y),
+            plot_rect.right(),
+            int(middle_y),
+        )
+
+        painter.setPen(QColor(theme.TEXT_MUTED))
+        painter.drawText(
+            QRectF(4, plot_rect.top() - 9, plot_rect.left() - 10, 18),
+            Qt.AlignRight | Qt.AlignVCenter,
+            f"+{self._format_value(limit)}",
+        )
+        painter.drawText(
+            QRectF(4, middle_y - 9, plot_rect.left() - 10, 18),
+            Qt.AlignRight | Qt.AlignVCenter,
+            "0",
+        )
+        painter.drawText(
+            QRectF(4, plot_rect.bottom() - 9, plot_rect.left() - 10, 18),
+            Qt.AlignRight | Qt.AlignVCenter,
+            f"-{self._format_value(limit)}",
+        )
+
+        raw_points = []
+        filtered_points = []
+        for timestamp, raw_value, filtered_value in visible:
+            x_ratio = (timestamp - earliest_time) / self._time_window_seconds
+            x = plot_rect.left() + x_ratio * plot_rect.width()
+            raw_y_ratio = (raw_value + limit) / (2.0 * limit)
+            filtered_y_ratio = (filtered_value + limit) / (2.0 * limit)
+            raw_y = (
+                plot_rect.bottom()
+                - raw_y_ratio * plot_rect.height()
+            )
+            filtered_y = (
+                plot_rect.bottom()
+                - filtered_y_ratio * plot_rect.height()
+            )
+            raw_points.append((x, raw_y, raw_value))
+            filtered_points.append((x, filtered_y, filtered_value))
+
+        if raw_points:
+            raw_path = QPainterPath()
+            raw_path.moveTo(raw_points[0][0], raw_points[0][1])
+            for point in raw_points[1:]:
+                raw_path.lineTo(point[0], point[1])
+            raw_colour = QColor(theme.TEXT_MUTED)
+            raw_colour.setAlpha(155)
+            painter.setPen(QPen(raw_colour, 1))
+            painter.drawPath(raw_path)
+
+        for previous, current in zip(filtered_points, filtered_points[1:]):
+            colour = theme.DANGER if current[2] >= 0.0 else theme.INFO
+            painter.setPen(QPen(QColor(colour), 3))
+            painter.drawLine(
+                int(previous[0]),
+                int(previous[1]),
+                int(current[0]),
+                int(current[1]),
+            )
+
+        if filtered_points:
+            latest_x, latest_y, latest_value = filtered_points[-1]
+            latest_colour = theme.DANGER if latest_value >= 0.0 else theme.INFO
+            painter.setPen(QPen(QColor(latest_colour), 1))
+            painter.setBrush(QColor(latest_colour))
+            painter.drawEllipse(
+                QRectF(latest_x - 4, latest_y - 4, 8, 8)
+            )
+
+        legend_y = plot_rect.top() - 12
+        painter.setPen(QPen(QColor(theme.TEXT_MUTED), 1))
+        painter.drawLine(
+            plot_rect.right() - 190,
+            legend_y,
+            plot_rect.right() - 170,
+            legend_y,
+        )
+        painter.drawText(
+            plot_rect.right() - 165,
+            legend_y + 4,
+            "Raw",
+        )
+        painter.setPen(QPen(QColor(theme.DANGER), 3))
+        painter.drawLine(
+            plot_rect.right() - 105,
+            legend_y,
+            plot_rect.right() - 85,
+            legend_y,
+        )
+        painter.setPen(QColor(theme.TEXT_MUTED))
+        painter.drawText(
+            plot_rect.right() - 80,
+            legend_y + 4,
+            "Filtered",
+        )
+
+        self._draw_axis_titles(painter, plot_rect)
+
+    def _draw_axis_titles(self, painter, plot_rect):
+        painter.setPen(QColor(theme.TEXT_MUTED))
+        painter.drawText(
+            QRectF(plot_rect.left(), self.height() - 22, plot_rect.width(), 18),
+            Qt.AlignCenter,
+            "Time from latest sample (s)",
+        )
+        painter.save()
+        painter.translate(15, plot_rect.center().y())
+        painter.rotate(-90)
+        painter.drawText(
+            QRectF(-plot_rect.height() / 2, -9, plot_rect.height(), 18),
+            Qt.AlignCenter,
+            "Raw - calibration (signal units)",
+        )
+        painter.restore()
+
+
+class SensorSignalTrackingWindow(QDialog):
+    """Modeless live-history window for one selected sensor cell."""
+
+    def __init__(self, flat_index, row, column, parent=None):
+        super().__init__(parent, flags=Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.flat_index = int(flat_index)
+        self.row = int(row)
+        self.column = int(column)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.setWindowTitle(
+            f"Live Sensor Difference - P{self.flat_index} "
+            f"(r{self.row}, c{self.column})"
+        )
+        self.resize(1000, 520)
+        self._filter_window = 10
+        self._filter_values = deque(maxlen=self._filter_window)
+        self._latest_record = None
+        self._recording_file = None
+        self._recording_writer = None
+        self._recording_path = ""
+        self._recording_buffer = []
+        self._recording_started_at = None
+        self._recording_count = 0
+
+        layout = QVBoxLayout(self)
+        self.current_label = QLabel(
+            f"P{self.flat_index}  r{self.row} c{self.column} | waiting for data"
+        )
+        self.current_label.setAlignment(Qt.AlignCenter)
+        self.current_label.setStyleSheet(theme.INFO_LABEL_STYLE)
+        layout.addWidget(self.current_label)
+
+        self.chart = SensorSignalHistoryChart(self, time_window_seconds=30.0)
+        layout.addWidget(self.chart, stretch=1)
+
+        self.stats_label = QLabel("Statistics: waiting for samples")
+        self.stats_label.setAlignment(Qt.AlignCenter)
+        self.stats_label.setWordWrap(True)
+        self.stats_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        layout.addWidget(self.stats_label)
+
+        controls = QHBoxLayout()
+        self.pause_button = QPushButton("Pause Display")
+        self.pause_button.setCheckable(True)
+        self.pause_button.toggled.connect(self._on_pause_toggled)
+        controls.addWidget(self.pause_button)
+
+        clear_button = QPushButton("Clear History")
+        clear_button.clicked.connect(self.clear_history)
+        controls.addWidget(clear_button)
+
+        controls.addWidget(QLabel("Time window:"))
+        self.window_combo = QComboBox()
+        for seconds in (10, 30, 60, 120):
+            self.window_combo.addItem(f"{seconds} s", seconds)
+        self.window_combo.setCurrentIndex(1)
+        self.window_combo.currentIndexChanged.connect(
+            lambda _index: self.chart.set_time_window(
+                float(self.window_combo.currentData())
+            )
+        )
+        controls.addWidget(self.window_combo)
+
+        controls.addWidget(QLabel("Moving average:"))
+        self.filter_combo = QComboBox()
+        for samples in (1, 5, 10, 20, 50):
+            label = "Off" if samples == 1 else f"{samples} frames"
+            self.filter_combo.addItem(label, samples)
+        self.filter_combo.setCurrentIndex(2)
+        self.filter_combo.currentIndexChanged.connect(
+            self._on_filter_window_changed
+        )
+        controls.addWidget(self.filter_combo)
+
+        self.record_button = QPushButton("Start CSV Recording")
+        self.record_button.clicked.connect(self._on_record_button_clicked)
+        controls.addWidget(self.record_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        self.recording_label = QLabel("CSV recording: off")
+        self.recording_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        self.recording_label.setWordWrap(True)
+        layout.addWidget(self.recording_label)
+
+        self._display_timer = QTimer(self)
+        self._display_timer.setInterval(33)
+        self._display_timer.timeout.connect(self._refresh_display)
+        self._display_timer.start()
+
+        self._recording_flush_timer = QTimer(self)
+        self._recording_flush_timer.setInterval(500)
+        self._recording_flush_timer.timeout.connect(
+            self._flush_recording_buffer
+        )
+
+    def _on_pause_toggled(self, paused):
+        self.chart.set_paused(paused)
+        self.pause_button.setText(
+            "Resume Display" if paused else "Pause Display"
+        )
+
+    def _on_filter_window_changed(self, _index):
+        self._filter_window = max(
+            1, int(self.filter_combo.currentData())
+        )
+        self._filter_values = deque(maxlen=self._filter_window)
+        raw_history = [
+            sample[1] for sample in list(self.chart._samples)[
+                -self._filter_window:
+            ]
+        ]
+        self._filter_values.extend(raw_history)
+        self.chart.recompute_filtered(self._filter_window)
+
+    def clear_history(self):
+        self.chart.clear()
+        self._filter_values.clear()
+        self._latest_record = None
+        self.current_label.setText(
+            f"P{self.flat_index}  r{self.row} c{self.column} | waiting for data"
+        )
+        self.stats_label.setText("Statistics: waiting for samples")
+
+    def append_frame(
+        self,
+        timestamp,
+        frame_sequence,
+        raw_value,
+        calibration_value,
+    ):
+        timestamp = float(timestamp)
+        raw_value = float(raw_value)
+        calibration_value = float(calibration_value)
+        difference = raw_value - calibration_value
+        self._filter_values.append(difference)
+        filtered = float(
+            sum(self._filter_values) / len(self._filter_values)
+        )
+        self.chart.append_sample(
+            difference,
+            filtered_value=filtered,
+            timestamp=timestamp,
+        )
+        self._latest_record = {
+            "timestamp": timestamp,
+            "frame_sequence": int(frame_sequence),
+            "raw": raw_value,
+            "calibration": calibration_value,
+            "difference": difference,
+            "filtered": filtered,
+        }
+        if self._recording_writer is not None:
+            if self._recording_started_at is None:
+                self._recording_started_at = timestamp
+            self._recording_buffer.append(
+                [
+                    f"{timestamp:.9f}",
+                    f"{timestamp - self._recording_started_at:.9f}",
+                    int(frame_sequence),
+                    self.flat_index,
+                    self.row,
+                    self.column,
+                    f"{raw_value:.9f}",
+                    f"{calibration_value:.9f}",
+                    f"{difference:.9f}",
+                    f"{filtered:.9f}",
+                ]
+            )
+            self._recording_count += 1
+            if len(self._recording_buffer) >= 200:
+                self._flush_recording_buffer()
+
+    def append_sample(self, value, timestamp=None):
+        """Compatibility helper used by lightweight UI tests."""
+        timestamp = time.monotonic() if timestamp is None else timestamp
+        self.append_frame(timestamp, -1, value, 0.0)
+
+    def _refresh_display(self):
+        if self.chart.paused:
+            return
+        self.chart.update()
+        record = self._latest_record
+        stats = self.chart.statistics()
+        if record is None or stats is None:
+            return
+        difference = float(record["difference"])
+        filtered = float(record["filtered"])
+        sign = "+" if difference > 0.0 else ""
+        filtered_sign = "+" if filtered > 0.0 else ""
+        self.current_label.setText(
+            f"P{self.flat_index}  r{self.row} c{self.column} | "
+            f"Raw: {record['raw']:.3f} | Cal: {record['calibration']:.3f} | "
+            f"Difference: {sign}{difference:.3f} | "
+            f"Filtered: {filtered_sign}{filtered:.3f}"
+        )
+        self.stats_label.setText(
+            f"Window samples: {stats['sample_count']}  |  "
+            f"Rate: {stats['sample_rate']:.1f} Hz  |  "
+            f"Min: {stats['minimum']:.3f}  |  "
+            f"Max: {stats['maximum']:.3f}  |  "
+            f"Mean: {stats['mean']:.3f}  |  "
+            f"Std: {stats['std']:.3f}  |  "
+            f"RMS: {stats['rms']:.3f}"
+        )
+        if self._recording_writer is not None:
+            self.recording_label.setText(
+                f"CSV recording: {self._recording_count} native frames | "
+                f"{self._recording_path}"
+            )
+
+    def _on_record_button_clicked(self):
+        if self._recording_writer is not None:
+            self.stop_csv_recording()
+            return
+        default_dir = resource_path("sensor_signal_recordings")
+        try:
+            os.makedirs(default_dir, exist_ok=True)
+        except OSError:
+            default_dir = os.path.expanduser("~")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        default_path = os.path.join(
+            default_dir,
+            f"signal_P{self.flat_index}_r{self.row}_c{self.column}_{stamp}.csv",
+        )
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Record Selected Sensor Signal",
+            default_path,
+            "CSV files (*.csv)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            handle = open(path, "w", newline="", encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "CSV Recording",
+                f"Could not open CSV file:\n{exc}",
+            )
+            return
+        self._recording_file = handle
+        self._recording_writer = csv.writer(handle)
+        self._recording_writer.writerow(
+            [
+                "timestamp_monotonic_s",
+                "elapsed_s",
+                "frame_sequence",
+                "point_id",
+                "row",
+                "column",
+                "raw_signal",
+                "calibration_signal",
+                "signed_difference",
+                "filtered_difference",
+            ]
+        )
+        self._recording_path = path
+        self._recording_buffer = []
+        self._recording_started_at = None
+        self._recording_count = 0
+        self.record_button.setText("Stop CSV Recording")
+        self.recording_label.setText(f"CSV recording started: {path}")
+        self._recording_flush_timer.start()
+
+    def _flush_recording_buffer(self):
+        if self._recording_writer is None or self._recording_file is None:
+            return
+        if self._recording_buffer:
+            self._recording_writer.writerows(self._recording_buffer)
+            self._recording_buffer.clear()
+        try:
+            self._recording_file.flush()
+        except OSError:
+            pass
+
+    def stop_csv_recording(self):
+        if self._recording_writer is None:
+            return
+        self._recording_flush_timer.stop()
+        self._flush_recording_buffer()
+        try:
+            self._recording_file.close()
+        except OSError:
+            pass
+        saved_path = self._recording_path
+        saved_count = self._recording_count
+        self._recording_file = None
+        self._recording_writer = None
+        self.record_button.setText("Start CSV Recording")
+        self.recording_label.setText(
+            f"CSV saved: {saved_count} native frames | {saved_path}"
+        )
+
+    def closeEvent(self, event):
+        self._display_timer.stop()
+        self.stop_csv_recording()
+        super().closeEvent(event)
+
+
 class SensorSignalWindow(QWidget):
     def __init__(self, parent=None, sensor_functions_ref=None):
         super().__init__(parent, flags=Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
@@ -264,16 +936,19 @@ class SensorSignalWindow(QWidget):
         self._reader_generation = 0
         self._latest_raw_list = []
         self._last_reader_error_log_time = 0.0
+        self._standalone_frame_sequence = 0
+        self._native_frame_signal = None
 
         self.table_rows = 1
         self.table_columns = 1
         self.calibration_data = []
-        self.display_mode = "raw"
-        self.hide_numbers = True
+        self.display_mode = "diff"
+        self.hide_numbers = False
         self.initial_diffs = []
         self.threshold_max = {}
         self.cells_remaining_for_threshold = None
         self.selected_index = None
+        self._signal_tracker_window = None
         self._heatmap_saturation_pct = float(DEFAULT_HEATMAP_SATURATION_PCT)
         self._heatmap_noise_floor_pct = float(DEFAULT_HEATMAP_NOISE_FLOOR_PCT)
         self._heatmap_response_mode = DEFAULT_HEATMAP_RESPONSE_MODE
@@ -519,7 +1194,11 @@ class SensorSignalWindow(QWidget):
         self.update_cal_button.clicked.connect(self.on_update_calibration)
         info_layout.addWidget(self.update_cal_button)
 
-        self.toggle_mode_button = QPushButton("Show Differences")
+        self.toggle_mode_button = QPushButton("Show Calibration")
+        self.toggle_mode_button.setToolTip(
+            "Cycle table values through difference, calibration, raw, and "
+            "signed diffPerData percentage."
+        )
         self.toggle_mode_button.clicked.connect(self.on_toggle_mode)
         info_layout.addWidget(self.toggle_mode_button)
 
@@ -528,7 +1207,17 @@ class SensorSignalWindow(QWidget):
         self.action_button.clicked.connect(self.on_action_clicked)
         info_layout.addWidget(self.action_button)
 
-        self.hide_button = QPushButton("Show Numbers")
+        self.track_signal_button = QPushButton("Track Selected Signal")
+        self.track_signal_button.setEnabled(False)
+        self.track_signal_button.setToolTip(
+            "Open a live signed raw-minus-calibration graph for the selected cell."
+        )
+        self.track_signal_button.clicked.connect(
+            self.on_track_selected_signal
+        )
+        info_layout.addWidget(self.track_signal_button)
+
+        self.hide_button = QPushButton("Hide Numbers")
         self.hide_button.clicked.connect(self.on_toggle_hide)
         info_layout.addWidget(self.hide_button)
 
@@ -865,8 +1554,55 @@ class SensorSignalWindow(QWidget):
         self.table_columns = max(1, n_col)
         self._sync_shared_calibration()
         self._publish_heatmap_settings_to_sensor()
+        self._connect_shared_native_frame_signal(sensor_functions)
         self.info_label.setText("Using live sensor stream")
         return True
+
+    def _connect_shared_native_frame_signal(self, sensor_functions):
+        bridge = getattr(sensor_functions, "_payload_bridge", None)
+        signal = getattr(bridge, "frame_processed", None)
+        if signal is None or self._native_frame_signal is not None:
+            return False
+        try:
+            signal.connect(self._on_shared_native_frame_processed)
+        except Exception:
+            return False
+        self._native_frame_signal = signal
+        return True
+
+    def _disconnect_shared_native_frame_signal(self):
+        signal = getattr(self, "_native_frame_signal", None)
+        if signal is None:
+            return
+        try:
+            signal.disconnect(self._on_shared_native_frame_processed)
+        except Exception:
+            pass
+        self._native_frame_signal = None
+
+    def _on_shared_native_frame_processed(
+        self,
+        timestamp,
+        frame_sequence,
+        raw_matrix,
+        calibration_matrix,
+    ):
+        raw_list = self._flatten_shared_matrix_for_display(
+            raw_matrix,
+            self.table_rows,
+            self.table_columns,
+        )
+        calibration_list = self._flatten_shared_matrix_for_display(
+            calibration_matrix,
+            self.table_rows,
+            self.table_columns,
+        )
+        self._append_tracker_native_frame(
+            timestamp,
+            frame_sequence,
+            raw_list,
+            calibration_list,
+        )
 
     def _has_sensor_source(self):
         return bool(self._using_shared_sensor_data or self.sensor_api)
@@ -888,6 +1624,28 @@ class SensorSignalWindow(QWidget):
                 values.append(value.item() if hasattr(value, "item") else value)
         return values
 
+    def _flatten_shared_matrix_for_display(self, matrix, rows, columns):
+        """Convert a source-oriented shared matrix to top-down table rows."""
+        try:
+            display_matrix = np.flipud(np.asarray(matrix))
+        except Exception:
+            return []
+        return self._flatten_sensor_matrix_column_major(
+            display_matrix, rows, columns
+        )
+
+    @staticmethod
+    def _display_list_to_shared_matrix(values, rows, columns):
+        """Convert a top-down, column-major table list back to source rows."""
+        try:
+            flat = np.asarray(values, dtype=float)
+            if flat.size != int(rows) * int(columns):
+                return None
+            display_matrix = flat.reshape(int(columns), int(rows)).T
+            return np.flipud(display_matrix)
+        except (TypeError, ValueError):
+            return None
+
     def _get_shared_sensor_functions(self):
         sensor_functions = self._resolve_sensor_functions()
         if sensor_functions is not None and getattr(sensor_functions, "_data", None) is not None:
@@ -907,7 +1665,9 @@ class SensorSignalWindow(QWidget):
         rows = max(1, int(getattr(sensor_functions, "n_row", self.table_rows) or self.table_rows))
         columns = max(1, int(getattr(sensor_functions, "n_col", self.table_columns) or self.table_columns))
         cal_matrix = getattr(data_obj, "calData", None)
-        cal_values = self._flatten_sensor_matrix_column_major(cal_matrix, rows, columns)
+        cal_values = self._flatten_shared_matrix_for_display(
+            cal_matrix, rows, columns
+        )
         if cal_values and cal_values != self.calibration_data:
             self.calibration_data = cal_values
             self.cells_remaining_for_threshold = len(self.calibration_data)
@@ -922,9 +1682,16 @@ class SensorSignalWindow(QWidget):
         if not callable(setter):
             return False
         try:
+            baseline_matrix = self._display_list_to_shared_matrix(
+                self.calibration_data,
+                self.table_rows,
+                self.table_columns,
+            )
+            if baseline_matrix is None:
+                return False
             return bool(
                 setter(
-                    self.calibration_data,
+                    baseline_matrix,
                     n_row=self.table_rows,
                     n_col=self.table_columns,
                 )
@@ -958,7 +1725,9 @@ class SensorSignalWindow(QWidget):
         self._sync_shared_calibration()
 
         raw_matrix = getattr(data_obj, "rawData", None)
-        return self._flatten_sensor_matrix_column_major(raw_matrix, rows, columns)
+        return self._flatten_shared_matrix_for_display(
+            raw_matrix, rows, columns
+        )
 
     def _current_raw_list(self):
         if self._using_shared_sensor_data:
@@ -1113,6 +1882,13 @@ class SensorSignalWindow(QWidget):
         if int(generation) != int(self._reader_generation):
             return
         self._latest_raw_list = list(raw_list or [])
+        self._standalone_frame_sequence += 1
+        self._append_tracker_native_frame(
+            time.perf_counter(),
+            self._standalone_frame_sequence,
+            self._latest_raw_list,
+            self.calibration_data,
+        )
 
     def _on_reader_error(self, message):
         now = time.monotonic()
@@ -1176,14 +1952,17 @@ class SensorSignalWindow(QWidget):
 
     def on_toggle_mode(self):
         if self.display_mode == "raw":
-            self.display_mode = "diff"
-            self.toggle_mode_button.setText("Show Calibration")
+            self.display_mode = "diff_per"
+            self.toggle_mode_button.setText("Show Differences")
         elif self.display_mode == "diff":
             self.display_mode = "cal"
             self.toggle_mode_button.setText("Show Raw Values")
-        else:
+        elif self.display_mode == "cal":
             self.display_mode = "raw"
-            self.toggle_mode_button.setText("Show Differences")
+            self.toggle_mode_button.setText("Show diffPerData (%)")
+        else:
+            self.display_mode = "diff"
+            self.toggle_mode_button.setText("Show Calibration")
 
         self.refresh_data()
 
@@ -1197,18 +1976,102 @@ class SensorSignalWindow(QWidget):
             return
         QMessageBox.information(self, "Selected Cell", f"Selected flat index: {self.selected_index}")
 
+    def on_track_selected_signal(self):
+        if self.selected_index is None:
+            return
+        flat_index = int(self.selected_index)
+        row = flat_index % max(1, int(self.table_rows))
+        column = flat_index // max(1, int(self.table_rows))
+
+        existing = getattr(self, "_signal_tracker_window", None)
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+
+        window = SensorSignalTrackingWindow(
+            flat_index,
+            row,
+            column,
+            parent=self,
+        )
+        self._signal_tracker_window = window
+        window.destroyed.connect(
+            lambda *_args, tracked=window: self._clear_signal_tracker_window(
+                tracked
+            )
+        )
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _clear_signal_tracker_window(self, tracked):
+        if getattr(self, "_signal_tracker_window", None) is tracked:
+            self._signal_tracker_window = None
+
+    def _append_tracker_native_frame(
+        self,
+        timestamp,
+        frame_sequence,
+        raw_list,
+        calibration_list,
+    ):
+        tracker = getattr(self, "_signal_tracker_window", None)
+        if tracker is None:
+            return
+        try:
+            if not tracker.isVisible():
+                return
+            flat_index = int(tracker.flat_index)
+            if (
+                flat_index < 0
+                or flat_index >= len(raw_list)
+                or flat_index >= len(calibration_list)
+            ):
+                return
+            tracker.append_frame(
+                timestamp,
+                frame_sequence,
+                raw_list[flat_index],
+                calibration_list[flat_index],
+            )
+        except RuntimeError:
+            self._signal_tracker_window = None
+
     def on_cell_clicked(self, row, column):
         flat_index = column * self.table_rows + row
         if self.selected_index == flat_index:
             self.table.clearSelection()
             self.selected_index = None
+            self._set_3d_selected_cell(None, None)
             self.info_label.setText("Click any cell to see its index")
             self.action_button.setEnabled(False)
+            self.track_signal_button.setEnabled(False)
+            self.table.viewport().update()
             return
 
         self.selected_index = flat_index
+        self._set_3d_selected_cell(row, column)
         self.info_label.setText(f"Clicked cell index: {flat_index}")
         self.action_button.setEnabled(True)
+        self.track_signal_button.setEnabled(True)
+        self.table.viewport().update()
+
+    def _set_3d_selected_cell(self, row=None, column=None):
+        """Mirror the table selection into the shared sensor plotter."""
+        sensor_functions = (
+            self._get_shared_sensor_functions()
+            if self._using_shared_sensor_data
+            else self._resolve_sensor_functions()
+        )
+        setter = getattr(sensor_functions, "set_selected_sensor_cell", None)
+        if not callable(setter):
+            return False
+        try:
+            return bool(setter(row, column))
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Data refresh / rendering
@@ -1228,6 +2091,7 @@ class SensorSignalWindow(QWidget):
 
         diff_list = self._build_diff_list(raw_list)
         percent_list = self._build_percent_list(raw_list)
+        diff_per_list = self._build_signed_percent_list(raw_list)
         heatmap_list = (
             self._read_shared_heatmap_list()
             if self._using_shared_sensor_data
@@ -1242,6 +2106,8 @@ class SensorSignalWindow(QWidget):
 
         if self.display_mode == "diff":
             display_list = diff_list
+        elif self.display_mode == "diff_per":
+            display_list = self._format_diff_per_values(diff_per_list)
         elif self.display_mode == "cal":
             display_list = list(self.calibration_data)
         else:
@@ -1256,6 +2122,22 @@ class SensorSignalWindow(QWidget):
         if len(self.calibration_data) == n:
             return [abs(raw_list[i] - self.calibration_data[i]) for i in range(n)]
         return [0] * n
+
+    def _build_signed_diff_list(self, raw_list):
+        """Return raw minus calibration without discarding signal polarity."""
+        n = len(raw_list)
+        if len(self.calibration_data) != n:
+            return []
+        values = []
+        for index in range(n):
+            try:
+                values.append(
+                    float(raw_list[index])
+                    - float(self.calibration_data[index])
+                )
+            except (TypeError, ValueError):
+                values.append(0.0)
+        return values
 
     def _build_percent_list(self, raw_list):
         """Per-cell |raw − cal| / cal × 100, matching ``data.calDiffPer`` so the
@@ -1279,6 +2161,26 @@ class SensorSignalWindow(QWidget):
                 raw_val = 0.0
             out[i] = abs(raw_val - cal_val) / abs(cal_val) * 100.0
         return out
+
+    def _build_signed_percent_list(self, raw_list):
+        """Return signed ``diffPerData`` as ``(raw - cal) / cal * 100``."""
+        n = len(raw_list)
+        if len(self.calibration_data) != n:
+            return [0.0] * n
+        out = [0.0] * n
+        for i in range(n):
+            try:
+                cal_val = float(self.calibration_data[i])
+                raw_val = float(raw_list[i])
+            except (TypeError, ValueError):
+                continue
+            if cal_val != 0.0:
+                out[i] = (raw_val - cal_val) / cal_val * 100.0
+        return out
+
+    @staticmethod
+    def _format_diff_per_values(values):
+        return [f"{float(value):.5f}" for value in values]
 
     def _update_thresholds(self, diff_list):
         n = len(diff_list)
@@ -1519,6 +2421,15 @@ class SensorSignalWindow(QWidget):
         if self.timer.isActive():
             self.timer.stop()
         self._stop_reader_worker()
+        self._disconnect_shared_native_frame_signal()
+        self._set_3d_selected_cell(None, None)
+        tracker = getattr(self, "_signal_tracker_window", None)
+        if tracker is not None:
+            try:
+                tracker.close()
+            except RuntimeError:
+                pass
+            self._signal_tracker_window = None
 
         if self._using_shared_sensor_data and self._shared_calibration_overridden:
             sensor_functions = self._get_shared_sensor_functions()

@@ -471,7 +471,7 @@ class ProximityControl:
         data_obj = getattr(self.my_sensor, "_data", None)
         if data_obj is None:
             return None
-        signal = getattr(data_obj, "diffDataAve", None)
+        signal = getattr(data_obj, "diffPerDataAve", None)
         if signal is None:
             return None
         signal = np.asarray(signal, dtype=float)

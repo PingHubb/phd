@@ -1553,10 +1553,11 @@ class AI_DirectFingerMotion(DirectFingerMotion):
 class AI_DirectFingerMotion_execution(DirectFingerMotion):
     MODE_TO_INDEX = {"stop": 0, "move": 1, "push": 2, "pull": 3}
     INDEX_TO_MODE = {v: k for k, v in MODE_TO_INDEX.items()}
+    SAFE_MAX_LINEAR_SPEED_MPS = 0.30
     DEFAULT_MODEL_CHECKPOINT = os.path.join(
         DirectFingerMotion.AI_MODELS_DIR,
         "ai_direct_finger_motion",
-        "latest_cnn_gru_model.pt",
+        "latest_cnn_gru_model_10x10.pt",
     )
 
     def __init__(self, ros_splitter_instance, my_sensor_instance):
@@ -1571,7 +1572,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self.model_checkpoint_path = self.DEFAULT_MODEL_CHECKPOINT
         self.model_conf_threshold = 0.55
         self.velocity_scale = 1.0
-        self.max_linear_speed = 0.05
+        self.max_linear_speed = self.SAFE_MAX_LINEAR_SPEED_MPS
         self.max_angular_speed = 0.0
         self.prediction_interval_ms = 16
         self.seq_len = 16
@@ -1630,6 +1631,16 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
     def set_dry_run_predictions_only(self, enabled=True):
         self.dry_run_predictions_only = bool(enabled)
         return self.dry_run_predictions_only
+
+    def set_velocity_scale(self, value=1.0):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 1.0
+        if not np.isfinite(value):
+            value = 1.0
+        self.velocity_scale = float(np.clip(value, 0.10, 20.00))
+        return self.velocity_scale
 
     def _reset_execution_buffers(self):
         self.frame_buffer = []
@@ -1985,6 +1996,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         linear_limit = abs(float(getattr(self, "max_linear_speed", 0.02)))
         angular_limit = abs(float(getattr(self, "max_angular_speed", 0.0)))
         velocity[:3] = np.clip(velocity[:3], -linear_limit, linear_limit)
+        linear_norm = float(np.linalg.norm(velocity[:3]))
+        if linear_norm > linear_limit and linear_norm > 1e-12:
+            velocity[:3] *= linear_limit / linear_norm
         velocity[3:] = np.clip(velocity[3:], -angular_limit, angular_limit)
         return velocity
 

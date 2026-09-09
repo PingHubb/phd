@@ -211,6 +211,14 @@ class CameraControlMixin:
             "_stop_admittance_control",
             "Pressure admittance control",
         )
+        self._shutdown_optional_call(
+            "_stop_ai_proximity_detection",
+            "AI proximity detection",
+        )
+        self._shutdown_optional_call(
+            "_stop_ai_proximity_environment_recording",
+            "AI proximity environment recording",
+        )
         self._shutdown_toggle_helper(
             "threelevel_hierarchical_transformer_class",
             "is_recognizing_gesture",
@@ -258,6 +266,10 @@ class CameraControlMixin:
         self._shutdown_optional_call(
             "_shutdown_hand_async_worker",
             "RH56F1 hand command worker",
+        )
+        self._shutdown_optional_call(
+            "_shutdown_humanoid_viewer",
+            "Humanoid viewer",
         )
         sensor_functions = getattr(self, "sensor_functions", None)
         if sensor_functions is not None and hasattr(sensor_functions, "shutdown"):

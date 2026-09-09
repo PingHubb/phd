@@ -154,6 +154,47 @@ def apply_3d_heatmap_color_gain(rgb, gain=DEFAULT_HEATMAP_3D_COLOR_GAIN):
     return output
 
 
+def signed_heatmap_rgb(
+    values,
+    response_mode=DEFAULT_HEATMAP_RESPONSE_MODE,
+    saturation_pct=DEFAULT_HEATMAP_SATURATION_PCT,
+    noise_floor_pct=DEFAULT_HEATMAP_NOISE_FLOOR_PCT,
+    proximity_noise_floor=DEFAULT_PROXIMITY_NOISE_FLOOR,
+    proximity_knee=DEFAULT_PROXIMITY_KNEE,
+    proximity_saturation=DEFAULT_PROXIMITY_SATURATION,
+    color_gain=DEFAULT_HEATMAP_3D_COLOR_GAIN,
+):
+    """Map signed response to blue-negative, white-zero, red-positive RGB."""
+    signed_values = np.nan_to_num(
+        np.asarray(values, dtype=float),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    strength = heatmap_strength(
+        signed_values,
+        response_mode=response_mode,
+        saturation_pct=saturation_pct,
+        noise_floor_pct=noise_floor_pct,
+        proximity_noise_floor=proximity_noise_floor,
+        proximity_knee=proximity_knee,
+        proximity_saturation=proximity_saturation,
+    )
+    gain_value = max(1.0, float(color_gain))
+    if gain_value > 1.0:
+        strength = 1.0 - np.power(1.0 - strength, gain_value)
+
+    remaining_white = np.rint(255.0 * (1.0 - strength)).astype(np.uint8)
+    rgb = np.full(signed_values.shape + (3,), 255, dtype=np.uint8)
+    positive = signed_values > 0.0
+    negative = signed_values < 0.0
+    rgb[..., 1][positive] = remaining_white[positive]
+    rgb[..., 2][positive] = remaining_white[positive]
+    rgb[..., 0][negative] = remaining_white[negative]
+    rgb[..., 1][negative] = remaining_white[negative]
+    return rgb
+
+
 def heatmap_3d_rgb(
     values,
     palette=DEFAULT_HEATMAP_3D_PALETTE,
@@ -164,8 +205,21 @@ def heatmap_3d_rgb(
     proximity_knee=DEFAULT_PROXIMITY_KNEE,
     proximity_saturation=DEFAULT_PROXIMITY_SATURATION,
     color_gain=DEFAULT_HEATMAP_3D_COLOR_GAIN,
+    use_absolute_signal=True,
 ):
     """Map sensor response using the selected 3D-only colour palette."""
+    if not bool(use_absolute_signal):
+        return signed_heatmap_rgb(
+            values,
+            response_mode=response_mode,
+            saturation_pct=saturation_pct,
+            noise_floor_pct=noise_floor_pct,
+            proximity_noise_floor=proximity_noise_floor,
+            proximity_knee=proximity_knee,
+            proximity_saturation=proximity_saturation,
+            color_gain=color_gain,
+        )
+
     palette = normalize_heatmap_3d_palette(palette)
     if palette == HEATMAP_3D_PALETTE_WHITE_RED:
         rgb = heatmap_rgb(

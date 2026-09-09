@@ -1,6 +1,7 @@
 import numpy as np
 
 from phd.dependence.func_meshLab import MyMeshLab
+from phd.ui.ui_ping_ai_controls import AiControlsMixin
 
 
 class _FakeRobotApi:
@@ -8,6 +9,7 @@ class _FakeRobotApi:
         self.commands = []
         self.exit_calls = []
         self.enter_calls = []
+        self.tool_position = np.zeros(3, dtype=float)
 
     def enter_end_effector_velocity_mode(self, suspend_existing=False):
         self.enter_calls.append(bool(suspend_existing))
@@ -15,6 +17,9 @@ class _FakeRobotApi:
 
     def get_current_positions(self):
         return [0.0] * 6
+
+    def get_current_tool_position(self):
+        return tuple(self.tool_position), (1.0, 0.0, 0.0, 0.0)
 
     def send_end_effector_velocity_in_frame(
         self, v_lin, v_rot=(0.0, 0.0, 0.0), frame="tool", ensure_mode=True
@@ -72,6 +77,41 @@ class _FakeTimer:
 
     def isActive(self):
         return self.active
+
+
+class _FakeToggleButton:
+    def __init__(self, checked=False, enabled=True):
+        self.checked = bool(checked)
+        self.enabled = bool(enabled)
+        self.active_style = False
+
+    def blockSignals(self, _blocked):
+        return None
+
+    def setChecked(self, checked):
+        self.checked = bool(checked)
+
+    def setEnabled(self, enabled):
+        self.enabled = bool(enabled)
+
+
+class _FakeAiControls(AiControlsMixin):
+    @staticmethod
+    def _set_button_active(button, active):
+        button.active_style = bool(active)
+
+
+class _FakeProximityMotionHelper:
+    def __init__(self):
+        self.stop_calls = 0
+        self.start_calls = 0
+
+    def start_ai_proximity_motion(self):
+        self.start_calls += 1
+        return True, "started"
+
+    def stop_ai_proximity_motion(self):
+        self.stop_calls += 1
 
 
 def _make_lab(estimate):
@@ -291,6 +331,115 @@ def test_teardown_exits_velocity_mode_with_zero():
     assert robot_api.exit_calls == [True]
     assert lab._robot_dialog_admittance_active is False
     assert lab._robot_dialog_admittance_velocity_mode_on is False
+
+
+def test_ai_proximity_retreats_then_returns_to_start():
+    lab, _sensor, robot_api = _make_lab(None)
+    lab._robot_dialog_admittance_active = False
+    lab._robot_dialog_admittance_velocity_mode_on = False
+    lab._ai_proximity_velocity_mode_on = False
+    lab._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+    lab._ai_proximity_mapping_config = None
+    config = dict(lab._robot_dialog_sensor_mapping_config)
+    lab._load_robot_sensor_mapping_config = lambda: config
+
+    started, _message = lab.start_ai_proximity_motion()
+    moving = lab.update_ai_proximity_motion(
+        0.0,
+        0.0,
+        2.0,
+        detected=True,
+        dry_run=False,
+    )
+    robot_api.tool_position[:] = [0.0, 0.0, -0.02]
+    returning = lab.update_ai_proximity_motion(
+        None,
+        None,
+        0.5,
+        detected=False,
+        dry_run=False,
+    )
+    robot_api.tool_position[:] = [0.0, 0.0, -0.001]
+    arrived = lab.update_ai_proximity_motion(
+        None,
+        None,
+        0.5,
+        detected=False,
+        dry_run=False,
+    )
+    lab.stop_ai_proximity_motion()
+
+    assert started is True
+    assert moving["ok"] is True
+    assert np.allclose(robot_api.commands[1][0], [0.0, 0.0, -0.03])
+    assert returning["ok"] is True
+    assert returning["returning"] is True
+    assert np.allclose(robot_api.commands[2][0], [0.0, 0.0, 0.03])
+    assert arrived["ok"] is True
+    assert arrived["at_start"] is True
+    assert robot_api.commands[3][0] == [0.0, 0.0, 0.0]
+    assert robot_api.exit_calls == [True]
+
+
+def test_ai_proximity_dry_run_estimates_motion_without_robot_command():
+    lab, _sensor, robot_api = _make_lab(None)
+    lab._robot_dialog_admittance_active = False
+    lab._ai_proximity_velocity_mode_on = False
+    lab._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+    config = dict(lab._robot_dialog_sensor_mapping_config)
+    lab._load_robot_sensor_mapping_config = lambda: config
+
+    preview = lab.update_ai_proximity_motion(
+        0.0,
+        0.0,
+        2.0,
+        detected=True,
+        dry_run=True,
+    )
+
+    assert preview["ok"] is True
+    assert np.allclose(preview["direction"], [0.0, 0.0, -1.0])
+    assert np.isclose(preview["speed_mps"], 0.03)
+    assert robot_api.commands == []
+    assert robot_api.enter_calls == []
+
+
+def test_stopping_ai_detection_disables_proximity_admittance_button():
+    controls = object.__new__(_FakeAiControls)
+    controls.mesh_functions = _FakeProximityMotionHelper()
+    controls.ai_proximity_detection_button = _FakeToggleButton(checked=True)
+    controls.ai_proximity_admittance_button = _FakeToggleButton(checked=True)
+    controls._ai_proximity_detection_active = True
+    controls._ai_proximity_robot_motion_active = True
+    controls._ai_proximity_timer = None
+    controls._ai_proximity_pending = None
+    controls._ai_proximity_executor = None
+    controls._ai_proximity_last_frame_sequence = 10
+    controls._ai_proximity_previous_averaged_frame = np.zeros((1, 1))
+    controls._ai_proximity_state = "detected"
+
+    controls._stop_ai_proximity_detection()
+
+    assert controls.mesh_functions.stop_calls == 1
+    assert controls._ai_proximity_robot_motion_active is False
+    assert controls.ai_proximity_detection_button.checked is False
+    assert controls.ai_proximity_admittance_button.checked is False
+    assert controls.ai_proximity_admittance_button.enabled is False
+    assert controls.ai_proximity_admittance_button.active_style is False
+
+
+def test_proximity_admittance_starts_without_confirmation_dialog():
+    controls = object.__new__(_FakeAiControls)
+    controls.mesh_functions = _FakeProximityMotionHelper()
+    controls._ai_proximity_motion_confirmed = False
+    controls._ai_proximity_robot_motion_active = False
+
+    started = controls._prepare_ai_proximity_robot_motion()
+
+    assert started is True
+    assert controls.mesh_functions.start_calls == 1
+    assert controls._ai_proximity_motion_confirmed is True
+    assert controls._ai_proximity_robot_motion_active is True
 
 
 def test_ai_tab_can_start_admittance_without_robot_dialog_or_actor():

@@ -51,12 +51,12 @@ def test_setting_mask_hides_coarse_and_dense_points_immediately():
 
     assert sensor.set_cell_zero_mask(mask)
 
-    masked_index = 3  # Plot row is vertically flipped from mask-dialog row 0.
+    masked_index = 2
     assert np.all(np.isnan(sensor.line_poly.points[masked_index]))
     assert np.all(np.isfinite(np.delete(sensor.line_poly.points, masked_index, axis=0)))
     assert sensor.colors_3d[masked_index, 3] == 0.0
     np.testing.assert_allclose(sensor.colors_3d[np.arange(6) != masked_index, 3], 1.0)
-    np.testing.assert_allclose(sensor.colors[[6, 7], 3], 0.0)
+    np.testing.assert_allclose(sensor.colors[[4, 5], 3], 0.0)
     assert np.count_nonzero(sensor.colors[:, 3] == 0.0) == 2
 
 
@@ -81,7 +81,7 @@ def test_zero_mask_expands_to_nearest_dense_taxel_regions():
 
     expected_rows = np.rint(np.linspace(0, 1, 4)).astype(int)
     expected_cols = np.rint(np.linspace(0, 2, 6)).astype(int)
-    expected = np.flip(sensor.cell_zero_mask, axis=0)[
+    expected = sensor.cell_zero_mask[
         expected_rows[:, None], expected_cols[None, :]
     ]
     np.testing.assert_array_equal(dense_mask, expected)
@@ -131,8 +131,25 @@ def test_masked_taxel_is_omitted_from_point_labels():
 
     sensor._refresh_sensor_point_label_actor()
 
-    assert sensor.plotter.labels == ["P0 r0 c0", "P1 r1 c0", "P2 r0 c1", "P4 r0 c2", "P5 r1 c2"]
+    assert sensor.plotter.labels == [
+        "P0 r0 c0",
+        "P1 r1 c0",
+        "P3 r1 c1",
+        "P4 r0 c2",
+        "P5 r1 c2",
+    ]
     assert len(sensor.plotter.points) == 5
+
+
+def test_point_labels_use_same_top_down_coordinates_as_zero_mask():
+    sensor = _sensor_for_visibility_tests()
+
+    labels = sensor._sensor_point_labels()
+
+    assert labels[0] == "P0 r0 c0"
+    assert labels[1] == "P1 r1 c0"
+    assert sensor.get_cell_point_label(0, 1) == "P2 r0 c1"
+    assert sensor.get_cell_point_label(1, 1) == "P3 r1 c1"
 
 
 def test_7x7_top_right_mask_hides_reported_displayed_point_ids():
@@ -149,8 +166,8 @@ def test_7x7_top_right_mask_hides_reported_displayed_point_ids():
     displayed = sensor._sensor_points_for_plotter(sensor.points)
     hidden_ids = set(np.flatnonzero(np.all(np.isnan(displayed), axis=1)).tolist())
 
-    assert hidden_ids == {40, 41, 47, 48}
-    assert hidden_ids.isdisjoint({35, 36, 42, 43})
+    assert hidden_ids == {35, 36, 42, 43}
+    assert hidden_ids.isdisjoint({40, 41, 47, 48})
 
 
 class _ActorCapturePlotter:

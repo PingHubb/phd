@@ -396,3 +396,132 @@ class TactileCNNGRUPolicy(nn.Module):
             "velocity_norm": self.velocity_head(final),
             "mode_logits": self.mode_head(final),
         }
+
+
+class TactileProximityCNNGRU(nn.Module):
+    """Predict normal tactile frames with a reusable spatial-temporal encoder.
+
+    The model consumes only frames preceding the frame being evaluated. During
+    normal-only training it learns to predict the next environmental frame.
+    At runtime, disagreement between that prediction and the measured frame is
+    an immediate proximity-anomaly signal. The encoder and GRU can later be
+    reused for gesture or continuous-control heads.
+    """
+
+    def __init__(
+        self,
+        in_channels=3,
+        sensor_rows=10,
+        sensor_cols=10,
+        d_model=64,
+        gru_hidden=96,
+        gru_layers=1,
+        dropout=0.1,
+    ):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.sensor_rows = int(sensor_rows)
+        self.sensor_cols = int(sensor_cols)
+        self.d_model = int(d_model)
+        self.gru_hidden = int(gru_hidden)
+
+        self.frame_features = nn.Sequential(
+            nn.Conv2d(
+                self.in_channels,
+                24,
+                kernel_size=3,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(24),
+            nn.GELU(),
+            nn.Conv2d(
+                24,
+                48,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False,
+            ),
+            nn.BatchNorm2d(48),
+            nn.GELU(),
+            nn.Conv2d(48, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+        )
+        self.encoded_rows = (self.sensor_rows + 1) // 2
+        self.encoded_cols = (self.sensor_cols + 1) // 2
+        encoded_size = 64 * self.encoded_rows * self.encoded_cols
+        self.frame_projection = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(encoded_size, self.d_model),
+            nn.GELU(),
+        )
+
+        gru_dropout = float(dropout) if int(gru_layers) > 1 else 0.0
+        self.gru = nn.GRU(
+            input_size=self.d_model,
+            hidden_size=self.gru_hidden,
+            num_layers=int(gru_layers),
+            dropout=gru_dropout,
+            batch_first=True,
+        )
+        self.context_norm = nn.LayerNorm(self.gru_hidden)
+        self.frame_decoder = nn.Sequential(
+            nn.Linear(
+                self.gru_hidden,
+                64 * self.encoded_rows * self.encoded_cols,
+            ),
+            nn.GELU(),
+        )
+        self.output_decoder = nn.Sequential(
+            nn.Conv2d(64, 48, kernel_size=3, padding=1),
+            nn.GELU(),
+            nn.Conv2d(48, self.in_channels, kernel_size=1),
+        )
+
+    def encode_frames(self, frames):
+        """Encode a batch of tactile frames into spatial embeddings."""
+        if frames.ndim != 4:
+            raise ValueError(
+                "frames must have shape (batch, channels, rows, cols)"
+            )
+        if tuple(frames.shape[1:]) != (
+            self.in_channels,
+            self.sensor_rows,
+            self.sensor_cols,
+        ):
+            raise ValueError(
+                "frame shape does not match the configured tactile sensor"
+            )
+        return self.frame_projection(self.frame_features(frames))
+
+    def forward(self, history):
+        if history.ndim != 5:
+            raise ValueError(
+                "history must have shape (batch, steps, channels, rows, cols)"
+            )
+        batch, steps, channels, rows, cols = history.shape
+        embeddings = self.encode_frames(
+            history.reshape(batch * steps, channels, rows, cols)
+        ).reshape(batch, steps, self.d_model)
+        encoded, _hidden = self.gru(embeddings)
+        context = self.context_norm(encoded[:, -1])
+        decoded = self.frame_decoder(context).reshape(
+            batch,
+            64,
+            self.encoded_rows,
+            self.encoded_cols,
+        )
+        decoded = nn.functional.interpolate(
+            decoded,
+            size=(self.sensor_rows, self.sensor_cols),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return {
+            "predicted_frame": self.output_decoder(decoded),
+            "context_embedding": context,
+            "history_embeddings": embeddings,
+        }

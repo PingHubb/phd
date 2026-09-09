@@ -41,6 +41,11 @@ except Exception:  # pragma: no cover - optional plotting dependency
 
 
 class DirectFingerMotionMixin:
+    AI_PROXIMITY_ENVIRONMENT_SESSION_PREFIX = "proximity_environment"
+    AI_PROXIMITY_ENVIRONMENT_DATASET_VERSION = 2
+    AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT = 10
+    AI_PROXIMITY_ENVIRONMENT_TRIAL_DURATION_SEC = 60.0
+    AI_PROXIMITY_ENVIRONMENT_INTER_TRIAL_DELAY_MS = 1000
     DIRECT_FINGER_MOTION_TOOL_POSE_RECORD_INTERVAL_MS = 200
     DIRECT_FINGER_MOTION_TOOL_POSE_PLAYBACK_INTERVAL_MS = 16
     DIRECT_FINGER_MOTION_TOOL_POSE_PLAYBACK_DURATION_SEC = 2.0
@@ -1031,6 +1036,16 @@ class DirectFingerMotionMixin:
         conf = float(prediction.get("mode_conf", 0.0))
         run_text = "dry" if prediction.get("dry_run", True) else "live"
         label.setText(f"Prediction: {mode_text} {conf:.2f} | [{velocity_text}] | {run_text}")
+
+    def _on_ai_direct_execution_velocity_scale_changed(self, value):
+        helper = self._get_ai_direct_finger_motion_execution_helper()
+        if helper is None:
+            return
+        if hasattr(helper, "set_velocity_scale"):
+            helper.set_velocity_scale(value)
+        else:
+            helper.velocity_scale = float(value)
+        self._update_ai_direct_execution_prediction_status()
 
     def _ensure_direct_finger_motion_tool_pose_timer(self):
         if hasattr(self, "_direct_finger_motion_tool_pose_timer"):
@@ -4840,6 +4855,30 @@ class DirectFingerMotionMixin:
                 self._ai_direct_finger_robot_active,
             )
 
+    def _automatic_ai_dfm_session_tag(self):
+        rows_spin = getattr(self, "grid_rows_spin", None)
+        cols_spin = getattr(self, "grid_cols_spin", None)
+        try:
+            rows = int(rows_spin.value()) if rows_spin is not None else 0
+            cols = int(cols_spin.value()) if cols_spin is not None else 0
+        except (TypeError, ValueError):
+            rows, cols = 0, 0
+        if rows > 0 and cols > 0:
+            return f"ai_dfm_{rows}x{cols}_v1"
+        return "ai_dfm_auto_v1"
+
+    def _current_ai_dfm_session_tag(self):
+        session_input = getattr(self, "ai_dfm_session_input", None)
+        custom = session_input.text().strip() if session_input is not None else ""
+        return custom or self._automatic_ai_dfm_session_tag()
+
+    def _update_ai_dfm_session_placeholder(self, _value=None):
+        session_input = getattr(self, "ai_dfm_session_input", None)
+        if session_input is not None:
+            session_input.setPlaceholderText(
+                f"Auto: {self._automatic_ai_dfm_session_tag()}"
+            )
+
     def _on_toggle_ai_direct_finger_motion(self, send_robot_commands=False):
         was_no_robot_active = bool(getattr(self, "_ai_direct_finger_active", False))
         was_robot_active = bool(getattr(self, "_ai_direct_finger_robot_active", False))
@@ -4853,7 +4892,7 @@ class DirectFingerMotionMixin:
                 robot_active=bool(send_robot_commands),
             )
 
-        session_tag = self.gesture_number_input.text().strip() if hasattr(self, "gesture_number_input") else ""
+        session_tag = self._current_ai_dfm_session_tag()
 
         try:
             helper = self._get_ai_direct_finger_motion_helper()
@@ -4872,6 +4911,524 @@ class DirectFingerMotionMixin:
             print(f"[UI] AI direct finger motion toggle failed: {exc}")
             self._set_ai_direct_finger_record_buttons(was_no_robot_active, was_robot_active)
 
+    def _set_ai_proximity_environment_status(self, text, state="idle"):
+        label = getattr(
+            self,
+            "ai_proximity_environment_record_status",
+            None,
+        )
+        if label is None:
+            return
+        label.setText(str(text))
+        if state == "active":
+            label.setStyleSheet(
+                f"color: {theme.SUCCESS_HOVER}; font-weight: 600;"
+            )
+        elif state == "error":
+            label.setStyleSheet(f"color: {theme.DANGER_HOVER};")
+        else:
+            label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+
+    def _set_ai_proximity_environment_recording_ui(self, active):
+        active = bool(active)
+        button = getattr(
+            self,
+            "ai_proximity_environment_record_button",
+            None,
+        )
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(active)
+            button.setText(
+                "Stop Environment Recording"
+                if active
+                else (
+                    f"Record {self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} x "
+                    "1-Minute Environment Trials"
+                )
+            )
+            button.blockSignals(False)
+            self._set_button_active(button, active)
+
+        control_names = (
+            "ai_direct_finger_motion_button",
+            "ai_direct_finger_motion_robot_button",
+        )
+        if active:
+            self._ai_environment_previous_control_states = {
+                name: bool(getattr(self, name).isEnabled())
+                for name in control_names
+                if hasattr(self, name)
+            }
+            for name in control_names:
+                control = getattr(self, name, None)
+                if control is not None:
+                    control.setEnabled(False)
+        else:
+            previous = getattr(
+                self,
+                "_ai_environment_previous_control_states",
+                {},
+            )
+            for name, enabled in previous.items():
+                control = getattr(self, name, None)
+                if control is not None:
+                    control.setEnabled(bool(enabled))
+            self._ai_environment_previous_control_states = {}
+
+    def _ensure_ai_proximity_environment_timers(self):
+        if not hasattr(self, "_ai_environment_trial_timer"):
+            self._ai_environment_trial_timer = QTimer(self)
+            self._ai_environment_trial_timer.setSingleShot(True)
+            self._ai_environment_trial_timer.timeout.connect(
+                self._finish_ai_proximity_environment_trial
+            )
+        if not hasattr(self, "_ai_environment_status_timer"):
+            self._ai_environment_status_timer = QTimer(self)
+            self._ai_environment_status_timer.setInterval(250)
+            self._ai_environment_status_timer.timeout.connect(
+                self._update_ai_proximity_environment_progress
+            )
+
+    def _on_toggle_ai_proximity_environment_recording(self, _checked=False):
+        if bool(getattr(self, "_ai_environment_recording_active", False)):
+            self._stop_ai_proximity_environment_recording()
+            return
+        self._start_ai_proximity_environment_recording()
+
+    @classmethod
+    def _ai_proximity_environment_session_tag(cls, sensor_shape):
+        rows, cols = (int(value) for value in sensor_shape)
+        return (
+            f"{cls.AI_PROXIMITY_ENVIRONMENT_SESSION_PREFIX}_"
+            f"{rows}x{cols}_v{cls.AI_PROXIMITY_ENVIRONMENT_DATASET_VERSION}"
+        )
+
+    @staticmethod
+    def _sensor_recording_shape(sensor):
+        return (
+            int(getattr(sensor, "n_row", 0)),
+            int(getattr(sensor, "n_col", 0)),
+        )
+
+    def _validate_ai_proximity_environment_sensor_shape(self, sensor):
+        expected = tuple(
+            getattr(self, "_ai_environment_sensor_shape", ()) or ()
+        )
+        current = self._sensor_recording_shape(sensor)
+        if len(expected) != 2 or current == expected:
+            return True
+        self._fail_ai_proximity_environment_recording(
+            "Sensor dimensions changed during environment recording: "
+            f"expected {expected[0]}x{expected[1]}, current "
+            f"{current[0]}x{current[1]}. Start a new recording batch."
+        )
+        return False
+
+    def _start_ai_proximity_environment_recording(self):
+        helper = self._get_ai_direct_finger_motion_helper()
+        sensor = getattr(helper, "my_sensor", None) if helper is not None else None
+        data_obj = getattr(sensor, "_data", None) if sensor is not None else None
+        if helper is None or sensor is None or data_obj is None:
+            self._set_ai_proximity_environment_recording_ui(False)
+            self._set_ai_proximity_environment_status(
+                "Build and update a sensor before recording.",
+                "error",
+            )
+            return
+        if not bool(getattr(sensor, "is_connected", False)):
+            self._set_ai_proximity_environment_recording_ui(False)
+            self._set_ai_proximity_environment_status(
+                "The sensor stream is not running. Update the sensor first.",
+                "error",
+            )
+            return
+        sensor_shape = self._sensor_recording_shape(sensor)
+        if sensor_shape[0] <= 0 or sensor_shape[1] <= 0:
+            self._set_ai_proximity_environment_recording_ui(False)
+            self._set_ai_proximity_environment_status(
+                "The active sensor dimensions are invalid. Build the sensor "
+                "again before recording.",
+                "error",
+            )
+            return
+        if bool(getattr(helper, "is_running", False)):
+            self._set_ai_proximity_environment_recording_ui(False)
+            self._set_ai_proximity_environment_status(
+                "Stop the current AI DFM recording before starting the batch.",
+                "error",
+            )
+            return
+        if not self._connect_ai_proximity_environment_calibration(sensor):
+            self._set_ai_proximity_environment_recording_ui(False)
+            self._set_ai_proximity_environment_status(
+                "The sensor calibration completion signal is unavailable.",
+                "error",
+            )
+            return
+
+        self._ensure_ai_proximity_environment_timers()
+        self._ai_environment_recording_active = True
+        self._ai_environment_completed_trials = 0
+        self._ai_environment_current_trial = 0
+        self._ai_environment_trial_started_perf = None
+        self._ai_environment_calibration_pending = False
+        self._ai_environment_sensor_shape = sensor_shape
+        self._ai_environment_session_tag = (
+            self._ai_proximity_environment_session_tag(sensor_shape)
+        )
+        self._set_ai_proximity_environment_recording_ui(True)
+        self._set_ai_proximity_environment_status(
+            f"Preparing {sensor_shape[0]}x{sensor_shape[1]} sensor | "
+            f"Session: {self._ai_environment_session_tag}",
+            "active",
+        )
+        self._start_next_ai_proximity_environment_trial()
+
+    def _connect_ai_proximity_environment_calibration(self, sensor):
+        bridge = getattr(sensor, "_calibration_bridge", None)
+        signal = getattr(bridge, "finished", None)
+        if signal is None:
+            return False
+        self._disconnect_ai_proximity_environment_calibration()
+        try:
+            signal.connect(
+                self._on_ai_proximity_environment_calibration_finished
+            )
+        except Exception:
+            return False
+        self._ai_environment_calibration_signal = signal
+        return True
+
+    def _disconnect_ai_proximity_environment_calibration(self):
+        signal = getattr(
+            self,
+            "_ai_environment_calibration_signal",
+            None,
+        )
+        self._ai_environment_calibration_signal = None
+        if signal is None:
+            return
+        try:
+            signal.disconnect(
+                self._on_ai_proximity_environment_calibration_finished
+            )
+        except (TypeError, RuntimeError):
+            pass
+
+    def _start_next_ai_proximity_environment_trial(self):
+        if not bool(getattr(self, "_ai_environment_recording_active", False)):
+            return
+        completed = int(
+            getattr(self, "_ai_environment_completed_trials", 0)
+        )
+        if completed >= self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT:
+            self._complete_ai_proximity_environment_recording()
+            return
+
+        helper = self._get_ai_direct_finger_motion_helper()
+        sensor = getattr(helper, "my_sensor", None) if helper is not None else None
+        if (
+            helper is None
+            or sensor is None
+            or bool(getattr(helper, "is_running", False))
+        ):
+            self._fail_ai_proximity_environment_recording(
+                "The environment recorder could not start the next trial."
+            )
+            return
+        if not self._validate_ai_proximity_environment_sensor_shape(sensor):
+            return
+
+        trial_number = completed + 1
+        self._ai_environment_calibration_pending = True
+        self._set_ai_proximity_environment_status(
+            f"Calibrating before trial {trial_number}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT}...",
+            "active",
+        )
+        if bool(getattr(sensor, "_sensor_calibration_in_progress", False)):
+            print(
+                "[AI Proximity Environment] waiting for the active "
+                f"calibration before trial {trial_number}"
+            )
+            return
+        try:
+            sensor.updateCal()
+        except Exception as exc:
+            self._ai_environment_calibration_pending = False
+            self._fail_ai_proximity_environment_recording(
+                f"Could not calibrate before trial {trial_number}: {exc}"
+            )
+            return
+        if not bool(getattr(sensor, "_sensor_calibration_in_progress", False)):
+            self._ai_environment_calibration_pending = False
+            self._fail_ai_proximity_environment_recording(
+                f"Calibration did not start before trial {trial_number}."
+            )
+
+    def _on_ai_proximity_environment_calibration_finished(self, succeeded):
+        if not bool(getattr(self, "_ai_environment_recording_active", False)):
+            return
+        if not bool(
+            getattr(self, "_ai_environment_calibration_pending", False)
+        ):
+            return
+        self._ai_environment_calibration_pending = False
+        trial_number = int(
+            getattr(self, "_ai_environment_completed_trials", 0)
+        ) + 1
+        if not bool(succeeded):
+            self._fail_ai_proximity_environment_recording(
+                f"Calibration failed before trial {trial_number}."
+            )
+            return
+        self._set_ai_proximity_environment_status(
+            f"Calibration complete | Starting trial {trial_number}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT}...",
+            "active",
+        )
+        QTimer.singleShot(
+            250,
+            self._begin_ai_proximity_environment_trial,
+        )
+
+    def _begin_ai_proximity_environment_trial(self):
+        if not bool(getattr(self, "_ai_environment_recording_active", False)):
+            return
+        completed = int(
+            getattr(self, "_ai_environment_completed_trials", 0)
+        )
+        helper = self._get_ai_direct_finger_motion_helper()
+        sensor = getattr(helper, "my_sensor", None) if helper is not None else None
+        if (
+            helper is None
+            or sensor is None
+            or not bool(getattr(sensor, "is_connected", False))
+            or bool(getattr(helper, "is_running", False))
+        ):
+            self._fail_ai_proximity_environment_recording(
+                "The sensor stream did not restart after calibration."
+            )
+            return
+        if not self._validate_ai_proximity_environment_sensor_shape(sensor):
+            return
+
+        trial_number = completed + 1
+        session_tag = str(
+            getattr(self, "_ai_environment_session_tag", "")
+        )
+        if not session_tag:
+            self._fail_ai_proximity_environment_recording(
+                "The environment recording session was not initialized."
+            )
+            return
+        try:
+            helper.toggle_ai_direct_finger_motion(
+                session_tag=session_tag,
+                send_robot_commands=False,
+            )
+        except Exception as exc:
+            self._fail_ai_proximity_environment_recording(
+                f"Could not start trial {trial_number}: {exc}"
+            )
+            return
+        if not bool(getattr(helper, "is_running", False)):
+            self._fail_ai_proximity_environment_recording(
+                f"Trial {trial_number} did not start."
+            )
+            return
+
+        self._ai_environment_current_trial = trial_number
+        self._ai_environment_trial_started_perf = time.perf_counter()
+        duration_ms = int(round(
+            self.AI_PROXIMITY_ENVIRONMENT_TRIAL_DURATION_SEC * 1000.0
+        ))
+        self._ai_environment_trial_timer.start(duration_ms)
+        self._ai_environment_status_timer.start()
+        self._update_ai_proximity_environment_progress()
+        print(
+            "[AI Proximity Environment] "
+            f"trial {trial_number}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} started"
+        )
+
+    def _update_ai_proximity_environment_progress(self):
+        if not bool(getattr(self, "_ai_environment_recording_active", False)):
+            return
+        helper = self._get_ai_direct_finger_motion_helper()
+        if helper is None or not bool(getattr(helper, "is_running", False)):
+            return
+        started = getattr(self, "_ai_environment_trial_started_perf", None)
+        elapsed = 0.0 if started is None else time.perf_counter() - started
+        remaining = max(
+            0.0,
+            self.AI_PROXIMITY_ENVIRONMENT_TRIAL_DURATION_SEC - elapsed,
+        )
+        episode = getattr(helper, "current_episode", {}) or {}
+        frame_count = len(episode.get("timestamps", []))
+        trial_number = int(getattr(self, "_ai_environment_current_trial", 0))
+        sensor_shape = tuple(
+            getattr(self, "_ai_environment_sensor_shape", ()) or ()
+        )
+        shape_text = (
+            f"{sensor_shape[0]}x{sensor_shape[1]} | "
+            if len(sensor_shape) == 2
+            else ""
+        )
+        self._set_ai_proximity_environment_status(
+            f"{shape_text}Trial {trial_number}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} | "
+            f"{remaining:.0f} s remaining | {frame_count} frames",
+            "active",
+        )
+
+    def _finish_ai_proximity_environment_trial(self):
+        if not bool(getattr(self, "_ai_environment_recording_active", False)):
+            return
+        helper = self._get_ai_direct_finger_motion_helper()
+        trial_number = int(getattr(self, "_ai_environment_current_trial", 0))
+        if helper is None or not bool(getattr(helper, "is_running", False)):
+            self._fail_ai_proximity_environment_recording(
+                f"Trial {trial_number} stopped before it could be saved."
+            )
+            return
+
+        episode = getattr(helper, "current_episode", {}) or {}
+        frame_count = len(episode.get("timestamps", []))
+        try:
+            helper.toggle_ai_direct_finger_motion()
+        except Exception as exc:
+            self._fail_ai_proximity_environment_recording(
+                f"Could not save trial {trial_number}: {exc}"
+            )
+            return
+
+        self._ai_environment_completed_trials = trial_number
+        print(
+            "[AI Proximity Environment] "
+            f"trial {trial_number}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} saved | "
+            f"frames={frame_count}"
+        )
+        if trial_number >= self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT:
+            self._complete_ai_proximity_environment_recording()
+            return
+
+        self._set_ai_proximity_environment_status(
+            f"Trial {trial_number}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} saved | "
+            "preparing next trial...",
+            "active",
+        )
+        QTimer.singleShot(
+            self.AI_PROXIMITY_ENVIRONMENT_INTER_TRIAL_DELAY_MS,
+            self._start_next_ai_proximity_environment_trial,
+        )
+
+    def _complete_ai_proximity_environment_recording(self):
+        session_tag = str(
+            getattr(self, "_ai_environment_session_tag", "")
+        )
+        self._ai_environment_recording_active = False
+        self._ai_environment_trial_started_perf = None
+        self._ai_environment_calibration_pending = False
+        self._disconnect_ai_proximity_environment_calibration()
+        for timer_name in (
+            "_ai_environment_trial_timer",
+            "_ai_environment_status_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        self._set_ai_proximity_environment_recording_ui(False)
+        self._set_ai_proximity_environment_status(
+            f"Completed {self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} | Session: "
+            f"{session_tag}",
+            "active",
+        )
+        print(
+            "[AI Proximity Environment] COMPLETE | "
+            f"session={session_tag}"
+        )
+
+    def _fail_ai_proximity_environment_recording(self, message):
+        self._ai_environment_recording_active = False
+        self._ai_environment_calibration_pending = False
+        self._disconnect_ai_proximity_environment_calibration()
+        for timer_name in (
+            "_ai_environment_trial_timer",
+            "_ai_environment_status_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        helper = self._get_ai_direct_finger_motion_helper()
+        if helper is not None and bool(getattr(helper, "is_running", False)):
+            try:
+                helper.toggle_ai_direct_finger_motion()
+            except Exception as exc:
+                print(
+                    "[AI Proximity Environment] "
+                    f"Could not stop the failed trial cleanly: {exc}"
+                )
+        self._set_ai_proximity_environment_recording_ui(False)
+        self._set_ai_proximity_environment_status(message, "error")
+        print(f"[AI Proximity Environment] ERROR: {message}")
+
+    def _stop_ai_proximity_environment_recording(self):
+        was_active = bool(
+            getattr(self, "_ai_environment_recording_active", False)
+        )
+        if not was_active:
+            return
+        for timer_name in (
+            "_ai_environment_trial_timer",
+            "_ai_environment_status_timer",
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+
+        helper = self._get_ai_direct_finger_motion_helper()
+        partial_saved = False
+        if helper is not None and bool(getattr(helper, "is_running", False)):
+            episode = getattr(helper, "current_episode", {}) or {}
+            partial_saved = len(episode.get("timestamps", [])) >= int(
+                getattr(helper, "min_frames_to_save", 5)
+            )
+            try:
+                helper.toggle_ai_direct_finger_motion()
+            except Exception as exc:
+                print(
+                    "[AI Proximity Environment] "
+                    f"Could not save the partial trial: {exc}"
+                )
+
+        self._ai_environment_recording_active = False
+        self._ai_environment_trial_started_perf = None
+        self._ai_environment_calibration_pending = False
+        self._disconnect_ai_proximity_environment_calibration()
+        self._set_ai_proximity_environment_recording_ui(False)
+        completed = int(
+            getattr(self, "_ai_environment_completed_trials", 0)
+        )
+        suffix = " | Partial trial saved" if partial_saved else ""
+        session_tag = str(
+            getattr(self, "_ai_environment_session_tag", "")
+        )
+        self._set_ai_proximity_environment_status(
+            f"Stopped | {completed}/"
+            f"{self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} complete"
+            f"{suffix} | Session: {session_tag}",
+            "idle",
+        )
+        print(
+            "[AI Proximity Environment] STOPPED | "
+            f"completed={completed} | partial_saved={partial_saved}"
+        )
+
     def _on_toggle_ai_direct_finger_motion_execution(self):
         model_path = ""
         if hasattr(self, "ai_direct_execution_model_path_input"):
@@ -4884,6 +5441,18 @@ class DirectFingerMotionMixin:
             helper = self._get_ai_direct_finger_motion_execution_helper()
             if helper is None:
                 raise AttributeError("ai_direct_finger_motion_execution_class is not available")
+            velocity_scale_spin = getattr(
+                self, "ai_direct_execution_velocity_scale_spin", None
+            )
+            velocity_scale = (
+                float(velocity_scale_spin.value())
+                if velocity_scale_spin is not None
+                else 1.0
+            )
+            if hasattr(helper, "set_velocity_scale"):
+                helper.set_velocity_scale(velocity_scale)
+            else:
+                helper.velocity_scale = velocity_scale
             if hasattr(self.sensor_functions, "toggle_ai_direct_finger_motion_execution"):
                 self.sensor_functions.toggle_ai_direct_finger_motion_execution(
                     model_checkpoint_path=model_path or None,
@@ -4908,6 +5477,7 @@ class DirectFingerMotionMixin:
             else:
                 self._ai_direct_execution_status_timer.stop()
             self._update_ai_direct_execution_prediction_status()
+
         except Exception as exc:
             print(f"[UI] AI direct finger motion execution toggle failed: {exc}")
             helper = self._get_ai_direct_finger_motion_execution_helper()
@@ -4919,3 +5489,68 @@ class DirectFingerMotionMixin:
                 self._ai_direct_finger_execution_active,
             )
             self._update_ai_direct_execution_prediction_status()
+
+    def _set_ai_direct_execution_model_path(
+        self,
+        model_path,
+        *,
+        is_default=False,
+    ):
+        path = os.path.abspath(os.path.expanduser(str(model_path).strip()))
+        if hasattr(self, "ai_direct_execution_model_path_input"):
+            self.ai_direct_execution_model_path_input.setText(path)
+
+        label = getattr(self, "ai_direct_execution_model_status", None)
+        if label is not None:
+            prefix = "Default" if is_default else "Selected"
+            label.setText(f"{prefix}: {os.path.basename(path)}")
+            label.setToolTip(path)
+            if os.path.isfile(path):
+                label.setStyleSheet(
+                    f"color: {theme.SUCCESS_HOVER}; font-weight: 600;"
+                )
+            else:
+                label.setStyleSheet(f"color: {theme.DANGER_HOVER};")
+
+        default_button = getattr(
+            self,
+            "ai_direct_execution_use_default_button",
+            None,
+        )
+        if default_button is not None:
+            default_button.setEnabled(not is_default)
+
+    def _on_select_ai_direct_execution_model(self):
+        default_path = self._get_default_ai_execution_model_path()
+        current_path = default_path
+        if hasattr(self, "ai_direct_execution_model_path_input"):
+            current_path = (
+                self.ai_direct_execution_model_path_input.text().strip()
+                or default_path
+            )
+        start_directory = (
+            os.path.dirname(current_path)
+            if os.path.isdir(os.path.dirname(current_path))
+            else os.path.dirname(default_path)
+        )
+        dialog = QFileDialog(
+            self,
+            "Select AI Direct Finger Motion Model",
+            start_directory,
+            "PyTorch Models (*.pt *.pth);;All Files (*)",
+        )
+        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+        dialog.setViewMode(QFileDialog.Detail)
+        if dialog.exec_() != QFileDialog.Accepted:
+            return
+        selected = dialog.selectedFiles()
+        if not selected:
+            return
+        self._set_ai_direct_execution_model_path(selected[0])
+
+    def _on_use_default_ai_direct_execution_model(self):
+        self._set_ai_direct_execution_model_path(
+            self._get_default_ai_execution_model_path(),
+            is_default=True,
+        )

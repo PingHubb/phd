@@ -86,6 +86,11 @@ class MyMeshLab():
         self._admittance_source = None
         self._admittance_pending_start = False
         self._admittance_mapping_config = None
+        self._ai_proximity_velocity_mode_on = False
+        self._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+        self._ai_proximity_mapping_config = None
+        self._ai_proximity_start_tool_position = None
+        self._ai_proximity_last_detected = False
         self._robot_dialog_admittance_timer = QTimer(self.parent)
         self._robot_dialog_admittance_timer.setInterval(33)
         self._robot_dialog_admittance_timer.timeout.connect(
@@ -2594,10 +2599,18 @@ class MyMeshLab():
         ratio = float(np.clip((peak - threshold) / (full_scale - threshold), 0.0, 1.0))
         return speed_limit * ratio
 
-    def _robot_dialog_other_velocity_control_name(self):
+    def _robot_dialog_other_velocity_control_name(
+        self,
+        ignore_ai_proximity=False,
+    ):
         """Return the name of another live robot-motion source, if any."""
         if getattr(self, "_robot_dialog_drag_active", False):
             return "3D robot drag control"
+        if (
+            not bool(ignore_ai_proximity)
+            and getattr(self, "_ai_proximity_velocity_mode_on", False)
+        ):
+            return "AI proximity control"
 
         parent = getattr(self, "parent", None)
         if parent is not None and bool(getattr(parent, "_direct_finger_active", False)):
@@ -2942,6 +2955,355 @@ class MyMeshLab():
         except Exception as exc:
             print(f"[PressureAdmittance] Velocity send failed: {exc}")
         return False
+
+    def is_ai_proximity_motion_active(self):
+        return bool(getattr(self, "_ai_proximity_velocity_mode_on", False))
+
+    @staticmethod
+    def _ai_proximity_current_tool_position(api):
+        if api is None or not hasattr(api, "get_current_tool_position"):
+            return None
+        try:
+            pose = api.get_current_tool_position()
+            position = pose[0] if isinstance(pose, (list, tuple)) else None
+            values = np.asarray(position, dtype=float)
+        except Exception:
+            return None
+        if values.shape != (3,) or not np.all(np.isfinite(values)):
+            return None
+        return values
+
+    def start_ai_proximity_motion(self):
+        """Enter robot velocity mode for mapped proximity retreat control."""
+        if self.is_ai_proximity_motion_active():
+            return True, "AI proximity robot motion is already active"
+        if self.is_pressure_admittance_active():
+            return False, "Stop Pressure Admittance first"
+
+        conflict = self._robot_dialog_other_velocity_control_name(
+            ignore_ai_proximity=True
+        )
+        if conflict:
+            return False, f"Stop {conflict} first"
+
+        api = getattr(self.parent, "robot_api", None)
+        required = bool(
+            api is not None
+            and hasattr(api, "get_current_positions")
+            and hasattr(api, "get_current_tool_position")
+            and hasattr(api, "enter_end_effector_velocity_mode")
+            and hasattr(api, "exit_end_effector_velocity_mode")
+            and (
+                hasattr(api, "send_end_effector_velocity_in_frame")
+                or hasattr(api, "send_end_effector_velocity")
+            )
+        )
+        if not required:
+            return False, "Robot velocity API is unavailable"
+
+        start_position = self._ai_proximity_current_tool_position(api)
+        if start_position is None:
+            return False, "Robot tool-position feedback is unavailable"
+
+        try:
+            entered = bool(
+                api.enter_end_effector_velocity_mode(suspend_existing=True)
+            )
+        except Exception as exc:
+            return False, f"Could not enter velocity mode: {exc}"
+        if not entered:
+            return False, "Could not enter robot velocity mode"
+
+        self._ai_proximity_velocity_mode_on = True
+        self._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+        self._ai_proximity_start_tool_position = start_position.copy()
+        self._ai_proximity_last_detected = False
+        self._ai_proximity_mapping_config = (
+            self._normalize_robot_sensor_mapping_config(
+                self._load_robot_sensor_mapping_config()
+            )
+        )
+        if not self._send_robot_dialog_admittance_velocity(
+            np.zeros(3, dtype=float)
+        ):
+            self.stop_ai_proximity_motion()
+            return False, "Could not send the initial zero velocity"
+        return True, "AI proximity robot motion armed"
+
+    def stop_ai_proximity_motion(self):
+        """Send zero and leave robot velocity mode owned by proximity AI."""
+        active = self.is_ai_proximity_motion_active()
+        api = getattr(self.parent, "robot_api", None)
+        if active:
+            try:
+                self._send_robot_dialog_admittance_velocity(
+                    np.zeros(3, dtype=float)
+                )
+            except Exception:
+                pass
+            if api is not None and hasattr(
+                api,
+                "exit_end_effector_velocity_mode",
+            ):
+                try:
+                    api.exit_end_effector_velocity_mode(send_zero=True)
+                except Exception as exc:
+                    print(
+                        "[AIProximityMotion] Velocity teardown failed: "
+                        f"{exc}"
+                    )
+        self._ai_proximity_velocity_mode_on = False
+        self._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+        self._ai_proximity_mapping_config = None
+        self._ai_proximity_start_tool_position = None
+        self._ai_proximity_last_detected = False
+
+    def _return_ai_proximity_motion_to_start(self, *, dry_run=False):
+        result = {
+            "ok": True,
+            "error": "",
+            "direction": None,
+            "speed_mps": 0.0,
+            "mode": "return_to_start",
+            "returning": False,
+            "at_start": True,
+            "position_error_m": 0.0,
+        }
+        if bool(dry_run):
+            return result
+        if not self.is_ai_proximity_motion_active():
+            result["ok"] = False
+            result["error"] = "Robot velocity mode is not active"
+            return result
+
+        conflict = self._robot_dialog_other_velocity_control_name(
+            ignore_ai_proximity=True
+        )
+        if conflict:
+            self.stop_ai_proximity_motion()
+            result["ok"] = False
+            result["error"] = f"Conflicting motion source: {conflict}"
+            return result
+
+        api = getattr(self.parent, "robot_api", None)
+        start_position = np.asarray(
+            getattr(self, "_ai_proximity_start_tool_position", None),
+            dtype=float,
+        )
+        current_position = self._ai_proximity_current_tool_position(api)
+        if (
+            start_position.shape != (3,)
+            or not np.all(np.isfinite(start_position))
+            or current_position is None
+        ):
+            result["ok"] = False
+            result["error"] = "Robot tool-position feedback is unavailable"
+            return result
+
+        position_error = start_position - current_position
+        distance = float(np.linalg.norm(position_error))
+        result["position_error_m"] = distance
+        arrival_tolerance_m = 0.002
+        if distance <= arrival_tolerance_m:
+            self._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+            result["ok"] = bool(
+                self._send_robot_dialog_admittance_velocity(
+                    np.zeros(3, dtype=float)
+                )
+            )
+            if not result["ok"]:
+                result["error"] = "Failed to hold the start position"
+            return result
+
+        config = self._normalize_robot_sensor_mapping_config(
+            getattr(self, "_ai_proximity_mapping_config", None)
+            or self._load_robot_sensor_mapping_config()
+        )
+        self._ai_proximity_mapping_config = config
+        maximum_speed = float(config["admittance_max_speed_mps"])
+        target_velocity = 1.5 * position_error
+        target_speed = float(np.linalg.norm(target_velocity))
+        if target_speed > maximum_speed:
+            target_velocity *= maximum_speed / target_speed
+
+        was_detected = bool(
+            getattr(self, "_ai_proximity_last_detected", False)
+        )
+        previous = np.asarray(
+            getattr(
+                self,
+                "_ai_proximity_filtered_velocity",
+                np.zeros(3, dtype=float),
+            ),
+            dtype=float,
+        )
+        if was_detected:
+            previous = np.zeros(3, dtype=float)
+        alpha = float(config["admittance_smoothing_alpha"])
+        filtered = previous + alpha * (target_velocity - previous)
+        filtered_speed = float(np.linalg.norm(filtered))
+        if filtered_speed > maximum_speed:
+            filtered *= maximum_speed / filtered_speed
+            filtered_speed = maximum_speed
+
+        direction = position_error / distance
+        result.update(
+            {
+                "direction": direction.tolist(),
+                "speed_mps": filtered_speed,
+                "returning": True,
+                "at_start": False,
+            }
+        )
+        self._ai_proximity_filtered_velocity = filtered
+        result["ok"] = bool(
+            self._send_robot_dialog_admittance_velocity(filtered)
+        )
+        if not result["ok"]:
+            result["error"] = "Failed to send return velocity"
+        return result
+
+    def update_ai_proximity_motion(
+        self,
+        center_row,
+        center_col,
+        anomaly_score,
+        *,
+        detected,
+        dry_run=False,
+    ):
+        """Preview or send mapped retreat velocity for one proximity result."""
+        result = {
+            "ok": True,
+            "error": "",
+            "direction": None,
+            "speed_mps": 0.0,
+            "mode": "",
+            "returning": False,
+            "at_start": False,
+            "position_error_m": 0.0,
+        }
+        live_motion = not bool(dry_run)
+        score = max(0.0, float(anomaly_score))
+
+        if not bool(detected):
+            return_result = self._return_ai_proximity_motion_to_start(
+                dry_run=dry_run
+            )
+            self._ai_proximity_last_detected = False
+            return return_result
+
+        if score <= 1.0:
+            self._ai_proximity_filtered_velocity = np.zeros(3, dtype=float)
+            if live_motion and self.is_ai_proximity_motion_active():
+                result["ok"] = bool(
+                    self._send_robot_dialog_admittance_velocity(
+                        np.zeros(3, dtype=float)
+                    )
+                )
+                if not result["ok"]:
+                    result["error"] = "Failed to send zero velocity"
+            return result
+
+        try:
+            row = float(center_row)
+            col = float(center_col)
+        except (TypeError, ValueError):
+            result["ok"] = False
+            result["error"] = "Proximity region is not localized yet"
+            return result
+        if not np.isfinite(row) or not np.isfinite(col):
+            result["ok"] = False
+            result["error"] = "Proximity region is invalid"
+            return result
+
+        if live_motion:
+            if not self.is_ai_proximity_motion_active():
+                result["ok"] = False
+                result["error"] = "Robot velocity mode is not active"
+                return result
+            conflict = self._robot_dialog_other_velocity_control_name(
+                ignore_ai_proximity=True
+            )
+            if conflict:
+                self.stop_ai_proximity_motion()
+                result["ok"] = False
+                result["error"] = f"Conflicting motion source: {conflict}"
+                return result
+
+        sensor = getattr(self.parent, "sensor_functions", None)
+        api = getattr(self.parent, "robot_api", None)
+        if sensor is None or api is None:
+            result["ok"] = False
+            result["error"] = "Sensor or robot API is unavailable"
+            return result
+        try:
+            joints = api.get_current_positions()
+        except Exception:
+            joints = None
+        if joints is None or isinstance(joints, str) or len(joints) < 6:
+            result["ok"] = False
+            result["error"] = "Waiting for robot joint feedback"
+            return result
+
+        config = self._normalize_robot_sensor_mapping_config(
+            getattr(self, "_ai_proximity_mapping_config", None)
+            or self._load_robot_sensor_mapping_config()
+        )
+        self._ai_proximity_mapping_config = config
+        estimate = {
+            "center_row": row,
+            "center_col": col,
+        }
+        direction = self._robot_dialog_admittance_direction_base(
+            sensor,
+            estimate,
+            joints,
+            config,
+        )
+        if direction is None:
+            result["ok"] = False
+            result["error"] = "Could not transform the proximity direction"
+            return result
+
+        maximum_speed = float(config["admittance_max_speed_mps"])
+        speed_ratio = float(np.clip(score - 1.0, 0.15, 1.0))
+        target_velocity = maximum_speed * speed_ratio * direction
+        alpha = float(config["admittance_smoothing_alpha"])
+        if bool(getattr(self, "_ai_proximity_last_detected", False)):
+            previous = np.asarray(
+                getattr(
+                    self,
+                    "_ai_proximity_filtered_velocity",
+                    np.zeros(3, dtype=float),
+                ),
+                dtype=float,
+            )
+        else:
+            previous = np.zeros(3, dtype=float)
+        filtered = previous + alpha * (target_velocity - previous)
+        filtered_norm = float(np.linalg.norm(filtered))
+        if filtered_norm > maximum_speed:
+            filtered *= maximum_speed / filtered_norm
+
+        result.update(
+            {
+                "direction": np.asarray(direction, dtype=float).tolist(),
+                "speed_mps": float(np.linalg.norm(filtered)),
+                "mode": str(config["admittance_direction_mode"]),
+            }
+        )
+        if bool(dry_run):
+            return result
+
+        self._ai_proximity_last_detected = True
+        self._ai_proximity_filtered_velocity = filtered
+        result["ok"] = bool(
+            self._send_robot_dialog_admittance_velocity(filtered)
+        )
+        if not result["ok"]:
+            result["error"] = "Failed to send robot velocity"
+        return result
 
     def _toggle_robot_dialog_admittance(
         self,

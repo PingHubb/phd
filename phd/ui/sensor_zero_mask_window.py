@@ -138,8 +138,13 @@ class SensorZeroMaskPanel(QWidget):
             for c in range(self._n_col):
                 btn = QToolButton()
                 btn.setCheckable(True)
-                btn.setText(f"{r},{c}")
-                btn.setMinimumSize(36, 28)
+                labeler = getattr(self._sensor, "get_cell_point_label", None)
+                if callable(labeler):
+                    label = str(labeler(r, c))
+                    btn.setText(label.replace(" r", "\nr", 1))
+                else:
+                    btn.setText(f"{r},{c}")
+                btn.setMinimumSize(44, 32)
                 btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 btn.setStyleSheet(self.CELL_STYLE)
                 btn.toggled.connect(self._on_cell_toggled)
