@@ -248,9 +248,6 @@ def test_point_grid_strong_signal_and_viewer_selection_use_same_point():
         diffPerDataAve=np.asarray([[5.0, 0.0], [0.0, 0.0]])
     )
     sensor._record_visualization_tick = lambda: None
-    sensor._update_contact_force_status = lambda _matrix: None
-    sensor._update_contact_normal_visualization = lambda _matrix: None
-
     sensor.update_visualization(sensor._data.diffPerDataAve)
     assert sensor.set_selected_sensor_cell(0, 0, render=False)
 
@@ -573,8 +570,6 @@ def test_linear_3d_heatmap_uses_averaged_percentage_frame():
     sensor.line_poly = pv.PolyData(sensor.points)
     sensor._2D_map = pv.PolyData(sensor.points)
     sensor._record_visualization_tick = lambda: None
-    sensor._update_contact_force_status = lambda _matrix: None
-    sensor._update_contact_normal_visualization = lambda _matrix: None
     received = []
     sensor._update_heatmap_visualization = (
         lambda matrix: received.append(np.array(matrix, copy=True))

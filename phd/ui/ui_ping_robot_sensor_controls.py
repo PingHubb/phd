@@ -36,7 +36,10 @@ class RobotSensorControlsMixin:
             ],
             enabled,
         )
-        self.robots_sub_tabs.setTabEnabled(0, enabled)
+        # Only the TM Robot subtab depends on the arm; Humanoid stays usable.
+        self.robots_sub_tabs.setTabEnabled(
+            int(getattr(self, "tm_robot_tab_index", 0)), enabled
+        )
 
     def disable_robot_controls(self, disable: bool):
         return None
@@ -68,7 +71,7 @@ class RobotSensorControlsMixin:
         port_path = self._get_selected_sensor_port_path()
         if not port_path:
             self.log_display.append(
-                "Select a serial port in Sensor > Send Operation first."
+                "Select a serial port in Sensor > Setup first."
             )
             return None
         if is_goodix_usb_source(port_path):
@@ -82,7 +85,7 @@ class RobotSensorControlsMixin:
         port_path = self._get_selected_sensor_port_path()
         if not port_path:
             self.log_display.append(
-                "Select a serial port in Sensor > Send Operation first."
+                "Select a serial port in Sensor > Setup first."
             )
             return
 
@@ -129,7 +132,7 @@ class RobotSensorControlsMixin:
         port_path = self._get_selected_sensor_port_path()
         if not port_path:
             self.log_display.append(
-                "Select a serial port in Sensor > Send Operation first."
+                "Select a serial port in Sensor > Setup first."
             )
             return
 

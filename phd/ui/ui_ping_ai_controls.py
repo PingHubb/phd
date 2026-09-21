@@ -110,7 +110,7 @@ class AiControlsMixin:
         latch_on = bool(getattr(three, "latch_mode", False)) if three else False
 
         self._set_button_active(self.btn_toggle_3lvl_latch, latch_on)
-        self.btn_toggle_3lvl_latch.setText(f"3-Level: Latch {'ON' if latch_on else 'OFF'}")
+        self.btn_toggle_3lvl_latch.setText(f"Latch {'on' if latch_on else 'off'}")
         self._update_anchor_button_label()
         self._refresh_ai_proximity_model_preview()
 
@@ -260,7 +260,7 @@ class AiControlsMixin:
             self._update_ai_proximity_model_buttons()
             return
         if checkpoint_path is None:
-            label.setText("Model: automatic selection from sensor size")
+            label.setText("Automatic, from sensor size")
             label.setStyleSheet(theme.MUTED_LABEL_STYLE)
             self._update_ai_proximity_model_buttons()
             return
@@ -1037,7 +1037,7 @@ class AiControlsMixin:
                 return
             three.toggle_latch_mode()
             latch = bool(getattr(three, "latch_mode", False))
-            self.btn_toggle_3lvl_latch.setText(f"3-Level: Latch {'ON' if latch else 'OFF'}")
+            self.btn_toggle_3lvl_latch.setText(f"Latch {'on' if latch else 'off'}")
             self._set_button_active(self.btn_toggle_3lvl_latch, latch)
         except Exception as exc:
             print(f"[UI] Could not toggle 3-Level latch mode: {exc}")

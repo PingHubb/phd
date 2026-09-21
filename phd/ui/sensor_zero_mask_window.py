@@ -16,7 +16,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from phd.ui import theme
+from phd.ui import components, theme
 
 
 class SensorZeroMaskPanel(QWidget):
@@ -108,7 +108,7 @@ class SensorZeroMaskPanel(QWidget):
         if self._n_row <= 0 or self._n_col <= 0:
             label = QLabel(
                 "Build a sensor scene first.\n\n"
-                "Use Build Scene and Update Sensor, then reopen Sensor Parameters "
+                "Use Connect Sensor and Calibrate Sensor, then reopen Sensor Parameters "
                 "to configure the zero mask."
             )
             label.setAlignment(Qt.AlignCenter)
@@ -156,6 +156,7 @@ class SensorZeroMaskPanel(QWidget):
         # Action buttons row.
         action_row = QHBoxLayout()
         self._btn_clear = QPushButton("Clear All")
+        components.apply_variant(self._btn_clear, "danger")
         self._btn_clear.clicked.connect(self._on_clear)
         action_row.addWidget(self._btn_clear)
 
@@ -228,6 +229,13 @@ class SensorZeroMaskPanel(QWidget):
         self._push_mask(self._current_mask())
 
     def _on_clear(self):
+        if self._current_mask().any() and not components.confirm(
+            self,
+            "Clear zero mask?",
+            "This re-enables every masked cell on this sensor.",
+            confirm_text="Clear mask",
+        ):
+            return
         for row in self._cell_buttons:
             for btn in row:
                 btn.blockSignals(True)

@@ -14,6 +14,7 @@ from PyQt5.QtCore import QObject, QThread, QTimer, Qt
 from PyQt5.QtWidgets import QListWidgetItem
 from tqdm import tqdm
 from phd.dependence.paths import resource_path, sensor_resource_path
+from phd.ui import theme
 from phd.dependence.sensor_layout import (
     column_major_idx as _column_major_idx,
     flatten_column_major_view as _flatten_column_major_view,
@@ -62,6 +63,7 @@ from phd.dependence.sensor_heatmap import (
 from phd.dependence.sensor_protocol import (
     DEFAULT_SENSOR_BAUD_RATE,
     DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
+    discard_pending_serial_input,
 )
 from phd.dependence.sensor_serial import (
     SensorCalibrationBridge,
@@ -488,6 +490,27 @@ class _LazyFeatureProxy:
         return True
 
 
+def format_live_sensor_source_caption(
+    port_label,
+    *,
+    model_label="",
+    n_row=0,
+    n_col=0,
+    is_primary=False,
+):
+    """One-line label for a live sensor: port, geometry, grid, primary."""
+    parts = [str(port_label or "sensor").strip() or "sensor"]
+    if model_label:
+        parts.append(str(model_label))
+    rows = int(n_row or 0)
+    cols = int(n_col or 0)
+    if rows > 0 and cols > 0:
+        parts.append(f"{rows}×{cols}")
+    if is_primary:
+        parts.append("primary")
+    return " · ".join(parts)
+
+
 class MySensor:
     DEFAULT_2D_GRID_SHAPE = (10, 10)
     VISUALIZATION_TARGET_HZ = 60.0
@@ -636,22 +659,16 @@ class MySensor:
         self.stereo_field_response_scale_pct = 2.0
         self.stereo_field_length_scale = 0.35
         self.stereo_field_smoothing_alpha = 0.82
-        self.contactNormalActor = None
-        self.contactNormalMesh = None
-        self._contact_normal_smoothed_start = None
-        self._contact_normal_smoothed_direction = None
-        self._contact_motion_previous_center = None
-        self._contact_anchor_center = None
-        self._contact_motion_smoothed_delta = None
         self.referenceAxisActors = []
         self.actorPlaneXY = None
-        self.show_sensor_background_reference = True
+        # Keep the unloaded viewport quiet. A built scene restores this from
+        # that sensor's saved axes/grid preference.
+        self.show_sensor_background_reference = False
         self._sensor_geometry_base_points_origin = None
         self._sensor_geometry_base_normals = None
         self._sensor_geometry_base_fine_points = None
         self.current_sensor_geometry_config = None
         self.sensor_visual_offset_scale = 0.0
-        self._contact_normal_missing_frames = 0
         self.sensorPointLabelActor = None
         self.sensorSelectionActor = None
         self.sensorSelectionPoly = None
@@ -660,20 +677,9 @@ class MySensor:
         self.n_row = 0
         self.touch_sensitivity_scale = 0.05
         self.sensor_visualization_mode = "point_grid"
-        self.show_contact_normal_vector = False
         self.show_sensor_point_labels = False
-        self.contact_normal_estimator_mode = "touch_anchor_v4"
-        self.contact_normal_threshold_pct = 3.0
-        self.contact_normal_cluster_floor_pct = 0.8
-        self.contact_normal_tilt_gain = 0.85
-        self.contact_normal_residual_gain = 1.2
-        self.contact_normal_residual_deadband = 0.06
-        self.contact_normal_smoothing_alpha = 0.65
-        self.contact_normal_missing_grace_frames = 4
-        self.contact_motion_deadband_cells = 0.008
-        self.contact_motion_smoothing_alpha = 0.68
-        self.contact_motion_tilt_gain = 6.0
-        self.contact_motion_max_tilt_deg = 90.0
+        self.contact_force_threshold_pct = 3.0
+        self.contact_force_cluster_floor_pct = 0.8
         self.contact_force_scale_n_per_signal = 0.0
         self.cal_data = []
         self.sensor_transport = "serial"
@@ -1182,10 +1188,6 @@ class MySensor:
                 self.restore_saved_sensor_perspective(render=False)
             self._apply_sensor_background_reference_visibility(render=False)
             self._set_actor_visible(
-                getattr(self, "contactNormalActor", None),
-                bool(getattr(self, "show_contact_normal_vector", False)),
-            )
-            self._set_actor_visible(
                 getattr(self, "sensorPointLabelActor", None),
                 bool(getattr(self, "show_sensor_point_labels", False)),
             )
@@ -1195,7 +1197,6 @@ class MySensor:
                 getattr(self, "actionMesh", None),
                 getattr(self, "matrixLineActor", None),
                     getattr(self, "heatmapActor", None),
-                    getattr(self, "contactNormalActor", None),
                     getattr(self, "sensorPointLabelActor", None),
                     getattr(self, "sensorSelectionActor", None),
                     getattr(self, "actorPlaneXY", None),
@@ -1253,7 +1254,69 @@ class MySensor:
         stopped = self._close_serial_ports()
         if stopped:
             self.is_connected = False
+            self._set_sensor_scene_ready(False)
         return bool(stopped)
+
+    def disconnect_sensor_scene(self):
+        """Reversibly stop the current sensor scene and release its devices."""
+        if self._is_shutting_down:
+            self._set_sensor_stream_error("The sensor backend is shutting down.")
+            return False
+        if self._sensor_calibration_in_progress:
+            self._set_sensor_stream_error(
+                "Wait for the current sensor calibration to finish before disconnecting."
+            )
+            return False
+
+        self._set_sensor_update_button_enabled(False)
+        was_connected = bool(self.is_connected)
+        self.is_connected = False
+        if not self._close_serial_ports():
+            self.is_connected = was_connected
+            self._set_sensor_stream_error(
+                "Could not disconnect because the sensor reader is still stopping."
+            )
+            self._set_sensor_update_button_enabled(True)
+            return False
+
+        try:
+            self._close_goodix_client()
+            self._close_standalone_sensor_api()
+        except Exception as exc:
+            self._set_sensor_stream_error(
+                f"Could not close the sensor connection cleanly: {exc}"
+            )
+            self._set_sensor_update_button_enabled(True)
+            return False
+
+        self._clear_scene_actors()
+        self.clearParameters()
+        self.reset_ai_helpers(
+            "Connect a sensor scene first to initialize AI features."
+        )
+        self.current_model_name = None
+        self.sensor_transport = "serial"
+        self._sensor_profiles_by_port = {}
+        self._latest_sensor_payloads = {}
+        self._last_sensor_api_payloads = {}
+        self._primary_sensor_port = None
+        self._calibrated_sensor_ports = set()
+        self.cal_data = []
+        self._sensor_update_hz = 0.0
+        self._sensor_update_tick_count = 0
+        self._sensor_update_tick_started_at = time.perf_counter()
+        self._visualization_hz = 0.0
+        self._visualization_tick_count = 0
+        self._visualization_tick_started_at = time.perf_counter()
+        self._reset_scene_build_state()
+        self._set_sensor_scene_ready(False)
+        self._set_sensor_update_button_enabled(True)
+        self._set_sensor_stream_error("")
+        try:
+            self.plotter.render()
+        except Exception:
+            pass
+        return True
 
     def get_sensor_visualization_modes(self):
         return list(self.SENSOR_VISUALIZATION_MODE_OPTIONS)
@@ -1758,8 +1821,13 @@ class MySensor:
         ):
             self._rebuild_heatmap_visualization_actor(render=render)
 
-    def _current_heatmap_sensor_matrix(self, fallback=None):
-        data_obj = getattr(self, "_data", None)
+    def _current_heatmap_sensor_matrix(self, fallback=None, port_name=None):
+        if port_name:
+            data_obj = self._sensor_data_for_port(port_name)
+            apply_override = self.is_primary_sensor_port(port_name)
+        else:
+            data_obj = getattr(self, "_data", None)
+            apply_override = True
         response_mode = normalize_heatmap_response_mode(
             getattr(self, "heatmap_response_mode", DEFAULT_HEATMAP_RESPONSE_MODE)
         )
@@ -1773,7 +1841,11 @@ class MySensor:
         calibration_override = getattr(
             self, "_heatmap_calibration_override", None
         )
-        if raw_matrix is not None and calibration_override is not None:
+        if (
+            apply_override
+            and raw_matrix is not None
+            and calibration_override is not None
+        ):
             raw_values = np.asarray(raw_matrix, dtype=float)
             calibration_values = np.asarray(calibration_override, dtype=float)
             if not proximity_enhanced:
@@ -1799,9 +1871,9 @@ class MySensor:
             return np.flipud(np.asarray(matrix))
         return fallback if matrix is None else matrix
 
-    def get_heatmap_sensor_matrix(self):
-        """Return the exact live value matrix currently coloured by the 3D heatmap."""
-        matrix = self._current_heatmap_sensor_matrix()
+    def get_heatmap_sensor_matrix(self, port_name=None):
+        """Return the live value matrix for the 3D heatmap, or for ``port_name``."""
+        matrix = self._current_heatmap_sensor_matrix(port_name=port_name)
         if matrix is None:
             return None
         return np.array(matrix, dtype=float, copy=True)
@@ -2463,6 +2535,7 @@ class MySensor:
 
     def buildScene(self, show_main_visualization: bool = True):
         self._set_sensor_stream_error("")
+        self._set_sensor_scene_ready(False)
         selected_sources = self._get_selected_port_names()
         if not selected_sources:
             message = (
@@ -2470,7 +2543,7 @@ class MySensor:
             )
             self._set_sensor_stream_error(message)
             print(message)
-            return
+            return False
         port_profiles = self._resolve_sensor_port_profiles(selected_sources)
         primary_profile = port_profiles[
             self._sensor_port_key(selected_sources[0])
@@ -2503,7 +2576,7 @@ class MySensor:
                 )
                 self._set_sensor_stream_error(message)
                 print(message)
-                return
+                return False
         if len(selected_sources) > 1 and any(
             is_goodix_usb_source(source) for source in selected_sources
         ):
@@ -2513,11 +2586,11 @@ class MySensor:
             )
             self._set_sensor_stream_error(message)
             print(message)
-            return
+            return False
         use_goodix_usb = is_goodix_usb_source(selected_sources[0])
         if not use_goodix_usb and not self._ensure_sensor_api_backend():
             print(self.get_last_sensor_stream_error())
-            return
+            return False
         self.main_visualization_enabled = bool(show_main_visualization)
         self._reset_scene_build_state()
         self._set_sensor_update_button_enabled(False)
@@ -2529,7 +2602,7 @@ class MySensor:
             self._set_sensor_stream_error(message)
             self._set_sensor_update_button_enabled(True)
             print(message)
-            return
+            return False
         self._clear_scene_actors()
         self._close_goodix_client()
         self._close_standalone_sensor_api()
@@ -2550,7 +2623,7 @@ class MySensor:
                 self._set_sensor_stream_error(message)
                 print(message)
                 self._close_goodix_client()
-                return
+                return False
             self.ser_list = []
         else:
             self.sensor_transport = "serial"
@@ -2561,7 +2634,7 @@ class MySensor:
                         "Could not open any of the selected sensor ports."
                     )
                 print("Could not open any of the selected ports.")
-                return
+                return False
 
         self.clearParameters()
         if not self._initialize_selected_sensor_model(
@@ -2572,12 +2645,13 @@ class MySensor:
             self._close_serial_ports()
             self._close_goodix_client()
             print("Unsupported sensor selection.")
-            return
+            return False
         self._configure_sensor_port_views()
         self.initialize_ai_helpers()
         self.update_ui_elements()
         if not bool(show_main_visualization):
             self.set_main_visualization_enabled(False, render=True)
+        return True
 
     def _initialize_from_factory(self, model: SensorModelFactory):
         """Helper to assign all model attributes from the factory to the MySensor instance."""
@@ -2665,24 +2739,31 @@ class MySensor:
         self.current_sensor_geometry_config = None
         self.sensor_visual_offset_scale = 0.0
         self._last_sensor_visualization_matrix = None
-        self._clear_contact_normal_actor()
         self._clear_sensor_point_label_actor()
 
     def update_ui_elements(self):
-        self.parent.buildScene.setText("Scene Built")
-        self.parent.buildScene.setStyleSheet("""
-            color: #3498db;
-            font-weight: bold;
-        """)
+        self.parent.buildScene.setText("Connected")
+        self.parent.buildScene.setStyleSheet(theme.active_button_style())
+        self._set_sensor_scene_ready(True)
         self._set_sensor_update_button_enabled(True)
 
     def _reset_scene_build_state(self):
-        self.parent.buildScene.setText("Build Scene")
-        self.parent.buildScene.setStyleSheet("color: white; font-weight: normal;")
+        self.parent.buildScene.setText("Connect Sensor")
+        # Clearing the sheet drops the green "running" fill and lets the
+        # button's own `primary` variant repaint it as the page's main action.
+        self.parent.buildScene.setStyleSheet("")
 
     def _set_sensor_update_button_enabled(self, enabled: bool):
+        # Gates the toolbar's Calibrate Sensor button, which is the only entry
+        # point for recalibration.
         try:
-            self.parent.sensor_update.setEnabled(bool(enabled))
+            self.parent.set_sensor_update_enabled(bool(enabled))
+        except Exception:
+            pass
+
+    def _set_sensor_scene_ready(self, ready: bool):
+        try:
+            self.parent.set_sensor_scene_ready(bool(ready))
         except Exception:
             pass
 
@@ -2726,7 +2807,6 @@ class MySensor:
         self._matrix_line_height_variation = None
         self._stereo_field_smoothed_visibility = None
         self._stereo_field_smoothed_color_response = None
-        self._clear_contact_normal_actor()
         self._clear_sensor_point_label_actor()
 
     def _get_selected_port_names(self):
@@ -3014,6 +3094,87 @@ class MySensor:
             }
         return profiles
 
+    def _sensor_source_list_label(self, port_name):
+        """Label used in Sensor Setup, including any humanoid annotation."""
+        key = self._sensor_port_key(port_name)
+        channel = getattr(getattr(self, "parent", None), "serial_channel", None)
+        if channel is not None:
+            for index in range(channel.count()):
+                item = channel.item(index)
+                if item is None:
+                    continue
+                try:
+                    source = item.data(Qt.UserRole)
+                except (AttributeError, TypeError):
+                    source = None
+                source = str(source or item.text() or "")
+                if self._sensor_port_key(source) == key:
+                    text = str(item.text() or "").strip()
+                    if text:
+                        return text
+        if is_goodix_usb_source(port_name) or key == GOODIX_USB_SOURCE_ID:
+            return GOODIX_USB_SOURCE_LABEL
+        return os.path.basename(str(key or port_name or "sensor"))
+
+    def describe_live_sensor_source(self, port_name=None):
+        """Describe one live source for the signal viewer chrome."""
+        key = self._sensor_port_key(
+            port_name or getattr(self, "_primary_sensor_port", "") or ""
+        )
+        if not key:
+            return None
+        data_obj = self._sensor_data_for_port(key)
+        if data_obj is None and key == self._sensor_port_key(
+            getattr(self, "_primary_sensor_port", "")
+        ):
+            data_obj = getattr(self, "_data", None)
+        profile = self._sensor_profile_for_port(key)
+        n_row = int(getattr(data_obj, "n_row", profile["n_row"]) or 0)
+        n_col = int(getattr(data_obj, "n_col", profile["n_col"]) or 0)
+        is_primary = self.is_primary_sensor_port(key)
+        model_name = (
+            str(getattr(self, "current_model_name", "") or "")
+            if is_primary
+            else "2d"
+        )
+        model_label = self.SENSOR_MODEL_LABELS.get(model_name, model_name)
+        port_label = self._sensor_source_list_label(key)
+        return {
+            "key": key,
+            "port_label": port_label,
+            "model": model_name,
+            "model_label": model_label,
+            "n_row": n_row,
+            "n_col": n_col,
+            "is_primary": bool(is_primary),
+            "caption": format_live_sensor_source_caption(
+                port_label,
+                model_label=model_label,
+                n_row=n_row,
+                n_col=n_col,
+                is_primary=is_primary,
+            ),
+        }
+
+    def list_live_sensor_sources(self):
+        """Live sensor ports in display order: primary first, then the rest."""
+        by_port = getattr(self, "_sensor_data_by_port", {}) or {}
+        keys = []
+        primary = self._sensor_port_key(
+            getattr(self, "_primary_sensor_port", "") or ""
+        )
+        if primary and (primary in by_port or getattr(self, "_data", None) is not None):
+            keys.append(primary)
+        for key in by_port:
+            if key not in keys:
+                keys.append(key)
+        sources = []
+        for key in keys:
+            described = self.describe_live_sensor_source(key)
+            if described is not None:
+                sources.append(described)
+        return sources
+
     def is_primary_sensor_port(self, port_name):
         primary = self._sensor_port_key(
             getattr(self, "_primary_sensor_port", "")
@@ -3056,6 +3217,7 @@ class MySensor:
                     timeout=DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
                 )
                 serial_ports.append(ser)
+                discard_pending_serial_input(ser)
                 print(f"Opened port: /dev/{port_name}")
             except Exception as exc:
                 self._set_sensor_stream_error(
@@ -4571,7 +4733,6 @@ class MySensor:
             if current_matrix is not None:
                 self._update_heatmap_visualization(current_matrix)
         self._refresh_sensor_visualization_mode_actors()
-        self._clear_contact_normal_actor()
         self._refresh_sensor_point_label_actor()
         if render:
             try:
@@ -4880,7 +5041,7 @@ class MySensor:
         data_obj.getWin(window_index)
 
     def _apply_cell_zero_mask_to_raw(self, raw_matrix, data_obj):
-        mask = getattr(self, "cell_zero_mask", None)
+        mask = self._cell_zero_mask_for_data_object(data_obj)
         if mask is None or mask.size == 0 or not bool(mask.any()):
             return
         if raw_matrix.shape != mask.shape:
@@ -4889,6 +5050,15 @@ class MySensor:
         if cal is None or cal.shape != raw_matrix.shape:
             return
         raw_matrix[mask] = cal[mask]
+
+    def _cell_zero_mask_for_data_object(self, data_obj):
+        """Return the mask belonging to the sensor data buffer being updated."""
+        if data_obj is getattr(self, "_data", None):
+            return getattr(self, "cell_zero_mask", None)
+        for view in getattr(self, "_multi_port_sensor_views", {}).values():
+            if data_obj is getattr(view, "_data", None):
+                return getattr(view, "cell_zero_mask", None)
+        return None
 
     def _apply_live_raw_overrides(self, raw_values, data_obj=None):
         """Patch known bad channels for specific live sensor layouts."""
@@ -4914,14 +5084,21 @@ class MySensor:
     # ------------------------------------------------------------------
     # Cell zero-mask: force a chosen subset of cells to always read 0.
     # ------------------------------------------------------------------
-    def get_zero_mask_key(self):
-        """Stable identifier used as the JSON key for the current sensor layout."""
-        model = self.current_model_name or "sensor"
+    def _zero_mask_key_for_layout(self, model_name, n_row, n_col):
+        model = str(model_name or "sensor")
         if self.is_goodix_usb_transport():
             model = f"goodix_usb_{model}"
+        return f"{model}_{int(n_row)}x{int(n_col)}"
+
+    def get_zero_mask_key(self):
+        """Stable identifier used as the JSON key for the current sensor layout."""
         n_row = int(getattr(self, "n_row", 0) or 0)
         n_col = int(getattr(self, "n_col", 0) or 0)
-        return f"{model}_{n_row}x{n_col}"
+        return self._zero_mask_key_for_layout(
+            self.current_model_name or "sensor",
+            n_row,
+            n_col,
+        )
 
     def get_cell_zero_mask(self):
         n_row = int(getattr(self, "n_row", 0) or 0)
@@ -5134,23 +5311,36 @@ class MySensor:
         masks[self.get_zero_mask_key()] = self.get_cell_zero_mask().astype(int).tolist()
         return self._write_zero_mask_file(payload)
 
+    def get_saved_cell_zero_mask(self, model_name, n_row, n_col):
+        """Load the saved mask for one layout without modifying live actors."""
+        n_row = int(n_row)
+        n_col = int(n_col)
+        if n_row <= 0 or n_col <= 0:
+            return None
+        payload = self._read_zero_mask_file()
+        masks = payload.get("masks", {}) if isinstance(payload, dict) else {}
+        raw = masks.get(self._zero_mask_key_for_layout(model_name, n_row, n_col))
+        if raw is None:
+            return None
+        try:
+            mask = np.asarray(raw, dtype=bool)
+        except Exception:
+            return None
+        if mask.shape != (n_row, n_col):
+            return None
+        return mask.copy()
+
     def load_cell_zero_mask_from_disk(self):
         n_row = int(getattr(self, "n_row", 0) or 0)
         n_col = int(getattr(self, "n_col", 0) or 0)
-        if n_row <= 0 or n_col <= 0:
+        mask = self.get_saved_cell_zero_mask(
+            self.current_model_name or "sensor",
+            n_row,
+            n_col,
+        )
+        if mask is None:
             return False
-        payload = self._read_zero_mask_file()
-        masks = payload.get("masks", {}) if isinstance(payload, dict) else {}
-        raw = masks.get(self.get_zero_mask_key())
-        if raw is None:
-            return False
-        try:
-            arr = np.asarray(raw, dtype=bool)
-        except Exception:
-            return False
-        if arr.shape != (n_row, n_col):
-            return False
-        self.cell_zero_mask = arr.copy()
+        self.cell_zero_mask = mask
         self._refresh_cell_zero_mask_visualization(render=True)
         return True
 
@@ -5602,8 +5792,6 @@ class MySensor:
         ):
             self._update_heatmap_visualization(latest_heatmap_matrix)
         self._refresh_sensor_selection_actor(render=False)
-        self._update_contact_force_status(sensor_matrix)
-        self._update_contact_normal_visualization(plotter_sensor_matrix)
         if render:
             self.plotter.render()
 
@@ -5620,107 +5808,6 @@ class MySensor:
         if fallback_norm > 1e-9:
             return fallback_arr / fallback_norm
         return np.array([0.0, 0.0, 1.0], dtype=float)
-
-    def _set_contact_normal_status(self, text):
-        label = getattr(self.parent, "contact_normal_status_label", None)
-        if label is not None:
-            try:
-                label.setText(str(text))
-            except Exception:
-                pass
-
-    def _set_contact_force_status(self, text):
-        label = getattr(self.parent, "contact_force_status_label", None)
-        if label is not None:
-            try:
-                label.setText(str(text))
-            except Exception:
-                pass
-
-    def set_contact_normal_visualization_enabled(self, enabled: bool):
-        self.show_contact_normal_vector = bool(enabled)
-        if not self.show_contact_normal_vector:
-            self._clear_contact_normal_actor()
-            self._set_contact_normal_status("Normal vector: off")
-            try:
-                self.plotter.render()
-            except Exception:
-                pass
-        else:
-            self._set_contact_normal_status("Normal vector: waiting for contact")
-
-    def get_contact_normal_estimator_modes(self):
-        return [
-            ("motion_direction_v3", "Motion Direction (V3)"),
-            ("touch_anchor_v4", "Touch Anchor Direction (V4)"),
-        ]
-
-    def set_contact_normal_estimator_mode(self, mode):
-        valid_modes = {key for key, _label in self.get_contact_normal_estimator_modes()}
-        mode = str(mode or "touch_anchor_v4")
-        if mode not in valid_modes:
-            mode = "touch_anchor_v4"
-        self.contact_normal_estimator_mode = mode
-        if mode == "motion_direction_v3":
-            self._set_contact_normal_status("Contact vector mode: Motion Direction (V3)")
-        else:
-            self._set_contact_normal_status("Contact vector mode: Touch Anchor Direction (V4)")
-        self._reset_contact_motion_tracker()
-        self._contact_normal_smoothed_start = None
-        self._contact_normal_smoothed_direction = None
-
-    def _reset_contact_motion_tracker(self):
-        self._contact_motion_previous_center = None
-        self._contact_anchor_center = None
-        self._contact_motion_smoothed_delta = None
-
-    def _clear_contact_normal_actor(self):
-        self.contactNormalActor = self._remove_actor_safely(
-            getattr(self, "contactNormalActor", None)
-        )
-        self.contactNormalMesh = None
-        self._contact_normal_smoothed_start = None
-        self._contact_normal_smoothed_direction = None
-        self._reset_contact_motion_tracker()
-
-    def _sensor_scene_span(self):
-        points = np.asarray(getattr(self, "points_origin", None), dtype=float)
-        if points.size == 0:
-            return 1.0
-        finite = points[np.all(np.isfinite(points), axis=1)]
-        if finite.size == 0:
-            return 1.0
-        span = np.ptp(finite, axis=0)
-        return max(float(np.linalg.norm(span)), 1e-3)
-
-    def _grid_point_index(self, col, row):
-        col = int(np.clip(int(col), 0, max(0, self.n_col - 1)))
-        row = int(np.clip(int(row), 0, max(0, self.n_row - 1)))
-        return _column_major_idx(self.n_row, col, row)
-
-    def _point_at_cell(self, col, row):
-        return np.asarray(self.points_origin[self._grid_point_index(col, row)], dtype=float)
-
-    def _local_contact_tangent_axes(self, peak_col, peak_row, surface_normal):
-        normal = self._normalize_vector(surface_normal)
-
-        left_col = max(0, int(peak_col) - 1)
-        right_col = min(self.n_col - 1, int(peak_col) + 1)
-        down_row = max(0, int(peak_row) - 1)
-        up_row = min(self.n_row - 1, int(peak_row) + 1)
-
-        tangent_col = self._point_at_cell(right_col, peak_row) - self._point_at_cell(left_col, peak_row)
-        tangent_row = self._point_at_cell(peak_col, up_row) - self._point_at_cell(peak_col, down_row)
-
-        tangent_col = tangent_col - normal * float(np.dot(tangent_col, normal))
-        tangent_col = self._normalize_vector(tangent_col, fallback=np.cross(normal, [0.0, 0.0, 1.0]))
-        if float(np.linalg.norm(tangent_col)) <= 1e-9:
-            tangent_col = self._normalize_vector(np.cross(normal, [1.0, 0.0, 0.0]))
-
-        tangent_row = tangent_row - normal * float(np.dot(tangent_row, normal))
-        tangent_row = tangent_row - tangent_col * float(np.dot(tangent_row, tangent_col))
-        tangent_row = self._normalize_vector(tangent_row, fallback=np.cross(normal, tangent_col))
-        return tangent_col, tangent_row
 
     def _contact_cluster_mask(self, pressure, peak_row, peak_col, threshold):
         touched = np.asarray(pressure >= float(threshold), dtype=bool)
@@ -5753,7 +5840,7 @@ class MySensor:
 
         pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
         if peak_threshold is None:
-            peak_threshold = getattr(self, "contact_normal_threshold_pct", 3.0)
+            peak_threshold = getattr(self, "contact_force_threshold_pct", 3.0)
         peak_threshold = max(0.0, float(peak_threshold))
         peak_flat = int(np.argmax(pressure))
         peak_row, peak_col = np.unravel_index(peak_flat, pressure.shape)
@@ -5761,7 +5848,10 @@ class MySensor:
         if peak_pressure < peak_threshold:
             return None
 
-        cluster_floor = max(0.0, float(getattr(self, "contact_normal_cluster_floor_pct", 0.8)))
+        cluster_floor = max(
+            0.0,
+            float(getattr(self, "contact_force_cluster_floor_pct", 0.8)),
+        )
         cluster_threshold = min(
             peak_threshold,
             max(cluster_floor, peak_pressure * 0.08),
@@ -5792,502 +5882,6 @@ class MySensor:
             "center_col": center_col,
             "peak_pressure": peak_pressure,
         }
-
-    def _update_contact_force_status(self, sensor_matrix):
-        estimate = self._estimate_contact_force_signal(sensor_matrix)
-        if estimate is None:
-            self._set_contact_force_status("Contact force: no contact")
-            return
-
-        force_n = estimate.get("force_n")
-        if force_n is None:
-            self._set_contact_force_status(
-                "Contact force: uncalibrated | "
-                f"signal {estimate['signal_sum']:.2f}, "
-                f"nodes {estimate['active_nodes']}, "
-                f"center r{estimate['center_row']:.2f} c{estimate['center_col']:.2f}"
-            )
-        else:
-            self._set_contact_force_status(
-                f"Contact force: {force_n:.3f} N | "
-                f"signal {estimate['signal_sum']:.2f}, "
-                f"scale {estimate['scale']:.6f} N/signal"
-            )
-
-    @staticmethod
-    def _bilinear_sample_matrix(matrix, row, col):
-        data = np.asarray(matrix, dtype=float)
-        n_row, n_col = data.shape
-        if row < 0.0 or col < 0.0 or row > (n_row - 1) or col > (n_col - 1):
-            return None
-
-        r0 = int(np.floor(row))
-        c0 = int(np.floor(col))
-        r1 = min(r0 + 1, n_row - 1)
-        c1 = min(c0 + 1, n_col - 1)
-        fr = float(row - r0)
-        fc = float(col - c0)
-
-        return float(
-            data[r0, c0] * (1.0 - fr) * (1.0 - fc)
-            + data[r1, c0] * fr * (1.0 - fc)
-            + data[r0, c1] * (1.0 - fr) * fc
-            + data[r1, c1] * fr * fc
-        )
-
-    def _pressure_residual_tilt_components(self, weights, center_row, center_col):
-        weights = np.asarray(weights, dtype=float)
-        if weights.shape != (self.n_row, self.n_col):
-            return 0.0, 0.0, 0.0
-
-        rows, cols = np.indices((self.n_row, self.n_col))
-        weight_sum = float(np.sum(weights))
-        if weight_sum <= 1e-9:
-            return 0.0, 0.0, 0.0
-
-        d_rows = rows - float(center_row)
-        d_cols = cols - float(center_col)
-        spread = float(np.sqrt(np.sum(weights * (d_rows ** 2 + d_cols ** 2)) / weight_sum))
-        spread = max(spread, 0.5)
-
-        residual_row = 0.0
-        residual_col = 0.0
-        residual_abs = 0.0
-        sample_count = 0
-
-        active_indices = np.argwhere(weights > 0.0)
-        for row, col in active_indices:
-            mirror_row = 2.0 * float(center_row) - float(row)
-            mirror_col = 2.0 * float(center_col) - float(col)
-            mirror_value = self._bilinear_sample_matrix(weights, mirror_row, mirror_col)
-            if mirror_value is None:
-                continue
-
-            residual = float(weights[row, col] - mirror_value)
-            residual_row += residual * float(row - center_row)
-            residual_col += residual * float(col - center_col)
-            residual_abs += abs(residual)
-            sample_count += 1
-
-        if sample_count <= 0:
-            return 0.0, 0.0, 0.0
-
-        norm = max(weight_sum * spread, 1e-9)
-        tilt_row = residual_row / norm
-        tilt_col = residual_col / norm
-        residual_strength = residual_abs / max(weight_sum, 1e-9)
-
-        deadband = max(0.0, float(getattr(self, "contact_normal_residual_deadband", 0.06)))
-        magnitude = float(np.hypot(tilt_row, tilt_col))
-        if magnitude <= deadband:
-            return 0.0, 0.0, residual_strength
-
-        scale = (magnitude - deadband) / magnitude
-        gain = float(getattr(self, "contact_normal_residual_gain", 1.2))
-        return tilt_row * scale * gain, tilt_col * scale * gain, residual_strength
-
-    def _contact_motion_delta(self, center_row, center_col):
-        current_center = np.array([float(center_row), float(center_col)], dtype=float)
-        previous_center = getattr(self, "_contact_motion_previous_center", None)
-        self._contact_motion_previous_center = current_center
-
-        if previous_center is None:
-            raw_delta = np.zeros(2, dtype=float)
-        else:
-            previous_center = np.asarray(previous_center, dtype=float)
-            if previous_center.shape != (2,) or not np.all(np.isfinite(previous_center)):
-                raw_delta = np.zeros(2, dtype=float)
-            else:
-                raw_delta = current_center - previous_center
-
-        alpha = float(getattr(self, "contact_motion_smoothing_alpha", 0.55))
-        alpha = max(0.0, min(1.0, alpha))
-        previous_delta = getattr(self, "_contact_motion_smoothed_delta", None)
-        if previous_delta is None:
-            smoothed_delta = raw_delta
-        else:
-            previous_delta = np.asarray(previous_delta, dtype=float)
-            if previous_delta.shape != (2,) or not np.all(np.isfinite(previous_delta)):
-                smoothed_delta = raw_delta
-            else:
-                smoothed_delta = alpha * raw_delta + (1.0 - alpha) * previous_delta
-
-        self._contact_motion_smoothed_delta = smoothed_delta
-        return raw_delta, smoothed_delta
-
-    def _contact_anchor_delta(self, center_row, center_col):
-        current_center = np.array([float(center_row), float(center_col)], dtype=float)
-        anchor_center = getattr(self, "_contact_anchor_center", None)
-        if anchor_center is None:
-            self._contact_anchor_center = current_center
-            raw_delta = np.zeros(2, dtype=float)
-        else:
-            anchor_center = np.asarray(anchor_center, dtype=float)
-            if anchor_center.shape != (2,) or not np.all(np.isfinite(anchor_center)):
-                self._contact_anchor_center = current_center
-                raw_delta = np.zeros(2, dtype=float)
-            else:
-                raw_delta = current_center - anchor_center
-
-        alpha = float(getattr(self, "contact_motion_smoothing_alpha", 0.55))
-        alpha = max(0.0, min(1.0, alpha))
-        previous_delta = getattr(self, "_contact_motion_smoothed_delta", None)
-        if previous_delta is None:
-            smoothed_delta = raw_delta
-        else:
-            previous_delta = np.asarray(previous_delta, dtype=float)
-            if previous_delta.shape != (2,) or not np.all(np.isfinite(previous_delta)):
-                smoothed_delta = raw_delta
-            else:
-                smoothed_delta = alpha * raw_delta + (1.0 - alpha) * previous_delta
-
-        self._contact_motion_smoothed_delta = smoothed_delta
-        return raw_delta, smoothed_delta
-
-    @staticmethod
-    def _angle_between_vectors_deg(vector_a, vector_b):
-        a = np.asarray(vector_a, dtype=float)
-        b = np.asarray(vector_b, dtype=float)
-        a_norm = float(np.linalg.norm(a))
-        b_norm = float(np.linalg.norm(b))
-        if a_norm <= 1e-9 or b_norm <= 1e-9:
-            return 0.0
-        return float(
-            np.degrees(
-                np.arccos(
-                    np.clip(float(np.dot(a / a_norm, b / b_norm)), -1.0, 1.0)
-                )
-            )
-        )
-
-    def _smooth_contact_normal_pose(self, start, direction, preserve_direction_sign=False):
-        alpha = float(getattr(self, "contact_normal_smoothing_alpha", 0.65))
-        alpha = max(0.0, min(1.0, alpha))
-        start = np.asarray(start, dtype=float)
-        direction = self._normalize_vector(direction)
-
-        previous_start = getattr(self, "_contact_normal_smoothed_start", None)
-        previous_direction = getattr(self, "_contact_normal_smoothed_direction", None)
-        if previous_start is None or previous_direction is None:
-            self._contact_normal_smoothed_start = start
-            self._contact_normal_smoothed_direction = direction
-            return start, direction
-
-        previous_start = np.asarray(previous_start, dtype=float)
-        previous_direction = self._normalize_vector(previous_direction, fallback=direction)
-        if not preserve_direction_sign and float(np.dot(previous_direction, direction)) < 0.0:
-            previous_direction = -previous_direction
-
-        smoothed_start = alpha * start + (1.0 - alpha) * previous_start
-        smoothed_direction = self._normalize_vector(
-            alpha * direction + (1.0 - alpha) * previous_direction,
-            fallback=direction,
-        )
-
-        self._contact_normal_smoothed_start = smoothed_start
-        self._contact_normal_smoothed_direction = smoothed_direction
-        return smoothed_start, smoothed_direction
-
-    @staticmethod
-    def _make_contact_normal_arrow_mesh(start, direction, arrow_length):
-        direction = np.asarray(direction, dtype=float)
-        norm = float(np.linalg.norm(direction))
-        if norm <= 1e-9:
-            direction = np.array([0.0, 0.0, 1.0], dtype=float)
-        else:
-            direction = direction / norm
-        length = max(float(arrow_length), 1e-6)
-        return pv.Arrow(
-            start=np.asarray(start, dtype=float),
-            direction=direction,
-            scale=length,
-            tip_length=0.28,
-            tip_radius=0.065,
-            shaft_radius=0.022,
-            tip_resolution=24,
-            shaft_resolution=24,
-        )
-
-    def _estimate_contact_normal_vector(self, sensor_matrix):
-        if self.points_origin is None or self.normals is None:
-            return None
-
-        values = np.asarray(sensor_matrix, dtype=float)
-        if values.shape != (self.n_row, self.n_col):
-            return None
-
-        pressure = np.abs(np.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0))
-        peak_threshold = max(0.0, float(getattr(self, "contact_normal_threshold_pct", 3.0)))
-        peak_flat = int(np.argmax(pressure))
-        peak_row, peak_col = np.unravel_index(peak_flat, pressure.shape)
-        peak_pressure = float(pressure[peak_row, peak_col])
-        if peak_pressure < peak_threshold:
-            return None
-
-        cluster_floor = max(0.0, float(getattr(self, "contact_normal_cluster_floor_pct", 0.8)))
-        cluster_threshold = min(
-            peak_threshold,
-            max(cluster_floor, peak_pressure * 0.08),
-        )
-
-        cluster = self._contact_cluster_mask(pressure, peak_row, peak_col, cluster_threshold)
-        if not bool(cluster.any()):
-            return None
-
-        weights = np.where(cluster, np.maximum(pressure - cluster_threshold, 0.0), 0.0)
-        weight_sum = float(np.sum(weights))
-        if weight_sum <= 1e-9:
-            weights = np.where(cluster, pressure, 0.0)
-            weight_sum = float(np.sum(weights))
-        if weight_sum <= 1e-9:
-            return None
-
-        rows, cols = np.indices((self.n_row, self.n_col))
-        center_row = float(np.sum(rows * weights) / weight_sum)
-        center_col = float(np.sum(cols * weights) / weight_sum)
-
-        weighted_point = np.zeros(3, dtype=float)
-        weighted_surface_normal = np.zeros(3, dtype=float)
-        for col in range(self.n_col):
-            for row in range(self.n_row):
-                weight = float(weights[row, col])
-                if weight <= 0.0:
-                    continue
-                idx = _column_major_idx(self.n_row, col, row)
-                weighted_point += np.asarray(self.points_origin[idx], dtype=float) * weight
-                weighted_surface_normal += np.asarray(self.normals[idx], dtype=float) * weight
-
-        contact_point = weighted_point / weight_sum
-        peak_idx = _column_major_idx(self.n_row, int(peak_col), int(peak_row))
-        surface_normal = self._normalize_vector(
-            weighted_surface_normal / weight_sum,
-            fallback=self.normals[peak_idx],
-        )
-
-        delta_col = float(center_col - peak_col)
-        delta_row = float(center_row - peak_row)
-        mode = str(getattr(self, "contact_normal_estimator_mode", "touch_anchor_v4"))
-        residual_strength = 0.0
-        if mode in ("motion_direction_v3", "touch_anchor_v4"):
-            anchor_col = int(np.clip(round(center_col), 0, max(0, self.n_col - 1)))
-            anchor_row = int(np.clip(round(center_row), 0, max(0, self.n_row - 1)))
-            tangent_col, tangent_row = self._local_contact_tangent_axes(
-                anchor_col,
-                anchor_row,
-                surface_normal,
-            )
-            if mode == "touch_anchor_v4":
-                raw_delta, smoothed_delta = self._contact_anchor_delta(center_row, center_col)
-            else:
-                raw_delta, smoothed_delta = self._contact_motion_delta(center_row, center_col)
-            motion_cells = float(np.linalg.norm(smoothed_delta))
-            deadband_cells = max(0.0, float(getattr(self, "contact_motion_deadband_cells", 0.025)))
-            motion_vector = tangent_row * float(smoothed_delta[0]) + tangent_col * float(smoothed_delta[1])
-            motion_vector_norm = float(np.linalg.norm(motion_vector))
-            motion_over_deadband = max(0.0, motion_cells - deadband_cells)
-            has_motion = motion_over_deadband > 0.0 and motion_vector_norm > 1e-9
-            if has_motion:
-                motion_direction = self._normalize_vector(motion_vector, fallback=tangent_col)
-                max_tilt_deg = max(
-                    0.0,
-                    min(90.0, float(getattr(self, "contact_motion_max_tilt_deg", 90.0))),
-                )
-                motion_strength = 1.0 - float(
-                    np.exp(
-                        -motion_over_deadband
-                        * max(0.0, float(getattr(self, "contact_motion_tilt_gain", 6.0)))
-                    )
-                )
-                tilt_rad = np.radians(max_tilt_deg * np.clip(motion_strength, 0.0, 1.0))
-                display_direction = self._normalize_vector(
-                    (-surface_normal * float(np.cos(tilt_rad)))
-                    + (motion_direction * float(np.sin(tilt_rad))),
-                    fallback=-surface_normal,
-                )
-                vector_type = "motion tilt"
-            else:
-                display_direction = self._normalize_vector(-surface_normal, fallback=(0.0, 0.0, -1.0))
-                vector_type = "perpendicular"
-
-            normal = self._normalize_vector(-display_direction, fallback=surface_normal)
-            tilt_deg = self._angle_between_vectors_deg(-surface_normal, display_direction)
-            return {
-                "point": contact_point,
-                "surface_normal": surface_normal,
-                "normal": normal,
-                "display_direction": display_direction,
-                "center_row": center_row,
-                "center_col": center_col,
-                "peak_row": int(peak_row),
-                "peak_col": int(peak_col),
-                "peak_pressure": peak_pressure,
-                "tilt_deg": tilt_deg,
-                "mode": mode,
-                "mode_label": (
-                    "Touch Anchor Direction (V4)"
-                    if mode == "touch_anchor_v4"
-                    else "Motion Direction (V3)"
-                ),
-                "residual_strength": residual_strength,
-                "motion_cells": motion_cells,
-                "anchor_row": (
-                    float(self._contact_anchor_center[0])
-                    if mode == "touch_anchor_v4"
-                    and getattr(self, "_contact_anchor_center", None) is not None
-                    else None
-                ),
-                "anchor_col": (
-                    float(self._contact_anchor_center[1])
-                    if mode == "touch_anchor_v4"
-                    and getattr(self, "_contact_anchor_center", None) is not None
-                    else None
-                ),
-                "raw_motion_row": float(raw_delta[0]),
-                "raw_motion_col": float(raw_delta[1]),
-                "smoothed_motion_row": float(smoothed_delta[0]),
-                "smoothed_motion_col": float(smoothed_delta[1]),
-                "vector_type": vector_type,
-            }
-
-        if mode == "peak_offset_v1":
-            tangent_col, tangent_row = self._local_contact_tangent_axes(
-                int(peak_col),
-                int(peak_row),
-                surface_normal,
-            )
-            tilt = tangent_col * delta_col + tangent_row * delta_row
-            mode_label = "Peak Offset (V1)"
-        else:
-            anchor_col = int(np.clip(round(center_col), 0, max(0, self.n_col - 1)))
-            anchor_row = int(np.clip(round(center_row), 0, max(0, self.n_row - 1)))
-            tangent_col, tangent_row = self._local_contact_tangent_axes(
-                anchor_col,
-                anchor_row,
-                surface_normal,
-            )
-            tilt_row, tilt_col, residual_strength = self._pressure_residual_tilt_components(
-                weights,
-                center_row,
-                center_col,
-            )
-            tilt = tangent_col * tilt_col + tangent_row * tilt_row
-            mode_label = "Balanced Residual (V2)"
-
-        normal = self._normalize_vector(
-            surface_normal + float(self.contact_normal_tilt_gain) * tilt,
-            fallback=surface_normal,
-        )
-        tilt_deg = float(
-            np.degrees(
-                np.arccos(
-                    np.clip(float(np.dot(surface_normal, normal)), -1.0, 1.0)
-                )
-            )
-        )
-        return {
-            "point": contact_point,
-            "surface_normal": surface_normal,
-            "normal": normal,
-            "center_row": center_row,
-            "center_col": center_col,
-            "peak_row": int(peak_row),
-            "peak_col": int(peak_col),
-            "peak_pressure": peak_pressure,
-            "tilt_deg": tilt_deg,
-            "mode": mode,
-            "mode_label": mode_label,
-            "residual_strength": residual_strength,
-        }
-
-    def _update_contact_normal_visualization(self, sensor_matrix):
-        if not bool(getattr(self, "show_contact_normal_vector", False)):
-            return
-
-        estimate = self._estimate_contact_normal_vector(sensor_matrix)
-        if estimate is None:
-            if str(getattr(self, "contact_normal_estimator_mode", "")) in (
-                "motion_direction_v3",
-                "touch_anchor_v4",
-            ):
-                self._reset_contact_motion_tracker()
-            self._contact_normal_missing_frames += 1
-            grace = max(0, int(getattr(self, "contact_normal_missing_grace_frames", 4)))
-            if self.contactNormalActor is not None and self._contact_normal_missing_frames <= grace:
-                self._set_contact_normal_status("Normal vector: holding last estimate")
-                return
-            self._clear_contact_normal_actor()
-            self._set_contact_normal_status("Normal vector: no contact")
-            return
-        self._contact_normal_missing_frames = 0
-
-        span = self._sensor_scene_span()
-        arrow_length = max(span * 0.22, 0.03)
-        surface_offset = max(span * 0.015, 0.003)
-        display_surface_normal = -estimate["surface_normal"]
-        direction = estimate.get("display_direction")
-        if direction is None:
-            direction = -estimate["normal"]
-        direction = self._normalize_vector(direction, fallback=-estimate["surface_normal"])
-        start = estimate["point"] + display_surface_normal * surface_offset
-        preserve_direction_sign = estimate.get("mode") in (
-            "motion_direction_v3",
-            "touch_anchor_v4",
-        )
-        start, direction = self._smooth_contact_normal_pose(
-            start,
-            direction,
-            preserve_direction_sign=preserve_direction_sign,
-        )
-
-        try:
-            new_arrow = self._make_contact_normal_arrow_mesh(start, direction, arrow_length)
-            if self.contactNormalMesh is None or self.contactNormalActor is None:
-                self.contactNormalMesh = new_arrow
-                self.contactNormalActor = self.plotter.add_mesh(
-                    self.contactNormalMesh,
-                    color="#ffd34d",
-                    smooth_shading=True,
-                    reset_camera=False,
-                    name="contact_normal_vector",
-                    render=False,
-                )
-            else:
-                self.contactNormalMesh.copy_from(new_arrow)
-                self.contactNormalMesh.Modified()
-        except Exception as exc:
-            self._clear_contact_normal_actor()
-            self._set_contact_normal_status(f"Normal vector error: {exc}")
-            return
-
-        if estimate.get("mode") in ("motion_direction_v3", "touch_anchor_v4"):
-            if estimate.get("mode") == "touch_anchor_v4":
-                anchor_text = (
-                    f"anchor r{estimate.get('anchor_row', 0.0):.2f} "
-                    f"c{estimate.get('anchor_col', 0.0):.2f}, "
-                )
-                distance_label = "anchor displacement"
-            else:
-                anchor_text = ""
-                distance_label = "frame motion"
-            self._set_contact_normal_status(
-                "Contact vector: "
-                f"{estimate.get('mode_label', 'Motion Direction (V3)')}, "
-                f"{estimate.get('vector_type', 'motion')}, "
-                f"{anchor_text}"
-                f"row {estimate['center_row']:.2f}, col {estimate['center_col']:.2f}, "
-                f"{distance_label} {estimate.get('motion_cells', 0.0):.3f} cells, "
-                f"tilt {estimate.get('tilt_deg', 0.0):.1f} deg, "
-                f"v=({direction[0]:+.2f}, {direction[1]:+.2f}, {direction[2]:+.2f})"
-            )
-        else:
-            self._set_contact_normal_status(
-                "Normal vector: "
-                f"{estimate.get('mode_label', 'Balanced Residual (V2)')}, "
-                f"row {estimate['center_row']:.2f}, col {estimate['center_col']:.2f}, "
-                f"tilt {estimate['tilt_deg']:.1f} deg, "
-                f"residual {estimate.get('residual_strength', 0.0):.2f}, "
-                f"n=({direction[0]:+.2f}, {direction[1]:+.2f}, {direction[2]:+.2f})"
-            )
 
     def set_touch_sensitivity(self, new_value: float):
         """
@@ -6439,12 +6033,9 @@ class _MultiPortSensorReplica(MySensor):
         replica._multi_port_sensor_views = {}
         replica._multi_port_label_actors = []
         replica._selected_sensor_cell = None
-        replica.show_contact_normal_vector = False
         replica.show_sensor_point_labels = False
         replica.referenceAxisActors = []
         replica.actorPlaneXY = None
-        replica.contactNormalActor = None
-        replica.contactNormalMesh = None
         replica.sensorPointLabelActor = None
         replica.sensorSelectionActor = None
         replica.sensorSelectionPoly = None
@@ -6528,9 +6119,15 @@ class _MultiPortSensorReplica(MySensor):
         if owner_mask.shape == (replica.n_row, replica.n_col):
             replica.cell_zero_mask = owner_mask.copy()
         else:
-            replica.cell_zero_mask = np.zeros(
-                (replica.n_row, replica.n_col),
-                dtype=bool,
+            saved_mask = owner.get_saved_cell_zero_mask(
+                "2d",
+                replica.n_row,
+                replica.n_col,
+            )
+            replica.cell_zero_mask = (
+                saved_mask
+                if saved_mask is not None
+                else np.zeros((replica.n_row, replica.n_col), dtype=bool)
             )
 
         replica._ensure_main_sensor_visualization_actors()
@@ -6575,7 +6172,6 @@ class _MultiPortSensorReplica(MySensor):
             "matrixLineActor",
             "heatmapActor",
             "heatmapGridActor",
-            "contactNormalActor",
             "sensorPointLabelActor",
             "sensorSelectionActor",
         ):
@@ -6589,12 +6185,6 @@ class _MultiPortSensorReplica(MySensor):
             setattr(self, actor_name, None)
 
     def _record_visualization_tick(self):
-        return None
-
-    def _update_contact_force_status(self, sensor_matrix):
-        return None
-
-    def _update_contact_normal_visualization(self, sensor_matrix):
         return None
 
     def _refresh_sensor_selection_actor(self, render=True):

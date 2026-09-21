@@ -22,6 +22,7 @@ from PyQt5.QtWidgets import (
 )
 import time
 from phd.dependence.paths import resource_path, robot_resource_path
+from phd.ui import components, theme
 import math
 from math import sin, cos
 
@@ -61,7 +62,9 @@ class MyMeshLab():
         self.referenceAxisActors_2 = []
         self.actorPlaneXY = None
         self.actorPlaneXY_2 = None
-        self.show_secondary_background_reference = True
+        # Reference geometry is restored when a sensor scene is built. Keeping
+        # it hidden initially avoids an enormous empty grid at startup.
+        self.show_secondary_background_reference = False
         self.creatPlaneXY()
         self.timer = QTimer()
         # self.timer.timeout.connect(self.update_animation)
@@ -417,7 +420,7 @@ class MyMeshLab():
         # render window is properly finalized and stops competing for the
         # OpenGL context. Without this the sensor plotter can stay frozen.
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        dialog.resize(900, 760)
+        components.size_to_screen(dialog, 900, 760)
         v = QVBoxLayout(dialog)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(0)
@@ -435,10 +438,9 @@ class MyMeshLab():
             "Toggle live follow: poll the robot's current joint angles and "
             "update the visualization in real time."
         )
-        btn_live.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#c84040;color:white;font-weight:bold;}"
-        )
+        # Green = this is running. Reserved for read-only/benign toggles;
+        # anything that commands robot motion uses amber further down.
+        btn_live.setStyleSheet(theme.checkable_button_style(theme.SUCCESS))
         toolbar.addWidget(btn_live)
 
         btn_reset = QPushButton("Reset View")
@@ -459,8 +461,7 @@ class MyMeshLab():
             "The same single serial reader is used; main-UI sensor rendering is disabled."
         )
         btn_robot_sensor_stream.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#356aa0;color:white;font-weight:bold;}"
+            theme.checkable_button_style(theme.SUCCESS)
         )
         toolbar.addWidget(btn_robot_sensor_stream)
 
@@ -470,10 +471,7 @@ class MyMeshLab():
             "Overlay the current built sensor, or preview the selected sensor model, on a robot link.\n"
             "Use 'Sensor Mount...' to tune and save the link-to-sensor transform."
         )
-        btn_map_sensor.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#2f8f72;color:white;font-weight:bold;}"
-        )
+        btn_map_sensor.setStyleSheet(theme.checkable_button_style(theme.ACCENT))
         toolbar.addWidget(btn_map_sensor)
 
         btn_sensor_mount = QPushButton("Sensor Mount…")
@@ -489,10 +487,7 @@ class MyMeshLab():
             "Colour the mapped sensor from live diffPerDataAve values. "
             "Turn off to restore the row/column orientation colours."
         )
-        btn_sensor_signal.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#a34b3f;color:white;font-weight:bold;}"
-        )
+        btn_sensor_signal.setStyleSheet(theme.checkable_button_style(theme.SUCCESS))
         toolbar.addWidget(btn_sensor_signal)
 
         v.addLayout(toolbar)
@@ -507,10 +502,9 @@ class MyMeshLab():
             "Yield along the mapped sensor normal using pressure-controlled "
             "base-frame TCP velocity. This commands the real robot."
         )
-        btn_admittance.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#b76a20;color:white;font-weight:bold;}"
-        )
+        # Amber for every mode that commands the real robot, so it reads as
+        # "the arm can move now" at a glance.
+        btn_admittance.setStyleSheet(theme.checkable_button_style(theme.WARNING))
         btn_admittance.setChecked(
             bool(getattr(self, "_robot_dialog_admittance_active", False))
         )
@@ -522,10 +516,7 @@ class MyMeshLab():
         btn_link5_frame.setToolTip(
             "Show the exact link-5 kinematic frame origin and its local XYZ axes."
         )
-        btn_link5_frame.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#3977a8;color:white;font-weight:bold;}"
-        )
+        btn_link5_frame.setStyleSheet(theme.checkable_button_style(theme.ACCENT))
         motion_toolbar.addWidget(btn_link5_frame)
 
         btn_drag_vel = QPushButton("✥ Drag (Velocity)")
@@ -535,10 +526,7 @@ class MyMeshLab():
             "sphere via a 30 Hz P-controller (uses ContinueVLine velocity mode).\n"
             "Best for smooth, fast, continuous tracking."
         )
-        btn_drag_vel.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#d68e1d;color:white;font-weight:bold;}"
-        )
+        btn_drag_vel.setStyleSheet(theme.checkable_button_style(theme.WARNING))
         motion_toolbar.addWidget(btn_drag_vel)
 
         btn_drag_ptp = QPushButton("✥ Drag (PTP)")
@@ -548,16 +536,13 @@ class MyMeshLab():
             "PTP via SetPositions).\n"
             "Best for discrete, precise hops to a teach target."
         )
-        btn_drag_ptp.setStyleSheet(
-            "QPushButton{padding:4px 12px;}"
-            "QPushButton:checked{background-color:#1d8ed6;color:white;font-weight:bold;}"
-        )
+        btn_drag_ptp.setStyleSheet(theme.checkable_button_style(theme.WARNING))
         motion_toolbar.addWidget(btn_drag_ptp)
 
         motion_toolbar.addStretch(1)
 
         status_label = QLabel("Idle")
-        status_label.setStyleSheet("color:#aaaaaa;")
+        status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
         status_label.setMaximumWidth(300)
         motion_toolbar.addWidget(status_label)
 
@@ -572,10 +557,10 @@ class MyMeshLab():
         # wireframe ground plane and bright RGB axes, so the imported robot
         # reads the same as inside the sensor view.
         try:
-            plotter.background_color = '#202020'
+            plotter.background_color = theme.VIEWPORT_BG
         except Exception:
             try:
-                plotter.set_background('#202020')
+                plotter.set_background(theme.VIEWPORT_BG)
             except Exception:
                 pass
 
@@ -2224,7 +2209,7 @@ class MyMeshLab():
             f"Sensor Mount Mapping — {self._robot_sensor_mapping_key()}"
         )
         dialog.setModal(False)
-        dialog.resize(520, 760)
+        components.size_to_screen(dialog, 520, 760)
         layout = QVBoxLayout(dialog)
         description = QLabel(
             "Tune the transform from the selected robot link to the center of the "
@@ -5525,7 +5510,7 @@ class MyMeshLab():
         dialog.setWindowTitle(f"Dexterous Hand Model - {source_name}")
         dialog.setWindowFlags(dialog.windowFlags() | Qt.Window)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        dialog.resize(900, 760)
+        components.size_to_screen(dialog, 900, 760)
 
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -5593,7 +5578,7 @@ class MyMeshLab():
         plotter = QtInteractor(dialog)
         layout.addWidget(plotter.interactor)
         try:
-            plotter.set_background("#202020")
+            plotter.set_background(theme.VIEWPORT_BG)
         except Exception:
             pass
 

@@ -30,7 +30,7 @@ from PyQt5.QtWidgets import (
 )
 from pyvistaqt import QtInteractor
 from phd.dependence.paths import resource_path, robot_resource_path  # pyright: ignore[reportMissingImports]
-from phd.ui import theme
+from phd.ui import components, theme
 
 try:
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -61,7 +61,7 @@ class DirectFingerMotionMixin:
     def _build_ps5_controller_test_dialog(self):
         self.ps5_controller_test_dialog = QDialog(self)
         self.ps5_controller_test_dialog.setWindowTitle("PS5 Controller Test")
-        self.ps5_controller_test_dialog.resize(760, 420)
+        components.size_to_screen(self.ps5_controller_test_dialog, 760, 420)
 
         layout = QVBoxLayout(self.ps5_controller_test_dialog)
         self.ps5_controller_status_label = QLabel("Device: not connected")
@@ -153,7 +153,7 @@ class DirectFingerMotionMixin:
     def _build_sensor_controller_test_dialog(self):
         self.sensor_controller_test_dialog = QDialog(self)
         self.sensor_controller_test_dialog.setWindowTitle("Sensor Controller Test")
-        self.sensor_controller_test_dialog.resize(760, 520)
+        components.size_to_screen(self.sensor_controller_test_dialog, 760, 520)
 
         layout = QVBoxLayout(self.sensor_controller_test_dialog)
         self.sensor_controller_status_label = QLabel("Sensor mapping preview: ready")
@@ -309,13 +309,16 @@ class DirectFingerMotionMixin:
         self.sensor_touch_grid_info_label.setText(f"Grid: {shape[0]} x {shape[1]}")
 
     def _touch_cell_style(self, active_strength):
+        # White -> red ramp, matching the heatmap convention used by the 3D
+        # sensor view, so an idle cell here looks the same as the idle style
+        # applied when the grid is built.
         strength = float(np.clip(active_strength, 0.0, 1.0))
-        red = int(40 + 200 * strength)
-        green = int(35 + 70 * strength)
-        blue = int(35 + 50 * (1.0 - strength))
+        green = int(255 - 190 * strength)
+        blue = int(255 - 200 * strength)
+        text = "#FFFFFF" if strength > 0.55 else theme.TEXT_MUTED
         return (
-            f"background-color: rgb({red}, {green}, {blue}); "
-            f"border: 1px solid {theme.BORDER_SUBTLE}; color: #ffffff;"
+            f"background-color: rgb(255, {green}, {blue}); "
+            f"border: 1px solid {theme.BORDER_SUBTLE}; color: {text};"
         )
 
     @staticmethod
@@ -732,7 +735,7 @@ class DirectFingerMotionMixin:
     def _build_direct_finger_motion_settings_dialog(self):
         self.direct_finger_motion_settings_dialog = QDialog(self)
         self.direct_finger_motion_settings_dialog.setWindowTitle("Direct Finger Motion Parameters")
-        self.direct_finger_motion_settings_dialog.resize(900, 720)
+        components.size_to_screen(self.direct_finger_motion_settings_dialog, 900, 720)
         # Tooltips inherit the themed QToolTip style from the global QSS.
 
         dialog_layout = QVBoxLayout(self.direct_finger_motion_settings_dialog)
@@ -748,29 +751,24 @@ class DirectFingerMotionMixin:
         header_text_layout.addWidget(self.direct_finger_motion_subtitle_label)
         dialog_layout.addLayout(header_text_layout)
 
-        self.direct_finger_motion_settings_group = QGroupBox("DFM Parameters")
+        self.direct_finger_motion_settings_group = QWidget()
         panel_layout = QVBoxLayout(self.direct_finger_motion_settings_group)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(theme.SPACE_SM)
         self.direct_finger_motion_inputs = {}
 
-        def make_section(title):
-            section = QGroupBox(title)
-            section_grid = QGridLayout(section)
-            section_grid.setHorizontalSpacing(10)
-            section_grid.setVerticalSpacing(6)
-            section_grid.setColumnStretch(1, 1)
-            section_grid.setColumnStretch(3, 1)
-            return section, section_grid
+        def make_section(title, subtitle=""):
+            return components.section(title, subtitle)
 
-        def add_field(section_grid, name, label, row, col, widget):
+        def add_field(section_list, name, label, row, col, widget):
             widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
-            label_widget.setMinimumWidth(150)
             tooltip = self.DFM_PARAMETER_TOOLTIPS.get(name, "")
             if tooltip:
-                label_widget.setToolTip(tooltip)
                 widget.setToolTip(tooltip)
-            section_grid.addWidget(label_widget, row, col)
-            section_grid.addWidget(widget, row, col + 1)
+            hint = tooltip.splitlines()[0] if tooltip else ""
+            section_list.add(
+                components.SettingsRow(label, widget, hint=hint)
+            )
             self.direct_finger_motion_inputs[name] = widget
 
         def add_double(section_grid, name, label, row, col, minimum, maximum, step, decimals=4):
@@ -789,20 +787,29 @@ class DirectFingerMotionMixin:
         def add_bool(section_grid, name, label, row, col):
             add_field(section_grid, name, label, row, col, QCheckBox())
 
-        touch_group, touch_grid = make_section("Touch Detection & Tracking")
+        touch_group, touch_grid = make_section(
+            "Touch detection",
+            "Contact and centroid tracking thresholds.",
+        )
         add_double(touch_grid, "motion_threshold", "Motion Threshold", 0, 0, -1000.0, 1000.0, 0.1, 3)
         add_double(touch_grid, "centroid_deadband", "Centroid Deadband", 1, 0, 0.0, 10.0, 0.001, 4)
         add_double(touch_grid, "keep_margin", "Keep Margin", 2, 0, 0.0, 100.0, 0.05, 3)
         add_int(touch_grid, "no_touch_reset_limit", "No-touch Reset Frames", 3, 0, 0, 999)
 
-        speed_group, speed_grid = make_section("Speed, Ratio & Smoothing")
+        speed_group, speed_grid = make_section(
+            "Motion response",
+            "Robot speed scaling and command smoothing.",
+        )
         add_double(speed_grid, "robot_speed", "Robot Speed", 0, 0, 0.0, 10.0, 0.01, 4)
         add_double(speed_grid, "centroid_gain", "Centroid Gain", 1, 0, 0.0, 100.0, 0.1, 3)
         add_double(speed_grid, "min_speed_ratio", "Min Speed Ratio", 2, 0, 0.0, 100.0, 0.05, 3)
         add_double(speed_grid, "max_speed_ratio", "Max Speed Ratio", 3, 0, 0.0, 100.0, 0.05, 3)
         add_double(speed_grid, "velocity_smoothing_alpha", "Velocity Smoothing α", 4, 0, 0.0, 1.0, 0.05, 2)
 
-        push_pull_group, push_pull_grid = make_section("Push & Pull")
+        push_pull_group, push_pull_grid = make_section(
+            "Push and pull",
+            "Pressure and two-contact depth commands.",
+        )
         add_bool(push_pull_grid, "push_pinch_enabled", "Enable Push/Pinch", 0, 0)
         add_double(push_pull_grid, "push_value_threshold", "Push Value Threshold", 1, 0, -1000.0, 1000.0, 0.5, 3)
         add_double(push_pull_grid, "push_speed", "Push Speed", 2, 0, 0.0, 10.0, 0.01, 4)
@@ -816,7 +823,10 @@ class DirectFingerMotionMixin:
         add_double(push_pull_grid, "pinch_midpoint_deadband", "Pinch Midpoint Deadband", 5, 2, 0.0, 100.0, 0.05, 3)
         add_int(push_pull_grid, "pinch_frames_required", "Pinch Frames", 6, 2, 0, 999)
 
-        rotation_group, rotation_grid = make_section("Two-Finger Swipe Rotation")
+        rotation_group, rotation_grid = make_section(
+            "Two-finger rotation",
+            "Swipe recognition and axis locking.",
+        )
         add_bool(rotation_grid, "two_finger_swipe_enable_horizontal", "Enable Horizontal Swipe", 0, 0)
         add_bool(rotation_grid, "two_finger_swipe_enable_vertical", "Enable Vertical Swipe", 1, 0)
         add_double(rotation_grid, "rotation_speed", "Rotation Speed", 2, 0, 0.0, 10.0, 0.001, 4)
@@ -825,7 +835,10 @@ class DirectFingerMotionMixin:
         add_int(rotation_grid, "two_finger_swipe_axis_lock_frames", "Axis Lock Frames", 5, 0, 0, 999)
         add_int(rotation_grid, "two_finger_release_grace_frames", "Release Grace Frames", 6, 0, 0, 999)
 
-        runtime_group, runtime_grid = make_section("Runtime & Logging")
+        runtime_group, runtime_grid = make_section(
+            "Runtime and logging",
+            "Stream safety and diagnostic output.",
+        )
         add_double(runtime_grid, "sensor_frame_timeout_sec", "Sensor Timeout (s)", 0, 0, 0.0, 5.0, 0.01, 2)
         add_int(runtime_grid, "frame_interval_ms", "Timer Interval (ms)", 1, 0, 0, 10000)
         add_bool(runtime_grid, "motion_ratio_log_enabled", "Enable Motion Ratio Log", 2, 0)
@@ -849,7 +862,11 @@ class DirectFingerMotionMixin:
         panel_layout.addWidget(scroll_area)
 
         button_row = QHBoxLayout()
-        self.apply_direct_finger_motion_settings_button = QPushButton("Apply DFM Params")
+        self.apply_direct_finger_motion_settings_button = QPushButton("Apply Changes")
+        components.apply_variant(
+            self.apply_direct_finger_motion_settings_button,
+            "primary",
+        )
         self.reload_direct_finger_motion_settings_button = QPushButton("Reload Saved Params")
         button_row.addWidget(self.apply_direct_finger_motion_settings_button)
         button_row.addWidget(self.reload_direct_finger_motion_settings_button)
@@ -876,7 +893,7 @@ class DirectFingerMotionMixin:
     def _build_console_control_settings_dialog(self):
         self.console_control_settings_dialog = QDialog(self)
         self.console_control_settings_dialog.setWindowTitle("Console Control Parameters")
-        self.console_control_settings_dialog.resize(720, 520)
+        components.size_to_screen(self.console_control_settings_dialog, 720, 520)
 
         dialog_layout = QVBoxLayout(self.console_control_settings_dialog)
         title = QLabel("Console Control Parameters")
@@ -887,10 +904,53 @@ class DirectFingerMotionMixin:
         dialog_layout.addWidget(title)
         dialog_layout.addWidget(subtitle)
 
-        group = QGroupBox("Controller Mapping and Motion")
+        group = QWidget()
         panel_layout = QVBoxLayout(group)
-        grid = QGridLayout()
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(theme.SPACE_SM)
         self.console_control_inputs = {}
+
+        motion_group, motion_list = components.section(
+            "Motion response",
+            "Deadband and maximum tool velocities.",
+        )
+        mapping_group, mapping_list = components.section(
+            "Controller mapping",
+            "Linux joystick axis and button assignments.",
+        )
+        direction_group, direction_list = components.section(
+            "Direction",
+            "Use -1 only when an axis moves in reverse.",
+        )
+        runtime_group, runtime_list = components.section(
+            "Runtime",
+            "Command timing, smoothing, and Sensor V2 modifiers.",
+        )
+
+        mapping_names = {
+            "console_device_index",
+            "console_axis_left_x", "console_axis_left_y",
+            "console_axis_right_x", "console_axis_right_y",
+            "console_axis_l2", "console_axis_r2",
+            "console_button_l1", "console_button_r1",
+        }
+        direction_names = {
+            "console_x_sign", "console_y_sign", "console_z_sign",
+            "console_rx_sign", "console_ry_sign", "console_rz_sign",
+        }
+        runtime_names = {
+            "frame_interval_ms", "velocity_smoothing_alpha",
+            "console_sensor_v2_slow_scale", "console_sensor_v2_fast_scale",
+        }
+
+        def target_list(name):
+            if name in mapping_names:
+                return mapping_list
+            if name in direction_names:
+                return direction_list
+            if name in runtime_names:
+                return runtime_list
+            return motion_list
 
         def add_double(name, label, row, col, minimum, maximum, step, decimals=4, tooltip=""):
             widget = QDoubleSpinBox()
@@ -898,12 +958,11 @@ class DirectFingerMotionMixin:
             widget.setRange(minimum, maximum)
             widget.setSingleStep(step)
             widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
             if tooltip:
-                label_widget.setToolTip(tooltip)
                 widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
+            target_list(name).add(
+                components.SettingsRow(label, widget, hint=tooltip)
+            )
             self.console_control_inputs[name] = widget
 
         def add_int(name, label, row, col, minimum, maximum, step=1, tooltip=""):
@@ -911,12 +970,11 @@ class DirectFingerMotionMixin:
             widget.setRange(minimum, maximum)
             widget.setSingleStep(step)
             widget.setMinimumWidth(120)
-            label_widget = QLabel(label)
             if tooltip:
-                label_widget.setToolTip(tooltip)
                 widget.setToolTip(tooltip)
-            grid.addWidget(label_widget, row, col)
-            grid.addWidget(widget, row, col + 1)
+            target_list(name).add(
+                components.SettingsRow(label, widget, hint=tooltip)
+            )
             self.console_control_inputs[name] = widget
 
         add_int("console_device_index", "Joystick Device Index", 0, 0, 0, 9, tooltip="/dev/input/jsN device number.")
@@ -947,9 +1005,28 @@ class DirectFingerMotionMixin:
         add_double("console_sensor_v2_slow_scale", "Sensor V2 Slow Scale", 8, 2, 0.05, 1.0, 0.05, 2, "L1 speed multiplier in Sensor V2.")
         add_double("console_sensor_v2_fast_scale", "Sensor V2 Fast Scale", 9, 2, 1.0, 4.0, 0.1, 2, "R1 speed multiplier in Sensor V2.")
 
-        panel_layout.addLayout(grid)
+        content = QWidget()
+        content_layout = QGridLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setHorizontalSpacing(theme.SPACE_MD)
+        content_layout.setVerticalSpacing(theme.SPACE_MD)
+        content_layout.addWidget(motion_group, 0, 0)
+        content_layout.addWidget(mapping_group, 0, 1)
+        content_layout.addWidget(direction_group, 1, 0)
+        content_layout.addWidget(runtime_group, 1, 1)
+        content_layout.setColumnStretch(0, 1)
+        content_layout.setColumnStretch(1, 1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+        scroll.setWidget(content)
+        panel_layout.addWidget(scroll)
         button_row = QHBoxLayout()
-        self.apply_console_control_settings_button = QPushButton("Apply Console Params")
+        self.apply_console_control_settings_button = QPushButton("Apply Changes")
+        components.apply_variant(
+            self.apply_console_control_settings_button,
+            "primary",
+        )
         self.reload_console_control_settings_button = QPushButton("Reload Saved Params")
         button_row.addWidget(self.apply_console_control_settings_button)
         button_row.addWidget(self.reload_console_control_settings_button)
@@ -1109,11 +1186,9 @@ class DirectFingerMotionMixin:
                 self._set_button_active(self.direct_finger_motion_tool_pose_record_menu_button, active)
 
     def _append_direct_finger_motion_log(self, message):
+        # Append only: DFM logs motion ratios several times a second while
+        # running, which must not keep re-opening a log the user closed.
         if hasattr(self, "log_display"):
-            if not self.log_display.isVisible():
-                self.log_display.setVisible(True)
-                if hasattr(self, "adjust_splitter_sizes"):
-                    self.adjust_splitter_sizes()
             self.log_display.append(message)
         else:
             print(message)
@@ -3919,7 +3994,7 @@ class DirectFingerMotionMixin:
         summary_text = self._format_direct_finger_motion_multi_path_analysis_summary(analyses)
         dialog = QDialog(self)
         dialog.setWindowTitle("Robot Tool Path Method Comparison")
-        dialog.resize(1400, 1040)
+        components.size_to_screen(dialog, 1400, 1040)
         layout = QVBoxLayout(dialog)
 
         summary = QPlainTextEdit(dialog)
@@ -4017,7 +4092,7 @@ class DirectFingerMotionMixin:
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Tool Pose Path Analysis")
-        dialog.resize(1320, 920)
+        components.size_to_screen(dialog, 1320, 920)
         layout = QVBoxLayout(dialog)
 
         summary = QPlainTextEdit(dialog)
@@ -4214,7 +4289,7 @@ class DirectFingerMotionMixin:
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Tool Pose Path Viewer")
-        dialog.resize(900, 700)
+        components.size_to_screen(dialog, 900, 700)
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -5503,8 +5578,8 @@ class DirectFingerMotionMixin:
         label = getattr(self, "ai_direct_execution_model_status", None)
         if label is not None:
             prefix = "Default" if is_default else "Selected"
-            label.setText(f"{prefix}: {os.path.basename(path)}")
             label.setToolTip(path)
+            label.setText(f"{prefix}: {os.path.basename(path)}")
             if os.path.isfile(path):
                 label.setStyleSheet(
                     f"color: {theme.SUCCESS_HOVER}; font-weight: 600;"

@@ -27,7 +27,7 @@ from phd.dependence.sensor_geometry import (
     heatmap_surface_from_corner_lattice,
     smooth_grid_points,
 )
-from phd.ui import theme
+from phd.ui import components, theme
 
 
 class SensorShapeEditorDialog(QDialog):
@@ -45,7 +45,7 @@ class SensorShapeEditorDialog(QDialog):
     def __init__(self, editor_data, geometry_config, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Custom Sensor Shape Editor")
-        self.resize(1180, 760)
+        components.size_to_screen(self, 1180, 760)
         self.setModal(True)
 
         self.n_row = int(editor_data["n_row"])

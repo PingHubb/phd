@@ -74,12 +74,10 @@ class ProximityControl:
         self.load_settings_from_file()
 
     def _append_log(self, message: str):
+        # Append only: this runs from the proximity control loop, so forcing
+        # the log open here would resize the workspace during robot motion.
         if hasattr(self.ros_splitter, "log_display"):
             try:
-                if not self.ros_splitter.log_display.isVisible():
-                    self.ros_splitter.log_display.setVisible(True)
-                    if hasattr(self.ros_splitter, "adjust_splitter_sizes"):
-                        self.ros_splitter.adjust_splitter_sizes()
                 self.ros_splitter.log_display.append(message)
                 return
             except Exception:

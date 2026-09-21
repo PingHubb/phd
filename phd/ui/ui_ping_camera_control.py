@@ -291,6 +291,7 @@ class CameraControlMixin:
         self._shutdown_dialog("console_control_settings_dialog", "Console Control settings")
         self._shutdown_dialog("proximity_settings_dialog", "Proximity Control settings")
         self._shutdown_dialog("sensor_parameters_dialog", "Sensor Parameters")
+        self._shutdown_dialog("log_console_window", "application log")
         self._shutdown_dialog("ps5_controller_test_dialog", "PS5 controller test dialog")
         self._shutdown_dialog("sensor_controller_test_dialog", "Sensor controller test dialog")
         self._shutdown_dialog(
@@ -350,6 +351,7 @@ class CameraControlMixin:
         self.centering_active = self.auto_center_button.isChecked()
 
         if self.centering_active:
+            self._software_motion_stopped = False
             self._set_auto_center_ui_state(True)
             print("Auto-Centering ACTIVATED. Enabling Robot Velocity Mode...")
 
@@ -366,7 +368,9 @@ class CameraControlMixin:
             self._stop_auto_centering()
 
     def process_yolo_data(self, detections, frame_size):
-        if self._is_shutting_down:
+        if self._is_shutting_down or bool(
+            getattr(self, "_software_motion_stopped", False)
+        ):
             return
 
         if not self.centering_active:
@@ -453,7 +457,9 @@ class CameraControlMixin:
             QTimer.singleShot(2000, self.check_grip_result)
 
     def check_grip_result(self):
-        if self._is_shutting_down:
+        if self._is_shutting_down or bool(
+            getattr(self, "_software_motion_stopped", False)
+        ):
             return
 
         action, self.grip_fail_count = self.gripper.evaluate_grip_attempt(self.grip_fail_count)
@@ -470,6 +476,9 @@ class CameraControlMixin:
             self.start_manual_mode()
 
     def perform_lift_action(self):
+        if bool(getattr(self, "_software_motion_stopped", False)):
+            self.is_lifting = False
+            return
         self.is_lifting = True
         lift_speed = -0.04
 
@@ -478,7 +487,9 @@ class CameraControlMixin:
         QTimer.singleShot(5000, self.stop_lift_action)
 
     def stop_lift_action(self):
-        if self._is_shutting_down:
+        if self._is_shutting_down or bool(
+            getattr(self, "_software_motion_stopped", False)
+        ):
             self.is_lifting = False
             return
 
@@ -487,14 +498,18 @@ class CameraControlMixin:
         self.send_velocity_command(0.0, 0.0, 0.0)
 
     def reset_grab_flag(self):
-        if self._is_shutting_down:
+        if self._is_shutting_down or bool(
+            getattr(self, "_software_motion_stopped", False)
+        ):
             return
 
         print("[System] Ready to grab again.")
         self.grab_triggered = False
 
     def start_manual_mode(self):
-        if self._is_shutting_down:
+        if self._is_shutting_down or bool(
+            getattr(self, "_software_motion_stopped", False)
+        ):
             return
 
         self.manual_mode_active = True
@@ -527,6 +542,10 @@ class CameraControlMixin:
             self.stop_manual_mode()
 
     def stop_manual_mode(self):
+        if bool(getattr(self, "_software_motion_stopped", False)):
+            self.manual_mode_active = False
+            self.manual_watchdog_timer.stop()
+            return
         self.grab_triggered = True
         self.manual_mode_active = False
         self.grip_fail_count = 0

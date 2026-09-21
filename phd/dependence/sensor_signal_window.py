@@ -44,7 +44,7 @@ from PyQt5.QtGui import (
     QPainterPath,
     QPen,
 )
-from phd.ui import theme
+from phd.ui import components, theme
 from phd.dependence.sensor_heatmap import (
     DEFAULT_HEATMAP_3D_COLOR_GAIN,
     DEFAULT_HEATMAP_3D_PALETTE,
@@ -630,7 +630,7 @@ class SensorSignalTrackingWindow(QDialog):
             f"Live Sensor Difference - P{self.flat_index} "
             f"(r{self.row}, c{self.column})"
         )
-        self.resize(1000, 520)
+        components.size_to_screen(self, 1000, 520)
         self._filter_window = 10
         self._filter_values = deque(maxlen=self._filter_window)
         self._latest_record = None
@@ -938,6 +938,10 @@ class SensorSignalWindow(QWidget):
         self._last_reader_error_log_time = 0.0
         self._standalone_frame_sequence = 0
         self._native_frame_signal = None
+        self._native_port_frame_signal = None
+        self._watched_source_key = None
+        self._listed_source_keys = None
+        self._standalone_port = None
 
         self.table_rows = 1
         self.table_columns = 1
@@ -1006,9 +1010,35 @@ class SensorSignalWindow(QWidget):
     # ------------------------------------------------------------------
     def _build_ui(self):
         self.setWindowTitle("Sensor Signal Viewer")
-        self.resize(1600, 800)
+        components.size_to_screen(self, 1600, 800)
 
         layout = QVBoxLayout(self)
+
+        source_row = QWidget()
+        source_layout = QHBoxLayout(source_row)
+        source_layout.setContentsMargins(0, 0, 0, theme.SPACE_SM)
+        source_layout.setSpacing(theme.SPACE_SM)
+        watching_label = QLabel("Watching")
+        watching_label.setStyleSheet(theme.type_style("caption"))
+        self.source_combo = QComboBox()
+        self.source_combo.setMinimumContentsLength(24)
+        self.source_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLength
+        )
+        self.source_combo.setToolTip(
+            "Which connected sensor this window is showing. When Multiple "
+            "Ports is on, pick another port here without rebuilding the scene."
+        )
+        self.source_combo.currentIndexChanged.connect(
+            self._on_watched_source_changed
+        )
+        self.source_caption = QLabel("")
+        self.source_caption.setStyleSheet(theme.type_style("caption"))
+        self.source_caption.setWordWrap(True)
+        source_layout.addWidget(watching_label)
+        source_layout.addWidget(self.source_combo, 1)
+        source_layout.addWidget(self.source_caption, 1)
+        layout.addWidget(source_row)
 
         self.table = QTableWidget()
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -1532,6 +1562,285 @@ class SensorSignalWindow(QWidget):
         self.info_label.setText(f"Heatmap saved → {path}")
 
     # ------------------------------------------------------------------
+    # Live source (port / sensor) selection
+    # ------------------------------------------------------------------
+    def _py_attr(self, name, default=None):
+        """Read a Python attribute without touching QWidget.getattr.
+
+        Several unit tests construct this window with ``__new__`` and never
+        call ``QWidget.__init__``. Qt's getattr then raises RuntimeError.
+        """
+        try:
+            return object.__getattribute__(self, name)
+        except AttributeError:
+            return default
+
+    def _source_descriptions(self):
+        if not self._py_attr("_using_shared_sensor_data", False):
+            sensor_api = self._py_attr("sensor_api")
+            port = self._py_attr("_standalone_port") or getattr(
+                sensor_api, "serial_port", None
+            )
+            if not port:
+                return []
+            return [
+                {
+                    "key": str(port),
+                    "port_label": os.path.basename(str(port)),
+                    "model": "",
+                    "model_label": "",
+                    "n_row": int(self.table_rows or 0),
+                    "n_col": int(self.table_columns or 0),
+                    "is_primary": True,
+                    "caption": self._format_source_caption(
+                        os.path.basename(str(port)),
+                        n_row=self.table_rows,
+                        n_col=self.table_columns,
+                    ),
+                }
+            ]
+        sensor_functions = self._get_shared_sensor_functions()
+        lister = getattr(sensor_functions, "list_live_sensor_sources", None)
+        if callable(lister):
+            try:
+                sources = list(lister() or [])
+            except Exception:
+                sources = []
+            if sources:
+                return sources
+        if sensor_functions is None:
+            return []
+        fallback_rows = int(self._py_attr("table_rows") or 0)
+        fallback_cols = int(self._py_attr("table_columns") or 0)
+        n_row = int(getattr(sensor_functions, "n_row", fallback_rows) or 0)
+        n_col = int(getattr(sensor_functions, "n_col", fallback_cols) or 0)
+        if n_row <= 0 or n_col <= 0:
+            return []
+        return [
+            {
+                "key": "primary",
+                "port_label": "Live sensor stream",
+                "model": str(
+                    getattr(sensor_functions, "current_model_name", "") or ""
+                ),
+                "model_label": "",
+                "n_row": n_row,
+                "n_col": n_col,
+                "is_primary": True,
+                "caption": self._format_source_caption(
+                    "Live sensor stream",
+                    n_row=n_row,
+                    n_col=n_col,
+                ),
+            }
+        ]
+
+    @staticmethod
+    def _format_source_caption(port_label, model_label="", n_row=0, n_col=0, is_primary=False):
+        from phd.dependence.func_sensor import format_live_sensor_source_caption
+
+        return format_live_sensor_source_caption(
+            port_label,
+            model_label=model_label,
+            n_row=n_row,
+            n_col=n_col,
+            is_primary=is_primary,
+        )
+
+    def _current_source_dict(self):
+        key = self._py_attr("_watched_source_key")
+        for source in self._source_descriptions():
+            if key is None or source.get("key") == key:
+                return source
+        return None
+
+    def _watched_source_caption(self):
+        source = self._current_source_dict()
+        if source is None:
+            return ""
+        return str(source.get("caption") or source.get("port_label") or "")
+
+    def _idle_info_text(self):
+        caption = self._watched_source_caption()
+        if caption:
+            return f"Watching {caption}. Click any cell to see its index."
+        return "Click any cell to see its index"
+
+    def _cell_info_text(self, flat_index):
+        caption = self._watched_source_caption()
+        if caption:
+            return f"{caption} · cell {flat_index}"
+        return f"Clicked cell index: {flat_index}"
+
+    def _is_watching_primary_source(self):
+        if not self._py_attr("_using_shared_sensor_data", False):
+            return True
+        source = self._current_source_dict()
+        if source is not None:
+            return bool(source.get("is_primary", True))
+        sensor_functions = self._get_shared_sensor_functions()
+        checker = getattr(sensor_functions, "is_primary_sensor_port", None)
+        key = self._py_attr("_watched_source_key")
+        if callable(checker) and key:
+            try:
+                return bool(checker(key))
+            except Exception:
+                return True
+        return True
+
+    def _shared_data_obj(self):
+        sensor_functions = self._get_shared_sensor_functions()
+        if sensor_functions is None:
+            return None
+        key = self._py_attr("_watched_source_key")
+        getter = getattr(sensor_functions, "_sensor_data_for_port", None)
+        if key and callable(getter):
+            data_obj = getter(key)
+            if data_obj is not None:
+                return data_obj
+        return getattr(sensor_functions, "_data", None)
+
+    def _update_source_chrome(self):
+        caption = self._watched_source_caption()
+        self.setWindowTitle(
+            f"Sensor Signal — {caption}" if caption else "Sensor Signal Viewer"
+        )
+        combo = self._py_attr("source_combo")
+        hint = self._py_attr("source_caption")
+        sources = self._source_descriptions()
+        if combo is not None:
+            combo.setEnabled(len(sources) > 1)
+        if hint is None:
+            return
+        source = self._current_source_dict()
+        if len(sources) > 1 and source and source.get("is_primary"):
+            hint.setText("Primary — AI and robot control keep using this port.")
+        elif len(sources) > 1:
+            hint.setText("Showing this port. Switch the list to watch another.")
+        else:
+            hint.setText("")
+
+    def _fill_source_combo(self, sources, selected_key):
+        combo = self._py_attr("source_combo")
+        if combo is None:
+            return
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            selected_index = 0
+            for index, source in enumerate(sources):
+                combo.addItem(
+                    str(source.get("caption") or source.get("port_label") or ""),
+                    source.get("key"),
+                )
+                if source.get("key") == selected_key:
+                    selected_index = index
+            if sources:
+                combo.setCurrentIndex(selected_index)
+        finally:
+            combo.blockSignals(False)
+
+    def _apply_watched_source(self, source, *, source_changed):
+        self.table_rows = max(1, int(source.get("n_row") or self.table_rows or 1))
+        self.table_columns = max(
+            1, int(source.get("n_col") or self.table_columns or 1)
+        )
+        if not source_changed:
+            return
+        self.selected_index = None
+        for button_name in ("action_button", "track_signal_button"):
+            button = self._py_attr(button_name)
+            if button is not None:
+                button.setEnabled(False)
+        self._close_signal_tracker()
+        if self._is_watching_primary_source():
+            self._set_3d_selected_cell(None, None)
+        else:
+            self._clear_3d_selected_cell()
+        self._shared_calibration_overridden = False
+        self.calibration_data = []
+        initial_diffs = self._py_attr("initial_diffs")
+        if initial_diffs is not None:
+            initial_diffs.clear()
+        threshold_max = self._py_attr("threshold_max")
+        if threshold_max is not None:
+            threshold_max.clear()
+        self.cells_remaining_for_threshold = None
+        self._sync_shared_calibration()
+        info_label = self._py_attr("info_label")
+        if info_label is not None:
+            info_label.setText(self._idle_info_text())
+
+    def _refresh_watched_sources(self, prefer_primary=False):
+        sources = self._source_descriptions()
+        keys = [source.get("key") for source in sources]
+        previous_key = self._py_attr("_watched_source_key")
+        keys_changed = keys != self._py_attr("_listed_source_keys")
+        if not keys_changed and not prefer_primary and previous_key in keys:
+            return previous_key
+        self._listed_source_keys = keys
+        selected_key = previous_key
+        if prefer_primary or selected_key not in keys:
+            primary = next(
+                (source for source in sources if source.get("is_primary")),
+                sources[0] if sources else None,
+            )
+            selected_key = primary.get("key") if primary else None
+        self._watched_source_key = selected_key
+        self._fill_source_combo(sources, selected_key)
+        source = next(
+            (item for item in sources if item.get("key") == selected_key),
+            None,
+        )
+        if source is not None:
+            self._apply_watched_source(
+                source,
+                source_changed=selected_key != previous_key or prefer_primary,
+            )
+        self._update_source_chrome()
+        return selected_key
+
+    def _on_watched_source_changed(self, index):
+        combo = self._py_attr("source_combo")
+        if combo is None:
+            return
+        key = combo.itemData(index)
+        if not key or key == self._py_attr("_watched_source_key"):
+            return
+        previous = self._watched_source_key
+        self._watched_source_key = key
+        source = self._current_source_dict()
+        if source is not None:
+            self._apply_watched_source(source, source_changed=key != previous)
+        self._update_source_chrome()
+        if self._has_sensor_source():
+            self.refresh_data()
+
+    def _close_signal_tracker(self):
+        tracker = self._py_attr("_signal_tracker_window")
+        if tracker is None:
+            return
+        try:
+            tracker.close()
+        except RuntimeError:
+            pass
+        self._signal_tracker_window = None
+
+    def _clear_3d_selected_cell(self):
+        sensor_functions = (
+            self._get_shared_sensor_functions()
+            if self._using_shared_sensor_data
+            else self._resolve_sensor_functions()
+        )
+        setter = getattr(sensor_functions, "set_selected_sensor_cell", None)
+        if not callable(setter):
+            return False
+        try:
+            return bool(setter(None, None))
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
     # Sensor connection
     # ------------------------------------------------------------------
     def _try_connect_shared_sensor_source(self):
@@ -1552,14 +1861,27 @@ class SensorSignalWindow(QWidget):
         self.sensor_api = None
         self.table_rows = max(1, n_row)
         self.table_columns = max(1, n_col)
-        self._sync_shared_calibration()
-        self._publish_heatmap_settings_to_sensor()
         self._connect_shared_native_frame_signal(sensor_functions)
-        self.info_label.setText("Using live sensor stream")
+        self._refresh_watched_sources(prefer_primary=True)
+        self._publish_heatmap_settings_to_sensor()
+        if hasattr(self, "info_label") and self.info_label is not None:
+            self.info_label.setText(self._idle_info_text())
         return True
 
     def _connect_shared_native_frame_signal(self, sensor_functions):
         bridge = getattr(sensor_functions, "_payload_bridge", None)
+        port_signal = getattr(bridge, "port_frame_processed", None)
+        if (
+            port_signal is not None
+            and self._native_port_frame_signal is None
+        ):
+            try:
+                port_signal.connect(self._on_shared_port_frame_processed)
+            except Exception:
+                port_signal = None
+            else:
+                self._native_port_frame_signal = port_signal
+                return True
         signal = getattr(bridge, "frame_processed", None)
         if signal is None or self._native_frame_signal is not None:
             return False
@@ -1571,6 +1893,13 @@ class SensorSignalWindow(QWidget):
         return True
 
     def _disconnect_shared_native_frame_signal(self):
+        port_signal = getattr(self, "_native_port_frame_signal", None)
+        if port_signal is not None:
+            try:
+                port_signal.disconnect(self._on_shared_port_frame_processed)
+            except Exception:
+                pass
+            self._native_port_frame_signal = None
         signal = getattr(self, "_native_frame_signal", None)
         if signal is None:
             return
@@ -1580,7 +1909,16 @@ class SensorSignalWindow(QWidget):
             pass
         self._native_frame_signal = None
 
-    def _on_shared_native_frame_processed(
+    def _port_matches_watched_source(self, port_name):
+        watched = self._py_attr("_watched_source_key")
+        if not watched:
+            return True
+        sensor_functions = self._get_shared_sensor_functions()
+        key_fn = getattr(sensor_functions, "_sensor_port_key", None)
+        incoming = key_fn(port_name) if callable(key_fn) else str(port_name)
+        return incoming == watched
+
+    def _ingest_shared_native_frame(
         self,
         timestamp,
         frame_sequence,
@@ -1602,6 +1940,37 @@ class SensorSignalWindow(QWidget):
             frame_sequence,
             raw_list,
             calibration_list,
+        )
+
+    def _on_shared_port_frame_processed(
+        self,
+        port_name,
+        timestamp,
+        frame_sequence,
+        raw_matrix,
+        calibration_matrix,
+    ):
+        if not self._port_matches_watched_source(port_name):
+            return
+        self._ingest_shared_native_frame(
+            timestamp,
+            frame_sequence,
+            raw_matrix,
+            calibration_matrix,
+        )
+
+    def _on_shared_native_frame_processed(
+        self,
+        timestamp,
+        frame_sequence,
+        raw_matrix,
+        calibration_matrix,
+    ):
+        self._ingest_shared_native_frame(
+            timestamp,
+            frame_sequence,
+            raw_matrix,
+            calibration_matrix,
         )
 
     def _has_sensor_source(self):
@@ -1657,13 +2026,17 @@ class SensorSignalWindow(QWidget):
         if self._shared_calibration_overridden:
             return
 
-        sensor_functions = self._get_shared_sensor_functions()
-        data_obj = getattr(sensor_functions, "_data", None) if sensor_functions is not None else None
+        data_obj = self._shared_data_obj()
         if data_obj is None:
             return
 
-        rows = max(1, int(getattr(sensor_functions, "n_row", self.table_rows) or self.table_rows))
-        columns = max(1, int(getattr(sensor_functions, "n_col", self.table_columns) or self.table_columns))
+        source = self._current_source_dict()
+        if source:
+            rows = max(1, int(source.get("n_row") or self.table_rows or 1))
+            columns = max(1, int(source.get("n_col") or self.table_columns or 1))
+        else:
+            rows = max(1, int(getattr(data_obj, "n_row", self.table_rows) or self.table_rows))
+            columns = max(1, int(getattr(data_obj, "n_col", self.table_columns) or self.table_columns))
         cal_matrix = getattr(data_obj, "calData", None)
         cal_values = self._flatten_shared_matrix_for_display(
             cal_matrix, rows, columns
@@ -1674,6 +2047,8 @@ class SensorSignalWindow(QWidget):
 
     def _publish_heatmap_baseline_to_sensor(self):
         if not self._using_shared_sensor_data or not self.calibration_data:
+            return False
+        if not self._is_watching_primary_source():
             return False
         sensor_functions = self._get_shared_sensor_functions()
         setter = getattr(
@@ -1705,7 +2080,14 @@ class SensorSignalWindow(QWidget):
         if not callable(getter):
             return []
         try:
-            matrix = getter()
+            key = self._py_attr("_watched_source_key")
+            if key:
+                try:
+                    matrix = getter(port_name=key)
+                except TypeError:
+                    matrix = getter()
+            else:
+                matrix = getter()
         except Exception:
             return []
         return self._flatten_sensor_matrix_column_major(
@@ -1713,13 +2095,17 @@ class SensorSignalWindow(QWidget):
         )
 
     def _read_shared_raw_list(self):
-        sensor_functions = self._get_shared_sensor_functions()
-        data_obj = getattr(sensor_functions, "_data", None) if sensor_functions is not None else None
+        data_obj = self._shared_data_obj()
         if data_obj is None:
             return []
 
-        rows = max(1, int(getattr(sensor_functions, "n_row", self.table_rows) or self.table_rows))
-        columns = max(1, int(getattr(sensor_functions, "n_col", self.table_columns) or self.table_columns))
+        source = self._current_source_dict()
+        if source:
+            rows = max(1, int(source.get("n_row") or self.table_rows or 1))
+            columns = max(1, int(source.get("n_col") or self.table_columns or 1))
+        else:
+            rows = max(1, int(getattr(data_obj, "n_row", self.table_rows) or self.table_rows))
+            columns = max(1, int(getattr(data_obj, "n_col", self.table_columns) or self.table_columns))
         self.table_rows = rows
         self.table_columns = columns
         self._sync_shared_calibration()
@@ -1791,8 +2177,10 @@ class SensorSignalWindow(QWidget):
             QTimer.singleShot(0, self.close)
             return
 
+        self._standalone_port = port
         self._initialize_sensor_dimensions()
         self._initialize_calibration()
+        self._refresh_watched_sources(prefer_primary=True)
 
     def _initialize_sensor_dimensions(self):
         try:
@@ -1996,6 +2384,12 @@ class SensorSignalWindow(QWidget):
             column,
             parent=self,
         )
+        caption = self._watched_source_caption()
+        if caption:
+            window.setWindowTitle(
+                f"Live Sensor Difference — {caption} · P{flat_index} "
+                f"(r{row}, c{column})"
+            )
         self._signal_tracker_window = window
         window.destroyed.connect(
             lambda *_args, tracked=window: self._clear_signal_tracker_window(
@@ -2045,7 +2439,7 @@ class SensorSignalWindow(QWidget):
             self.table.clearSelection()
             self.selected_index = None
             self._set_3d_selected_cell(None, None)
-            self.info_label.setText("Click any cell to see its index")
+            self.info_label.setText(self._idle_info_text())
             self.action_button.setEnabled(False)
             self.track_signal_button.setEnabled(False)
             self.table.viewport().update()
@@ -2053,13 +2447,19 @@ class SensorSignalWindow(QWidget):
 
         self.selected_index = flat_index
         self._set_3d_selected_cell(row, column)
-        self.info_label.setText(f"Clicked cell index: {flat_index}")
+        self.info_label.setText(self._cell_info_text(flat_index))
         self.action_button.setEnabled(True)
         self.track_signal_button.setEnabled(True)
         self.table.viewport().update()
 
     def _set_3d_selected_cell(self, row=None, column=None):
         """Mirror the table selection into the shared sensor plotter."""
+        if (
+            row is not None
+            and self._py_attr("_using_shared_sensor_data", False)
+            and not self._is_watching_primary_source()
+        ):
+            return False
         sensor_functions = (
             self._get_shared_sensor_functions()
             if self._using_shared_sensor_data
@@ -2081,6 +2481,7 @@ class SensorSignalWindow(QWidget):
             return
 
         if self._using_shared_sensor_data:
+            self._refresh_watched_sources(prefer_primary=False)
             self._publish_heatmap_settings_to_sensor()
 
         raw_list = list(self._current_raw_list() or [])
@@ -2198,7 +2599,9 @@ class SensorSignalWindow(QWidget):
                 if self.cells_remaining_for_threshold is not None:
                     self.cells_remaining_for_threshold -= 1
                     if self.cells_remaining_for_threshold == 0:
-                        self.update_cal_button.setStyleSheet("background-color: lightgreen;")
+                        self.update_cal_button.setStyleSheet(
+                            theme.active_button_style()
+                        )
 
     def _render_table(
         self, display_list, diff_list, percent_list, n, heatmap_list=None
@@ -2315,8 +2718,14 @@ class SensorSignalWindow(QWidget):
         could still be holding the original ``_FeatureDisabledProxy``).
 
         Returns ``None`` if the mask is missing, all-False, or cannot be
-        reconciled with the viewer dimensions.
+        reconciled with the viewer dimensions. Secondary multi-port views
+        keep their own grid, so the primary mask is not applied there.
         """
+        if (
+            self._using_shared_sensor_data
+            and not self._is_watching_primary_source()
+        ):
+            return None
         sensor_functions = self._resolve_sensor_functions()
         if sensor_functions is None:
             return None
@@ -2423,13 +2832,7 @@ class SensorSignalWindow(QWidget):
         self._stop_reader_worker()
         self._disconnect_shared_native_frame_signal()
         self._set_3d_selected_cell(None, None)
-        tracker = getattr(self, "_signal_tracker_window", None)
-        if tracker is not None:
-            try:
-                tracker.close()
-            except RuntimeError:
-                pass
-            self._signal_tracker_window = None
+        self._close_signal_tracker()
 
         if self._using_shared_sensor_data and self._shared_calibration_overridden:
             sensor_functions = self._get_shared_sensor_functions()

@@ -4,9 +4,20 @@ from phd.dependence.sensor_protocol import (
     DEFAULT_SENSOR_BAUD_RATE,
     DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
     DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
+    SENSOR_FRAME_CONTINUATION_GRACE_SEC,
+    SENSOR_RESPONSE_IDLE_TIMEOUT_SEC,
+    SENSOR_RESPONSE_START_GRACE_SEC,
+    SENSOR_UPDATE_CAL_START_GRACE_SEC,
+    discard_pending_serial_input,
+    extract_sensor_frame,
+    has_sensor_frame_end,
+    has_sensor_frame_start,
     parse_serial_ints,
     read_complete_serial_line,
     sensor_response_timeout_for_values,
+    take_complete_sensor_payload,
+    trim_sensor_payload_accumulator,
+    wait_for_serial_input,
 )
 
 try:
@@ -56,6 +67,7 @@ class ArduinoCommander:
                 self.baud_rate,
                 timeout=self.timeout,
             )
+            discard_pending_serial_input(self.ser)
             return True
         except serial.SerialException as exc:
             print(
@@ -128,7 +140,7 @@ class ArduinoCommander:
             self.close()
             return False
 
-    def _read_line(self, timeout=None):
+    def _read_line(self, timeout=None, inter_byte_timeout=None):
         if not self.is_connected():
             return ""
 
@@ -137,6 +149,7 @@ class ArduinoCommander:
             return read_complete_serial_line(
                 self.ser,
                 timeout=max(0.0, float(line_timeout)),
+                inter_byte_timeout=inter_byte_timeout,
             )
         except Exception as exc:
             print(f"[SensorAPI] Failed to read from sensor serial port: {exc}")
@@ -150,25 +163,7 @@ class ArduinoCommander:
     @staticmethod
     def _extract_sensor_frame(data_list):
         """Extract the latest complete 55555...44444 framed payload."""
-        values = list(data_list or [])
-        frames = []
-        index = 0
-        while index + 3 < len(values):
-            if values[index:index + 2] != [55555, 55555]:
-                index += 1
-                continue
-            end = index + 2
-            while end + 1 < len(values):
-                if values[end:end + 2] == [44444, 44444]:
-                    payload = values[index + 2:end]
-                    if payload:
-                        frames.append(payload)
-                    index = end + 2
-                    break
-                end += 1
-            else:
-                break
-        return frames[-1] if frames else None
+        return extract_sensor_frame(data_list)
 
     # ------------------------------------------------------------------
     # Command API
@@ -242,13 +237,37 @@ class ArduinoCommander:
                 )
         timeout = max(0.05, float(timeout))
         deadline = time.perf_counter() + timeout
+        pending = []
 
         while time.perf_counter() < deadline:
+            remaining = max(0.0, deadline - time.perf_counter())
+            response_start_grace = (
+                SENSOR_UPDATE_CAL_START_GRACE_SEC
+                if command == "updateCal"
+                else SENSOR_RESPONSE_START_GRACE_SEC
+            )
+            if (
+                sensor_frame_command
+                and not wait_for_serial_input(
+                    self.ser,
+                    timeout=min(
+                        remaining,
+                        response_start_grace,
+                    ),
+                )
+            ):
+                return None
+            remaining = max(0.0, deadline - time.perf_counter())
             response = self._read_line(
-                timeout=max(0.0, deadline - time.perf_counter())
+                timeout=remaining,
+                inter_byte_timeout=(
+                    SENSOR_RESPONSE_IDLE_TIMEOUT_SEC
+                    if sensor_frame_command
+                    else None
+                ),
             )
             if not response:
-                continue
+                return None
 
             data_list = self._parse_ints(response)
 
@@ -257,9 +276,32 @@ class ArduinoCommander:
                 # after the serial port opens.  That text is not the response
                 # to our command, so keep waiting for a framed numeric packet
                 # instead of returning an empty payload and failing sensor
-                # calibration.
-                payload = self._extract_sensor_frame(data_list)
+                # calibration. Short remnants are accumulated, not accepted.
+                if not data_list:
+                    continue
+                fresh_line = not pending
+                pending.extend(data_list)
+                saw_frame_end = has_sensor_frame_end(pending)
+                payload, pending = take_complete_sensor_payload(
+                    pending,
+                    self.expected_payload_values,
+                    allow_unframed=fresh_line,
+                )
                 if payload is None:
+                    if saw_frame_end:
+                        return None
+                    if (
+                        has_sensor_frame_start(pending)
+                        and not wait_for_serial_input(
+                            self.ser,
+                            timeout=SENSOR_FRAME_CONTINUATION_GRACE_SEC,
+                        )
+                    ):
+                        return None
+                    pending = trim_sensor_payload_accumulator(
+                        pending,
+                        self.expected_payload_values,
+                    )
                     continue
                 return payload
             if command in {"channelCheck", "stop"}:

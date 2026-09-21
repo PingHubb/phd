@@ -10,6 +10,7 @@ from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 
 from phd.dependence.paths import resource_path
+from phd.ui import components, theme
 
 
 _HAND_POSE_PRESET_PATH = resource_path(
@@ -48,14 +49,10 @@ class UiInteractionsMixin:
         self.position_script_widget.transmit_script.connect(self._on_transmit_robot_script)
         self.show_robot_button.pressed.connect(self._on_show_robot)
         self.buildScene.pressed.connect(self._on_build_scene)
-        self.sensor_update.pressed.connect(self._on_sensor_update)
         self.record_gesture_button.pressed.connect(self.start_record_gesture)
-        self.set_no_trigger_button.pressed.connect(self._on_set_no_trigger_mode)
-        self.set_no_trigger_auto_button.pressed.connect(self._on_set_no_trigger_auto_mode)
-        self.set_no_trigger_no_updatecal_auto_button.pressed.connect(
-            self._on_set_no_trigger_no_updatecal_auto_mode
+        self.record_trigger_mode_combo.currentIndexChanged.connect(
+            self._on_record_trigger_mode_selected
         )
-        self.set_trigger_button.pressed.connect(self._on_set_trigger_mode)
         self.predict_threelevel_hierarchical_transformer_gesture_button.pressed.connect(
             self._on_toggle_threelevel_predict
         )
@@ -85,7 +82,12 @@ class UiInteractionsMixin:
             self._toggle_direct_finger_motion_tool_pose_recording
         )
         self.load_tool_pose_path_button.clicked.connect(self._load_direct_finger_motion_tool_pose_path_from_dialog)
-        self.clear_tool_pose_path_button.clicked.connect(self._clear_direct_finger_motion_tool_pose_path_plot)
+        # Confirm on the click, not inside the clear method: that method is
+        # also called internally (e.g. before loading a new path) where a modal
+        # prompt would be wrong.
+        self.clear_tool_pose_path_button.clicked.connect(
+            self._confirm_clear_direct_finger_motion_tool_pose_path
+        )
         self.apply_direct_finger_motion_settings_button.clicked.connect(
             self._apply_direct_finger_motion_settings_from_ui
         )
@@ -167,10 +169,6 @@ class UiInteractionsMixin:
         )
         self.sensor_transparent_screenshot_button.clicked.connect(
             self._on_capture_transparent_sensor_plotter
-        )
-        self.contact_normal_checkbox.toggled.connect(self._on_contact_normal_visibility_changed)
-        self.contact_normal_estimator_combo.currentIndexChanged.connect(
-            self._on_contact_normal_estimator_changed
         )
         self.btn_toggle_anchor_axes.pressed.connect(self._on_toggle_anchor_axes)
         self.hand_open_all_button.clicked.connect(self._on_hand_open_all)
@@ -532,6 +530,27 @@ class UiInteractionsMixin:
             f"Software zero applied at {float(raw_force):+.1f} N"
         )
 
+    def _confirm_clear_direct_finger_motion_tool_pose_path(self):
+        """Ask before discarding a plotted tool-pose path."""
+        has_path = bool(
+            getattr(self, "_direct_finger_motion_tool_pose_plot_actors", None)
+            or getattr(self, "_direct_finger_motion_tool_pose_plot_points", None) is not None
+            or getattr(self, "_direct_finger_motion_tool_pose_target_points", None)
+            is not None
+        )
+        if has_path and not components.confirm(
+            # window(), not parent: this mixin is used by a QSplitter, whose
+            # `parent` attribute is Qt's bound method rather than a widget.
+            self.window(),
+            "Clear tool pose path?",
+            "This removes the plotted robot path and the loaded target path "
+            "from the 3D graph.",
+            detail="Recorded CSV files on disk are not affected.",
+            confirm_text="Clear path",
+        ):
+            return
+        self._clear_direct_finger_motion_tool_pose_path_plot()
+
     def _clear_force_meter_zero(self):
         self._force_meter_tare_newtons = 0.0
         self.force_meter_chart.set_tare(0.0)
@@ -709,36 +728,16 @@ class UiInteractionsMixin:
             f"Transparent PNG saved to:\n{path}",
         )
 
-    def _on_contact_normal_visibility_changed(self, checked: bool):
-        helper = getattr(self, "sensor_functions", None)
-        if helper is not None and hasattr(helper, "set_contact_normal_visualization_enabled"):
-            helper.set_contact_normal_visualization_enabled(bool(checked))
-
-    def _on_contact_normal_estimator_changed(self, *_args):
-        helper = getattr(self, "sensor_functions", None)
-        combo = getattr(self, "contact_normal_estimator_combo", None)
-        if helper is None or combo is None:
-            return
-        mode = combo.currentData()
-        if hasattr(helper, "set_contact_normal_estimator_mode"):
-            helper.set_contact_normal_estimator_mode(mode)
-
     def _set_record_trigger_mode(self, mode: str):
         helper = self._get_sensor_helper("record_gesture_class")
         if helper is not None:
             helper.set_trigger_mode(mode)
 
-    def _on_set_no_trigger_mode(self):
-        self._set_record_trigger_mode("no_trigger")
-
-    def _on_set_no_trigger_auto_mode(self):
-        self._set_record_trigger_mode("no_trigger_auto")
-
-    def _on_set_no_trigger_no_updatecal_auto_mode(self):
-        self._set_record_trigger_mode("no_trigger_no_updatecal_auto")
-
-    def _on_set_trigger_mode(self):
-        self._set_record_trigger_mode("trigger")
+    def _on_record_trigger_mode_selected(self, _index=None):
+        """Apply the recording mode chosen in the Data page's dropdown."""
+        mode = self.record_trigger_mode_combo.currentData()
+        if mode:
+            self._set_record_trigger_mode(str(mode))
 
     def _on_toggle_proximity_control(self):
         try:
@@ -1000,8 +999,25 @@ class UiInteractionsMixin:
             print(f"[UI] Failed to apply proximity settings: {exc}")
 
     def toggle_plotter_visibility(self):
-        self.log_display.setVisible(not self.log_display.isVisible())
-        self.adjust_splitter_sizes()
+        console = getattr(self, "log_console_window", None)
+        if console is None:
+            # Compatibility for lightweight embedded/test surfaces that still
+            # expose only the legacy text widget.
+            self.log_display.setVisible(not self.log_display.isVisible())
+            if self.log_display.isVisible():
+                self._clear_log_unread_count()
+            return
+
+        if console.isVisible():
+            remember = getattr(console, "remember_geometry", None)
+            if callable(remember):
+                remember()
+            console.hide()
+        else:
+            console.show()
+            console.raise_()
+            console.activateWindow()
+            self._clear_log_unread_count()
 
     def _toggle_robot_editor(self, target_widget):
         """Exclusive robot send panels: only one open; same button closes its panel.
@@ -1016,15 +1032,18 @@ class UiInteractionsMixin:
             self.position_script_widget,
         ]
 
-        if target_widget.isVisible():
+        # is_visible_to_parent, not isVisible: the editors sit inside the
+        # Robots page, so isVisible() is False whenever another workspace is
+        # showing and every check below would misread an open editor.
+        if components.is_visible_to_parent(target_widget):
             target_widget.toggle_visibility()
         else:
             for w in widgets:
-                if w.isVisible():
+                if components.is_visible_to_parent(w):
                     w.toggle_visibility()
             target_widget.toggle_visibility()
 
-        any_open = any(widget.isVisible() for widget in widgets)
+        any_open = any(components.is_visible_to_parent(widget) for widget in widgets)
         self.read_group_robot.setVisible(not any_open)
         self._sync_robot_send_button_highlights()
 
@@ -1048,19 +1067,19 @@ class UiInteractionsMixin:
             return
         self._set_button_active(
             self.send_position_PTP_J_button,
-            self.position_entry_widget.isVisible(),
+            components.is_visible_to_parent(self.position_entry_widget),
         )
         self._set_button_active(
             self.send_position_PTP_T_button,
-            self.position_quaternion_widget.isVisible(),
+            components.is_visible_to_parent(self.position_quaternion_widget),
         )
         self._set_button_active(
             self.send_position_PTP_T_toolframe_button,
-            self.position_toolframe_widget.isVisible(),
+            components.is_visible_to_parent(self.position_toolframe_widget),
         )
         self._set_button_active(
             self.send_script_button,
-            self.position_script_widget.isVisible(),
+            components.is_visible_to_parent(self.position_script_widget),
         )
 
     def _on_transmit_robot_script(self, script: str):
@@ -1093,10 +1112,302 @@ class UiInteractionsMixin:
     def toggle_tool_frame_position_input(self):
         self._toggle_robot_editor(self.position_toolframe_widget)
 
-    def show_log_if_hidden(self):
-        if not self.log_display.isVisible():
-            self.log_display.setVisible(True)
-            self.adjust_splitter_sizes()
+    def set_sensor_update_enabled(self, enabled: bool):
+        """Enable/disable the toolbar's Calibrate Sensor control.
+
+        The sensor backend gates recalibration while a scene is rebuilding or
+        a calibration sweep is running. That state used to drive a hidden
+        duplicate button in the Sensor page, which left the *visible* toolbar
+        control clickable at exactly the wrong moments.
+        """
+        setter = getattr(self.window(), "set_sensor_update_enabled", None)
+        if callable(setter):
+            setter(bool(enabled))
+
+    def set_sensor_scene_ready(self, ready: bool):
+        """Forward sensor-scene validity to the main-window calibration gate."""
+        setter = getattr(self.window(), "set_sensor_scene_ready", None)
+        if callable(setter):
+            setter(bool(ready))
+
+    def _stop_sensor_driven_controls(self):
+        """Stop modes that must not keep commanding hardware without sensor data."""
+        self._shutdown_optional_call(
+            "_stop_admittance_control",
+            "pressure admittance control",
+        )
+        self._shutdown_optional_call(
+            "_stop_ai_proximity_detection",
+            "AI proximity detection",
+        )
+        self._shutdown_optional_call(
+            "_stop_ai_proximity_environment_recording",
+            "AI proximity environment recording",
+        )
+        self._shutdown_toggle_helper(
+            "threelevel_hierarchical_transformer_class",
+            "is_recognizing_gesture",
+            "toggle_gesture_recognition",
+            "3-Level recognition",
+        )
+        self._shutdown_toggle_helper(
+            "direct_finger_motion_class",
+            "is_running",
+            "toggle_direct_finger_motion",
+            "Direct Finger Motion",
+        )
+        self._shutdown_toggle_helper(
+            "ai_direct_finger_motion_class",
+            "is_running",
+            "toggle_ai_direct_finger_motion",
+            "AI Direct Finger Motion recording",
+        )
+        self._shutdown_toggle_helper(
+            "ai_direct_finger_motion_execution_class",
+            "is_running",
+            "toggle_ai_direct_finger_motion_execution",
+            "AI Direct Finger Motion execution",
+        )
+        self._shutdown_proximity_helper()
+        self._shutdown_recording_helper()
+        self._shutdown_optional_call(
+            "_stop_direct_finger_motion_tool_pose_recording",
+            "DFM tool-pose recording",
+        )
+        self._shutdown_optional_call(
+            "_stop_sensor_controller_test",
+            "sensor controller test",
+        )
+        # Disconnect is also a safety boundary: no console-driven robot mode
+        # should remain active while sensor helpers are being reset.
+        self._shutdown_console_helper()
+
+    def _stop_robot_motion_commands(self):
+        """Send the strongest available stop sequence to the TM robot API."""
+        api = getattr(self, "robot_api", None)
+        if api is None:
+            return []
+        features = getattr(self, "features", {}) or {}
+        if "robot_ready" in features and not bool(features.get("robot_ready")):
+            return []
+
+        issues = []
+        exit_velocity = getattr(api, "exit_end_effector_velocity_mode", None)
+        if callable(exit_velocity):
+            try:
+                if exit_velocity(send_zero=True) is False:
+                    issues.append("robot velocity stop was not acknowledged")
+            except Exception as exc:
+                issues.append(f"robot velocity stop: {exc}")
+        else:
+            send_request = getattr(api, "send_request", None)
+            if callable(send_request):
+                for command_name, values in (
+                    ("set_end_effector_velocity", [0.0] * 6),
+                    ("suspend_end_effector_velocity_mode", None),
+                    ("stop_end_effector_velocity_mode", None),
+                ):
+                    builder = getattr(api, command_name, None)
+                    if not callable(builder):
+                        continue
+                    try:
+                        command = builder(values) if values is not None else builder()
+                        if send_request(command) is False:
+                            issues.append(f"{command_name} was not acknowledged")
+                    except Exception as exc:
+                        issues.append(f"{command_name}: {exc}")
+
+        send_request = getattr(api, "send_request", None)
+        if callable(send_request):
+            for command_name in (
+                "stop_joint_velocity_mode",
+                "stop_and_clear_buffer",
+            ):
+                builder = getattr(api, command_name, None)
+                if not callable(builder):
+                    continue
+                try:
+                    if send_request(builder()) is False:
+                        issues.append(f"{command_name} was not acknowledged")
+                except Exception as exc:
+                    issues.append(f"{command_name}: {exc}")
+
+        for state_name in (
+            "_end_effector_velocity_mode_active",
+            "_joint_velocity_mode_active",
+        ):
+            if hasattr(api, state_name):
+                setattr(api, state_name, False)
+        return issues
+
+    def _stop_hand_motion_commands(self):
+        """Cancel queued RH56F1 commands and request zero actuator speed."""
+        live_check = getattr(self, "hand_sliders_live_check", None)
+        if live_check is not None:
+            live_check.blockSignals(True)
+            live_check.setChecked(False)
+            live_check.blockSignals(False)
+        timer = getattr(self, "_hand_live_timer", None)
+        if timer is not None:
+            timer.stop()
+        self._hand_live_pending = {}
+        self._hand_live_deferred = None
+        self._hand_live_inflight = False
+
+        executor = getattr(self, "_hand_async_executor", None)
+        self._hand_async_executor = None
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                executor.shutdown(wait=False)
+
+        api = getattr(self, "robot_api", None)
+        set_speed = getattr(api, "hand_set_speed_all", None)
+        features = getattr(self, "features", {}) or {}
+        if not callable(set_speed) or not bool(features.get("hand_ready", False)):
+            return
+        speed_spin = getattr(self, "hand_speed_spin", None)
+        if speed_spin is not None:
+            speed_spin.setValue(0)
+        self._submit_hand_worker(
+            "speed",
+            "Software stop: hand speed=0",
+            lambda worker_api: worker_api.hand_set_speed_all(0),
+        )
+
+    def stop_all_motion(self):
+        """Best-effort stop of every software motion source; keep sensors live."""
+        issues = []
+        self._software_motion_stopped = True
+        self.manual_mode_active = False
+        self.is_lifting = False
+        self.grab_triggered = True
+        watchdog = getattr(self, "manual_watchdog_timer", None)
+        if watchdog is not None:
+            watchdog.stop()
+
+        try:
+            self._stop_auto_centering()
+        except Exception as exc:
+            issues.append(f"camera auto-centering: {exc}")
+        try:
+            self._stop_sensor_driven_controls()
+        except Exception as exc:
+            issues.append(f"sensor-driven controls: {exc}")
+        self._shutdown_optional_call(
+            "_stop_direct_finger_motion_tool_pose_path_animation",
+            "DFM tool-pose path animation",
+            reset_button=False,
+        )
+        try:
+            self._init_ai_toggle_states()
+        except Exception as exc:
+            issues.append(f"control-state reset: {exc}")
+        try:
+            self._stop_hand_motion_commands()
+        except Exception as exc:
+            issues.append(f"dexterous hand stop: {exc}")
+
+        gripper = getattr(self, "gripper", None)
+        stop_gripper = getattr(gripper, "stop_motion", None)
+        if callable(stop_gripper):
+            try:
+                if stop_gripper() is False and bool(
+                    getattr(gripper, "is_available", False)
+                ):
+                    issues.append("gripper hold command was not acknowledged")
+            except Exception as exc:
+                issues.append(f"gripper stop: {exc}")
+
+        issues.extend(self._stop_robot_motion_commands())
+        if hasattr(self, "log_display"):
+            self.log_display.append(
+                "Software Stop All Motion executed. Sensor streaming was left active."
+            )
+        return issues
+
+    def disconnect_sensor_scene(self):
+        """Stop sensor consumers, release devices, and keep the UI reconnectable."""
+        sensor = getattr(self, "sensor_functions", None)
+        disconnect = getattr(sensor, "disconnect_sensor_scene", None)
+        if not callable(disconnect):
+            return False
+        if bool(getattr(sensor, "_sensor_calibration_in_progress", False)):
+            message = (
+                "Wait for the current sensor calibration to finish before "
+                "disconnecting."
+            )
+            set_error = getattr(sensor, "_set_sensor_stream_error", None)
+            if callable(set_error):
+                set_error(message)
+            self.log_display.append(message)
+            return False
+
+        self._stop_sensor_driven_controls()
+        humanoid_viewer = getattr(self, "humanoid_viewer", None)
+        stop_humanoid_sensors = getattr(
+            humanoid_viewer,
+            "disconnect_sensor_streams",
+            None,
+        )
+        if callable(stop_humanoid_sensors):
+            stop_humanoid_sensors()
+
+        disconnected = bool(disconnect())
+        if disconnected:
+            self.log_display.append(
+                "Sensor disconnected; all sensor streams and the built scene were cleared."
+            )
+        return disconnected
+
+    def note_log_activity(self):
+        """Record that a line was logged, without disturbing the workspace.
+
+        The log used to force itself visible on every appended line, taking a
+        fifth of the visualization width away mid-task -- and any background
+        chatter (motion-ratio logging, per-second experiment ticks) would keep
+        re-opening it after the user closed it. Lines now accumulate quietly
+        and the Log action carries an unread count instead.
+        """
+        console = getattr(self, "log_console_window", None)
+        visible = (
+            console.isVisible()
+            if console is not None
+            else self.log_display.isVisible()
+        )
+        if visible:
+            return
+        self._log_unread_count = int(getattr(self, "_log_unread_count", 0)) + 1
+        self._publish_log_unread_count()
+
+    def publish_latest_log_message(self):
+        """Mirror the final non-empty log line into the main status bar."""
+        document = self.log_display.document()
+        block = document.lastBlock()
+        while block.isValid():
+            message = block.text().strip()
+            if message:
+                break
+            block = block.previous()
+        else:
+            message = ""
+
+        setter = getattr(self.window(), "set_activity_message", None)
+        if callable(setter):
+            setter(message)
+
+    def _clear_log_unread_count(self):
+        self._log_unread_count = 0
+        self._publish_log_unread_count()
+
+    def _publish_log_unread_count(self):
+        """Mirror the unread count onto the window's Log action, if present."""
+        # window(), not parent: this mixin is used by a QSplitter, whose
+        # `parent` attribute is Qt's bound method rather than a widget.
+        setter = getattr(self.window(), "set_log_unread_count", None)
+        if callable(setter):
+            setter(int(getattr(self, "_log_unread_count", 0)))
 
     def _update_slider_label(self, value):
         self.gripper_label.setText(f"{value/100.0:.2f}")
@@ -1360,12 +1671,25 @@ class UiInteractionsMixin:
             table.setItem(row, col, item)
         item.setText(str(text))
 
+    def _set_hand_tactile_empty(self, is_empty: bool, message: str = ""):
+        """Show the tactile table, or an explanation instead of a grid of "--"."""
+        stack = getattr(self, "hand_tactile_stack", None)
+        if stack is None:
+            return
+        stack.set_empty(bool(is_empty))
+        if is_empty and message:
+            stack.empty.set_message(message)
+        row = getattr(self, "hand_tactile_stream_row", None)
+        if row is not None:
+            row.setVisible(not is_empty)
+
     def _refresh_hand_tactile_display(self):
         api = getattr(self, "robot_api", None)
         status = getattr(self, "hand_tactile_status_label", None)
         if api is None or not hasattr(api, "get_latest_hand_tactile"):
             if status is not None:
                 status.setText("Tactile unavailable")
+            self._set_hand_tactile_empty(True, "Tactile interface unavailable")
             return
 
         data = api.get_latest_hand_tactile()
@@ -1376,13 +1700,20 @@ class UiInteractionsMixin:
                     publisher_count = api.hand_tactile_publisher_count()
                 if publisher_count <= 0:
                     status.setText("No /touch_data publisher")
+                    self._set_hand_tactile_empty(
+                        True, "Nothing is publishing /touch_data"
+                    )
                 else:
                     status.setText("Waiting for /touch_data")
+                    self._set_hand_tactile_empty(
+                        True, "Waiting for the first tactile frame"
+                    )
             helper = getattr(self, "mesh_functions", None)
             if helper is not None and hasattr(helper, "updateDexterousHandTactile"):
                 helper.updateDexterousHandTactile(None)
             return
 
+        self._set_hand_tactile_empty(False)
         finger_forces = list(data.get("finger_forces") or [])
         finger_tangentials = list(data.get("finger_tangentials") or [])
         finger_angles = list(data.get("finger_angles") or [])
@@ -1821,11 +2152,15 @@ class UiInteractionsMixin:
 
     def adjust_splitter_sizes(self):
         total_width = self.splitter_1.width()
-        if self.log_display.isVisible():
-            self.splitter_1.setSizes([int(total_width * 0.4), int(total_width * 0.4), int(total_width * 0.2)])
-        else:
-            self.splitter_1.setSizes([int(total_width * 0.5), int(total_width * 0.5), 0])
+        self.splitter_1.setSizes(
+            [int(total_width * 0.5), int(total_width * 0.5)]
+        )
 
     def reLayout(self):
-        self.setSizes([round(self.width() * 4), round(self.width())])
-        self.splitter_1.setSizes([self.width(), self.width(), 0])
+        # Ratio, not pixels: reLayout runs before the splitter has been laid
+        # out, so self.width() is still the default. QSplitter normalises the
+        # values it is given, so a ratio survives the first real resize.
+        scale = 10000
+        panel = round(scale * theme.CONTROL_PANEL_RATIO)
+        self.setSizes([scale - panel, panel])
+        self.splitter_1.setSizes([self.width(), self.width()])

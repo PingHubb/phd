@@ -38,6 +38,7 @@ from phd.dependence.humanoid_signal_parts import (
     load_colored_line_obj,
 )
 from phd.dependence.humanoid_urdf import load_urdf
+from phd.ui import components, theme
 
 
 DEFAULT_HUMANOID_AUTO_PORT_TARGETS = {
@@ -490,7 +491,14 @@ class HumanoidSensorAutoWorker(QtCore.QObject):
                         expected_active,
                         expected_active + int(shape[0]),
                     }
-                    api.expected_payload_values = max(expected_lengths)
+                    # The discovery read accepts either the plain matrix or
+                    # the firmware variant with one trailing extra column.
+                    # Do not make the lower-level frame parser enforce only
+                    # the larger variant before we know which one this sensor
+                    # actually sends. ``_read_stable_frame`` validates both
+                    # candidates below, and the exact detected size is stored
+                    # on the API after matching.
+                    api.expected_payload_values = None
                 raw = self._read_stable_frame(
                     api,
                     expected_lengths=expected_lengths,
@@ -833,11 +841,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self._scene_suspended = False
         self._status_before_suspend = None
         self._closed = False
-        self._live_frame_signal = None
-        self._live_mapping: tuple[str, str] | None = None
-        self._pending_live_frames: dict[
-            str, tuple[np.ndarray, np.ndarray]
-        ] = {}
         self._auto_sensor_thread = None
         self._auto_sensor_worker = None
         self._resume_auto_live_after_restore = False
@@ -978,58 +981,33 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         )
         control_layout.setSpacing(8)
 
-        source_group = QtWidgets.QGroupBox("Scene Source")
-        source_grid = QtWidgets.QGridLayout(source_group)
-        source_grid.setContentsMargins(10, 10, 10, 10)
-        source_grid.setHorizontalSpacing(8)
-        source_grid.setVerticalSpacing(8)
-        source_grid.setColumnStretch(1, 1)
-
-        source_grid.addWidget(QtWidgets.QLabel("Robot model"), 0, 0)
-        self.path_edit = QtWidgets.QLineEdit(str(self.default_urdf))
-        self.path_edit.setToolTip(str(self.default_urdf))
-        self.path_edit.setClearButtonEnabled(True)
-        source_grid.addWidget(self.path_edit, 0, 1)
-        browse_urdf = QtWidgets.QToolButton()
-        browse_urdf.setIcon(
-            self.style().standardIcon(QtWidgets.QStyle.SP_DialogOpenButton)
-        )
-        browse_urdf.setToolTip("Choose robot URDF")
-        browse_urdf.setFixedSize(32, 32)
-        browse_urdf.clicked.connect(self._browse_urdf)
-        source_grid.addWidget(browse_urdf, 0, 2)
-
-        source_grid.addWidget(QtWidgets.QLabel("Sensor signals"), 1, 0)
-        self.signal_dir_edit = QtWidgets.QLineEdit(str(self.default_signal_dir))
-        self.signal_dir_edit.setToolTip(
-            "Directory containing N_part.obj and N/curves_col_signal.obj"
-        )
-        self.signal_dir_edit.setClearButtonEnabled(True)
-        source_grid.addWidget(self.signal_dir_edit, 1, 1)
-        browse_signal = QtWidgets.QToolButton()
-        browse_signal.setIcon(
-            self.style().standardIcon(QtWidgets.QStyle.SP_DirOpenIcon)
-        )
-        browse_signal.setToolTip("Choose sensor signal directory")
-        browse_signal.setFixedSize(32, 32)
-        browse_signal.clicked.connect(self._browse_signal_dir)
-        source_grid.addWidget(browse_signal, 1, 2)
-        control_layout.addWidget(source_group)
-
-        self.load_button = QtWidgets.QPushButton("Load URDF and Sensor Signals")
-        self.load_button.setObjectName("btnRunRecord")
+        self.load_button = QtWidgets.QPushButton("Load Humanoid Scene")
+        components.apply_variant(self.load_button, "primary")
         self.load_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_DialogApplyButton)
+        )
+        self.load_button.setToolTip(
+            "Load the fixed Unitree G1 model and its sensor-signal surfaces"
         )
         self.load_button.setMinimumHeight(34)
         self.load_button.clicked.connect(self.reload)
         control_layout.addWidget(self.load_button)
 
         self.humanoid_control_tabs = QtWidgets.QTabWidget()
+        # The sensor page carries a ten-row mapping grid whose height is fixed
+        # by its contents. A tab page is resized to the stack's geometry
+        # regardless of its minimum, so on a laptop-height window the rows
+        # were being squeezed on top of each other. Scrolling instead.
         self.sensor_controls_page = QtWidgets.QWidget()
-        sensor_controls_layout = QtWidgets.QVBoxLayout(
-            self.sensor_controls_page
-        )
+        sensor_page_layout = QtWidgets.QVBoxLayout(self.sensor_controls_page)
+        sensor_page_layout.setContentsMargins(0, 0, 0, 0)
+        sensor_controls_scroll = QtWidgets.QScrollArea()
+        sensor_controls_scroll.setWidgetResizable(True)
+        sensor_controls_scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        sensor_page_layout.addWidget(sensor_controls_scroll)
+        sensor_controls_host = QtWidgets.QWidget()
+        sensor_controls_scroll.setWidget(sensor_controls_host)
+        sensor_controls_layout = QtWidgets.QVBoxLayout(sensor_controls_host)
         sensor_controls_layout.setContentsMargins(4, 4, 4, 4)
         sensor_controls_layout.setSpacing(8)
         self.joint_controls_page = QtWidgets.QWidget()
@@ -1047,9 +1025,13 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             "Joint Pose",
         )
 
-        self.view_group = QtWidgets.QGroupBox("Visualization")
-        mode_row = QtWidgets.QHBoxLayout(self.view_group)
-        mode_row.setContentsMargins(10, 10, 10, 10)
+        self.view_group, view_list = components.section(
+            "Visualization",
+            "Switch the viewport between robot geometry and sensor surfaces.",
+        )
+        mode_widget = QtWidgets.QWidget()
+        mode_row = QtWidgets.QHBoxLayout(mode_widget)
+        mode_row.setContentsMargins(0, 0, 0, 0)
         self.display_button_group = QtWidgets.QButtonGroup(self)
         self.display_button_group.setExclusive(True)
         self.mode_robot = QtWidgets.QPushButton("Robot")
@@ -1062,43 +1044,13 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.display_button_group.addButton(self.mode_signal)
         mode_row.addWidget(self.mode_robot, 1)
         mode_row.addWidget(self.mode_signal, 1)
+        view_list.add(mode_widget)
         sensor_controls_layout.addWidget(self.view_group)
 
-        self.live_group = QtWidgets.QGroupBox("Live Sensor Heatmap")
-        live_grid = QtWidgets.QGridLayout(self.live_group)
-        live_grid.setContentsMargins(10, 10, 10, 10)
-        live_grid.setHorizontalSpacing(8)
-        live_grid.setVerticalSpacing(8)
-        live_grid.addWidget(QtWidgets.QLabel("Humanoid part"), 0, 0)
-        self.live_part_combo = QtWidgets.QComboBox()
-        self.live_part_combo.setToolTip(
-            "Signal-mesh section that will receive the live sensor colours."
+        self.live_group, live_list = components.section(
+            "Independent sensor heatmap",
+            "Auto-detect the saved set of USB devices mapped onto the humanoid.",
         )
-        self.live_part_combo.currentIndexChanged.connect(
-            self._on_live_part_changed
-        )
-        live_grid.addWidget(self.live_part_combo, 0, 1)
-        live_grid.addWidget(QtWidgets.QLabel("Sensor port"), 1, 0)
-        self.live_port_combo = QtWidgets.QComboBox()
-        self.live_port_combo.setToolTip(
-            "Active Sensor-tab port whose calibrated matrix drives this part."
-        )
-        self.live_port_combo.currentIndexChanged.connect(
-            self._on_live_part_changed
-        )
-        live_grid.addWidget(self.live_port_combo, 1, 1)
-        self.live_button = QtWidgets.QPushButton(
-            "Use Sensor Tab Live Heatmap"
-        )
-        self.live_button.setCheckable(True)
-        self.live_button.setObjectName("btnRunRecord")
-        self.live_button.setToolTip(
-            "Map the selected live sensor to the selected humanoid signal part."
-        )
-        self.live_button.toggled.connect(
-            self._on_live_heatmap_toggled
-        )
-        live_grid.addWidget(self.live_button, 2, 0, 1, 2)
         self.auto_live_button = QtWidgets.QPushButton(
             "Auto-Detect Independent Sensors"
         )
@@ -1110,24 +1062,13 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.auto_live_button.toggled.connect(
             self._on_auto_live_toggled
         )
-        live_grid.addWidget(
-            self.auto_live_button,
-            3,
-            0,
-            1,
-            2,
-        )
-        live_grid.addWidget(
-            QtWidgets.QLabel("Detected mapping"),
-            4,
-            0,
-        )
+        live_list.add(self.auto_live_button)
         self.auto_mapping_combo = QtWidgets.QComboBox()
         self.auto_mapping_combo.setEnabled(False)
         self.auto_mapping_combo.currentIndexChanged.connect(
             self._on_auto_mapping_selected
         )
-        live_grid.addWidget(self.auto_mapping_combo, 4, 1)
+        live_list.add(components.SettingsRow("Detected mapping", self.auto_mapping_combo))
         self.swap_drive_sensor_checkbox = QtWidgets.QCheckBox(
             "Swap Drive ↔ Sensor axes"
         )
@@ -1139,13 +1080,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.swap_drive_sensor_checkbox.toggled.connect(
             self._on_swap_drive_sensor_toggled
         )
-        live_grid.addWidget(
-            self.swap_drive_sensor_checkbox,
-            5,
-            0,
-            1,
-            2,
-        )
+        live_list.add(self.swap_drive_sensor_checkbox)
         self.transpose_point_mapping_checkbox = QtWidgets.QCheckBox(
             "Transpose Humanoid Point Mapping (Row ↔ Column)"
         )
@@ -1158,13 +1093,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.transpose_point_mapping_checkbox.toggled.connect(
             self._on_transpose_point_mapping_toggled
         )
-        live_grid.addWidget(
-            self.transpose_point_mapping_checkbox,
-            6,
-            0,
-            1,
-            2,
-        )
+        live_list.add(self.transpose_point_mapping_checkbox)
         self.flip_horizontal_mapping_checkbox = QtWidgets.QCheckBox(
             "Flip Humanoid Mapping Left ↔ Right"
         )
@@ -1176,13 +1105,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.flip_horizontal_mapping_checkbox.toggled.connect(
             self._on_flip_horizontal_mapping_toggled
         )
-        live_grid.addWidget(
-            self.flip_horizontal_mapping_checkbox,
-            7,
-            0,
-            1,
-            2,
-        )
+        live_list.add(self.flip_horizontal_mapping_checkbox)
         self.flip_vertical_mapping_checkbox = QtWidgets.QCheckBox(
             "Flip Humanoid Mapping Top ↔ Bottom"
         )
@@ -1194,13 +1117,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.flip_vertical_mapping_checkbox.toggled.connect(
             self._on_flip_vertical_mapping_toggled
         )
-        live_grid.addWidget(
-            self.flip_vertical_mapping_checkbox,
-            8,
-            0,
-            1,
-            2,
-        )
+        live_list.add(self.flip_vertical_mapping_checkbox)
         self.auto_live_status = QtWidgets.QLabel(
             "Independent sensors: off"
         )
@@ -1208,14 +1125,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.auto_live_status.setTextInteractionFlags(
             QtCore.Qt.TextSelectableByMouse
         )
-        live_grid.addWidget(
-            self.auto_live_status,
-            9,
-            0,
-            1,
-            2,
-        )
-        live_grid.setColumnStretch(1, 1)
+        live_list.add(self.auto_live_status)
         sensor_controls_layout.addWidget(self.live_group)
         sensor_controls_layout.addStretch(1)
 
@@ -1226,12 +1136,12 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.status.setContentsMargins(4, 0, 4, 0)
         control_layout.addWidget(self.status)
 
-        self.joint_group = QtWidgets.QGroupBox("Joint Pose")
-        joint_layout = QtWidgets.QVBoxLayout(self.joint_group)
-        joint_layout.setContentsMargins(10, 10, 10, 10)
-        joint_layout.setSpacing(6)
+        self.joint_group, joint_list = components.section(
+            "Joint pose",
+            "Inspect and adjust the loaded humanoid configuration.",
+        )
         self.joint_summary = QtWidgets.QLabel("No joints loaded")
-        joint_layout.addWidget(self.joint_summary)
+        joint_list.add(self.joint_summary)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -1240,14 +1150,15 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.slider_layout.setContentsMargins(0, 0, 0, 0)
         self.slider_layout.setSpacing(4)
         scroll.setWidget(self.slider_host)
-        joint_layout.addWidget(scroll, 1)
+        scroll.setMinimumHeight(280)
+        joint_list.add(scroll)
 
         self.reset_button = QtWidgets.QPushButton("Reset Joint Pose")
         self.reset_button.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.SP_BrowserReload)
         )
         self.reset_button.clicked.connect(self._reset_joints)
-        joint_layout.addWidget(self.reset_button)
+        joint_list.add(self.reset_button)
         joint_controls_layout.addWidget(self.joint_group, 1)
         control_layout.addWidget(self.humanoid_control_tabs, 1)
         self._set_scene_controls_enabled(False)
@@ -1337,27 +1248,8 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             "specular_power": 28,
         }
 
-    def _browse_urdf(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Select Humanoid URDF",
-            str(Path(self.path_edit.text()).expanduser().parent),
-            "URDF (*.urdf);;All files (*.*)",
-        )
-        if path:
-            self.path_edit.setText(path)
-
-    def _browse_signal_dir(self) -> None:
-        path = QtWidgets.QFileDialog.getExistingDirectory(
-            self,
-            "Select Sensor Signal Directory",
-            self.signal_dir_edit.text().strip() or str(self.default_signal_dir),
-        )
-        if path:
-            self.signal_dir_edit.setText(path)
-
     def reload(self) -> None:
-        path = Path(self.path_edit.text().strip()).expanduser()
+        path = Path(self.default_urdf).expanduser()
         if not path.is_file():
             QtWidgets.QMessageBox.warning(self, "URDF not found", str(path))
             return
@@ -1456,7 +1348,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         if self.model is None:
             return
         self._stop_auto_sensors(restore_static=False)
-        self._stop_live_heatmap(restore_static=False)
         if self._owns_plotter:
             self.plotter.clear()
             self._setup_studio()
@@ -1531,8 +1422,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             bounds.append(mesh.bounds)
 
         signal_count, skipped_signals = self._load_signals(positions, bounds)
-        self._refresh_live_mapping_controls()
-
         message = (
             f"Humanoid ready: {loaded} robot meshes and "
             f"{signal_count} sensor signal sections"
@@ -1723,7 +1612,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         positions: dict[str, float],
         bounds: list,
     ) -> tuple[int, list[str]]:
-        signal_root = Path(self.signal_dir_edit.text().strip()).expanduser()
+        signal_root = Path(self.default_signal_dir).expanduser()
         if not signal_root.is_dir():
             return 0, [f"missing directory {signal_root}"]
 
@@ -1827,177 +1716,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
                 skipped.append(f"{number}:no signal")
         return loaded, skipped
 
-    def _normalize_live_port(self, port_name: str) -> str:
-        normalizer = getattr(
-            self.sensor_functions,
-            "_sensor_port_key",
-            None,
-        )
-        if callable(normalizer):
-            return str(normalizer(port_name))
-        return str(port_name or "")
-
-    def _active_sensor_profiles(self) -> dict[str, dict]:
-        getter = getattr(
-            self.sensor_functions,
-            "get_live_sensor_port_profiles",
-            None,
-        )
-        if not callable(getter):
-            return {}
-        try:
-            return {
-                self._normalize_live_port(port): dict(profile)
-                for port, profile in dict(getter() or {}).items()
-            }
-        except Exception:
-            return {}
-
-    def _refresh_live_mapping_controls(self) -> None:
-        previous_part = self.live_part_combo.currentData()
-        previous_port = self.live_port_combo.currentData()
-        self.live_part_combo.blockSignals(True)
-        self.live_port_combo.blockSignals(True)
-        self.live_part_combo.clear()
-        self.live_port_combo.clear()
-        for key in self._signal_keys:
-            if key not in self._signal_channel_indices:
-                continue
-            self.live_part_combo.addItem(
-                self._signal_display_names.get(key, key),
-                key,
-            )
-        profiles = self._active_sensor_profiles()
-        for port_name, profile in profiles.items():
-            rows = int(profile.get("n_row", 0) or 0)
-            columns = int(profile.get("n_col", 0) or 0)
-            primary = " [primary]" if profile.get("is_primary") else ""
-            self.live_port_combo.addItem(
-                f"{os.path.basename(port_name)} — "
-                f"{rows}x{columns} ({rows * columns} ch){primary}",
-                port_name,
-            )
-        for combo, previous in (
-            (self.live_part_combo, previous_part),
-            (self.live_port_combo, previous_port),
-        ):
-            index = combo.findData(previous)
-            if index >= 0:
-                combo.setCurrentIndex(index)
-        self.live_part_combo.blockSignals(False)
-        self.live_port_combo.blockSignals(False)
-        self._on_live_part_changed()
-
-    def _on_live_part_changed(self, *_args) -> None:
-        if self._live_mapping is not None:
-            self._stop_live_heatmap(restore_static=True)
-        part_key = self.live_part_combo.currentData()
-        required = int(
-            self._signal_required_channels.get(str(part_key), 0)
-        )
-        exact_index = -1
-        sufficient_index = -1
-        profiles = self._active_sensor_profiles()
-        for index in range(self.live_port_combo.count()):
-            port_name = str(self.live_port_combo.itemData(index) or "")
-            profile = profiles.get(port_name, {})
-            count = int(profile.get("n_row", 0) or 0) * int(
-                profile.get("n_col", 0) or 0
-            )
-            if count == required:
-                exact_index = index
-                break
-            if count >= required and sufficient_index < 0:
-                sufficient_index = index
-        preferred = exact_index if exact_index >= 0 else sufficient_index
-        if preferred >= 0:
-            self.live_port_combo.setCurrentIndex(preferred)
-        self.live_button.setEnabled(
-            bool(part_key)
-            and self.live_port_combo.count() > 0
-            and required > 0
-        )
-
-    def _connect_live_frame_signal(self) -> bool:
-        if self._live_frame_signal is not None:
-            return True
-        bridge = getattr(
-            self.sensor_functions,
-            "_payload_bridge",
-            None,
-        )
-        signal = getattr(bridge, "port_frame_processed", None)
-        if signal is None:
-            return False
-        try:
-            signal.connect(self._on_live_port_frame)
-        except Exception:
-            return False
-        self._live_frame_signal = signal
-        return True
-
-    def _disconnect_live_frame_signal(self) -> None:
-        signal = self._live_frame_signal
-        if signal is None:
-            return
-        try:
-            signal.disconnect(self._on_live_port_frame)
-        except Exception:
-            pass
-        self._live_frame_signal = None
-
-    def _on_live_heatmap_toggled(self, enabled: bool) -> None:
-        if not enabled:
-            self._stop_live_heatmap(restore_static=True)
-            return
-        if self.auto_live_button.isChecked():
-            self._stop_auto_sensors(restore_static=True)
-        self._refresh_live_mapping_controls()
-        part_key = str(self.live_part_combo.currentData() or "")
-        port_name = self._normalize_live_port(
-            str(self.live_port_combo.currentData() or "")
-        )
-        required = int(
-            self._signal_required_channels.get(part_key, 0)
-        )
-        profiles = self._active_sensor_profiles()
-        profile = profiles.get(port_name)
-        available = (
-            int(profile.get("n_row", 0) or 0)
-            * int(profile.get("n_col", 0) or 0)
-            if profile is not None
-            else 0
-        )
-        if (
-            not self._scene_active
-            or not part_key
-            or profile is None
-            or available < required
-            or not self._connect_live_frame_signal()
-        ):
-            self.live_button.blockSignals(True)
-            self.live_button.setChecked(False)
-            self.live_button.blockSignals(False)
-            self.status.setText(
-                "Live heatmap unavailable. Start and calibrate a Sensor-tab "
-                f"source with at least {required} channels, then reload."
-            )
-            return
-        self._live_mapping = (port_name, part_key)
-        self._pending_live_frames.clear()
-        self.mode_signal.setChecked(True)
-        self._live_render_timer.start()
-        size_note = (
-            ""
-            if available == required
-            else f"; first {required} of {available} channels used"
-        )
-        self.status.setText(
-            f"Live heatmap: {os.path.basename(port_name)} → "
-            f"{self._signal_display_names.get(part_key, part_key)}"
-            f"{size_note}"
-        )
-
     def _on_auto_live_toggled(self, enabled: bool) -> None:
         if not enabled:
             self._resume_auto_live_after_restore = False
@@ -2024,7 +1742,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             )
             return
 
-        self._stop_live_heatmap(restore_static=True)
         requirements = [
             (
                 key,
@@ -2122,12 +1839,12 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         failed_count = int(failed_count)
         if failed_count:
             self.auto_live_status.setText(
-                f"Humanoid sensor update: {updated_count} succeeded, "
+                f"Humanoid sensor calibration: {updated_count} succeeded, "
                 f"{failed_count} failed; live heatmap continues."
             )
         else:
             self.auto_live_status.setText(
-                f"Humanoid sensor update complete: "
+                f"Humanoid sensor calibration complete: "
                 f"{updated_count} calibrated."
             )
 
@@ -2464,8 +2181,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.transpose_point_mapping_checkbox.setEnabled(False)
         self.flip_horizontal_mapping_checkbox.setEnabled(False)
         self.flip_vertical_mapping_checkbox.setEnabled(False)
-        if self._live_mapping is None:
-            self._live_render_timer.stop()
+        self._live_render_timer.stop()
         if restore_static:
             self._restore_static_signal_colors()
             if self._scene_active:
@@ -2482,8 +2198,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self.auto_live_button.setChecked(False)
         self.auto_live_button.blockSignals(False)
         self.auto_live_button.setEnabled(self._scene_active)
-        if self._live_mapping is None:
-            self._live_render_timer.stop()
+        self._live_render_timer.stop()
         if (
             self._scene_active
             and (
@@ -2576,53 +2291,22 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    def _stop_live_heatmap(self, restore_static: bool) -> None:
-        self._live_render_timer.stop()
-        self._disconnect_live_frame_signal()
-        self._pending_live_frames.clear()
-        self._live_mapping = None
-        self.live_button.blockSignals(True)
-        self.live_button.setChecked(False)
-        self.live_button.blockSignals(False)
-        if restore_static:
-            self._restore_static_signal_colors()
-            if self._scene_active:
-                try:
-                    self.plotter.render()
-                except Exception:
-                    pass
-
-    def _on_live_port_frame(
-        self,
-        port_name,
-        _timestamp,
-        _frame_sequence,
-        raw_matrix,
-        calibration_matrix,
-    ) -> None:
-        mapping = self._live_mapping
-        if mapping is None:
-            return
-        normalized_port = self._normalize_live_port(port_name)
-        if normalized_port != mapping[0]:
-            return
-        self._pending_live_frames[normalized_port] = (
-            np.asarray(raw_matrix, dtype=float).copy(),
-            np.asarray(calibration_matrix, dtype=float).copy(),
+    def disconnect_sensor_streams(self) -> None:
+        """Stop independently detected sensors without unloading the model."""
+        self._resume_auto_live_after_restore = False
+        self._auto_restart_pending = False
+        self._stop_auto_sensors(
+            restore_static=True,
+            wait_for_thread=True,
         )
+        self.auto_live_status.setText("Independent sensors: off")
+        if self._scene_active:
+            self.status.setText(
+                "Sensor streams disconnected. The humanoid model remains loaded."
+            )
 
     def _render_pending_live_heatmap(self) -> None:
         rendered = False
-        mapping = self._live_mapping
-        if mapping is not None:
-            frame = self._pending_live_frames.pop(mapping[0], None)
-            if frame is not None:
-                rendered = self._apply_live_heatmap_frame(
-                    mapping[1],
-                    frame[0],
-                    frame[1],
-                    settings=self._sensor_tab_heatmap_settings(),
-                ) or rendered
         pending_auto = getattr(self, "_pending_auto_frames", {})
         auto_frames = dict(pending_auto)
         pending_auto.clear()
@@ -2664,19 +2348,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             ) or rendered
         if rendered and self.mode_signal.isChecked():
             self.plotter.render()
-
-    def _sensor_tab_heatmap_settings(self) -> dict:
-        settings_getter = getattr(
-            self.sensor_functions,
-            "get_heatmap_settings",
-            None,
-        )
-        if not callable(settings_getter):
-            return {}
-        try:
-            return dict(settings_getter() or {})
-        except Exception:
-            return {}
 
     def _live_channel_indices(
         self,
@@ -2957,7 +2628,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             self._scene_suspended = False
             self._scene_active = True
             self._set_scene_controls_enabled(True)
-            self._refresh_live_mapping_controls()
             previous_status = self._status_before_suspend
             if previous_status is not None:
                 self.status.setText(previous_status[0])
@@ -3027,7 +2697,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             self._live_render_timer.stop()
         else:
             self._stop_auto_sensors(restore_static=False)
-        self._stop_live_heatmap(restore_static=False)
         if not discard:
             if not keep_auto_live:
                 self._restore_static_signal_colors()
@@ -3077,7 +2746,7 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
         self._set_scene_controls_enabled(False)
         if self.model is not None:
             self.status.setText(
-                "Humanoid scene hidden. Press Load URDF and Sensor Signals to show it."
+                "Humanoid scene hidden. Press Load Humanoid Scene to show it."
             )
         if render:
             try:
@@ -3092,7 +2761,6 @@ class HumanoidViewerWidget(QtWidgets.QWidget):
             restore_static=False,
             wait_for_thread=True,
         )
-        self._stop_live_heatmap(restore_static=False)
         if self._owns_plotter:
             try:
                 self.plotter.clear()

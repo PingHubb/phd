@@ -252,6 +252,20 @@ class GripperHelper(Node if ROS_AVAILABLE else object):
         print(f"[Gripper] Closing to 1.0 with Force {force}...")
         return self.send_command(self.DEFAULT_CLOSED_POSITION, force=force)
 
+    def stop_motion(self) -> bool:
+        """Best-effort hold at the latest measured position.
+
+        The Robotiq action does not expose a dedicated emergency-stop goal.
+        Sending the measured position as the newest goal pre-empts ordinary
+        open/close motion while leaving the ROS interface usable.
+        """
+        if not self.data_received:
+            return False
+        return self.send_command(
+            self.current_finger_pos,
+            force=self.HARD_CLOSE_FORCE,
+        )
+
     # ------------------------------------------------------------------
     # Status / UI helpers
     # ------------------------------------------------------------------

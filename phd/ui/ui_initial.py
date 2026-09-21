@@ -4,7 +4,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QTimer, QSize, QEvent
+from PyQt5.QtCore import Qt, QTimer, QSize, QEvent, QSettings
 from PyQt5.QtWidgets import (
     QWidget, QAction, QSplitter, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QToolBar, QStatusBar, QComboBox,
@@ -17,7 +17,7 @@ from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath, QPixmap, QF
 import numpy as np
 from pyvistaqt import QtInteractor, MainWindow
 from phd.dependence.paths import icon_path, resource_path, stylesheet_path
-from phd.ui import theme
+from phd.ui import components, icons, theme
 from phd.ui.ui_ping import UI
 from phd.ui import experiment_tasks
 from phd.ui.calibration_result_dialog import CalibrationResultDialog
@@ -51,10 +51,21 @@ class Resources:
         """Loads the content of the QSS stylesheet."""
         try:
             with open(self.STYLE_FILE, 'r', encoding='utf-8') as f:
-                return f.read()
+                sheet = f.read()
         except FileNotFoundError:
             print(f"Warning: Stylesheet not found at '{self.STYLE_FILE}'.")
             # Return an empty string so the app can still run
+            return ""
+
+        generated_dir = icon_path("generated")
+        icons.write_stylesheet_assets(generated_dir)
+        try:
+            return theme.render_stylesheet(
+                sheet,
+                ICON_DIR=generated_dir.replace(os.sep, "/"),
+            )
+        except ValueError as exc:
+            print(f"Warning: Stylesheet token error: {exc}")
             return ""
 
 
@@ -263,7 +274,7 @@ class SensorCaptureResultDialog(QDialog):
     def __init__(self, series, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Sensor Peak Change (10s)")
-        self.resize(980, 620)
+        components.size_to_screen(self, 980, 620)
         self.setStyleSheet(
             f"""
             QDialog {{
@@ -273,7 +284,7 @@ class SensorCaptureResultDialog(QDialog):
             QLabel#resultTitle {{
                 font-size: 20px;
                 font-weight: 600;
-                color: #FFFFFF;
+                color: {theme.TEXT_PRIMARY};
             }}
             QLabel#resultSubtitle {{
                 font-size: 12px;
@@ -405,12 +416,47 @@ class SensorCaptureResultDialog(QDialog):
         layout.addWidget(button_box)
 
 
+class ExperimentControlsWindow(QDialog):
+    """Reusable modeless home for the experiment controls panel."""
+
+    _GEOMETRY_KEY = "windows/experiment_controls_geometry"
+
+    def __init__(self, controls: QWidget, parent=None):
+        super().__init__(parent, Qt.Window)
+        self._settings = QSettings("PingLab", "PingLab")
+        self.setWindowTitle("Experiment Controls")
+        self.setModal(False)
+        self.setMinimumSize(380, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(controls)
+
+        saved_geometry = self._settings.value(self._GEOMETRY_KEY)
+        if not saved_geometry or not self.restoreGeometry(saved_geometry):
+            components.size_to_screen(self, 440, 760)
+
+    def remember_geometry(self) -> None:
+        self._settings.setValue(self._GEOMETRY_KEY, self.saveGeometry())
+
+    def reject(self) -> None:
+        """Escape hides the utility without destroying its controls or state."""
+        self.remember_geometry()
+        self.hide()
+
+    def closeEvent(self, event) -> None:
+        """The window's close button hides it; experiments keep running."""
+        self.remember_geometry()
+        self.hide()
+        event.ignore()
+
+
 class MyMainWindow(MainWindow):
     """
     The main application window for PingLab.
 
     This class is responsible for setting up the main UI components,
-    including the menu bar, toolbar, 3D view area, sidebar, and status bar.
+    including the menu bar, toolbar, 3D view area, experiment window, and status bar.
     It manages the overall layout and handles core application events and state.
     """
 
@@ -421,6 +467,9 @@ class MyMainWindow(MainWindow):
         self._fps_timer = None
         self._sidebar_control_timer = None
         self._startup_requested = False
+        self._sensor_scene_ready = False
+        self._sensor_update_backend_enabled = True
+        self.experiments_window = None
         self._sidebar_active_control_id = None
         self._sensor_capture_result_dialog = None
         self._calibration_result_dialog = None
@@ -459,6 +508,7 @@ class MyMainWindow(MainWindow):
         # --- Build the User Interface ---
         self._setup_actions()
         self._setup_menu_and_toolbar()
+        self.set_sensor_scene_ready(False)
         self._setup_main_layout()
         self._connect_signals_to_slots()
 
@@ -470,26 +520,29 @@ class MyMainWindow(MainWindow):
 
     def _setup_actions(self):
         """Creates all QAction objects used in menus and toolbars."""
-        self.action_ping_mode = QAction(self.resources.get_icon('logo0.png'), 'Ping', self)
+        self.action_ping_mode = QAction(icons.icon('play'), 'Ping', self)
+        self.action_ping_mode.setToolTip('Enter Ping mode and build the main workspace')
 
-        self.action_log = QAction(self.resources.get_icon('logo2.png'), 'Log', self)
+        self.action_log = QAction(icons.icon('terminal'), 'Log', self)
+        self.action_log.setToolTip('Open or close the Application Log window')
 
-        self.action_sensor_signal = QAction(self.resources.get_icon('logo3.png'), "Sensor Signal", self)
+        self.action_sensor_signal = QAction(icons.icon('signal'), "Sensor Signal", self)
+        self.action_sensor_signal.setToolTip('Open the standalone sensor signal viewer')
         self.action_ps5_controller_test = QAction(
-            self._emoji_toolbar_icon("🎮"),
+            icons.icon('gamepad'),
             'PS5 Controller Test',
             self,
         )
         self.action_ps5_controller_test.setToolTip('Open the PS5 controller input test window')
         self.action_sensor_controller_test = QAction(
-            self._emoji_toolbar_icon("👆"),
+            icons.icon('target'),
             'Sensor Controller Test',
             self,
         )
         self.action_sensor_controller_test.setToolTip('Open the sensor-to-controller mapping test window')
 
         self.action_keyboard_tool_velocity = QAction(
-            self._emoji_toolbar_icon("⌨"),
+            icons.icon('keyboard'),
             'Keyboard Tool Velocity',
             self,
         )
@@ -501,52 +554,84 @@ class MyMainWindow(MainWindow):
             "Release a key to remove that component. Space stops all."
         )
 
-        self.action_direct_finger_motion_params = QAction(self.style().standardIcon(QStyle.SP_CommandLink), '🖐 DFM Parameters', self)
+        self.action_direct_finger_motion_params = QAction(
+            icons.icon('hand'), 'Direct Finger Motion Parameters', self
+        )
         self.action_direct_finger_motion_params.setToolTip('Open the Direct Finger Motion parameter editor')
         self.action_proximity_control_params = QAction(
-            self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
+            icons.icon('eye'),
             'Proximity Parameters',
             self,
         )
         self.action_proximity_control_params.setToolTip('Open the Proximity Control parameter editor')
         self.action_console_control_params = QAction(
-            self.style().standardIcon(QStyle.SP_ComputerIcon),
+            icons.icon('sliders'),
             'Console Control Parameters',
             self,
         )
         self.action_console_control_params.setToolTip('Open the Console Control parameter editor')
         self.action_sensor_params = QAction(
-            self.style().standardIcon(QStyle.SP_FileDialogListView),
+            icons.icon('sensor'),
             'Sensor Parameters',
             self,
         )
         self.action_sensor_params.setToolTip('Open the Sensor parameter editor')
         self.action_parameter_settings = QAction(
-            self.style().standardIcon(QStyle.SP_FileDialogDetailedView),
+            icons.icon('settings'),
             'Parameter Settings',
             self,
         )
         self.action_parameter_settings.setToolTip('Open parameter settings menu')
-        self.action_update_sensor = QAction('Update Sensor', self)
-        self.action_update_sensor.setToolTip('Update sensor values (same action used by AI/Sensor tabs before)')
+        self.action_update_sensor = QAction(icons.icon('refresh'), 'Calibrate Sensor', self)
+        self.action_update_sensor.setToolTip(
+            'Calibrate the sensor baseline (Sensor Plotter and humanoid sensors)'
+        )
+        self.action_stop_all_motion = QAction(
+            icons.icon('stop', color=theme.DANGER),
+            'Stop All Motion',
+            self,
+        )
+        self.action_stop_all_motion.setToolTip(
+            'Software stop: cancel active controls and command all robot motion '
+            'to stop. This does not replace the physical emergency stop.'
+        )
+        self.action_disconnect_sensor = QAction(
+            icons.icon('x-circle', color=theme.DANGER),
+            'Disconnect Sensor',
+            self,
+        )
+        self.action_disconnect_sensor.setToolTip(
+            'Stop the active sensor streams and clear the built sensor scene'
+        )
 
-        self.action_toggle_controls = QAction(self.resources.get_icon('logo5.png'), 'Show Experiments', self)
-        self.action_toggle_controls.setToolTip('Show the experiments sidebar')
+        self.action_toggle_controls = QAction(icons.icon('flask'), 'Experiments', self)
+        self.action_toggle_controls.setToolTip(
+            'Open or focus the Experiment Controls window'
+        )
 
-        self.action_exit = QAction(self.resources.get_icon('logo4.png'), 'Exit', self)
+        self.action_window_experiments = QAction(
+            icons.icon('flask'), 'Experiments', self
+        )
+        self.action_window_log = QAction(
+            icons.icon('terminal'), 'Application Log', self
+        )
+        self.action_window_sensor_signal = QAction(
+            icons.icon('signal'), 'Sensor Signal', self
+        )
+        self.action_close_auxiliary_windows = QAction(
+            icons.icon('x-circle'), 'Close Auxiliary Windows', self
+        )
+
+        self.action_presentation_mode = QAction('Presentation Mode', self)
+        self.action_presentation_mode.setCheckable(True)
+        self.action_presentation_mode.setShortcut('Ctrl+Shift+P')
+        self.action_presentation_mode.setToolTip(
+            'Increase control and row sizes for projected demonstrations or touch use'
+        )
+
+        self.action_exit = QAction(icons.icon('power', color=theme.DANGER), 'Exit', self)
+        self.action_exit.setToolTip('Quit PingLab (Ctrl+Q)')
         self.action_exit.setShortcut('Ctrl+Q')
-
-    def _emoji_toolbar_icon(self, emoji: str, size: int = 28) -> QIcon:
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        try:
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.setFont(QFont("Noto Color Emoji", max(12, int(size * 0.7))))
-            painter.drawText(pixmap.rect(), Qt.AlignCenter, str(emoji))
-        finally:
-            painter.end()
-        return QIcon(pixmap)
 
     def _setup_menu_and_toolbar(self):
         """Initializes the menu bar and the main toolbar using the predefined actions."""
@@ -554,6 +639,16 @@ class MyMainWindow(MainWindow):
         menu = self.menuBar()
         mode_menu = menu.addMenu('Mode')
         mode_menu.addAction(self.action_ping_mode)
+
+        view_menu = menu.addMenu('View')
+        view_menu.addAction(self.action_presentation_mode)
+
+        window_menu = menu.addMenu('Window')
+        window_menu.addAction(self.action_window_experiments)
+        window_menu.addAction(self.action_window_log)
+        window_menu.addAction(self.action_window_sensor_signal)
+        window_menu.addSeparator()
+        window_menu.addAction(self.action_close_auxiliary_windows)
 
         function_menu = menu.addMenu('Menu')
         function_menu.addAction(self.action_log)
@@ -573,7 +668,10 @@ class MyMainWindow(MainWindow):
 
         # --- Toolbar ---
         toolbar = QToolBar("Main")
-        toolbar.setIconSize(QSize(24, 24))
+        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setMovable(False)
+        toolbar.setFloatable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
         toolbar.addAction(self.action_ping_mode)
         toolbar.addSeparator()
         toolbar.addAction(self.action_log)
@@ -596,25 +694,122 @@ class MyMainWindow(MainWindow):
         toolbar.addAction(self.action_exit)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        # Without this the spacer picks up the default window background and
+        # paints a pale slab across the middle of the toolbar.
+        spacer.setStyleSheet("background: transparent;")
         toolbar.addWidget(spacer)
+        self.toolbar_stop_all_motion_button = QToolButton()
+        self.toolbar_stop_all_motion_button.setText("Stop All Motion")
+        self.toolbar_stop_all_motion_button.setIcon(
+            icons.icon('stop', color=theme.TEXT_ON_ACCENT, size=16)
+        )
+        self.toolbar_stop_all_motion_button.setIconSize(QSize(16, 16))
+        self.toolbar_stop_all_motion_button.setToolButtonStyle(
+            Qt.ToolButtonTextBesideIcon
+        )
+        self.toolbar_stop_all_motion_button.setToolTip(
+            self.action_stop_all_motion.toolTip()
+        )
+        self.toolbar_stop_all_motion_button.setCursor(Qt.PointingHandCursor)
+        self.toolbar_stop_all_motion_button.setStyleSheet(
+            "QToolButton {"
+            f" border: 1px solid {theme.DANGER};"
+            f" border-radius: {theme.RADIUS_MD}px;"
+            " padding: 4px 12px;"
+            " font-weight: 700;"
+            f" color: {theme.TEXT_ON_ACCENT};"
+            f" background-color: {theme.DANGER};"
+            "}"
+            "QToolButton:hover {"
+            f" background-color: {theme.DANGER_HOVER};"
+            f" border-color: {theme.DANGER_HOVER};"
+            "}"
+            "QToolButton:pressed {"
+            f" background-color: {theme.DANGER_PRESSED};"
+            f" border-color: {theme.DANGER_PRESSED};"
+            "}"
+        )
+        self.toolbar_stop_all_motion_button.clicked.connect(
+            self.action_stop_all_motion.trigger
+        )
+        toolbar.addWidget(self.toolbar_stop_all_motion_button)
+        toolbar.addSeparator()
+        self.toolbar_disconnect_sensor_button = QToolButton()
+        self.toolbar_disconnect_sensor_button.setText("Disconnect Sensor")
+        self.toolbar_disconnect_sensor_button.setIcon(
+            icons.icon('x-circle', color=theme.DANGER, size=16)
+        )
+        self.toolbar_disconnect_sensor_button.setIconSize(QSize(16, 16))
+        self.toolbar_disconnect_sensor_button.setToolButtonStyle(
+            Qt.ToolButtonTextBesideIcon
+        )
+        self.toolbar_disconnect_sensor_button.setToolTip(
+            self.action_disconnect_sensor.toolTip()
+        )
+        self.toolbar_disconnect_sensor_button.setCursor(Qt.PointingHandCursor)
+        self.toolbar_disconnect_sensor_button.setStyleSheet(
+            "QToolButton {"
+            f" border: 1px solid {theme.DANGER_BORDER};"
+            f" border-radius: {theme.RADIUS_MD}px;"
+            " padding: 4px 12px;"
+            " font-weight: 600;"
+            f" color: {theme.DANGER};"
+            f" background-color: {theme.DANGER_SOFT};"
+            "}"
+            "QToolButton:hover {"
+            f" color: {theme.TEXT_ON_ACCENT};"
+            f" background-color: {theme.DANGER_HOVER};"
+            f" border-color: {theme.DANGER_HOVER};"
+            "}"
+            "QToolButton:pressed {"
+            f" color: {theme.TEXT_ON_ACCENT};"
+            f" background-color: {theme.DANGER_PRESSED};"
+            f" border-color: {theme.DANGER_PRESSED};"
+            "}"
+            "QToolButton:disabled {"
+            f" background-color: {theme.SURFACE_RAISED};"
+            f" border-color: {theme.BORDER};"
+            f" color: {theme.TEXT_DISABLED};"
+            "}"
+        )
+        self.toolbar_disconnect_sensor_button.clicked.connect(
+            self.action_disconnect_sensor.trigger
+        )
+        toolbar.addWidget(self.toolbar_disconnect_sensor_button)
+        # Calibration is the main repeated sensor action, so it keeps the
+        # filled accent treatment beside the global safety controls.
         self.toolbar_update_sensor_button = QToolButton()
-        self.toolbar_update_sensor_button.setText("Update Sensor")
-        self.toolbar_update_sensor_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.toolbar_update_sensor_button.setAutoRaise(True)
+        self.toolbar_update_sensor_button.setText("Calibrate Sensor")
+        self.toolbar_update_sensor_button.setIcon(
+            icons.icon('refresh', color=theme.TEXT_ON_ACCENT, size=16)
+        )
+        self.toolbar_update_sensor_button.setIconSize(QSize(16, 16))
+        self.toolbar_update_sensor_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toolbar_update_sensor_button.setToolTip(
+            self.action_update_sensor.toolTip()
+        )
+        self.toolbar_update_sensor_button.setCursor(Qt.PointingHandCursor)
         self.toolbar_update_sensor_button.setStyleSheet(
             "QToolButton {"
             f" border: 1px solid {theme.ACCENT};"
-            " border-radius: 6px;"
-            " padding: 4px 10px;"
+            f" border-radius: {theme.RADIUS_MD}px;"
+            " padding: 4px 12px;"
             " font-weight: 600;"
-            f" color: {theme.TEXT_PRIMARY};"
-            " background-color: rgba(61, 130, 240, 0.16);"
+            f" color: {theme.TEXT_ON_ACCENT};"
+            f" background-color: {theme.ACCENT};"
             "}"
             "QToolButton:hover {"
-            " background-color: rgba(61, 130, 240, 0.30);"
+            f" background-color: {theme.ACCENT_HOVER};"
+            f" border-color: {theme.ACCENT_HOVER};"
             "}"
             "QToolButton:pressed {"
-            " background-color: rgba(61, 130, 240, 0.45);"
+            f" background-color: {theme.ACCENT_PRESSED};"
+            f" border-color: {theme.ACCENT_PRESSED};"
+            "}"
+            "QToolButton:disabled {"
+            f" background-color: {theme.SURFACE_RAISED};"
+            f" border-color: {theme.BORDER};"
+            f" color: {theme.TEXT_DISABLED};"
             "}"
         )
         self.toolbar_update_sensor_button.clicked.connect(self.action_update_sensor.trigger)
@@ -642,13 +837,15 @@ class MyMainWindow(MainWindow):
         self.view_placeholder.setAlignment(Qt.AlignCenter)
         view_layout.addWidget(self.view_placeholder)
 
-        # --- Sidebar (initially hidden) ---
+        # The experiment controls live in a modeless utility window so they do
+        # not continually take width away from the visualization workspace.
         self.sidebar = self._create_sidebar()
+        self.experiments_window = ExperimentControlsWindow(
+            self.sidebar,
+            parent=self,
+        )
 
         self.h_splitter.addWidget(self.view_container)
-        self.h_splitter.addWidget(self.sidebar)
-        self.h_splitter.setCollapsible(1, True)
-        self._set_sidebar_visible(False)
 
         main_layout.addWidget(self.h_splitter)
 
@@ -658,8 +855,12 @@ class MyMainWindow(MainWindow):
     def _create_sidebar(self) -> QFrame:
         """Creates the sidebar widget and all its contents."""
         sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
+        sidebar.setObjectName("experimentPanel")
         sidebar.setFrameShape(QFrame.StyledPanel)
+        sidebar.setStyleSheet(
+            f"QFrame#experimentPanel {{ background-color: {theme.WINDOW_BG}; "
+            "border: none; }"
+        )
         # Wider than the legacy 250 px so longer task descriptions / labels
         # (e.g. "Save per-point sensor CSV", "Per-point dwell:", J=[...]° log lines)
         # are not clipped by the splitter handle.
@@ -745,20 +946,397 @@ class MyMainWindow(MainWindow):
         return sidebar
 
     def _setup_status_bar(self):
-        """Initializes the status bar with informational labels."""
+        """Build the compact status bar.
+
+        Left side carries the last action message plus a warning slot; the
+        right side carries always-on device state and live rates, so the
+        operator can see connection, sensor rate, render rate and the active
+        control mode without leaving the current workspace.
+        """
         status = QStatusBar()
-        self.info_process = QLabel("Ready")
-        self.info_fps = QLabel("FPS: 0")
-        status.addWidget(self.info_process)
-        status.addPermanentWidget(self.info_fps)
+        status.setSizeGripEnabled(False)
+
+        self.info_process = components.ElidedLabel("Ready")
+        self.info_process.setObjectName("statusActivity")
+        self.info_process.setToolTip("Ready")
+        status.addWidget(self.info_process, 1)
+
+        self.status_experiment = components.StatusDot("Experiment", "active")
+        self.status_experiment.setVisible(False)
+        status.addWidget(self.status_experiment)
+
+        self.status_experiment_stop_button = QPushButton("Stop")
+        self.status_experiment_stop_button.setObjectName("btnStop")
+        self.status_experiment_stop_button.setToolTip(
+            "Stop the currently running experiment"
+        )
+        self.status_experiment_stop_button.setVisible(False)
+        status.addWidget(self.status_experiment_stop_button)
+
+        self.status_warning = QLabel("")
+        self.status_warning.setStyleSheet(
+            f"color: {theme.WARNING}; font-size: {theme.FONT_SIZE_SMALL};"
+            f" font-weight: {theme.WEIGHT_MEDIUM};"
+        )
+        self.status_warning.setVisible(False)
+        status.addWidget(self.status_warning)
+
+        self.status_sensor = components.StatusDot("Sensor", "idle")
+        self.status_robot = components.StatusDot("Robot", "idle")
+        self.status_hand = components.StatusDot("Hand", "idle")
+
+        self.status_mode = QLabel("Idle")
+        self.status_mode.setObjectName("statusMetric")
+        self.status_mode.setToolTip("Active control mode")
+
+        self.status_sensor_hz = QLabel("— Hz")
+        self.status_sensor_hz.setObjectName("statusMetric")
+        self.status_sensor_hz.setToolTip("Sensor acquisition rate")
+
+        self.info_fps = QLabel("0 fps")
+        self.info_fps.setObjectName("statusMetric")
+        self.info_fps.setToolTip("3D viewport render rate")
+
+        for widget in (
+            self.status_sensor,
+            self.status_robot,
+            self.status_hand,
+            self._status_separator(),
+            self.status_mode,
+            self._status_separator(),
+            self.status_sensor_hz,
+            self.info_fps,
+        ):
+            status.addPermanentWidget(widget)
+
         self.setStatusBar(status)
+
+    @staticmethod
+    def _status_separator() -> QLabel:
+        separator = QLabel("│")
+        separator.setObjectName("statusSeparator")
+        return separator
+
+    def set_status_warning(self, message: str = "") -> None:
+        """Show (or clear) the amber warning slot in the status bar."""
+        self.status_warning.setText(str(message or ""))
+        self.status_warning.setVisible(bool(message))
+
+    def set_activity_message(self, message: str = "") -> None:
+        """Show the newest log line without letting it widen the status bar."""
+        message = " ".join(str(message or "").splitlines()).strip()
+        message = message or "Application log is empty"
+        self.info_process.setText(message)
+        self.info_process.setToolTip(message)
+
+    def _refresh_sensor_update_control(self) -> None:
+        scene_ready = bool(self._sensor_scene_ready)
+        backend_idle = bool(self._sensor_update_backend_enabled)
+        enabled = scene_ready and backend_idle
+        self.action_update_sensor.setEnabled(enabled)
+        self.toolbar_update_sensor_button.setEnabled(enabled)
+        self.action_disconnect_sensor.setEnabled(enabled)
+        self.toolbar_disconnect_sensor_button.setEnabled(enabled)
+        update_tooltip = (
+            "Wait for the current sensor operation to finish."
+            if scene_ready and not backend_idle
+            else (
+                "Calibrate the sensor baseline (Sensor Plotter and humanoid sensors)"
+                if scene_ready
+                else "Connect a sensor scene before calibrating it."
+            )
+        )
+        disconnect_tooltip = (
+            "Wait for the current sensor operation to finish."
+            if scene_ready and not backend_idle
+            else (
+                "Stop the active sensor streams and clear the built sensor scene"
+                if scene_ready
+                else "No built sensor scene is connected."
+            )
+        )
+        self.action_update_sensor.setToolTip(update_tooltip)
+        self.toolbar_update_sensor_button.setToolTip(update_tooltip)
+        self.action_disconnect_sensor.setToolTip(disconnect_tooltip)
+        self.toolbar_disconnect_sensor_button.setToolTip(disconnect_tooltip)
+
+    def set_sensor_scene_ready(self, ready: bool = True) -> None:
+        """Record whether a valid sensor scene exists for recalibration."""
+        self._sensor_scene_ready = bool(ready)
+        self._refresh_sensor_update_control()
+
+    def set_sensor_update_enabled(self, enabled: bool = True) -> None:
+        """Gate recalibration while preserving the scene-ready requirement."""
+        self._sensor_update_backend_enabled = bool(enabled)
+        self._refresh_sensor_update_control()
+
+    def set_log_unread_count(self, count: int = 0) -> None:
+        """Mark the Log action when lines arrived while the panel was hidden.
+
+        This replaces the old embedded log forcing itself open on every message. The
+        toolbar is icon-only, so the count goes in the menu label and tooltip
+        and the icon switches to the accent colour -- noticeable on a glance,
+        but it never takes width from the 3D viewport.
+        """
+        count = max(int(count or 0), 0)
+        if count == getattr(self, "_log_unread_shown", None):
+            return
+        self._log_unread_shown = count
+        self.action_log.setText(f"Log ({count})" if count else "Log")
+        self.action_log.setToolTip(
+            f"Open the Application Log window — {count} new "
+            f"{'message' if count == 1 else 'messages'}"
+            if count
+            else "Open or close the Application Log window"
+        )
+        self.action_log.setIcon(
+            icons.icon("terminal", color=theme.ACCENT) if count
+            else icons.icon("terminal")
+        )
+
+    # Helper attribute -> label shown in the status bar's "active mode" slot.
+    # Ordered by precedence: the first running helper wins.
+    _MODE_INDICATORS = (
+        ("ai_direct_finger_motion_execution_class", "AI DFM (exec)"),
+        ("ai_direct_finger_motion_class", "AI DFM (record)"),
+        ("direct_finger_motion_class", "Rule-based DFM"),
+        ("proximity_control_class", "Proximity"),
+        ("console_control_class", "Console"),
+        ("threelevel_hierarchical_transformer_class", "3-Level"),
+        ("record_gesture_class", "Recording"),
+    )
+
+    def _refresh_status_indicators(self):
+        """Repoll device state for the status bar. Called once per second.
+
+        Everything read here is a cached flag or counter -- no serial or ROS
+        traffic is generated, so this stays off the critical path.
+        """
+        ui = self.ui_ros
+        if ui is None:
+            return
+
+        features = getattr(ui, "features", {}) or {}
+        sensor_functions = getattr(ui, "sensor_functions", None)
+
+        # --- Sensor ------------------------------------------------------
+        sensor_api = getattr(ui, "sensor_api", None)
+        connected = False
+        try:
+            connected = bool(sensor_api.is_connected())
+        except Exception:
+            connected = False
+        # Normal serial scenes are owned by MySensor rather than the lazy
+        # top-level API instance, so either backend can prove the stream live.
+        connected = connected or bool(
+            getattr(sensor_functions, "is_connected", False)
+        )
+        sensor_hz = float(getattr(sensor_functions, "_sensor_update_hz", 0.0) or 0.0)
+        if connected and sensor_hz > 0.5:
+            self.status_sensor.set_state("active", "Sensor")
+        elif connected:
+            self.status_sensor.set_state("warning", "Sensor")
+        else:
+            self.status_sensor.set_state("idle", "Sensor")
+        self.status_sensor_hz.setText(
+            f"{sensor_hz:5.1f} Hz" if sensor_hz > 0 else "  — Hz"
+        )
+
+        # --- Robot -------------------------------------------------------
+        robot_ready = bool(features.get("robot_ready", False))
+        velocity_active = False
+        try:
+            velocity_active = bool(ui._robot_velocity_mode_active())
+        except Exception:
+            velocity_active = False
+        if velocity_active:
+            self.status_robot.set_state("warning", "Robot moving")
+        elif robot_ready:
+            self.status_robot.set_state("active", "Robot")
+        else:
+            self.status_robot.set_state("idle", "Robot")
+
+        # --- Dexterous hand ---------------------------------------------
+        self.status_hand.set_state(
+            "active" if features.get("hand_ready", False) else "idle", "Hand"
+        )
+
+        # --- Active control mode ----------------------------------------
+        active_mode = self._active_mode_label(sensor_functions)
+        ai_proximity_button = getattr(ui, "ai_proximity_detection_button", None)
+        if ai_proximity_button is not None and ai_proximity_button.isChecked():
+            admittance_button = getattr(ui, "ai_proximity_admittance_button", None)
+            active_mode = (
+                "AI Proximity + Admittance"
+                if admittance_button is not None and admittance_button.isChecked()
+                else "AI Proximity"
+            )
+        self.status_mode.setText(active_mode)
+        self._refresh_session_strip(ui, active_mode, connected, sensor_hz)
+
+    @staticmethod
+    def _selected_sensor_summary(
+        ui,
+        connected: bool,
+        sensor_hz: float,
+    ) -> tuple[str, str]:
+        source = None
+        sensor_functions = getattr(ui, "sensor_functions", None)
+        if connected:
+            describe_source = getattr(
+                sensor_functions,
+                "describe_live_sensor_source",
+                None,
+            )
+            if callable(describe_source):
+                try:
+                    source = describe_source()
+                except Exception:
+                    source = None
+
+        if source:
+            port_text = str(source.get("port_label", "") or "").strip()
+            rows = int(source.get("n_row", 0) or 0)
+            cols = int(source.get("n_col", 0) or 0)
+        elif connected:
+            # A highlighted row is only a setup choice; it does not identify
+            # the stream that is already running. Prefer backend-owned port
+            # state, and avoid claiming that the selected row is live when
+            # older/fallback backends cannot provide source metadata.
+            primary_port = str(
+                getattr(sensor_functions, "_primary_sensor_port", "") or ""
+            ).strip()
+            sensor_api = getattr(ui, "sensor_api", None)
+            active_port = primary_port or str(
+                getattr(sensor_api, "serial_port", "") or ""
+            ).strip()
+            port_text = os.path.basename(active_port) if active_port else "Active sensor"
+            rows = int(getattr(sensor_functions, "n_row", 0) or 0)
+            cols = int(getattr(sensor_functions, "n_col", 0) or 0)
+        else:
+            ports = getattr(ui, "serial_channel", None)
+            current = ports.currentItem() if ports is not None else None
+            port_text = current.text().strip() if current is not None else "No sensor"
+            rows = getattr(
+                getattr(ui, "grid_rows_spin", None),
+                "value",
+                lambda: 0,
+            )()
+            cols = getattr(
+                getattr(ui, "grid_cols_spin", None),
+                "value",
+                lambda: 0,
+            )()
+
+        port_text = port_text or "Active sensor"
+        shape = f"{int(rows)}x{int(cols)}" if rows and cols else ""
+        state = "Streaming" if connected else "Offline"
+        details = [state, port_text]
+        if shape and shape.lower() not in port_text.lower():
+            details.append(shape)
+        if connected and sensor_hz > 0:
+            details.append(f"{sensor_hz:.0f} Hz")
+        value = " · ".join(details)
+        return value, value
+
+    def _refresh_session_strip(
+        self,
+        ui,
+        active_mode: str,
+        connected: bool,
+        sensor_hz: float,
+    ) -> None:
+        """Update the operator summary from cached labels and flags only."""
+        strip = getattr(ui, "session_strip", None)
+        if strip is None:
+            return
+
+        sensor_value, sensor_tooltip = self._selected_sensor_summary(
+            ui,
+            connected,
+            sensor_hz,
+        )
+        strip.set_value(
+            "sensor",
+            sensor_value,
+            tooltip=sensor_tooltip,
+            state="active" if connected else "idle",
+        )
+        strip.set_value(
+            "control",
+            active_mode,
+            state="active" if active_mode != "Idle" else "idle",
+        )
+
+        if active_mode == "AI DFM (exec)":
+            model_label = getattr(ui, "ai_direct_execution_model_status", None)
+        elif active_mode.startswith("AI Proximity"):
+            model_label = getattr(ui, "ai_proximity_model_status", None)
+        else:
+            model_label = None
+        model_text = model_label.text().strip() if model_label is not None else "Not active"
+        strip.set_value(
+            "model",
+            model_text,
+            tooltip=model_label.toolTip() if model_label is not None else model_text,
+            state="active" if model_label is not None else "idle",
+        )
+
+        force_label = getattr(ui, "force_meter_value_label", None)
+        force_button = getattr(ui, "force_meter_connect_button", None)
+        force_live = force_button is not None and force_button.isChecked()
+        force_text = force_label.text().strip() if force_label is not None else "— N"
+        force_value = f"Live · {force_text}" if force_live else "Offline"
+        strip.set_value(
+            "force",
+            force_value,
+            tooltip=f"Force meter: {force_value}",
+            state="active" if force_live else "idle",
+        )
+
+    def _active_mode_label(self, sensor_functions) -> str:
+        """Return the highest-precedence running control mode, or ``Idle``.
+
+        A helper that failed to initialize is replaced by a stub whose
+        ``__getattr__`` hands back a no-op *function* for every name, so a
+        truthiness test on ``is_running`` would report a mode that is not
+        running. Hence the identity check against ``True`` and the falsiness
+        guard -- both stub flavours define ``__bool__`` as ``False``.
+        """
+        if sensor_functions is None:
+            return "Idle"
+        getter = getattr(sensor_functions, "get_initialized_helper", None)
+        for attribute, label in self._MODE_INDICATORS:
+            if callable(getter):
+                helper = getter(attribute)
+            else:
+                helper = getattr(sensor_functions, attribute, None)
+            if not helper:
+                continue
+            if getattr(helper, "is_running", False) is True:
+                return label
+        return "Idle"
 
     def _connect_signals_to_slots(self):
         """Connects all QAction and widget signals to their corresponding methods (slots)."""
         self.action_exit.triggered.connect(self.close)
         self.action_ping_mode.triggered.connect(self.run_ping_mode)
         self.action_log.triggered.connect(self._toggle_log_view)
-        self.action_toggle_controls.triggered.connect(self.toggle_sidebar)
+        self.action_toggle_controls.triggered.connect(
+            self.open_experiments_window
+        )
+        self.action_window_experiments.triggered.connect(
+            self.open_experiments_window
+        )
+        self.action_window_log.triggered.connect(
+            self.open_application_log_window
+        )
+        self.action_window_sensor_signal.triggered.connect(
+            self.open_sensor_signal_window
+        )
+        self.action_close_auxiliary_windows.triggered.connect(
+            self.close_auxiliary_windows
+        )
         self.action_sensor_signal.triggered.connect(self.open_sensor_signal_window)
         self.action_ps5_controller_test.triggered.connect(self.open_ps5_controller_test_window)
         self.action_sensor_controller_test.triggered.connect(self.open_sensor_controller_test_window)
@@ -767,6 +1345,15 @@ class MyMainWindow(MainWindow):
         self.action_proximity_control_params.triggered.connect(self.open_proximity_control_params_window)
         self.action_console_control_params.triggered.connect(self.open_console_control_params_window)
         self.action_sensor_params.triggered.connect(self.open_sensor_params_window)
+        self.action_presentation_mode.toggled.connect(
+            self._set_presentation_mode
+        )
+        self.action_stop_all_motion.triggered.connect(
+            self._trigger_global_stop_all_motion
+        )
+        self.action_disconnect_sensor.triggered.connect(
+            self._trigger_global_sensor_disconnect
+        )
         self.action_update_sensor.triggered.connect(self._trigger_global_sensor_update)
         self.sidebar_btn_start.clicked.connect(self._start_sidebar_control)
         self.sigraph_scanning_reverse_button.clicked.connect(
@@ -778,13 +1365,31 @@ class MyMainWindow(MainWindow):
         self.sigraph_scanning_reverse_record_button.clicked.connect(
             self._start_sigraph_scanning_reverse_and_record
         )
-        self.sidebar_btn_stop.clicked.connect(self._stop_sidebar_control)
+        self.sidebar_btn_stop.clicked.connect(
+            lambda: self._stop_sidebar_control()
+        )
+        self.status_experiment_stop_button.clicked.connect(
+            lambda: self._stop_sidebar_control()
+        )
         self.sidebar_task_list.currentItemChanged.connect(self._on_sidebar_task_changed)
+
+    def _set_presentation_mode(self, enabled: bool) -> None:
+        """Apply larger hit targets without changing the normal lab layout."""
+        stylesheet = self.resources.get_stylesheet()
+        if enabled:
+            stylesheet += theme.presentation_override_stylesheet()
+        self.setStyleSheet(stylesheet)
 
     def _trigger_global_sensor_update(self):
         if not self._require_ui_ros(
-            "Please wait for Ping Mode to load before updating the sensor."
+            "Please wait for Ping Mode to load before calibrating the sensor."
         ):
+            return
+        # Legacy embedded callers do not expose the new state attribute; the
+        # real main window always initializes it explicitly to False.
+        if not bool(getattr(self, "_sensor_scene_ready", True)):
+            message = "Connect a sensor scene before calibrating"
+            self.info_process.setText(message)
             return
         try:
             humanoid_update_requested = False
@@ -802,31 +1407,105 @@ class MyMainWindow(MainWindow):
             elif hasattr(self.ui_ros, "sensor_functions") and hasattr(self.ui_ros.sensor_functions, "updateCal"):
                 self.ui_ros.sensor_functions.updateCal()
             self.info_process.setText(
-                "Updating Sensor Plotter and humanoid sensors..."
+                "Calibrating Sensor Plotter and humanoid sensors..."
                 if humanoid_update_requested
-                else "Updating Sensor Plotter..."
+                else "Calibrating Sensor Plotter..."
             )
         except Exception as exc:
-            self.info_process.setText("Sensor update failed")
+            self.info_process.setText("Sensor calibration failed")
             if self.ui_ros is not None and hasattr(self.ui_ros, "log_display"):
-                self.ui_ros.log_display.append(f"Sensor update failed: {exc}")
+                self.ui_ros.log_display.append(f"Sensor calibration failed: {exc}")
+
+    def _trigger_global_sensor_disconnect(self):
+        if not self._require_ui_ros(
+            "Please wait for Ping Mode to load before disconnecting the sensor."
+        ):
+            return
+        if not bool(getattr(self, "_sensor_scene_ready", True)):
+            message = "No built sensor scene is connected"
+            self.info_process.setText(message)
+            return
+
+        disconnect = getattr(self.ui_ros, "disconnect_sensor_scene", None)
+        if not callable(disconnect):
+            sensor = getattr(self.ui_ros, "sensor_functions", None)
+            disconnect = getattr(sensor, "disconnect_sensor_scene", None)
+        if not callable(disconnect):
+            message = "Sensor disconnect is unavailable"
+            self.info_process.setText(message)
+            return
+
+        try:
+            disconnected = bool(disconnect())
+        except Exception as exc:
+            disconnected = False
+            sensor = getattr(self.ui_ros, "sensor_functions", None)
+            set_error = getattr(sensor, "_set_sensor_stream_error", None)
+            if callable(set_error):
+                set_error(f"Sensor disconnect failed: {exc}")
+
+        if disconnected:
+            self.set_sensor_scene_ready(False)
+            self.set_sensor_update_enabled(True)
+            self.info_process.setText("Sensor disconnected")
+            return
+
+        sensor = getattr(self.ui_ros, "sensor_functions", None)
+        get_error = getattr(sensor, "get_last_sensor_stream_error", None)
+        error = str(get_error() or "") if callable(get_error) else ""
+        message = error or "Sensor disconnect failed"
+        self.info_process.setText(message)
+        log_display = getattr(self.ui_ros, "log_display", None)
+        if log_display is not None and hasattr(log_display, "append"):
+            log_display.append(message)
+
+    def _trigger_global_stop_all_motion(self):
+        """Best-effort software stop without disconnecting sensor feedback."""
+        issues = []
+        try:
+            self._stop_sidebar_control(
+                show_result=False,
+                message="Experiment stopped by Stop All Motion",
+            )
+        except Exception as exc:
+            issues.append(f"experiment: {exc}")
+
+        try:
+            self._disable_keyboard_tool_velocity_internal()
+        except Exception as exc:
+            issues.append(f"keyboard velocity: {exc}")
+
+        stop_motion = getattr(self.ui_ros, "stop_all_motion", None)
+        if callable(stop_motion):
+            try:
+                result = stop_motion()
+                if isinstance(result, (list, tuple)):
+                    issues.extend(str(item) for item in result if item)
+            except Exception as exc:
+                issues.append(f"embedded controls: {exc}")
+        elif self.ui_ros is not None:
+            issues.append("embedded motion stop is unavailable")
+
+        if issues:
+            message = "Software stop sent with warnings: " + "; ".join(issues)
+        else:
+            message = "All software motion stopped; sensor streaming remains active"
+        self.info_process.setText(message)
+        log_display = getattr(self.ui_ros, "log_display", None)
+        if log_display is not None and hasattr(log_display, "append"):
+            log_display.append(message)
 
     def _set_sidebar_visible(self, visible: bool):
-        """Updates sidebar visibility and keeps the toggle action text in sync."""
-        # Keep this in sync with ``_create_sidebar()``'s setMinimumWidth so
-        # the splitter never starts narrower than the sidebar can render
-        # without text clipping.
-        sidebar_w = max(330, self.sidebar.minimumWidth())
+        """Compatibility helper for showing or hiding the experiment window."""
+        window = getattr(self, "experiments_window", None)
+        if window is None:
+            return
         if visible:
-            self.sidebar.show()
-            self.h_splitter.setSizes([max(self.width() - sidebar_w, 0), sidebar_w])
-            self.action_toggle_controls.setText('Hide Experiments')
-            self.action_toggle_controls.setToolTip('Hide the experiments sidebar')
+            window.show()
+            self._focus_window(window)
         else:
-            self.sidebar.hide()
-            self.h_splitter.setSizes([self.width(), 0])
-            self.action_toggle_controls.setText('Show Experiments')
-            self.action_toggle_controls.setToolTip('Show the experiments sidebar')
+            window.remember_geometry()
+            window.hide()
 
     def _require_ui_ros(self, message: str) -> bool:
         """Shows a warning when Ping Mode is not ready yet."""
@@ -841,9 +1520,52 @@ class MyMainWindow(MainWindow):
         window.raise_()
         window.activateWindow()
 
+    def open_experiments_window(self):
+        """Open or focus the reusable modeless experiment-controls window."""
+        self._set_sidebar_visible(True)
+
+    def open_application_log_window(self):
+        """Open or focus the modeless application-log window."""
+        if not self._require_ui_ros(
+            "Please wait for Ping Mode to load before opening the Application Log."
+        ):
+            return
+
+        console = getattr(self.ui_ros, "log_console_window", None)
+        if console is None:
+            log_display = getattr(self.ui_ros, "log_display", None)
+            if log_display is not None:
+                log_display.setVisible(True)
+            return
+        console.show()
+        self._focus_window(console)
+        clear_unread = getattr(self.ui_ros, "_clear_log_unread_count", None)
+        if callable(clear_unread):
+            clear_unread()
+
+    def close_auxiliary_windows(self):
+        """Hide the three routine auxiliary windows without ending the session."""
+        self._set_sidebar_visible(False)
+
+        sensor_window = getattr(self, "sensor_window", None)
+        if sensor_window is not None:
+            sensor_window.close()
+
+        ui = getattr(self, "ui_ros", None)
+        console = getattr(ui, "log_console_window", None) if ui is not None else None
+        if console is not None:
+            remember = getattr(console, "remember_geometry", None)
+            if callable(remember):
+                remember()
+            console.hide()
+        elif ui is not None:
+            log_display = getattr(ui, "log_display", None)
+            if log_display is not None:
+                log_display.setVisible(False)
+
     def toggle_sidebar(self):
-        """Shows or hides the control sidebar."""
-        self._set_sidebar_visible(self.sidebar.isHidden())
+        """Backward-compatible alias for opening the experiment window."""
+        self.open_experiments_window()
 
     def open_sensor_signal_window(self):
         """
@@ -974,30 +1696,55 @@ class MyMainWindow(MainWindow):
         self._frame_count += 1
 
     def _update_fps_display(self):
-        """Updates the FPS label in the status bar."""
-        self.info_fps.setText(f"FPS: {self._frame_count}")
+        """Updates the FPS label and device indicators in the status bar."""
+        self.info_fps.setText(f"{self._frame_count:3d} fps")
         self._frame_count = 0
+        try:
+            self._refresh_status_indicators()
+        except Exception:
+            # The status bar is cosmetic: never let it interrupt the session.
+            pass
 
     def _toggle_log_view(self):
-        """Toggles the visibility of the log panel inside the main UI widget."""
+        """Toggle the modeless log console without resizing the workspace."""
         if self.ui_ros:
             self.ui_ros.toggle_plotter_visibility()
         else:
             QMessageBox.information(self, "Info", "Log is only available after Ping Mode has started.")
 
     def _append_sidebar_control_message(self, message: str):
+        # The status bar carries the message, so the log stays as the user
+        # left it. Experiment tasks tick once a second; forcing the log open
+        # on each one used to shrink the 3D view mid-run.
         self.info_process.setText(message)
         if self.ui_ros is not None and hasattr(self.ui_ros, "log_display"):
             try:
-                if not self.ui_ros.log_display.isVisible():
-                    self.ui_ros.log_display.setVisible(True)
-                    if hasattr(self.ui_ros, "adjust_splitter_sizes"):
-                        self.ui_ros.adjust_splitter_sizes()
                 self.ui_ros.log_display.append(message)
                 return
             except Exception:
                 pass
         print(message)
+
+    def _refresh_experiment_status(self) -> None:
+        """Keep a compact stop affordance visible when the popup is hidden."""
+        indicator = getattr(self, "status_experiment", None)
+        stop_button = getattr(self, "status_experiment_stop_button", None)
+        if indicator is None or stop_button is None:
+            return
+
+        task = getattr(self, "_sidebar_active_task", None)
+        running = task is not None
+        if running:
+            task_label = str(
+                getattr(task, "label", None)
+                or getattr(task, "id", None)
+                or "Experiment"
+            )
+            indicator.set_state("active", f"Experiment: {task_label}")
+            indicator.setToolTip(f"Running experiment: {task_label}")
+        indicator.setVisible(running)
+        stop_button.setVisible(running)
+        stop_button.setEnabled(running)
 
     def _current_sidebar_task_item(self):
         return getattr(self, "sidebar_task_list", None).currentItem() if hasattr(self, "sidebar_task_list") else None
@@ -1108,6 +1855,7 @@ class MyMainWindow(MainWindow):
         )
         self.sigraph_scanning_remove_button = QPushButton("Remove")
         self.sigraph_scanning_clear_button = QPushButton("Clear")
+        components.apply_variant(self.sigraph_scanning_clear_button, "danger")
         record_row.addWidget(self.sigraph_scanning_record_button, 1)
         record_row.addWidget(self.sigraph_scanning_copy_button)
         record_row.addWidget(self.sigraph_scanning_remove_button)
@@ -2257,6 +3005,7 @@ class MyMainWindow(MainWindow):
 
         self._sidebar_control_timer.start(int(interval_ms))
         self.info_process.setText(f"Control started: {task.label}")
+        self._refresh_experiment_status()
 
     def _stop_sidebar_control(self, show_result=True, message="Control stopped"):
         recording_elapsed_s = self._sigraph_heatmap_record_elapsed()
@@ -2266,6 +3015,7 @@ class MyMainWindow(MainWindow):
         self._sidebar_active_task = None
         self._sidebar_active_control_id = None
         self.info_process.setText(message)
+        self._refresh_experiment_status()
 
         if task is not None:
             try:
@@ -2564,6 +3314,10 @@ class MyMainWindow(MainWindow):
         )
 
         # Explicitly close any child windows to avoid orphaned processes
+        experiments_window = getattr(self, "experiments_window", None)
+        if experiments_window is not None:
+            experiments_window.remember_geometry()
+            experiments_window.hide()
         if self.sensor_window:
             self.sensor_window.close()
 

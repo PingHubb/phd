@@ -17,6 +17,50 @@ from phd.dependence.humanoid_sensor_registry import (
 from phd.dependence.humanoid_signal_parts import discover_signal_parts
 
 
+def test_humanoid_reload_uses_fixed_default_urdf(tmp_path):
+    urdf_path = tmp_path / "fixed_g1.urdf"
+    urdf_path.write_text("<robot name='fixed'/>", encoding="utf-8")
+    model = object()
+    calls = []
+    harness = SimpleNamespace(
+        default_urdf=urdf_path,
+        _load_urdf=lambda path: calls.append(("load", path)) or model,
+        _before_scene_load=None,
+        model=None,
+        _rebuild_sliders=lambda: calls.append(("sliders", None)),
+        _rebuild_scene=lambda reset_camera: calls.append(
+            ("scene", bool(reset_camera))
+        ),
+    )
+
+    HumanoidViewerWidget.reload(harness)
+
+    assert harness.model is model
+    assert calls == [
+        ("load", urdf_path),
+        ("sliders", None),
+        ("scene", True),
+    ]
+
+
+def test_humanoid_signal_loader_uses_fixed_default_directory(tmp_path):
+    signal_dir = tmp_path / "fixed_signals"
+    signal_dir.mkdir()
+    discovered = []
+    harness = SimpleNamespace(
+        default_signal_dir=signal_dir,
+        model=object(),
+        _discover_signal_parts=(
+            lambda root, model: discovered.append((root, model)) or []
+        ),
+    )
+
+    result = HumanoidViewerWidget._load_signals(harness, {}, [])
+
+    assert result == (0, ["no matching N_part.obj / curves_col_signal.obj"])
+    assert discovered == [(signal_dir, harness.model)]
+
+
 def test_humanoid_signal_txt_maps_vertices_to_zero_based_channels(tmp_path):
     signal_obj = tmp_path / "curves_col_signal.obj"
     (tmp_path / "signal.txt").write_text(
@@ -419,6 +463,76 @@ def test_auto_sensor_warmup_rejects_startup_sentinels_and_waits_for_stable_size(
     assert worker._frame_is_plausible([10, 20]) is True
 
 
+def test_auto_worker_does_not_lock_to_optional_extra_column_during_detection(
+    monkeypatch,
+):
+    raw_frame = list(range(1, 127))
+
+    class _Serial:
+        port = "/dev/ttyACM7"
+
+    class _Api:
+        instances = []
+
+        def __init__(self, serial_port, connect_immediately):
+            self.serial_port = serial_port
+            self.expected_payload_values = None
+            self.ser = _Serial()
+            self.closed = False
+            self.read_expectations = []
+            self.instances.append(self)
+
+        @staticmethod
+        def is_connected():
+            return True
+
+        @staticmethod
+        def channel_check():
+            return [14, 9]
+
+        def read_raw(self):
+            self.read_expectations.append(self.expected_payload_values)
+            if self.expected_payload_values not in (None, len(raw_frame)):
+                return None
+            return raw_frame
+
+        @staticmethod
+        def update_cal():
+            return raw_frame
+
+        @staticmethod
+        def read_cal():
+            return raw_frame
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(humanoid_viewer, "ArduinoCommander", _Api)
+    worker = HumanoidSensorAutoWorker(
+        [("signal:1:head_link", len(raw_frame))],
+        preferred_port_parts={
+            "ttyACM7": "signal:1:head_link",
+        },
+    )
+    worker.STARTUP_SETTLE_SECONDS = 0.0
+    worker.CALIBRATION_SETTLE_SECONDS = 0.0
+    worker._candidate_ports = lambda: ["/dev/ttyACM7"]
+    worker._drain_serial_until_quiet = lambda _api: None
+    summaries = []
+    worker.scan_summary.connect(
+        lambda summary: (summaries.append(str(summary)), worker.stop())
+    )
+
+    worker.run()
+
+    assert summaries and summaries[0].startswith("1 matched")
+    assert len(_Api.instances) == 1
+    api = _Api.instances[0]
+    assert api.read_expectations[0] is None
+    assert api.read_expectations[-1] == len(raw_frame)
+    assert api.closed is True
+
+
 def test_auto_worker_updates_live_calibration_without_reopening_sensor():
     class _Api:
         def __init__(self):
@@ -619,7 +733,6 @@ def test_suspended_humanoid_scene_restores_cached_actors():
         _set_scene_controls_enabled=(
             lambda enabled: calls.append(("controls", bool(enabled)))
         ),
-        _refresh_live_mapping_controls=lambda: calls.append("controls-ready"),
         _apply_visibility=lambda: calls.append("visible"),
     )
 

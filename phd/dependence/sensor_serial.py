@@ -8,10 +8,18 @@ from phd.dependence.sensor_protocol import (
     DEFAULT_SENSOR_BAUD_RATE,
     DEFAULT_SENSOR_IDLE_SLEEP_SEC,
     DEFAULT_SENSOR_RESPONSE_TIMEOUT_SEC,
+    SENSOR_FRAME_CONTINUATION_GRACE_SEC,
+    SENSOR_RESPONSE_IDLE_TIMEOUT_SEC,
+    SENSOR_RESPONSE_START_GRACE_SEC,
     SENSOR_READ_RAW_COMMAND,
+    has_sensor_frame_end,
+    has_sensor_frame_start,
     parse_serial_ints,
     read_complete_serial_line,
     sensor_response_timeout_for_values,
+    take_complete_sensor_payload,
+    trim_sensor_payload_accumulator,
+    wait_for_serial_input,
 )
 
 
@@ -76,13 +84,27 @@ class SensorReadWorker(QObject):
             minimum=self.response_timeout,
         )
         deadline = time.perf_counter() + response_timeout
+        pending = []
         while self._running and time.perf_counter() < deadline:
+            remaining = max(0.0, deadline - time.perf_counter())
+            if not wait_for_serial_input(
+                serial_port,
+                timeout=min(
+                    remaining,
+                    SENSOR_RESPONSE_START_GRACE_SEC,
+                ),
+                idle_sleep_sec=self.idle_sleep_sec,
+                should_continue=lambda: self._running,
+            ):
+                return None
+            remaining = max(0.0, deadline - time.perf_counter())
             try:
                 line = read_complete_serial_line(
                     serial_port,
-                    timeout=max(0.0, deadline - time.perf_counter()),
+                    timeout=remaining,
                     idle_sleep_sec=self.idle_sleep_sec,
                     should_continue=lambda: self._running,
+                    inter_byte_timeout=SENSOR_RESPONSE_IDLE_TIMEOUT_SEC,
                 )
             except Exception as exc:
                 self.error.emit(
@@ -91,11 +113,44 @@ class SensorReadWorker(QObject):
                 return None
 
             if not line:
-                continue
+                return None
 
             values = parse_serial_ints(line)
-            if values:
-                return values[2:-2] if len(values) >= 4 else values
+            if not values:
+                continue
+
+            fresh_line = not pending
+            pending.extend(values)
+            saw_frame_end = has_sensor_frame_end(pending)
+            payload, pending = take_complete_sensor_payload(
+                pending,
+                expected_values,
+                allow_unframed=fresh_line,
+            )
+            if payload is not None:
+                return payload
+            if saw_frame_end:
+                # A trailer without a valid expected-length frame cannot be
+                # repaired by waiting: ask the device for a fresh frame now
+                # instead of stalling for the full per-port timeout.
+                return None
+            if (
+                has_sensor_frame_start(pending)
+                and not wait_for_serial_input(
+                    serial_port,
+                    timeout=SENSOR_FRAME_CONTINUATION_GRACE_SEC,
+                    idle_sleep_sec=self.idle_sleep_sec,
+                    should_continue=lambda: self._running,
+                )
+            ):
+                # The firmware normally emits one newline-terminated frame.
+                # Preserve genuine split lines when bytes are already arriving,
+                # but retry promptly when an unterminated frame has gone quiet.
+                return None
+            pending = trim_sensor_payload_accumulator(
+                pending,
+                expected_values,
+            )
 
         return None
 

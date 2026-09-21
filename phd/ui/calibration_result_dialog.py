@@ -18,7 +18,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from phd.ui import theme
+from phd.ui import components, theme
 
 
 SIGNAL_LABELS = {
@@ -226,7 +226,7 @@ class CalibrationResultDialog(QDialog):
         self.trial_results = trial_results or [self.result]
         self.exported_graph_paths: list[str] = []
         self.setWindowTitle("Calibration Force-Signal Result")
-        self.resize(1040, 700)
+        components.size_to_screen(self, 1040, 700)
         self.setStyleSheet(
             f"QDialog {{ background: {theme.WINDOW_BG}; color: {theme.TEXT_PRIMARY}; }}"
         )

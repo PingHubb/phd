@@ -8,14 +8,22 @@ from typing import Any, Optional
 import numpy as np
 from PyQt5 import QtCore
 from PyQt5.QtCore import pyqtSignal, Qt, QTimer
-from PyQt5.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
+from PyQt5.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QPainter,
+    QPen,
+    QTextCursor,
+)
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
-    QGroupBox,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -51,7 +59,7 @@ from phd.dependence.humanoid_sensor_registry import (
     humanoid_sensor_extra_column_for_device,
     humanoid_sensor_grid_shape_for_device,
 )
-from phd.ui import theme
+from phd.ui import components, icons, nav_tabs, theme
 from phd.ui.force_meter_chart import ForceMeterChartWidget
 from phd.ui.sensor_zero_mask_window import SensorZeroMaskPanel
 from phd.ui.ui_ping_ai_controls import AiControlsMixin
@@ -287,6 +295,9 @@ class DisabledSensorFunctions:
     def updateCal(self):
         return None
 
+    def disconnect_sensor_scene(self):
+        return False
+
     def set_touch_sensitivity(self, *_args, **_kwargs):
         return None
 
@@ -341,18 +352,6 @@ class DisabledSensorFunctions:
         return None
 
     def set_saved_sensor_heatmap_config(self, *_args, **_kwargs):
-        return None
-
-    def set_contact_normal_visualization_enabled(self, *_args, **_kwargs):
-        return None
-
-    def get_contact_normal_estimator_modes(self):
-        return [
-            ("motion_direction_v3", "Motion Direction (V3)"),
-            ("touch_anchor_v4", "Touch Anchor Direction (V4)"),
-        ]
-
-    def set_contact_normal_estimator_mode(self, *_args, **_kwargs):
         return None
 
     def set_sensor_point_labels_enabled(self, *_args, **_kwargs):
@@ -435,6 +434,125 @@ class PlotterWidget(QWidget):
         self.filesDropped.emit(file_paths)
 
 
+class LogConsoleWindow(QDialog):
+    """Modeless log utility that never consumes visualization workspace."""
+
+    _GEOMETRY_KEY = "windows/log_console_geometry"
+
+    def __init__(self, log_display: QTextEdit, parent=None):
+        super().__init__(parent, Qt.Window)
+        self.log_display = log_display
+        self._settings = QtCore.QSettings("PingLab", "PingLab")
+        self.setWindowTitle("Application Log")
+        self.setModal(False)
+        self.setMinimumSize(520, 260)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(
+            theme.SPACE_MD,
+            theme.SPACE_MD,
+            theme.SPACE_MD,
+            theme.SPACE_MD,
+        )
+        layout.setSpacing(theme.SPACE_SM)
+
+        toolbar = QHBoxLayout()
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(theme.SPACE_XS)
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Find in log")
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setMaximumWidth(280)
+        toolbar.addWidget(self.search_input, 1)
+
+        self.search_button = components.IconButton(
+            "search", "Find the next matching log entry"
+        )
+        toolbar.addWidget(self.search_button)
+        toolbar.addStretch(1)
+
+        self.auto_scroll_check = QCheckBox("Auto-scroll")
+        self.auto_scroll_check.setChecked(True)
+        toolbar.addWidget(self.auto_scroll_check)
+        toolbar.addWidget(
+            components.divider(Qt.Vertical)
+        )
+
+        self.copy_button = components.IconButton(
+            "copy", "Copy the selection, or copy the entire log"
+        )
+        self.clear_button = components.IconButton(
+            "trash", "Clear the application log"
+        )
+        self.export_button = components.IconButton(
+            "save", "Export the application log as a text file"
+        )
+        toolbar.addWidget(self.copy_button)
+        toolbar.addWidget(self.clear_button)
+        toolbar.addWidget(self.export_button)
+        layout.addLayout(toolbar)
+        layout.addWidget(self.log_display, 1)
+
+        self.search_input.returnPressed.connect(self._find_next)
+        self.search_button.clicked.connect(self._find_next)
+        self.copy_button.clicked.connect(self._copy_log)
+        self.clear_button.clicked.connect(self.log_display.clear)
+        self.export_button.clicked.connect(self._export_log)
+        self.log_display.textChanged.connect(self._scroll_to_latest)
+
+        saved_geometry = self._settings.value(self._GEOMETRY_KEY)
+        if not saved_geometry or not self.restoreGeometry(saved_geometry):
+            components.size_to_screen(self, 760, 400)
+
+    def _find_next(self):
+        query = self.search_input.text().strip()
+        if not query:
+            return
+        if self.log_display.find(query):
+            return
+        cursor = self.log_display.textCursor()
+        cursor.movePosition(QTextCursor.Start)
+        self.log_display.setTextCursor(cursor)
+        self.log_display.find(query)
+
+    def _copy_log(self):
+        cursor = self.log_display.textCursor()
+        if cursor.hasSelection():
+            self.log_display.copy()
+            return
+        QApplication.clipboard().setText(self.log_display.toPlainText())
+
+    def _export_log(self):
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Application Log",
+            "pinglab_log.txt",
+            "Text files (*.txt);;All files (*)",
+        )
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".txt"
+        try:
+            with open(path, "w", encoding="utf-8") as output:
+                output.write(self.log_display.toPlainText())
+        except OSError as exc:
+            self.log_display.append(f"Log export failed: {exc}")
+
+    def _scroll_to_latest(self):
+        if not self.auto_scroll_check.isChecked():
+            return
+        scrollbar = self.log_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def remember_geometry(self):
+        self._settings.setValue(self._GEOMETRY_KEY, self.saveGeometry())
+
+    def closeEvent(self, event):
+        self.remember_geometry()
+        super().closeEvent(event)
+
+
 class ProximityRecordingChartWidget(QWidget):
     def __init__(self, title: str, series, parent=None):
         super().__init__(parent)
@@ -514,24 +632,29 @@ class RobotScriptSendWidget(QWidget):
         self.robot_api = robot_api
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(6)
-        outer.addWidget(QLabel("TM script (SendScript):"))
+        outer.setSpacing(theme.SPACE_SM)
+        script_section, script_list = components.section(
+            "Robot script",
+            "Send an explicit TM script command to the controller.",
+        )
         self.robot_script_input = QPlainTextEdit()
         self.robot_script_input.setPlaceholderText(
             'Example: PTP("JPP",0,-30,-45,0,-90,0,100,0,100,true)'
         )
         self.robot_script_input.setMinimumHeight(88)
         self.robot_script_input.setTabChangesFocus(True)
-        outer.addWidget(self.robot_script_input)
+        script_list.add_stacked("Script", self.robot_script_input)
         self.transmit_script_button = QPushButton("Transmit script")
+        components.apply_variant(self.transmit_script_button, "primary")
         self.transmit_script_button.clicked.connect(self._on_transmit_clicked)
-        outer.addWidget(self.transmit_script_button)
+        script_list.add(self.transmit_script_button)
+        outer.addWidget(script_section)
 
     def _on_transmit_clicked(self):
         self.transmit_script.emit(self.robot_script_input.toPlainText().strip())
 
     def toggle_visibility(self):
-        self.setVisible(not self.isVisible())
+        self.setVisible(not components.is_visible_to_parent(self))
 
 
 class RobotPositionWidget(QWidget):
@@ -556,22 +679,19 @@ class RobotPositionWidget(QWidget):
         self._load_presets_from_disk()
         self.current_preset_number = 1
 
-        # --- MODIFICATION: Use QGroupBox for title and layout ---
-        self.angle_group_box = QGroupBox("Angle")
-        # You can use QSS to style this group box, e.g., self.angle_group_box.setObjectName("angleGroup")
-        grid_layout = QGridLayout(self.angle_group_box)
-        grid_layout.setContentsMargins(10, 10, 10, 10)
+        self.angle_group_box, angle_list = components.section(
+            "Joint targets",
+            "Angles are in radians; use the step buttons for precise changes.",
+        )
 
         step_rad = math.radians(10.0)
         for i in range(6):
-            row = i % 3
-            start_col = 0 if i < 3 else 2
             row_widget = QWidget()
             row_h = QHBoxLayout(row_widget)
             row_h.setContentsMargins(0, 2, 0, 2)
             row_h.setSpacing(6)
 
-            label = QLabel(f"Joint {i + 1}:")
+            label = QLabel(f"Joint {i + 1}")
             line_edit = QLineEdit()
             line_edit.setText(f"{self.presets[1][i]:.4f}")
             line_edit.setMinimumWidth(72)
@@ -583,12 +703,11 @@ class RobotPositionWidget(QWidget):
             btn_minus.clicked.connect(lambda checked, idx=i, dr=-step_rad: self._nudge_joint_rad(idx, dr))
             btn_plus.clicked.connect(lambda checked, idx=i, dr=step_rad: self._nudge_joint_rad(idx, dr))
 
-            row_h.addWidget(label)
             row_h.addWidget(line_edit, 1)
             row_h.addWidget(btn_minus)
             row_h.addWidget(btn_plus)
 
-            grid_layout.addWidget(row_widget, row, start_col, 1, 2)
+            angle_list.add(components.SettingsRow(f"Joint {i + 1}", row_widget))
 
             self.labels.append(label)
             self.position_edits.append(line_edit)
@@ -597,19 +716,25 @@ class RobotPositionWidget(QWidget):
         self.angle_group_box.setVisible(False)
         self.layout().addWidget(self.angle_group_box)
 
-        # Group all buttons in a single horizontal layout to save vertical space
-        action_widget = QWidget()
-        action_layout = QHBoxLayout(action_widget)
-        action_layout.setContentsMargins(0, 10, 0, 0)
+        action_widget, action_list = components.section("Send", "Choose or capture a preset, then send it.")
+        preset_row = QWidget()
+        preset_layout = QHBoxLayout(preset_row)
+        preset_layout.setContentsMargins(0, 0, 0, 0)
+        preset_layout.setSpacing(theme.SPACE_XS)
 
         self.preset_buttons = []
         for i in range(1, 6):
             btn = QPushButton(str(i))
             btn.clicked.connect(lambda checked, p=i: self.apply_preset(p))
-            action_layout.addWidget(btn)
+            preset_layout.addWidget(btn)
             self.preset_buttons.append(btn)
+        preset_layout.addStretch(1)
+        action_list.add(components.SettingsRow("Preset", preset_row))
 
-        self.load_current_angle_button = QPushButton("Load Current Robot Angle")
+        command_row = QWidget()
+        action_layout = QHBoxLayout(command_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
+        self.load_current_angle_button = QPushButton("Capture Current")
         self.load_current_angle_button.clicked.connect(self.load_current_robot_angle_into_current_preset)
         action_layout.addWidget(self.load_current_angle_button)
         self._update_load_current_angle_button_state()
@@ -617,8 +742,10 @@ class RobotPositionWidget(QWidget):
         action_layout.addStretch()
 
         self.send_button = QPushButton("Send Positions")
+        components.apply_variant(self.send_button, "primary")
         self.send_button.clicked.connect(self.send_positions)
         action_layout.addWidget(self.send_button)
+        action_list.add(command_row)
 
         self.layout().addWidget(action_widget)
         self.action_widget = action_widget
@@ -746,7 +873,7 @@ class RobotPositionWidget(QWidget):
             print(f"Failed to send joint positions: {e}")
 
     def toggle_visibility(self):
-        isVisible = not self.isVisible()
+        isVisible = not components.is_visible_to_parent(self)
         self.angle_group_box.setVisible(isVisible)
         self.action_widget.setVisible(isVisible)
         self.setVisible(isVisible)
@@ -766,16 +893,19 @@ class RobotToolPositionWidget(QWidget):
         self.labels = {}
         self.line_edits = {}
 
-        # Group inputs into Position and Orientation
+        # Group inputs into Position and Orientation using the same inset-list
+        # language as the rest of the control panel.
         self.input_container = QWidget()
-        top_layout = QHBoxLayout(self.input_container)
+        top_layout = QVBoxLayout(self.input_container)
         top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(theme.SPACE_SM)
 
-        position_group = QGroupBox("Position (XYZ)")
-        position_layout = QVBoxLayout(position_group)
-
-        orientation_group = QGroupBox("Orientation (Quaternion)")
-        orientation_layout = QVBoxLayout(orientation_group)
+        position_group, position_layout = components.section(
+            "Position", "Tool position in metres.",
+        )
+        orientation_group, orientation_layout = components.section(
+            "Orientation", "Tool quaternion components.",
+        )
 
         self.setupControls('X', self.presets[1][0][0], position_layout)
         self.setupControls('Y', self.presets[1][0][1], position_layout)
@@ -792,10 +922,10 @@ class RobotToolPositionWidget(QWidget):
         self.layout().addWidget(self.input_container)
         self.input_container.setVisible(False)
 
-        # Group all buttons in a single horizontal layout to save vertical space
-        action_widget = QWidget()
-        action_layout = QHBoxLayout(action_widget)
-        action_layout.setContentsMargins(0, 10, 0, 0)
+        action_widget, action_list = components.section("Send")
+        action_row = QWidget()
+        action_layout = QHBoxLayout(action_row)
+        action_layout.setContentsMargins(0, 0, 0, 0)
 
         self.preset_buttons = []
         for i in range(1, 3):
@@ -807,8 +937,11 @@ class RobotToolPositionWidget(QWidget):
         action_layout.addStretch()
 
         self.send_button = QPushButton("Send Tool Position")
+        components.apply_variant(self.send_button, "primary")
         self.send_button.clicked.connect(self.send_positions)
         action_layout.addWidget(self.send_button)
+
+        action_list.add(action_row)
 
         self.layout().addWidget(action_widget)
         self.action_widget = action_widget
@@ -824,14 +957,10 @@ class RobotToolPositionWidget(QWidget):
                 self.line_edits[part].setText(f"{quaternion[i]:.2f}")
 
     def setupControls(self, identifier, preset_value, layout):
-        control_layout = QHBoxLayout()
         label = QLabel(f"{identifier}:")
         line_edit = QLineEdit()
         line_edit.setText(f"{preset_value:.2f}")
-
-        control_layout.addWidget(label)
-        control_layout.addWidget(line_edit)
-        layout.addLayout(control_layout)
+        layout.add(components.SettingsRow(identifier, line_edit))
 
         self.labels[identifier] = label
         self.line_edits[identifier] = line_edit
@@ -853,7 +982,7 @@ class RobotToolPositionWidget(QWidget):
             print(f"Failed to send tool position: {e}")
 
     def toggle_visibility(self):
-        isVisible = not self.isVisible()
+        isVisible = not components.is_visible_to_parent(self)
         self.input_container.setVisible(isVisible)
         self.action_widget.setVisible(isVisible)
         self.setVisible(isVisible)
@@ -885,17 +1014,16 @@ class RobotToolFramePositionWidget(QWidget):
         outer.setContentsMargins(6, 6, 6, 6)
         outer.setSpacing(8)
 
-        control_group = QGroupBox("Velocity Control (Tool Frame)")
-        outer.addWidget(control_group)
-        main_layout = QVBoxLayout(control_group)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(8)
-
-        info = QLabel(
-            "Set speed with the sliders, then click a direction button to send a tool-frame velocity command."
+        control_group, control_list = components.section(
+            "Tool-frame velocity",
+            "Set a speed, then send translation, rotation, or a direct 6D command.",
         )
-        info.setWordWrap(True)
-        main_layout.addWidget(info)
+        outer.addWidget(control_group)
+        control_content = QWidget()
+        main_layout = QVBoxLayout(control_content)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(8)
+        control_list.add(control_content)
 
         # -------------------------
         # Speed sliders
@@ -1026,15 +1154,19 @@ class RobotToolFramePositionWidget(QWidget):
         # -------------------------
         stop_row = QHBoxLayout()
 
+        # Red, and always the widest thing in this panel: stopping must be the
+        # easiest control to hit.
         self.btn_stop_all = QPushButton("STOP (All 0)")
-        self.btn_stop_all.setMinimumHeight(34)
+        self.btn_stop_all.setMinimumHeight(theme.CONTROL_HEIGHT_LG)
+        components.apply_variant(self.btn_stop_all, "danger")
         self.btn_stop_all.clicked.connect(self.stop_all_velocity)
-        stop_row.addWidget(self.btn_stop_all)
+        stop_row.addWidget(self.btn_stop_all, 2)
 
         self.btn_stop_velocity_mode = QPushButton("Stop Velocity Mode")
-        self.btn_stop_velocity_mode.setMinimumHeight(34)
+        self.btn_stop_velocity_mode.setMinimumHeight(theme.CONTROL_HEIGHT_LG)
+        components.apply_variant(self.btn_stop_velocity_mode, "danger")
         self.btn_stop_velocity_mode.clicked.connect(self.stop_velocity_mode)
-        stop_row.addWidget(self.btn_stop_velocity_mode)
+        stop_row.addWidget(self.btn_stop_velocity_mode, 1)
 
         main_layout.addLayout(stop_row)
 
@@ -1181,7 +1313,7 @@ class RobotToolFramePositionWidget(QWidget):
             self._append_log(f"❌ {msg}")
 
     def toggle_visibility(self):
-        self.setVisible(not self.isVisible())
+        self.setVisible(not components.is_visible_to_parent(self))
 
 
 class _MainControlPanelSplitterHandle(QSplitterHandle):
@@ -1191,24 +1323,22 @@ class _MainControlPanelSplitterHandle(QSplitterHandle):
         super().__init__(orientation, parent)
         self.toggle_button = QToolButton(self)
         self.toggle_button.setAutoRaise(False)
-        self.toggle_button.setFixedSize(20, 46)
+        self.toggle_button.setFixedSize(18, 44)
+        self.toggle_button.setIconSize(QtCore.QSize(12, 12))
         self.toggle_button.setCursor(Qt.PointingHandCursor)
         self.toggle_button.clicked.connect(
             self._toggle_main_control_panel
         )
         self.toggle_button.setStyleSheet(
             "QToolButton {"
-            f" color: {theme.TEXT_PRIMARY};"
-            f" background-color: {theme.SURFACE_RAISED};"
-            f" border: 1px solid {theme.BORDER_SUBTLE};"
-            " border-radius: 8px;"
-            " font-size: 13px;"
-            " font-weight: 700;"
+            f" background-color: {theme.SURFACE};"
+            f" border: 1px solid {theme.BORDER};"
+            f" border-radius: {theme.RADIUS_MD}px;"
             " padding: 0;"
             "}"
             "QToolButton:hover {"
-            f" background-color: {theme.ACCENT};"
-            " color: white;"
+            f" background-color: {theme.ACCENT_SOFT};"
+            f" border-color: {theme.ACCENT_BORDER};"
             "}"
         )
         self.set_panel_visible(True)
@@ -1225,11 +1355,15 @@ class _MainControlPanelSplitterHandle(QSplitterHandle):
 
     def set_panel_visible(self, visible):
         visible = bool(visible)
-        self.toggle_button.setText("▶" if visible else "◀")
+        self.toggle_button.setIcon(
+            icons.icon(
+                "chevron-right" if visible else "chevron-left",
+                color=theme.TEXT_SECONDARY,
+                size=12,
+            )
+        )
         self.toggle_button.setToolTip(
-            "Hide Sensor/Robots/AI panel"
-            if visible
-            else "Show Sensor/Robots/AI panel"
+            "Hide the control panel" if visible else "Show the control panel"
         )
 
     def resizeEvent(self, event):
@@ -1237,6 +1371,28 @@ class _MainControlPanelSplitterHandle(QSplitterHandle):
         x = max(0, (self.width() - self.toggle_button.width()) // 2)
         y = max(0, (self.height() - self.toggle_button.height()) // 2)
         self.toggle_button.move(x, y)
+
+
+class _WidthFittingScrollArea(QScrollArea):
+    """Scroll area that reports its page's natural width as its own.
+
+    A plain QScrollArea advertises a small fixed width hint regardless of what
+    it contains, which would let the control panel be sized narrower than its
+    widest control row and clip the labels at the right edge. Height is left
+    alone -- vertical scrolling is the whole point of the wrapper.
+    """
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        page = self.widget()
+        if page is None:
+            return hint
+        extra = 2 * self.frameWidth()
+        scrollbar = self.verticalScrollBar()
+        if scrollbar is not None:
+            extra += scrollbar.sizeHint().width()
+        hint.setWidth(page.sizeHint().width() + extra)
+        return hint
 
 
 class UI(
@@ -1271,9 +1427,12 @@ class UI(
         self.cam_label = None
         self.centering_active = False
         self._is_shutting_down = False
+        self._software_motion_stopped = False
         self._main_control_panel_collapsed = False
-        self._main_control_panel_last_width = 620
+        self._main_control_panel_last_width = theme.CONTROL_PANEL_WIDTH
         self._main_control_panel_state_syncing = False
+        self._main_control_panel_user_sized = False
+        self._log_unread_count = 0
 
         self.gripper_closed_flag = False
         self.grip_fail_count = 0
@@ -1364,6 +1523,8 @@ class UI(
             hand_tactile_ready = bool(self.robot_api.hand_tactile_available())
         except Exception:
             hand_tactile_ready = False
+        self.features['hand_commands_ready'] = hand_services_ready
+        self.features['hand_tactile_ready'] = hand_tactile_ready
         self.features['hand_ready'] = bool(hand_services_ready or hand_tactile_ready)
         self.features['sensor_ready'] = bool(self.features['sensor_module'])
         self.features['gripper_ready'] = bool(
@@ -1385,16 +1546,17 @@ class UI(
                 availability = {}
 
         robot_ready = bool(availability.get('robot', False))
-        hand_ready = bool(
-            availability.get('hand_commands', False)
-            or availability.get('hand_tactile', False)
-        )
+        hand_commands_ready = bool(availability.get('hand_commands', False))
+        hand_tactile_ready = bool(availability.get('hand_tactile', False))
+        hand_ready = bool(hand_commands_ready or hand_tactile_ready)
         gripper = getattr(self, 'gripper', None)
         gripper_ready = bool(
             self.features.get('gripper_driver', False)
             and getattr(gripper, 'is_available', False)
         )
         self.features['robot_ready'] = robot_ready
+        self.features['hand_commands_ready'] = hand_commands_ready
+        self.features['hand_tactile_ready'] = hand_tactile_ready
         self.features['hand_ready'] = hand_ready
         self.features['gripper_ready'] = gripper_ready
 
@@ -1405,7 +1567,11 @@ class UI(
                 robot_ready and self.features.get('camera_ready', False)
             )
         if hasattr(self, 'hand_tab_index') and hasattr(self, 'tab_widget'):
-            self.tab_widget.setTabEnabled(int(self.hand_tab_index), hand_ready)
+            self.tab_widget.setTabEnabled(int(self.hand_tab_index), True)
+        self._set_hand_controls_available(
+            hand_commands_ready,
+            hand_tactile_ready,
+        )
         if all(
             hasattr(self, name)
             for name in ('gripper_slider', 'btn_grip_open', 'btn_grip_close')
@@ -1516,18 +1682,83 @@ class UI(
         for widget in widgets:
             widget.setEnabled(enabled)
 
+    def _set_hand_controls_available(
+        self,
+        command_ready: bool,
+        tactile_ready: bool,
+    ):
+        """Keep the Hand workspace visible while gating hardware operations."""
+        command_names = (
+            'hand_apply_speed_button',
+            'hand_apply_force_button',
+            'hand_open_all_button',
+            'hand_close_all_button',
+            'hand_read_angles_button',
+            'hand_thumb_left_button',
+            'hand_thumb_center_button',
+            'hand_thumb_right_button',
+            'hand_send_custom_angles_button',
+            'hand_sliders_sync_button',
+            'hand_sliders_live_check',
+            'hand_pose_load_send_button',
+        )
+        command_widgets = [
+            getattr(self, name)
+            for name in command_names
+            if hasattr(self, name)
+        ]
+        command_widgets.extend(
+            getattr(self, '_hand_angle_send_buttons', []) or []
+        )
+        self._set_widgets_enabled(command_widgets, bool(command_ready))
+
+        tactile_widgets = [
+            getattr(self, name)
+            for name in (
+                'hand_tactile_live_button',
+                'hand_tactile_refresh_button',
+            )
+            if hasattr(self, name)
+        ]
+        self._set_widgets_enabled(tactile_widgets, bool(tactile_ready))
+
+        live_check = getattr(self, 'hand_sliders_live_check', None)
+        if not command_ready and live_check is not None and live_check.isChecked():
+            live_check.blockSignals(True)
+            live_check.setChecked(False)
+            live_check.blockSignals(False)
+            timer = getattr(self, '_hand_live_timer', None)
+            if timer is not None:
+                timer.stop()
+            self._hand_live_pending = {}
+
+        connection_label = getattr(self, 'hand_connection_label', None)
+        if connection_label is not None:
+            if command_ready and tactile_ready:
+                text = 'Connected · motion and tactile'
+            elif command_ready:
+                text = 'Connected · motion only'
+            elif tactile_ready:
+                text = 'Connected · tactile only'
+            else:
+                text = 'Offline · start the RH56F1 ROS nodes'
+            connection_label.setText(text)
+
     def _apply_startup_feature_state(self):
         if not self.features.get('sensor_module', False):
-            self.tab_widget.setTabEnabled(0, False)
-            self.tab_widget.setTabEnabled(2, False)
+            for index in (self.sensor_tab_index, self.ai_tab_index):
+                self.tab_widget.setTabEnabled(int(index), False)
 
         if not self.features.get('robot_ready', False):
             self.set_robot_subtab_enabled(False)
             self.auto_center_button.setEnabled(False)
 
-        if not self.features.get('hand_ready', False):
-            if hasattr(self, "hand_tab_index"):
-                self.tab_widget.setTabEnabled(int(self.hand_tab_index), False)
+        if hasattr(self, "hand_tab_index"):
+            self.tab_widget.setTabEnabled(int(self.hand_tab_index), True)
+        self._set_hand_controls_available(
+            self.features.get('hand_commands_ready', False),
+            self.features.get('hand_tactile_ready', False),
+        )
 
         if not self.features.get('camera_ready', False):
             self.live_yolo_button.setEnabled(False)
@@ -1593,6 +1824,8 @@ class UI(
         self._main_control_panel_collapsed = panel_width <= 0
         if panel_width > 0:
             self._main_control_panel_last_width = panel_width
+            # The user has chosen a width: stop auto-fitting on window resize.
+            self._main_control_panel_user_sized = True
         self._sync_main_control_panel_handle()
 
     def setup_layout(self):
@@ -1614,13 +1847,16 @@ class UI(
         self.log_display = QTextEdit()
         self.log_display.setObjectName("logDisplay")  # Set object name for QSS
         self.log_display.setReadOnly(True)
-        self.log_display.setVisible(False)
-        self.log_display.textChanged.connect(self.show_log_if_hidden)
+        self.log_display.textChanged.connect(self.note_log_activity)
+        self.log_display.textChanged.connect(self.publish_latest_log_message)
+        self.log_console_window = LogConsoleWindow(
+            self.log_display,
+            parent=self,
+        )
 
         self.splitter_1 = QSplitter(Qt.Horizontal, self)
         self.splitter_1.addWidget(self.widget_plotter)
         self.splitter_1.addWidget(self.widget_plotter_2)
-        self.splitter_1.addWidget(self.log_display)
         self.splitter_1.setHandleWidth(3)
 
         self.splitter_2 = QSplitter(Qt.Vertical, self)
@@ -1637,15 +1873,24 @@ class UI(
         self.position_toolframe_widget.setVisible(False)
         self.position_script_widget.setVisible(False)
 
+        # The four robot send editors used to live here, above the tab widget,
+        # which meant opening one left it hanging over every other workspace
+        # and shifted the whole panel down. setup_tab2 now mounts them inside
+        # the Robots page, under the buttons that open them.
         self.widget_func = QWidget()
         self.layout_func = QVBoxLayout(self.widget_func)
-        self.layout_func.addWidget(self.position_entry_widget)
-        self.layout_func.addWidget(self.position_quaternion_widget)
-        self.layout_func.addWidget(self.position_toolframe_widget)
-        self.layout_func.addWidget(self.position_script_widget)
+
+        # Always-visible operational context. This summarizes cached state
+        # only; MyMainWindow refreshes it alongside the status bar.
+        self.session_strip = components.SessionStrip(self.widget_func)
+        self.layout_func.addWidget(self.session_strip)
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setUsesScrollButtons(False)
+        # The navigation rail must be installed before any tab is added:
+        # QTabWidget stores its tabs *in* the tab bar, so replacing the bar
+        # afterwards would silently discard every page.
+        nav_tabs.install(self.tab_widget)
         self.setup_tabs()
 
         self.layout_func.addWidget(self.tab_widget)
@@ -1658,12 +1903,79 @@ class UI(
         )
         self._sync_main_control_panel_handle()
 
+    def resizeEvent(self, event):
+        """Keep the control panel at its content width as the window resizes.
+
+        ``reLayout`` runs before this splitter has been laid out, so it can
+        only set a ratio; a resize is the first point where the panel's own
+        size hint (driven by the widest control row in the densest page) can be
+        honoured. Re-fitting on every resize means growing the window widens
+        the 3D view rather than stretching the panel. Dragging the handle opts
+        out permanently.
+        """
+        super().resizeEvent(event)
+        if self.width() <= 1 or self._main_control_panel_user_sized:
+            return
+        self._fit_main_control_panel()
+
+    def _fit_main_control_panel(self):
+        """Size the panel to its content, keeping a floor for the 3D view.
+
+        The panel asks for the width its widest control row needs, so nothing
+        is clipped; on a wide display that number stops growing and the
+        viewport absorbs the rest.
+        """
+        if self._main_control_panel_collapsed:
+            return
+        total = self.width()
+        wanted = max(
+            self.splitter_2.sizeHint().width() + self.handleWidth(),
+            theme.CONTROL_PANEL_MIN_WIDTH,
+        )
+        panel = min(wanted, max(total - theme.VIEWPORT_MIN_WIDTH, 1))
+        panel = max(min(panel, total - 1), 1)
+        self._main_control_panel_last_width = panel
+        self._main_control_panel_state_syncing = True
+        try:
+            self.setSizes([max(total - panel, 1), panel])
+        finally:
+            self._main_control_panel_state_syncing = False
+
+    # Nav bar glyph per workspace, keyed by tab label. Keep in step with the
+    # labels passed to addTab in setup_tabs -- a stale key silently drops the
+    # icon, since nav_tabs.set_glyphs matches on text.
+    NAV_GLYPHS = {
+        "Sensor": "sensor",
+        "Robots": "robot",
+        "Control": "sliders",
+        "AI": "ai",
+        "Hand": "hand",
+        "Tools": "tools",
+    }
+
+    @staticmethod
+    def _scrollable(page: QWidget) -> QScrollArea:
+        """Wrap a dense control page so it scrolls instead of crushing its rows.
+
+        Several pages contain widgets with a large minimum height (the force
+        meter chart, the tactile tables). Without this, a short window makes Qt
+        squeeze the column past its minimum and rows visibly overlap.
+        """
+        area = _WidthFittingScrollArea()
+        area.setWidgetResizable(True)
+        area.setFrameShape(QScrollArea.NoFrame)
+        area.setWidget(page)
+        return area
+
     def setup_tabs(self):
-        # Tab 1: Sensor
+        # Every index is captured into a named attribute as its tab is added,
+        # so the code that enables/disables a workspace and the code that
+        # drives the humanoid viewport lifecycle never restate a literal
+        # position. Reordering this method is then safe on its own.
         tab1 = QWidget()
         tab1_layout = QVBoxLayout(tab1)
         self.setup_tab1(tab1_layout)
-        self.tab_widget.addTab(tab1, "Sensor")
+        self.sensor_tab_index = self.tab_widget.addTab(tab1, "Sensor")
 
         # Tab 2: ROBOTS (contains two subtabs)
         robots_tab = QWidget()
@@ -1675,7 +1987,9 @@ class UI(
         robot_page = QWidget()
         robot_layout = QVBoxLayout(robot_page)
         self.setup_tab2(robot_layout)
-        self.robots_sub_tabs.addTab(robot_page, "TM Robot")
+        self.tm_robot_tab_index = self.robots_sub_tabs.addTab(
+            self._scrollable(robot_page), "TM Robot"
+        )
 
         # The humanoid controls are constructed only when this subtab is opened.
         # The G1 scene is loaded explicitly into the existing sensor viewport.
@@ -1686,12 +2000,11 @@ class UI(
         self._humanoid_viewer_loading = False
         self._humanoid_viewport_active = False
         self._humanoid_previous_sensor_visibility = None
-        self.humanoid_placeholder = QLabel(
-            "Open this tab to load the humanoid URDF and sensor signals."
+        self.humanoid_placeholder = components.EmptyState(
+            "Humanoid viewer is not loaded",
+            glyph="robot",
+            hint="Opening this workspace prepares the URDF and sensor-signal controls.",
         )
-        self.humanoid_placeholder.setAlignment(Qt.AlignCenter)
-        self.humanoid_placeholder.setWordWrap(True)
-        self.humanoid_placeholder.setStyleSheet(theme.MUTED_LABEL_STYLE)
         self.humanoid_layout.addWidget(self.humanoid_placeholder)
         self.humanoid_tab_index = self.robots_sub_tabs.addTab(
             self.humanoid_page,
@@ -1704,24 +2017,48 @@ class UI(
         robots_layout.addWidget(self.robots_sub_tabs)
         self.robots_tab_index = self.tab_widget.addTab(robots_tab, "Robots")
 
-        # Tab 3: AI
+        # Tabs 3 and 4: Control, then AI. setup_tab3 builds both pages -- the
+        # deterministic controllers and the learned-policy controls share
+        # dialogs and status labels -- and leaves the Control page on
+        # self.control_page for us to mount as its own workspace. Control
+        # comes first because it is what you reach for before a policy runs.
         tab3 = QWidget()
         tab3_layout = QVBoxLayout(tab3)
         self.setup_tab3(tab3_layout)
-        self.tab_widget.addTab(tab3, "AI")
+        self.control_tab_index = self.tab_widget.addTab(
+            self._scrollable(self.control_page), "Control"
+        )
+        self.ai_tab_index = self.tab_widget.addTab(tab3, "AI")
 
         # Tab 4: Dexterous Hand
         tab4 = QWidget()
         tab4_layout = QVBoxLayout(tab4)
         self.setup_tab5(tab4_layout)
-        self.hand_tab_index = self.tab_widget.addTab(tab4, "Dexterous Hand")
+        self.hand_tab_index = self.tab_widget.addTab(tab4, "Hand")
 
-        # Tab 5: Extra (last)
+        # Tab 5: Tools (last)
         tab5 = QWidget()
         tab5_layout = QVBoxLayout(tab5)
         self.setup_tab4(tab5_layout)
-        self.tab_widget.addTab(tab5, "Extra")
+        self.tools_tab_index = self.tab_widget.addTab(
+            self._scrollable(tab5), "Tools"
+        )
         self.tab_widget.currentChanged.connect(self._on_main_tab_changed)
+
+        # Icons are keyed by tab label, so this has to run after every tab
+        # exists -- and NAV_GLYPHS has to be updated alongside any rename.
+        nav_tabs.set_glyphs(self.tab_widget, self.NAV_GLYPHS)
+
+        # Related tools inside an area read as one segmented control rather
+        # than a second row of page tabs competing with the rail.
+        for sub_tabs in (
+            getattr(self, "sensor_sub_tabs", None),
+            self.robots_sub_tabs,
+            getattr(self, "ai_sub_tabs", None),
+            getattr(self, "hand_sub_tabs", None),
+        ):
+            if sub_tabs is not None:
+                components.segmented(sub_tabs)
 
     def _on_robot_subtab_changed(self, index):
         if int(index) != int(getattr(self, "humanoid_tab_index", -1)):
@@ -1747,7 +2084,7 @@ class UI(
             self.humanoid_viewer.restore_scene(reset_camera=False)
             return
         self._humanoid_viewer_loading = True
-        self.humanoid_placeholder.setText("Loading humanoid viewer...")
+        self.humanoid_placeholder.set_message("Loading humanoid viewer...")
         try:
             # Keep this import lazy so normal phd_ui startup does not initialize
             # another PyVista render window or inspect the large G1 asset tree.
@@ -1770,7 +2107,7 @@ class UI(
             self.humanoid_placeholder.hide()
             self.humanoid_viewer = viewer
         except Exception as exc:
-            self.humanoid_placeholder.setText(
+            self.humanoid_placeholder.set_message(
                 "Humanoid viewer could not be loaded.\n\n"
                 f"{exc}\n\n"
                 "Switch away and return to this tab to retry."
@@ -1823,15 +2160,24 @@ class UI(
         self.sensor_sub_tabs = QTabWidget()
         self.sensor_sub_tabs.setUsesScrollButtons(False)
 
-        # ─── Subtab “Send Operation” ───
+        # ─── Subtab "Setup" ───
+        # Two grouped inset lists (the macOS System Settings pattern): each
+        # section is one rounded surface with hairline rules between its rows,
+        # and its title sits outside and above. The page is a linear task --
+        # choose a sensor, connect it, then adjust how it draws -- so a border
+        # around every step added weight without adding meaning.
         send_page = QWidget()
         send_page_layout = QVBoxLayout(send_page)
+        send_page_layout.setSpacing(theme.SPACE_LG)
 
-        send_group = QGroupBox("Send Operations")
-        send_layout = QVBoxLayout()
-
-        viz_group = QGroupBox("Visualization Settings")
-        viz_layout = QVBoxLayout(viz_group)
+        send_group, send_list = components.section(
+            "Sensor",
+            "Pick a sensor model and the port it is connected to.",
+        )
+        viz_group, viz_list = components.section(
+            "Visualization",
+            "How the live signal is drawn in the 3D view.",
+        )
 
         # Sensor selection and connection widgets
         self.sensor_choice = QListWidget(self.widget_func)
@@ -1840,10 +2186,13 @@ class UI(
             "2D", "Elbow", "Kuka", "Double Curve", "Half Cylinder Surface"
         ])
         self.sensor_choice.setCurrentRow(0)
-        send_layout.addWidget(self.sensor_choice)
+        self.sensor_choice.setToolTip(
+            "Geometry of the sensor being read, which sets how the 3D grid is "
+            "laid out."
+        )
+        components.fit_list_height(self.sensor_choice, max_rows=6)
+        send_list.add(self.sensor_choice)
 
-        sensor_source_mode_layout = QHBoxLayout()
-        sensor_source_mode_layout.addWidget(QLabel("Sensor display:"))
         self.sensor_source_mode_combo = QComboBox(self.widget_func)
         self.sensor_source_mode_combo.addItem("Single Sensor", "single")
         self.sensor_source_mode_combo.addItem("Multiple Ports", "multiple")
@@ -1853,14 +2202,31 @@ class UI(
             "+1-column format are configured independently for each port; "
             "the first selected port is used by AI and robot-control features."
         )
-        sensor_source_mode_layout.addWidget(self.sensor_source_mode_combo, 1)
-        send_layout.addLayout(sensor_source_mode_layout)
+        send_list.add_row("Show", self.sensor_source_mode_combo)
 
         self._sensor_port_profiles = {}
         self._sensor_port_profile_updating = False
         self.serial_channel = QListWidget(self.widget_func)
         self.serial_channel.setSelectionMode(QListWidget.SingleSelection)
-        send_layout.addWidget(self.serial_channel)
+        # An empty port list is the state this rig sits in most often (nothing
+        # plugged in yet), and a blank box there reads as a broken panel.
+        self.sensor_port_stack = components.EmptyStateStack(
+            self.serial_channel,
+            components.EmptyState(
+                "No sensor ports found",
+                glyph="plug",
+                hint="Connect the sensor over USB, then press Connect Sensor "
+                     "to rescan.",
+            ),
+        )
+        self.serial_channel.model().rowsInserted.connect(
+            self._refresh_sensor_port_empty_state
+        )
+        self.serial_channel.model().rowsRemoved.connect(
+            self._refresh_sensor_port_empty_state
+        )
+        self._refresh_sensor_port_empty_state()
+        send_list.add(self.sensor_port_stack)
 
         self.sensor_source_mode_combo.currentIndexChanged.connect(
             self._on_sensor_source_mode_changed
@@ -1878,28 +2244,32 @@ class UI(
         self.goodix_disable_desktop_touch_checkbox.toggled.connect(
             self._on_goodix_desktop_touch_toggled
         )
-        send_layout.addWidget(self.goodix_disable_desktop_touch_checkbox)
+        send_list.add(self.goodix_disable_desktop_touch_checkbox)
 
-        self.buildScene = QPushButton("Build Scene", self.widget_func)
-        send_layout.addWidget(self.buildScene)
+        # The one primary action on this page: it opens the port, builds the
+        # 3D grid and starts streaming.
+        self.buildScene = QPushButton("Connect Sensor", self.widget_func)
+        self.buildScene.setToolTip(
+            "Open the selected port, build the 3D sensor grid and start "
+            "streaming live data."
+        )
+        components.apply_variant(self.buildScene, "primary")
+        send_list.add(self.buildScene)
 
-        # Keep a single backend update trigger object for compatibility with existing
-        # enable/disable hooks; the visible Update Sensor control is now in top toolbar.
-        self.sensor_update = QPushButton("Update Sensor", self.widget_func)
-        self.sensor_update.setVisible(False)
-
-        send_group.setLayout(send_layout)
-
-        # 2D grid controls
+        # 2D grid controls. Trailing-aligned so they line up with the other
+        # controls in the list rather than hugging their label.
         grid_container = QWidget()
         grid_layout = QHBoxLayout(grid_container)
         grid_layout.setContentsMargins(0, 0, 0, 0)
+        grid_layout.setSpacing(theme.SPACE_XS)
+        grid_layout.addStretch(1)
 
-        grid_layout.addWidget(QLabel("2D Grid (rows × cols):"))
-
+        # Both spin boxes hold the same kind of value, so give them the same
+        # width -- otherwise the layout stretches them to different sizes.
         self.grid_rows_spin = QSpinBox()
         self.grid_rows_spin.setRange(2, 100)
         self.grid_rows_spin.setValue(10)
+        self.grid_rows_spin.setFixedWidth(64)
         grid_layout.addWidget(self.grid_rows_spin)
 
         grid_layout.addWidget(QLabel("×"))
@@ -1907,6 +2277,7 @@ class UI(
         self.grid_cols_spin = QSpinBox()
         self.grid_cols_spin.setRange(2, 100)
         self.grid_cols_spin.setValue(10)
+        self.grid_cols_spin.setFixedWidth(64)
         grid_layout.addWidget(self.grid_cols_spin)
 
         self.serial_channel.currentItemChanged.connect(
@@ -1919,15 +2290,6 @@ class UI(
             self._on_sensor_port_profile_controls_changed
         )
 
-        viz_layout.addWidget(grid_container)
-        port_profile_hint = QLabel(
-            "In Multiple Ports mode, these grid settings apply only to the "
-            "currently highlighted port."
-        )
-        port_profile_hint.setWordWrap(True)
-        port_profile_hint.setStyleSheet(theme.MUTED_LABEL_STYLE)
-        viz_layout.addWidget(port_profile_hint)
-
         self.sensor_extra_column_checkbox = QCheckBox(
             "Raw packet includes +1 column"
         )
@@ -1939,35 +2301,28 @@ class UI(
         self.sensor_extra_column_checkbox.toggled.connect(
             self._on_sensor_port_profile_controls_changed
         )
-        viz_layout.addWidget(self.sensor_extra_column_checkbox)
 
-        # Sensitivity slider
-        slider_container = QWidget()
-        slider_layout = QHBoxLayout(slider_container)
-        slider_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.sensitivity_slider = QSlider(Qt.Horizontal)
-        self.sensitivity_slider.setRange(0, 1000)
-        self.sensitivity_slider.setValue(50)
-        self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
-        self.sensitivity_slider.setTickInterval(10)
-        self.sensitivity_slider.setToolTip(
-            "Maximum point-grid displacement when the signal reaches the "
-            "configured full-colour level."
+        # Packet shape is a property of the hardware: set once per port, then
+        # never touched again. Behind a disclosure so the controls you do use
+        # every session stay visible without scrolling.
+        self.sensor_packet_format_group = components.CollapsibleGroup(
+            "Packet format"
         )
+        packet_list = components.InsetList()
+        packet_list.add(
+            components.SettingsRow(
+                "Rows × columns",
+                grid_container,
+                hint="In Multiple Ports mode this applies only to the "
+                     "highlighted port.",
+            )
+        )
+        packet_list.add(self.sensor_extra_column_checkbox)
+        self.sensor_packet_format_group.add(packet_list)
+        send_group.layout().addWidget(self.sensor_packet_format_group)
 
-        self.sensitivity_value_label = QLabel("0.050")
-        self.sensitivity_value_label.setFixedWidth(48)
-
-        slider_layout.addWidget(QLabel("Sensitivity:"))
-        slider_layout.addWidget(self.sensitivity_slider)
-        slider_layout.addWidget(self.sensitivity_value_label)
-
-        viz_layout.addWidget(slider_container)
-
-        visual_mode_container = QWidget()
-        visual_mode_layout = QHBoxLayout(visual_mode_container)
-        visual_mode_layout.setContentsMargins(0, 0, 0, 0)
+        # Style before sensitivity: the slider only makes sense once you know
+        # which rendering it is scaling.
         self.sensor_visualization_mode_combo = QComboBox()
         self.sensor_visualization_mode_combo.addItem("Point Grid", "point_grid")
         self.sensor_visualization_mode_combo.addItem("Stereo Field", "stereo_field")
@@ -1975,10 +2330,38 @@ class UI(
         self.sensor_visualization_mode_combo.setToolTip(
             "Choose the live sensor rendering style."
         )
-        visual_mode_layout.addWidget(QLabel("Visual Mode:"))
-        visual_mode_layout.addWidget(self.sensor_visualization_mode_combo)
-        visual_mode_layout.addStretch()
-        viz_layout.addWidget(visual_mode_container)
+        viz_list.add_row("Style", self.sensor_visualization_mode_combo)
+
+        # Sensitivity slider
+        slider_container = QWidget()
+        slider_layout = QHBoxLayout(slider_container)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(theme.SPACE_SM)
+
+        self.sensitivity_slider = QSlider(Qt.Horizontal)
+        self.sensitivity_slider.setRange(0, 1000)
+        self.sensitivity_slider.setValue(50)
+        self.sensitivity_slider.setTickPosition(QSlider.TicksBelow)
+        self.sensitivity_slider.setTickInterval(10)
+        self.sensitivity_slider.setMinimumWidth(140)
+        self.sensitivity_slider.setToolTip(
+            "Maximum point-grid displacement when the signal reaches the "
+            "configured full-colour level."
+        )
+
+        # Fixed-width figures: this value tracks the slider, and a proportional
+        # font would shuffle the slider sideways on every digit change.
+        self.sensitivity_value_label = QLabel("0.050")
+        self.sensitivity_value_label.setStyleSheet(theme.readout_style())
+        self.sensitivity_value_label.setAlignment(
+            Qt.AlignRight | Qt.AlignVCenter
+        )
+        self.sensitivity_value_label.setFixedWidth(48)
+
+        slider_layout.addWidget(self.sensitivity_slider, 1)
+        slider_layout.addWidget(self.sensitivity_value_label)
+
+        viz_list.add_row("Sensitivity", slider_container)
 
         self.sensor_transparent_screenshot_button = QPushButton(
             "Capture Transparent PNG"
@@ -1986,50 +2369,33 @@ class UI(
         self.sensor_transparent_screenshot_button.setToolTip(
             "Save the current sensor plotter view as a PNG with a transparent background."
         )
-        viz_layout.addWidget(self.sensor_transparent_screenshot_button)
-
-        normal_vector_status_container = QWidget()
-        normal_vector_status_layout = QVBoxLayout(
-            normal_vector_status_container
-        )
-        normal_vector_status_layout.setContentsMargins(0, 0, 0, 0)
-        normal_vector_status_layout.setSpacing(4)
-        self.contact_normal_status_label = QLabel("Normal vector: waiting for contact")
-        self.contact_normal_status_label.setWordWrap(True)
-        self.contact_normal_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
-        self.contact_force_status_label = QLabel("Contact force: waiting for contact")
-        self.contact_force_status_label.setWordWrap(True)
-        self.contact_force_status_label.setStyleSheet(theme.INFO_LABEL_STYLE)
-        normal_vector_status_layout.addWidget(
-            self.contact_normal_status_label
-        )
-        normal_vector_status_layout.addWidget(
-            self.contact_force_status_label
-        )
-        viz_layout.addWidget(normal_vector_status_container)
+        viz_list.add(self.sensor_transparent_screenshot_button)
 
         send_page_layout.addWidget(send_group)
         send_page_layout.addWidget(viz_group)
         send_page_layout.addStretch()
 
-        # ─── Subtab “Read Operation” ───
+        # ─── Subtab "Diagnostics" ───
         read_page = QWidget()
         read_page_layout = QVBoxLayout(read_page)
 
-        read_group = QGroupBox("Read Operations")
-        read_layout = QVBoxLayout()
+        read_group, read_list = components.section(
+            "Readouts",
+            "One-shot reads printed to the log, for checking wiring and "
+            "throughput.",
+        )
 
         self.read_sensor_api_button = QPushButton("Sensor API Raw Data")
         self.read_sensor_api_button.setToolTip(
-            "Read from the port selected in Send Operation."
+            "Read from the port selected in Sensor > Setup."
         )
         self.read_sensor_api_hz_button = QPushButton("Sensor API Raw Hz")
         self.read_sensor_api_hz_button.setToolTip(
-            "Measure the port selected in Send Operation."
+            "Measure the port selected in Sensor > Setup."
         )
         self.read_sensor_channel_button = QPushButton("Sensor API Channel")
         self.read_sensor_channel_button.setToolTip(
-            "Check the port selected in Send Operation."
+            "Check the port selected in Sensor > Setup."
         )
         self.read_sensor_raw_button = QPushButton("Sensor Raw Data")
         self.read_sensor_raw_ave_button = QPushButton("Sensor Raw Ave Data")
@@ -2037,23 +2403,68 @@ class UI(
         self.read_sensor_diff_debug_button = QPushButton("Sensor Diff Debug Views")
         self.read_runtime_hz_button = QPushButton("Sensor / DFM Runtime Hz")
 
-        read_layout.addWidget(self.read_sensor_api_button)
-        read_layout.addWidget(self.read_sensor_api_hz_button)
-        read_layout.addWidget(self.read_sensor_channel_button)
-        read_layout.addWidget(self.read_sensor_raw_button)
-        read_layout.addWidget(self.read_sensor_raw_ave_button)
-        read_layout.addWidget(self.read_sensor_diff_button)
-        read_layout.addWidget(self.read_sensor_diff_debug_button)
-        read_layout.addWidget(self.read_runtime_hz_button)
+        # Named rows rather than eight stacked buttons whose captions all begin
+        # "Sensor ...": the row says what you get, the button says the verb.
+        for label, hint, button in (
+            (
+                "Raw packet",
+                "One frame straight off the port, unparsed.",
+                self.read_sensor_api_button,
+            ),
+            (
+                "Packet rate",
+                "Frames per second measured over one second.",
+                self.read_sensor_api_hz_button,
+            ),
+            (
+                "Channel map",
+                "Drive and sensor counts the device reports.",
+                self.read_sensor_channel_button,
+            ),
+            ("Raw values", "", self.read_sensor_raw_button),
+            ("Averaged values", "", self.read_sensor_raw_ave_button),
+            ("Difference from calibration", "", self.read_sensor_diff_button),
+            ("Difference debug views", "", self.read_sensor_diff_debug_button),
+            (
+                "Runtime rates",
+                "Acquisition, visualization and DFM loop rates.",
+                self.read_runtime_hz_button,
+            ),
+        ):
+            button.setText("Read")
+            button.setMinimumWidth(72)
+            read_list.add(components.SettingsRow(label, button, hint=hint))
 
-        read_group.setLayout(read_layout)
         read_page_layout.addWidget(read_group)
         read_page_layout.addStretch()
 
-        self.sensor_sub_tabs.addTab(send_page, "Send Operation")
-        self.sensor_sub_tabs.addTab(read_page, "Read Operation")
+        self.sensor_setup_tab_index = self.sensor_sub_tabs.addTab(
+            self._scrollable(send_page), "Setup"
+        )
+        self.sensor_diagnostics_tab_index = self.sensor_sub_tabs.addTab(
+            self._scrollable(read_page), "Diagnostics"
+        )
         layout.addWidget(self.sensor_sub_tabs)
         self._build_sensor_parameters_dialog()
+
+    def _refresh_sensor_port_empty_state(self, *_args):
+        """Swap the port list for its empty state when no ports are listed."""
+        stack = getattr(self, "sensor_port_stack", None)
+        if stack is None:
+            return
+        is_empty = self.serial_channel.count() == 0
+        stack.set_empty(is_empty)
+        # Ports arrive after this page is built, so the list is re-fitted here
+        # rather than once at construction time.
+        components.fit_list_height(self.serial_channel, max_rows=4)
+        # QStackedWidget otherwise keeps an Expanding vertical policy even
+        # though its visible list has a fixed height, creating a large blank
+        # area that pushes Connect Sensor below the laptop fold.
+        stack.setFixedHeight(
+            max(112, stack.empty.minimumSizeHint().height())
+            if is_empty
+            else self.serial_channel.height()
+        )
 
     @staticmethod
     def _default_sensor_grid_shape_for_port(port_name):
@@ -2254,7 +2665,7 @@ class UI(
         self.sensor_parameters_dialog = QDialog(self)
         self.sensor_parameters_dialog.setWindowTitle("Sensor Parameters")
         self.sensor_parameters_dialog.setModal(False)
-        self.sensor_parameters_dialog.resize(860, 760)
+        components.size_to_screen(self.sensor_parameters_dialog, 860, 760)
         self.sensor_parameters_dialog.setMinimumSize(720, 540)
 
         outer_layout = QVBoxLayout(self.sensor_parameters_dialog)
@@ -2273,6 +2684,7 @@ class UI(
         layout.setContentsMargins(8, 8, 8, 8)
         sensor_parameters_scroll.setWidget(sensor_parameters_content)
         sensor_parameters_general_layout.addWidget(sensor_parameters_scroll, 1)
+        self.sensor_parameters_general_tab = sensor_parameters_general_tab
         self.sensor_parameters_tabs.addTab(
             sensor_parameters_general_tab, "General"
         )
@@ -2285,9 +2697,7 @@ class UI(
         )
         outer_layout.addWidget(self.sensor_parameters_tabs, 1)
         self.sensor_parameters_scroll = sensor_parameters_scroll
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(8)
+        layout.setSpacing(theme.SPACE_LG)
 
         self.sensor_parameter_model_combo = QComboBox(self.sensor_parameters_dialog)
         self.sensor_parameter_reorder_combo = QComboBox(self.sensor_parameters_dialog)
@@ -2361,10 +2771,10 @@ class UI(
             "Rotate the complete 2D sensor around Z after shape bending."
         )
 
-        self.sensor_parameter_normal_flip_checkbox = QCheckBox("Flip Normals")
-        self.sensor_parameter_use_shape_checkbox = QCheckBox("Use Selected Shape")
+        self.sensor_parameter_normal_flip_checkbox = QCheckBox("Flip normals")
+        self.sensor_parameter_use_shape_checkbox = QCheckBox("Use selected shape")
         self.sensor_parameter_heatmap_follows_shape_checkbox = QCheckBox(
-            "3D Heatmap Follows Sensor Shape"
+            "3D heatmap follows sensor shape"
         )
         self.sensor_parameter_heatmap_follows_shape_checkbox.setChecked(True)
         self.sensor_parameter_heatmap_follows_shape_checkbox.setToolTip(
@@ -2372,13 +2782,13 @@ class UI(
             "3D heatmap. Uncheck this to use the independently edited heatmap shape."
         )
         self.sensor_parameter_shape_editor_button = QPushButton(
-            "Edit Custom Shape"
+            "Edit custom shape"
         )
         self.sensor_parameter_shape_editor_button.setToolTip(
             "Open the interactive 3D taxel-grid editor for the currently built "
             "2D sensor."
         )
-        self.sensor_parameter_stereo_ignore_noise_checkbox = QCheckBox("Ignore Stereo Field Noise")
+        self.sensor_parameter_stereo_ignore_noise_checkbox = QCheckBox("Ignore stereo field noise")
         self.sensor_parameter_stereo_ignore_noise_checkbox.setChecked(True)
         self.sensor_parameter_stereo_ignore_noise_checkbox.setToolTip(
             "Ignore small baseline sensor changes so the stereo field does not vibrate while idle."
@@ -2515,167 +2925,121 @@ class UI(
             "the proximity baseline or saturation threshold."
         )
 
-        grid.addWidget(QLabel("Sensor:"), 0, 0)
-        grid.addWidget(self.sensor_parameter_model_combo, 0, 1)
-        grid.addWidget(QLabel("Reorder Logic:"), 1, 0)
-        grid.addWidget(self.sensor_parameter_reorder_combo, 1, 1)
-        grid.addWidget(QLabel("Force Scale (N/signal):"), 2, 0)
-        grid.addWidget(self.sensor_parameter_force_scale_spin, 2, 1)
-        grid.addWidget(QLabel("Average Window:"), 3, 0)
-        grid.addWidget(self.sensor_average_window_spin, 3, 1)
-        grid.addWidget(QLabel("Render Hz:"), 4, 0)
-        grid.addWidget(self.visualization_target_hz_spin, 4, 1)
-        grid.setColumnStretch(1, 1)
-        layout.addLayout(grid)
+        general_group, general_list = components.section(
+            "Sensor",
+            "Which sensor these settings apply to, and how it is sampled.",
+        )
+        general_list.add_row("Sensor", self.sensor_parameter_model_combo)
+        general_list.add_row(
+            "Reorder logic",
+            self.sensor_parameter_reorder_combo,
+            hint="Applied the next time the sensor connects.",
+        )
+        general_list.add_row(
+            "Force scale", self.sensor_parameter_force_scale_spin,
+            hint="Newtons per unit of signal.",
+        )
+        general_list.add_row("Average window", self.sensor_average_window_spin)
+        general_list.add_row("Render rate", self.visualization_target_hz_spin)
 
-        self.sensor_parameter_point_labels_checkbox = QCheckBox("Show Point Labels")
+        self.sensor_parameter_point_labels_checkbox = QCheckBox("Show point labels")
         self.sensor_parameter_point_labels_checkbox.setToolTip(
             "Show each coarse sensor point label in the 3D sensor scene."
         )
-        layout.addWidget(self.sensor_parameter_point_labels_checkbox)
+        general_list.add(self.sensor_parameter_point_labels_checkbox)
 
-        self.sensor_parameter_background_reference_checkbox = QCheckBox("Show Background Axes/Grid")
+        self.sensor_parameter_background_reference_checkbox = QCheckBox(
+            "Show background axes and grid"
+        )
         self.sensor_parameter_background_reference_checkbox.setToolTip(
             "Show the red/green reference axes and gray XY wireframe plane behind the sensor."
         )
         self.sensor_parameter_background_reference_checkbox.setChecked(True)
-        layout.addWidget(self.sensor_parameter_background_reference_checkbox)
+        general_list.add(self.sensor_parameter_background_reference_checkbox)
+        layout.addWidget(general_group)
 
-        view_group = QGroupBox("Sensor View")
-        view_layout = QHBoxLayout(view_group)
-        self.sensor_parameter_save_view_button = QPushButton(
-            "Save Current View"
-        )
+        view_group, view_list = components.section("Sensor view")
+        self.sensor_parameter_save_view_button = QPushButton("Save")
         self.sensor_parameter_save_view_button.setToolTip(
             "Save the current sensor plotter orientation and zoom for this "
             "sensor model and grid size."
         )
         self.sensor_parameter_save_view_button.setEnabled(False)
-        self.sensor_parameter_restore_view_button = QPushButton(
-            "Restore Saved View"
-        )
+        self.sensor_parameter_restore_view_button = QPushButton("Restore")
         self.sensor_parameter_restore_view_button.setToolTip(
             "Restore the saved sensor plotter orientation and zoom."
         )
         self.sensor_parameter_restore_view_button.setEnabled(False)
+        view_buttons = QWidget()
+        view_layout = QHBoxLayout(view_buttons)
+        view_layout.setContentsMargins(0, 0, 0, 0)
+        view_layout.setSpacing(theme.SPACE_SM)
         view_layout.addWidget(self.sensor_parameter_save_view_button)
         view_layout.addWidget(self.sensor_parameter_restore_view_button)
-        view_layout.addStretch()
+        view_list.add(
+            components.SettingsRow(
+                "Camera",
+                view_buttons,
+                hint="Per sensor model and grid size.",
+            )
+        )
         layout.addWidget(view_group)
 
-        contact_vector_group = QGroupBox("Contact Vector")
-        contact_vector_layout = QGridLayout(contact_vector_group)
-        contact_vector_layout.setHorizontalSpacing(12)
-        contact_vector_layout.setVerticalSpacing(8)
-        self.contact_normal_checkbox = QCheckBox("Show Contact Vector")
-        self.contact_normal_checkbox.setChecked(False)
-        self.contact_normal_checkbox.setToolTip(
-            "Show an estimated contact arrow in the 3D sensor scene."
+        stereo_group, stereo_list = components.section("Stereo field")
+        stereo_list.add(self.sensor_parameter_stereo_ignore_noise_checkbox)
+        stereo_list.add_row(
+            "Noise threshold", self.sensor_parameter_stereo_deadband_spin
         )
-        self.contact_normal_estimator_combo = QComboBox()
-        self.contact_normal_estimator_combo.addItem(
-            "Motion Direction (V3)",
-            "motion_direction_v3",
-        )
-        self.contact_normal_estimator_combo.addItem(
-            "Touch Anchor Direction (V4)",
-            "touch_anchor_v4",
-        )
-        self.contact_normal_estimator_combo.setCurrentIndex(1)
-        self.contact_normal_estimator_combo.setToolTip(
-            "Choose whether the arrow follows contact motion or the "
-            "touch-anchor direction."
-        )
-        contact_vector_layout.addWidget(
-            self.contact_normal_checkbox,
-            0,
-            0,
-            1,
-            2,
-        )
-        contact_vector_layout.addWidget(QLabel("Vector Type:"), 1, 0)
-        contact_vector_layout.addWidget(
-            self.contact_normal_estimator_combo,
-            1,
-            1,
-        )
-        contact_vector_layout.setColumnStretch(1, 1)
-        layout.addWidget(contact_vector_group)
-
-        stereo_group = QGroupBox("Stereo Field")
-        stereo_grid = QGridLayout(stereo_group)
-        stereo_grid.setHorizontalSpacing(12)
-        stereo_grid.setVerticalSpacing(8)
-        stereo_grid.addWidget(self.sensor_parameter_stereo_ignore_noise_checkbox, 0, 1)
-        stereo_grid.addWidget(QLabel("Noise Threshold:"), 1, 0)
-        stereo_grid.addWidget(self.sensor_parameter_stereo_deadband_spin, 1, 1)
-        stereo_grid.addWidget(QLabel("Line Length:"), 2, 0)
-        stereo_grid.addWidget(self.sensor_parameter_stereo_length_spin, 2, 1)
-        stereo_grid.setColumnStretch(1, 1)
+        stereo_list.add_row("Line length", self.sensor_parameter_stereo_length_spin)
         layout.addWidget(stereo_group)
 
-        heatmap_group = QGroupBox("3D Signal / Heatmap")
-        heatmap_grid = QGridLayout(heatmap_group)
-        heatmap_grid.setHorizontalSpacing(12)
-        heatmap_grid.setVerticalSpacing(8)
-        heatmap_grid.addWidget(QLabel("Signal Sign:"), 0, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_signal_mode_combo, 0, 1)
-        heatmap_grid.addWidget(QLabel("Point Grid Response:"), 1, 0)
-        heatmap_grid.addWidget(
-            self.sensor_parameter_point_grid_response_combo, 1, 1
+        heatmap_group, heatmap_list = components.section(
+            "3D signal and heatmap"
         )
-        heatmap_grid.addWidget(QLabel("Colour Scale:"), 2, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_palette_combo, 2, 1)
-        heatmap_grid.addWidget(QLabel("Response:"), 3, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_response_combo, 3, 1)
-        heatmap_grid.addWidget(QLabel("Linear Full Colour At:"), 4, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_saturation_spin, 4, 1)
-        heatmap_grid.addWidget(QLabel("Linear Noise Floor:"), 5, 0)
-        heatmap_grid.addWidget(self.sensor_parameter_heatmap_floor_spin, 5, 1)
-        heatmap_grid.addWidget(QLabel("Proximity Baseline:"), 6, 0)
-        heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_proximity_floor_spin, 6, 1
+        heatmap_list.add_row("Signal sign", self.sensor_parameter_signal_mode_combo)
+        heatmap_list.add_row(
+            "Point grid response", self.sensor_parameter_point_grid_response_combo
         )
-        heatmap_grid.addWidget(QLabel("Proximity Knee:"), 7, 0)
-        heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_proximity_knee_spin, 7, 1
+        heatmap_list.add_row(
+            "Colour scale", self.sensor_parameter_heatmap_palette_combo
         )
-        heatmap_grid.addWidget(QLabel("Proximity Saturation:"), 8, 0)
-        heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_proximity_saturation_spin, 8, 1
+        heatmap_list.add_row("Response", self.sensor_parameter_heatmap_response_combo)
+        heatmap_list.add_row(
+            "Full colour at", self.sensor_parameter_heatmap_saturation_spin
         )
-        heatmap_grid.addWidget(QLabel("3D Colour Strength:"), 9, 0)
-        heatmap_grid.addWidget(
-            self.sensor_parameter_heatmap_3d_color_gain_spin, 9, 1
+        heatmap_list.add_row(
+            "Noise floor", self.sensor_parameter_heatmap_floor_spin
         )
-        heatmap_grid.setColumnStretch(1, 1)
+        heatmap_list.add_row(
+            "Proximity baseline",
+            self.sensor_parameter_heatmap_proximity_floor_spin,
+        )
+        heatmap_list.add_row(
+            "Proximity knee", self.sensor_parameter_heatmap_proximity_knee_spin
+        )
+        heatmap_list.add_row(
+            "Proximity saturation",
+            self.sensor_parameter_heatmap_proximity_saturation_spin,
+        )
+        heatmap_list.add_row(
+            "3D colour strength",
+            self.sensor_parameter_heatmap_3d_color_gain_spin,
+        )
         layout.addWidget(heatmap_group)
 
-        geometry_group = QGroupBox("2D Geometry")
-        geometry_grid = QGridLayout(geometry_group)
-        geometry_grid.setHorizontalSpacing(12)
-        geometry_grid.setVerticalSpacing(8)
-        geometry_grid.addWidget(self.sensor_parameter_use_shape_checkbox, 0, 1)
-        geometry_grid.addWidget(QLabel("Shape:"), 1, 0)
-        geometry_grid.addWidget(self.sensor_parameter_shape_combo, 1, 1)
-        geometry_grid.addWidget(QLabel("Bend Direction:"), 2, 0)
-        geometry_grid.addWidget(self.sensor_parameter_bend_axis_combo, 2, 1)
-        geometry_grid.addWidget(QLabel("Arc Angle:"), 3, 0)
-        geometry_grid.addWidget(self.sensor_parameter_arc_spin, 3, 1)
-        geometry_grid.addWidget(self.sensor_parameter_normal_flip_checkbox, 4, 1)
-        geometry_grid.addWidget(QLabel("Rotation X:"), 5, 0)
-        geometry_grid.addWidget(self.sensor_parameter_rotation_x_spin, 5, 1)
-        geometry_grid.addWidget(QLabel("Rotation Y:"), 6, 0)
-        geometry_grid.addWidget(self.sensor_parameter_rotation_y_spin, 6, 1)
-        geometry_grid.addWidget(QLabel("Rotation Z:"), 7, 0)
-        geometry_grid.addWidget(self.sensor_parameter_rotation_z_spin, 7, 1)
-        geometry_grid.addWidget(
-            self.sensor_parameter_heatmap_follows_shape_checkbox, 8, 0, 1, 2
-        )
-        geometry_grid.addWidget(
-            self.sensor_parameter_shape_editor_button, 9, 0, 1, 2
-        )
-        geometry_grid.setColumnStretch(1, 1)
+        geometry_group, geometry_list = components.section("2D geometry")
+        geometry_list.add(self.sensor_parameter_use_shape_checkbox)
+        geometry_list.add_row("Shape", self.sensor_parameter_shape_combo)
+        geometry_list.add_row("Bend direction", self.sensor_parameter_bend_axis_combo)
+        geometry_list.add_row("Arc angle", self.sensor_parameter_arc_spin)
+        geometry_list.add(self.sensor_parameter_normal_flip_checkbox)
+        geometry_list.add_row("Rotation X", self.sensor_parameter_rotation_x_spin)
+        geometry_list.add_row("Rotation Y", self.sensor_parameter_rotation_y_spin)
+        geometry_list.add_row("Rotation Z", self.sensor_parameter_rotation_z_spin)
+        geometry_list.add(self.sensor_parameter_heatmap_follows_shape_checkbox)
+        geometry_list.add(self.sensor_parameter_shape_editor_button)
+        # Enabling/disabling the container reaches every control inside it,
+        # which is what _refresh_sensor_parameters_dialog relies on.
         self.sensor_parameter_geometry_group = geometry_group
         layout.addWidget(geometry_group)
 
@@ -2688,6 +3052,11 @@ class UI(
         self.sensor_parameter_reload_button = QPushButton("Reload Saved")
 
         button_box = QDialogButtonBox(QDialogButtonBox.Close)
+        close_button = button_box.button(QDialogButtonBox.Close)
+        if close_button is not None:
+            # Qt ships a red cross on this button, which reads as a
+            # destructive action on a dialog that only dismisses.
+            close_button.setIcon(QIcon())
         button_box.rejected.connect(self.sensor_parameters_dialog.close)
         footer_layout = QHBoxLayout()
         footer_layout.addStretch()
@@ -2799,7 +3168,9 @@ class UI(
                 self.sensor_zero_mask_panel
             )
         elif tab == "general":
-            self.sensor_parameters_tabs.setCurrentIndex(0)
+            self.sensor_parameters_tabs.setCurrentWidget(
+                self.sensor_parameters_general_tab
+            )
         self.sensor_parameters_dialog.show()
         self.sensor_parameters_dialog.raise_()
         self.sensor_parameters_dialog.activateWindow()
@@ -3267,23 +3638,6 @@ class UI(
             bool(context.get("point_labels_enabled", False))
         )
         self.sensor_parameter_point_labels_checkbox.blockSignals(False)
-        self.contact_normal_checkbox.blockSignals(True)
-        self.contact_normal_checkbox.setChecked(
-            bool(getattr(helper, "show_contact_normal_vector", False))
-        )
-        self.contact_normal_checkbox.blockSignals(False)
-        self.contact_normal_estimator_combo.blockSignals(True)
-        self._set_combo_current_data(
-            self.contact_normal_estimator_combo,
-            str(
-                getattr(
-                    helper,
-                    "contact_normal_estimator_mode",
-                    "touch_anchor_v4",
-                )
-            ),
-        )
-        self.contact_normal_estimator_combo.blockSignals(False)
         self.sensor_parameter_background_reference_checkbox.blockSignals(True)
         self.sensor_parameter_background_reference_checkbox.setChecked(
             bool(context.get("background_reference_enabled", True))
@@ -3310,18 +3664,6 @@ class UI(
         default_logic = context.get("default_logic") or "none"
         effective_logic = context.get("effective_logic") or "none"
         point_labels = "on" if context.get("point_labels_enabled", False) else "off"
-        contact_vector = (
-            "on"
-            if bool(getattr(helper, "show_contact_normal_vector", False))
-            else "off"
-        )
-        contact_vector_type = str(
-            getattr(
-                helper,
-                "contact_normal_estimator_mode",
-                "touch_anchor_v4",
-            )
-        )
         background_reference = "on" if context.get("background_reference_enabled", True) else "off"
         force_scale = float(context.get("force_scale_n_per_signal", 0.0) or 0.0)
         geometry_shape = str(geometry.get("shape", "flat") or "flat")
@@ -3339,9 +3681,8 @@ class UI(
             f"Key: {context.get('key', model_name)}\n"
             f"Factory default: {default_logic}\n"
             f"Saved mode: {self._sensor_reorder_mode_label(saved_mode)}\n"
-            f"Effective on next Build Scene: {effective_logic}\n"
+            f"Effective on next connect: {effective_logic}\n"
             f"Point labels: {point_labels}\n"
-            f"Contact vector: {contact_vector}; {contact_vector_type}\n"
             f"Background axes/grid: {background_reference}\n"
             f"Saved sensor view: {'yes' if saved_camera else 'no'}\n"
             f"Force scale: {force_scale:.6f} N/signal\n"
@@ -3703,7 +4044,7 @@ class UI(
             )
             self.sensor_parameter_status_label.setText(
                 f"Saved for {context.get('key', model_name)}.\n"
-                f"Effective on next Build Scene: {context.get('effective_logic') or 'none'}\n"
+                f"Effective on next connect: {context.get('effective_logic') or 'none'}\n"
                 f"Point labels: {'on' if context.get('point_labels_enabled', False) else 'off'}\n"
                 f"Background axes/grid: {'on' if context.get('background_reference_enabled', True) else 'off'}\n"
                 f"Saved sensor view: {'yes' if saved_camera else 'no'}\n"
@@ -3732,33 +4073,94 @@ class UI(
             self.sensor_parameter_status_label.setText("Failed to save sensor parameters.")
 
     def setup_tab2(self, layout):
-        self.read_group_robot = QGroupBox("Read Operations")
-        send_group = QGroupBox("Send Operations")
-        read_layout = QVBoxLayout()
-        send_layout = QVBoxLayout()
+        layout.setSpacing(theme.SPACE_LG)
 
-        self.read_joint_angle_button = QPushButton("Read Joint Angle")
-        self.read_tool_position_button = QPushButton("Read Tool Position ")
+        self.read_group_robot, read_list = components.section(
+            "Read",
+            "Query the arm's current state.",
+        )
+        send_group, send_list = components.section(
+            "Command",
+            "Pick what to send; its editor opens below.",
+        )
 
-        self.send_position_PTP_J_button = QPushButton("Send Joint Angle")
-        self.send_position_PTP_T_button = QPushButton("Send Tool Position (Base Frame)")
-        self.send_position_PTP_T_toolframe_button = QPushButton("Send Tool Velocity (Tool Frame)")
+        self.read_joint_angle_button = QPushButton("Read")
+        self.read_tool_position_button = QPushButton("Read")
+        self.show_robot_button = QPushButton("Open")
 
-        self.send_script_button = QPushButton("Send Script")
-        self.show_robot_button = QPushButton("Import 3D Robot Model")
+        # The row label names the thing; the button carries the verb, so a
+        # column of "Read" reads as one action applied to several quantities.
+        read_list.add(
+            components.SettingsRow("Joint angles", self.read_joint_angle_button)
+        )
+        read_list.add(
+            components.SettingsRow("Tool position", self.read_tool_position_button)
+        )
+        read_list.add(
+            components.SettingsRow(
+                "3D robot model",
+                self.show_robot_button,
+                hint="Opens the standalone viewer with sensor mapping and "
+                     "admittance controls.",
+            )
+        )
 
-        read_layout.addWidget(self.read_joint_angle_button)
-        read_layout.addWidget(self.read_tool_position_button)
-        read_layout.addWidget(self.show_robot_button)
-        send_layout.addWidget(self.send_position_PTP_J_button)
-        send_layout.addWidget(self.send_position_PTP_T_button)
-        send_layout.addWidget(self.send_position_PTP_T_toolframe_button)
-        send_layout.addWidget(self.send_script_button)
+        self.send_position_PTP_J_button = QPushButton("Edit")
+        self.send_position_PTP_T_button = QPushButton("Edit")
+        self.send_position_PTP_T_toolframe_button = QPushButton("Edit")
+        self.send_script_button = QPushButton("Edit")
 
-        self.read_group_robot.setLayout(read_layout)
-        send_group.setLayout(send_layout)
-        layout.addWidget(self.read_group_robot)
-        layout.addWidget(send_group)
+        for label, hint, button in (
+            (
+                "Joint angles",
+                "Move each of the six joints to an absolute angle.",
+                self.send_position_PTP_J_button,
+            ),
+            (
+                "Tool position",
+                "Absolute pose in the base frame.",
+                self.send_position_PTP_T_button,
+            ),
+            (
+                "Tool velocity",
+                "Continuous motion in the tool frame.",
+                self.send_position_PTP_T_toolframe_button,
+            ),
+            (
+                "TM script",
+                "Raw SendScript command.",
+                self.send_script_button,
+            ),
+        ):
+            send_list.add(components.SettingsRow(label, button, hint=hint))
+
+        self.robot_basic_controls_group = components.CollapsibleGroup(
+            "Basic controls",
+            expanded=True,
+        )
+        self.robot_basic_controls_group.add(self.read_group_robot)
+        self.robot_advanced_controls_group = components.CollapsibleGroup(
+            "Advanced commands"
+        )
+        self.robot_advanced_controls_group.add(send_group)
+
+        layout.addWidget(self.robot_basic_controls_group)
+        layout.addWidget(self.robot_advanced_controls_group)
+
+        # Editors are mounted here, below the buttons that open them, and only
+        # one is visible at a time (see _toggle_robot_editor). Inside the page
+        # rather than above the tab widget, so opening one no longer covers the
+        # other workspaces.
+        for editor in (
+            self.position_entry_widget,
+            self.position_quaternion_widget,
+            self.position_toolframe_widget,
+            self.position_script_widget,
+        ):
+            self.robot_advanced_controls_group.add(editor)
+
+        # Keep the groups at their natural height at the top of the page.
+        layout.addStretch(1)
 
     def setup_tab3(self, layout):
         self.ai_sub_tabs = QTabWidget()
@@ -3772,29 +4174,22 @@ class UI(
         rule_based_page = QWidget()
         rule_based_page_layout = QVBoxLayout(rule_based_page)
 
-        self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict (ThreeLevel)")
-        self.btn_toggle_3lvl_latch = QPushButton("3-Level: Latch OFF")
+        self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict")
+        self.btn_toggle_3lvl_latch = QPushButton("Latch off")
         self.proximity_control_button = QPushButton("Proximity Control")
         self.proximity_record_button = QPushButton("Record Proximity Data")
 
         self.proximity_settings_dialog = QDialog(self.widget_func)
         self.proximity_settings_dialog.setWindowTitle("Proximity Control Settings")
         self.proximity_settings_dialog.setModal(False)
-        self.proximity_settings_dialog.resize(820, 560)
+        components.size_to_screen(self.proximity_settings_dialog, 820, 560)
         proximity_settings_layout = QVBoxLayout(self.proximity_settings_dialog)
         proximity_settings_layout.setContentsMargins(10, 10, 10, 10)
         proximity_settings_layout.setSpacing(8)
-        proximity_note = QLabel(
-            "Tune how the robot keeps the finger centered over the sensor and maintains the taught hover distance."
+        self.proximity_settings_group, proximity_params_list = components.section(
+            "Proximity control",
+            "Tune centering, hover distance, smoothing, and lost-signal recovery.",
         )
-        proximity_note.setWordWrap(True)
-        proximity_settings_layout.addWidget(proximity_note)
-
-        self.proximity_settings_group = QGroupBox("Proximity Control Parameters")
-        proximity_params_grid = QGridLayout(self.proximity_settings_group)
-        proximity_params_grid.setContentsMargins(10, 10, 10, 10)
-        proximity_params_grid.setHorizontalSpacing(12)
-        proximity_params_grid.setVerticalSpacing(8)
 
         def _mk_dspin(default: float, minimum: float, maximum: float, step: float) -> QDoubleSpinBox:
             sp = QDoubleSpinBox()
@@ -3806,17 +4201,11 @@ class UI(
             return sp
 
         def _add_param_row(row: int, name: str, description: str, widget):
-            name_label = QLabel(name)
-            desc_label = QLabel(description)
-            desc_label.setWordWrap(True)
-            desc_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
             tooltip = f"{name}\n\n{description}"
-            name_label.setToolTip(tooltip)
-            desc_label.setToolTip(tooltip)
             widget.setToolTip(tooltip)
-            proximity_params_grid.addWidget(name_label, row, 0)
-            proximity_params_grid.addWidget(desc_label, row, 1)
-            proximity_params_grid.addWidget(widget, row, 2)
+            proximity_params_list.add(
+                components.SettingsRow(name, widget, hint=description)
+            )
 
         self.proximity_frame_interval_spin = QSpinBox()
         self.proximity_frame_interval_spin.setRange(10, 500)
@@ -3906,7 +4295,6 @@ class UI(
             "Multiplier for normal speed during short lost-signal recovery. Higher values chase faster but can overshoot.",
             self.proximity_lost_signal_speed_ratio_spin,
         )
-        proximity_params_grid.setColumnStretch(1, 1)
         proximity_settings_layout.addWidget(self.proximity_settings_group)
 
         proximity_button_row = QWidget(self.proximity_settings_dialog)
@@ -3926,8 +4314,6 @@ class UI(
         frame_grid.setContentsMargins(0, 0, 0, 0)
         frame_grid.setHorizontalSpacing(8)
         frame_grid.setVerticalSpacing(6)
-        frame_grid.addWidget(QLabel("EE frame:"), 0, 0)
-
         self.ai_frame_buttons = {}
         self.ai_selected_frame = "tool"
 
@@ -3947,68 +4333,91 @@ class UI(
             ("tool", "Tool"),
         ]
         frame_button_positions = {
-            "joint1": (0, 1),
-            "joint2": (0, 2),
-            "joint3": (0, 3),
-            "joint4": (1, 1),
-            "joint5": (1, 2),
-            "tool": (1, 3),
+            "joint1": (0, 0),
+            "joint2": (0, 1),
+            "joint3": (0, 2),
+            "joint4": (1, 0),
+            "joint5": (1, 1),
+            "tool": (1, 2),
         }
         for frame_key, frame_label in frame_button_order:
             btn = QPushButton(frame_label)
             btn.setCheckable(True)
-            btn.setMinimumWidth(90)
-            btn.setMinimumHeight(32)
             btn.clicked.connect(lambda checked, key=frame_key: self._set_ai_frame(key))
             self.ai_frame_buttons[frame_key] = btn
             row, col = frame_button_positions[frame_key]
             frame_grid.addWidget(btn, row, col)
 
         self.btn_toggle_anchor_axes = QPushButton("Axes: Anchored ON")  # label will be synced on init
-        self.btn_toggle_anchor_axes.setMinimumWidth(150)
-        self.btn_toggle_anchor_axes.setMinimumHeight(32)
-        frame_grid.addWidget(self.btn_toggle_anchor_axes, 0, 4, 2, 1)
 
-        frame_grid.setColumnStretch(5, 1)
+        frame_grid.setColumnStretch(3, 1)
         self._update_ai_frame_buttons()
-        ai_model_layout.addWidget(frame_row)
 
-        tactile_ai_group = QGroupBox("Tactile")
-        tactile_ai_layout = QVBoxLayout(tactile_ai_group)
-        tactile_ai_layout.setContentsMargins(10, 10, 10, 10)
-        tactile_ai_layout.setSpacing(6)
+        # Which link the predicted velocity is expressed in, plus whether the
+        # axes stay anchored. Set once per session, so it leads the page as a
+        # compact reference rather than as a wall of buttons.
+        frame_group, frame_list = components.section(
+            "Reference frame",
+            "Link the AI's velocity command is applied in.",
+        )
+        frame_list.add(components.SettingsRow("End effector", frame_row))
 
-        proximity_ai_group = QGroupBox("Proximity")
-        proximity_ai_layout = QVBoxLayout(proximity_ai_group)
-        proximity_ai_layout.setContentsMargins(10, 10, 10, 10)
-        proximity_ai_layout.setSpacing(6)
+        tactile_ai_group, tactile_ai_list = components.section(
+            "Tactile policy",
+            "Learned control from the tactile signal.",
+        )
+        tactile_ai_advanced_group, tactile_ai_advanced_list = components.section(
+            "Tactile policy setup",
+            "Checkpoint selection and gesture-recognition tools.",
+        )
+        proximity_ai_group, proximity_ai_list = components.section(
+            "Proximity",
+            "Detects approach before contact and can retreat the arm.",
+        )
+        proximity_ai_advanced_group, proximity_ai_advanced_list = components.section(
+            "Proximity setup",
+            "Detection tuning and checkpoint selection.",
+        )
 
-        hybrid_ai_group = QGroupBox("Hybrid")
-        hybrid_ai_group.setMinimumHeight(72)
-        hybrid_ai_layout = QVBoxLayout(hybrid_ai_group)
-        hybrid_ai_layout.setContentsMargins(10, 10, 10, 10)
-        hybrid_ai_layout.addStretch()
-
-        rule_based_group = QGroupBox("Rule-Based")
-        rule_based_layout = QVBoxLayout(rule_based_group)
-        rule_based_layout.setContentsMargins(10, 10, 10, 10)
-        rule_based_layout.setSpacing(6)
-
-        admittance_group = QGroupBox("Admittance Control")
-        admittance_layout = QVBoxLayout(admittance_group)
-        admittance_layout.setContentsMargins(10, 10, 10, 10)
-        admittance_layout.setSpacing(6)
+        rule_based_group, rule_based_list = components.section(
+            "Tactile motion",
+            "Deterministic controllers driven straight from the sensor.",
+        )
+        console_group, console_list = components.section(
+            "Controller input",
+            "Drive the arm from a gamepad or from the sensor itself.",
+        )
+        tool_path_group, tool_path_list = components.section(
+            "Tool path",
+            "Record and review where the tool actually travelled.",
+        )
+        admittance_group, admittance_list = components.section(
+            "Pressure admittance",
+            "The arm yields to pressure on the sensor.",
+        )
         self.admittance_control_button = QPushButton("Start Admittance Control")
         self.admittance_control_button.setCheckable(True)
         self.admittance_control_button.setToolTip(
             "Start pressure-based robot admittance using the selected sensor and "
             "its saved robot-link mapping. The 3D robot window is not required."
         )
-        self.admittance_control_status_label = QLabel("Pressure admittance: idle")
-        self.admittance_control_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
+        self.admittance_control_button.setText("Start")
+        self.admittance_control_status_label = QLabel("Idle")
+        self.admittance_control_status_label.setStyleSheet(
+            theme.type_style("caption")
+        )
         self.admittance_control_status_label.setWordWrap(True)
-        admittance_layout.addWidget(self.admittance_control_button)
-        admittance_layout.addWidget(self.admittance_control_status_label)
+        admittance_list.add(
+            components.SettingsRow(
+                "Admittance",
+                self.admittance_control_button,
+                hint="Uses the selected sensor and its saved robot-link "
+                     "mapping; the 3D robot window is not required.",
+            )
+        )
+        admittance_list.add(
+            components.SettingsRow("State", self.admittance_control_status_label)
+        )
 
         self.direct_finger_motion_button = QPushButton("Direct Finger Motion")
         self.console_control_button = QPushButton("Console Control (PS5)")
@@ -4020,11 +4429,9 @@ class UI(
         self.ai_direct_finger_motion_button = QPushButton("AI DFM Record (No Robot)")
         self.ai_direct_finger_motion_robot_button = QPushButton("AI DFM Record + Robot")
         self.ai_direct_finger_motion_execution_button = QPushButton("AI Direct Finger Motion (Execute)")
-        self.ai_proximity_detection_button = QPushButton("AI Proximity Detection")
+        self.ai_proximity_detection_button = QPushButton("Detect")
         self.ai_proximity_detection_button.setCheckable(True)
-        self.ai_proximity_admittance_button = QPushButton(
-            "Proximity Admittance Control"
-        )
+        self.ai_proximity_admittance_button = QPushButton("Retreat on approach")
         self.ai_proximity_admittance_button.setCheckable(True)
         self.ai_proximity_admittance_button.setChecked(False)
         self.ai_proximity_admittance_button.setEnabled(False)
@@ -4062,7 +4469,7 @@ class UI(
             theme.MUTED_LABEL_STYLE
         )
         self.ai_proximity_model_status = QLabel(
-            "Model: automatic selection from sensor size"
+            "Automatic, from sensor size"
         )
         self.ai_proximity_model_status.setWordWrap(True)
         self.ai_proximity_model_status.setTextInteractionFlags(
@@ -4096,10 +4503,9 @@ class UI(
         default_ai_model_path = self._get_default_ai_execution_model_path()
         self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
         self.ai_direct_execution_model_path_input.setVisible(False)
-        self.ai_direct_execution_model_status = QLabel()
-        self.ai_direct_execution_model_status.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
-        )
+        # A checkpoint filename can be long. Let the label give up width and
+        # elide rather than push the buttons beside it off the panel edge.
+        self.ai_direct_execution_model_status = components.ElidedLabel()
         self.ai_direct_execution_select_model_button = QPushButton(
             "Select Model"
         )
@@ -4113,7 +4519,9 @@ class UI(
         self.ai_direct_execution_use_default_button.setToolTip(
             "Restore the current latest_cnn_gru_model_10x10.pt checkpoint."
         )
-        model_row_layout.addWidget(QLabel("Model:"))
+        self.ai_direct_execution_model_status.setStyleSheet(
+            theme.type_style("caption")
+        )
         model_row_layout.addWidget(
             self.ai_direct_execution_model_status,
             1,
@@ -4139,19 +4547,25 @@ class UI(
             "When checked, AI predicts live velocity but does not send robot motion commands."
         )
         self.ai_direct_execution_prediction_status = QLabel("Prediction: idle")
+        self.ai_direct_execution_prediction_status.setStyleSheet(
+            theme.type_style("caption")
+        )
         execute_safety_layout.addWidget(self.ai_direct_execution_dry_run_checkbox)
-        execute_safety_layout.addWidget(self.ai_direct_execution_prediction_status)
         execute_safety_layout.addStretch()
+        execute_safety_layout.addWidget(self.ai_direct_execution_prediction_status)
 
         execute_action_row = QWidget()
         execute_action_layout = QHBoxLayout(execute_action_row)
         execute_action_layout.setContentsMargins(0, 0, 0, 0)
         execute_action_layout.setSpacing(6)
+        self.ai_direct_finger_motion_execution_button.setText("Execute")
+        self.ai_direct_finger_motion_execution_button.setToolTip(
+            "Run the learned tactile policy and command robot motion."
+        )
         execute_action_layout.addWidget(
             self.ai_direct_finger_motion_execution_button,
             1,
         )
-        execute_action_layout.addWidget(QLabel("Velocity scale:"))
         self.ai_direct_execution_velocity_scale_spin = QDoubleSpinBox()
         self.ai_direct_execution_velocity_scale_spin.setRange(0.10, 20.00)
         self.ai_direct_execution_velocity_scale_spin.setDecimals(2)
@@ -4160,18 +4574,11 @@ class UI(
         self.ai_direct_execution_velocity_scale_spin.setSuffix("x")
         self.ai_direct_execution_velocity_scale_spin.setToolTip(
             "Multiply the AI-predicted velocity. The execution safety limit "
-            "still caps each XYZ component at 0.05 m/s."
+            "still caps the total XYZ linear-speed magnitude at 0.30 m/s."
         )
         execute_action_layout.addWidget(
             self.ai_direct_execution_velocity_scale_spin
         )
-        self.ai_direct_execution_speed_cap_label = QLabel(
-            "Safety velocity cap: 0.30 m/s (total XYZ)"
-        )
-        self.ai_direct_execution_speed_cap_label.setStyleSheet(
-            f"color: {theme.TEXT_MUTED}; font-size: 11px;"
-        )
-
         threelevel_row = QWidget()
         threelevel_row_layout = QHBoxLayout(threelevel_row)
         threelevel_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -4183,39 +4590,65 @@ class UI(
             1,
         )
         threelevel_row_layout.addWidget(self.btn_toggle_3lvl_latch, 1)
-        tactile_ai_layout.addWidget(threelevel_row)
         proximity_row = QWidget()
         proximity_row_layout = QHBoxLayout(proximity_row)
         proximity_row_layout.setContentsMargins(0, 0, 0, 0)
         proximity_row_layout.setSpacing(6)
         self.proximity_control_button.setMinimumWidth(0)
         self.proximity_record_button.setMinimumWidth(0)
+        self.proximity_control_button.setText("Follow")
+        self.proximity_record_button.setText("Record data")
         proximity_row_layout.addWidget(self.proximity_control_button, 1)
         proximity_row_layout.addWidget(self.proximity_record_button, 1)
-        rule_based_layout.addWidget(proximity_row)
-        rule_based_layout.addWidget(self.direct_finger_motion_button)
+        rule_based_list.add(
+            components.SettingsRow(
+                "Proximity",
+                proximity_row,
+                hint="Keeps the finger centred over the sensor at the taught "
+                     "hover distance.",
+            )
+        )
+        self.direct_finger_motion_button.setText("Start")
+        rule_based_list.add(
+            components.SettingsRow(
+                "Direct finger motion",
+                self.direct_finger_motion_button,
+                hint="Moves the arm from the tracked contact centroid.",
+            )
+        )
+
         console_row = QWidget()
         console_row_layout = QHBoxLayout(console_row)
         console_row_layout.setContentsMargins(0, 0, 0, 0)
         console_row_layout.setSpacing(6)
-        self.console_control_button.setMinimumWidth(0)
-        self.console_control_sensor_button.setMinimumWidth(0)
-        self.console_control_sensor_v2_button.setMinimumWidth(0)
-        console_row_layout.addWidget(self.console_control_button, 1)
-        console_row_layout.addWidget(self.console_control_sensor_button, 1)
-        console_row_layout.addWidget(self.console_control_sensor_v2_button, 1)
-        rule_based_layout.addWidget(console_row)
+        # The shared "Console Control" prefix moves into the row label:
+        # repeating it on all three buttons made this the widest row in the app.
+        for button, short_text in (
+            (self.console_control_button, "PS5"),
+            (self.console_control_sensor_button, "Sensor"),
+            (self.console_control_sensor_v2_button, "Sensor V2"),
+        ):
+            button.setToolTip(button.text())
+            button.setText(short_text)
+            button.setMinimumWidth(0)
+            console_row_layout.addWidget(button, 1)
+        console_list.add_stacked("Source", console_row)
+
         tool_pose_row = QWidget()
         tool_pose_row_layout = QHBoxLayout(tool_pose_row)
         tool_pose_row_layout.setContentsMargins(0, 0, 0, 0)
         tool_pose_row_layout.setSpacing(6)
+        self.direct_finger_motion_tool_pose_record_menu_button.setText("Record")
+        self.load_tool_pose_path_button.setText("Load")
+        self.clear_tool_pose_path_button.setText("Clear")
+        components.apply_variant(self.clear_tool_pose_path_button, "danger")
         self.direct_finger_motion_tool_pose_record_menu_button.setMinimumWidth(0)
         self.load_tool_pose_path_button.setMinimumWidth(0)
         self.clear_tool_pose_path_button.setMinimumWidth(0)
         tool_pose_row_layout.addWidget(self.direct_finger_motion_tool_pose_record_menu_button, 1)
         tool_pose_row_layout.addWidget(self.load_tool_pose_path_button, 1)
         tool_pose_row_layout.addWidget(self.clear_tool_pose_path_button, 1)
-        rule_based_layout.addWidget(tool_pose_row)
+        tool_path_list.add_stacked("Path", tool_pose_row)
         self._build_direct_finger_motion_settings_dialog()
         self._build_console_control_settings_dialog()
         ai_proximity_row = QWidget()
@@ -4230,7 +4663,6 @@ class UI(
             self.ai_proximity_admittance_button,
             1,
         )
-        proximity_ai_layout.addWidget(ai_proximity_row)
         ai_proximity_options_row = QWidget()
         ai_proximity_options_layout = QHBoxLayout(
             ai_proximity_options_row
@@ -4246,7 +4678,6 @@ class UI(
             self.ai_proximity_sensitivity_combo
         )
         ai_proximity_options_layout.addStretch()
-        proximity_ai_layout.addWidget(ai_proximity_options_row)
         ai_proximity_model_row = QWidget()
         ai_proximity_model_layout = QHBoxLayout(ai_proximity_model_row)
         ai_proximity_model_layout.setContentsMargins(0, 0, 0, 0)
@@ -4261,52 +4692,108 @@ class UI(
         ai_proximity_model_layout.addWidget(
             self.ai_proximity_use_auto_model_button
         )
-        proximity_ai_layout.addWidget(ai_proximity_model_row)
-        proximity_ai_layout.addWidget(self.ai_proximity_detection_status)
-        tactile_ai_layout.addWidget(model_row)
-        tactile_ai_layout.addWidget(execute_safety_row)
-        tactile_ai_layout.addWidget(execute_action_row)
-        tactile_ai_layout.addWidget(self.ai_direct_execution_speed_cap_label)
-        ai_model_layout.addWidget(tactile_ai_group)
-        ai_model_layout.addWidget(proximity_ai_group)
-        ai_model_layout.addWidget(hybrid_ai_group)
+        # ── Tactile policy section ──────────────────────────────────────
+        # Execution first: it is the action you came here for. Its safety cap
+        # rides along as the row's hint rather than as a separate grey line.
+        execute_row = components.SettingsRow(
+            "Direct finger motion",
+            execute_action_row,
+            hint="Safety cap: 0.30 m/s total linear speed",
+        )
+        tactile_ai_list.add(execute_row)
+        tactile_ai_advanced_list.add(
+            components.SettingsRow("Checkpoint", model_row)
+        )
+        tactile_ai_list.add(execute_safety_row)
+        tactile_ai_advanced_list.add(
+            components.SettingsRow("Gesture recognition", threelevel_row)
+        )
+
+        # ── Proximity section ───────────────────────────────────────────
+        proximity_ai_list.add(
+            components.SettingsRow("Detection", ai_proximity_row)
+        )
+        proximity_ai_advanced_list.add_stacked("Tuning", ai_proximity_options_row)
+        proximity_ai_advanced_list.add(
+            components.SettingsRow("Checkpoint", ai_proximity_model_row)
+        )
+        proximity_ai_list.add(
+            components.SettingsRow("State", self.ai_proximity_detection_status)
+        )
+
+        self.ai_basic_controls_group = components.CollapsibleGroup(
+            "Basic controls",
+            expanded=True,
+        )
+        self.ai_basic_controls_group.add(tactile_ai_group)
+        self.ai_basic_controls_group.add(proximity_ai_group)
+        self.ai_advanced_controls_group = components.CollapsibleGroup(
+            "Advanced setup"
+        )
+        self.ai_advanced_controls_group.add(frame_group)
+        self.ai_advanced_controls_group.add(tactile_ai_advanced_group)
+        self.ai_advanced_controls_group.add(proximity_ai_advanced_group)
+        ai_model_layout.addWidget(self.ai_basic_controls_group)
+        ai_model_layout.addWidget(self.ai_advanced_controls_group)
         ai_model_layout.addStretch()
+        rule_based_page_layout.setSpacing(theme.SPACE_LG)
         rule_based_page_layout.addWidget(rule_based_group)
+        rule_based_page_layout.addWidget(console_group)
+        rule_based_page_layout.addWidget(tool_path_group)
         rule_based_page_layout.addWidget(admittance_group)
         rule_based_page_layout.addStretch()
 
-        # ─── Subtab “Data Training” ───
+        # ─── Subtab "Data" ───
         training_page = QWidget()
         training_layout = QVBoxLayout(training_page)
+        training_layout.setSpacing(theme.SPACE_LG)
 
-        self.set_no_trigger_button = QPushButton("Set No Trigger Mode")
-        training_layout.addWidget(self.set_no_trigger_button)
-        self.set_no_trigger_auto_button = QPushButton("Set No Trigger Auto Mode")
-        training_layout.addWidget(self.set_no_trigger_auto_button)
-        self.set_no_trigger_no_updatecal_auto_button = QPushButton("Set No Trigger No UpdateCal Auto Mode")
-        training_layout.addWidget(self.set_no_trigger_no_updatecal_auto_button)
-        self.set_trigger_button = QPushButton("Set Trigger Mode")
-        training_layout.addWidget(self.set_trigger_button)
-
-        first_row_layout = QHBoxLayout()
-        gesture_label = QLabel("Legacy Gesture Label:")
-        self.gesture_number_input = QLineEdit()
-        self.gesture_number_input.setMinimumWidth(160)
-        self.gesture_number_input.setToolTip(
-            "Label used only by the legacy Record button."
+        record_group, record_list = components.section(
+            "Record a dataset",
+            "Capture tactile trials for training the policy.",
         )
-        first_row_layout.addWidget(gesture_label)
-        first_row_layout.addWidget(self.gesture_number_input)
-        first_row_layout.addStretch()
-        self.record_gesture_button = QPushButton("Record")
-        training_layout.addLayout(first_row_layout)
-        training_layout.addWidget(self.record_gesture_button)
 
-        ai_dfm_session_row = QWidget()
-        ai_dfm_session_layout = QHBoxLayout(ai_dfm_session_row)
-        ai_dfm_session_layout.setContentsMargins(0, 0, 0, 0)
-        ai_dfm_session_layout.setSpacing(6)
-        ai_dfm_session_layout.addWidget(QLabel("AI-DFM Dataset Session:"))
+        # One selection instead of four "Set ... Mode" buttons: these were
+        # mutually exclusive settings of a single value, so a button each gave
+        # no way to see which one was in force.
+        trigger_mode_row = QWidget()
+        trigger_mode_layout = QHBoxLayout(trigger_mode_row)
+        trigger_mode_layout.setContentsMargins(0, 0, 0, 0)
+        trigger_mode_layout.setSpacing(6)
+        self.record_trigger_mode_combo = QComboBox()
+        for label, mode, hint in (
+            (
+                "Manual start/stop",
+                "no_trigger",
+                "Record only while you hold the Record button.",
+            ),
+            (
+                "Auto trials, recalibrate each",
+                "no_trigger_auto",
+                "Record repeated trials automatically, recalibrating the "
+                "sensor between each one.",
+            ),
+            (
+                "Auto trials, keep calibration",
+                "no_trigger_no_updatecal_auto",
+                "Record repeated trials automatically without recalibrating "
+                "between them, so a slow drift is preserved in the data.",
+            ),
+            (
+                "Start on touch",
+                "trigger",
+                "Begin each trial automatically when contact is detected.",
+            ),
+        ):
+            self.record_trigger_mode_combo.addItem(label, mode)
+            index = self.record_trigger_mode_combo.count() - 1
+            self.record_trigger_mode_combo.setItemData(
+                index, hint, Qt.ToolTipRole
+            )
+        self.record_trigger_mode_combo.setCurrentIndex(0)
+        trigger_mode_layout.addWidget(self.record_trigger_mode_combo, 1)
+        record_list.add(components.SettingsRow("Mode", trigger_mode_row))
+
         self.ai_dfm_session_input = QLineEdit()
         self.ai_dfm_session_input.setPlaceholderText(
             "Auto: ai_dfm_10x10_v1"
@@ -4315,28 +4802,34 @@ class UI(
             "Optional custom dataset session. Leave blank to group trials "
             "automatically by sensor size."
         )
-        ai_dfm_session_layout.addWidget(self.ai_dfm_session_input, 1)
-        training_layout.addWidget(ai_dfm_session_row)
+        record_list.add(
+            components.SettingsRow(
+                "Session",
+                self.ai_dfm_session_input,
+                hint="Leave blank to group trials by sensor size.",
+            )
+        )
 
         ai_dfm_record_row = QWidget()
         ai_dfm_record_row_layout = QHBoxLayout(ai_dfm_record_row)
         ai_dfm_record_row_layout.setContentsMargins(0, 0, 0, 0)
         ai_dfm_record_row_layout.setSpacing(6)
+        self.ai_direct_finger_motion_button.setText("Without robot")
+        self.ai_direct_finger_motion_robot_button.setText("With robot")
         self.ai_direct_finger_motion_button.setMinimumWidth(0)
         self.ai_direct_finger_motion_robot_button.setMinimumWidth(0)
         ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_button, 1)
         ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_robot_button, 1)
-        training_layout.addWidget(ai_dfm_record_row)
-
-        environment_record_group = QGroupBox(
-            "AI Proximity Environment Data"
+        record_list.add(
+            components.SettingsRow(
+                "Record trial",
+                ai_dfm_record_row,
+                hint="Space starts and stops recording on this page.",
+            )
         )
-        environment_record_layout = QVBoxLayout(environment_record_group)
-        environment_record_layout.setContentsMargins(10, 10, 10, 10)
-        environment_record_layout.setSpacing(6)
+
         self.ai_proximity_environment_record_button = QPushButton(
-            f"Record {self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} x "
-            "1-Minute Environment Trials"
+            f"Record {self.AI_PROXIMITY_ENVIRONMENT_TRIAL_COUNT} trials"
         )
         self.ai_proximity_environment_record_button.setCheckable(True)
         self.ai_proximity_environment_record_button.setToolTip(
@@ -4348,81 +4841,179 @@ class UI(
         )
         self.ai_proximity_environment_record_status.setWordWrap(True)
         self.ai_proximity_environment_record_status.setStyleSheet(
-            theme.MUTED_LABEL_STYLE
+            theme.type_style("caption")
         )
-        environment_record_layout.addWidget(
-            self.ai_proximity_environment_record_button
+        record_list.add(
+            components.SettingsRow(
+                "Proximity background",
+                self.ai_proximity_environment_record_button,
+                hint="Ten one-minute trials of the empty environment.",
+            )
         )
-        environment_record_layout.addWidget(
-            self.ai_proximity_environment_record_status
+        record_list.add(
+            components.SettingsRow(
+                "State", self.ai_proximity_environment_record_status
+            )
         )
-        training_layout.addWidget(environment_record_group)
 
-        self.ai_teaching_label_group = QGroupBox("AI Teaching Label")
-        teaching_grid = QGridLayout(self.ai_teaching_label_group)
-        teaching_grid.setContentsMargins(8, 8, 8, 8)
-        teaching_grid.setHorizontalSpacing(6)
-        teaching_grid.setVerticalSpacing(6)
+        # Legacy path kept but demoted behind a disclosure: it writes the old
+        # gesture-number dataset that only the original Record button reads.
+        legacy_group = components.CollapsibleGroup("Legacy gesture recording")
+        legacy_list = components.InsetList()
+        self.gesture_number_input = QLineEdit()
+        self.gesture_number_input.setToolTip(
+            "Label used only by the legacy Record button."
+        )
+        self.record_gesture_button = QPushButton("Record")
+        legacy_list.add(
+            components.SettingsRow("Gesture label", self.gesture_number_input)
+        )
+        legacy_list.add(
+            components.SettingsRow("Capture", self.record_gesture_button)
+        )
+        legacy_group.add(legacy_list)
+        record_group.layout().addWidget(legacy_group)
+
+        # ── Teaching label ─────────────────────────────────────────────
+        # Sixteen momentary buttons in one flat grid gave no clue that they
+        # fall into three kinds, so they are grouped and the axis pairs are
+        # laid out to read as pairs.
+        self.ai_teaching_label_group, teaching_list = components.section(
+            "Teaching label",
+            "Tag what the demonstration is doing while it records.",
+        )
 
         self.ai_teaching_label_buttons = {}
-        self.ai_teaching_label_status = QLabel("Teaching: Auto/DFM")
+        self.ai_teaching_label_status = QLabel("Auto/DFM")
+        self.ai_teaching_label_status.setStyleSheet(theme.type_style("caption"))
 
-        teaching_specs = [
-            ("auto", "Auto/DFM"),
-            ("stop", "Stop"),
-            ("normal_swipe", "Normal Swipe"),
-            ("push", "Push"),
-            ("pull", "Pull"),
-            ("x_pos", "X+"),
-            ("x_neg", "X-"),
-            ("y_pos", "Y+"),
-            ("y_neg", "Y-"),
-            ("z_pos", "Z+"),
-            ("z_neg", "Z-"),
-            ("rx_pos", "RX+"),
-            ("rx_neg", "RX-"),
-            ("ry_pos", "RY+"),
-            ("ry_neg", "RY-"),
-            ("rz_pos", "RZ+"),
-            ("rz_neg", "RZ-"),
+        # Each axis gets a stable row. This costs a little height, but is much
+        # easier to scan and hit during a projected or touch-led session than
+        # six equally weighted buttons in one line.
+        teaching_rows = [
+            (
+                "Behaviour",
+                [
+                    ("auto", "Auto/DFM"),
+                    ("stop", "Stop"),
+                    ("normal_swipe", "Swipe"),
+                    ("push", "Push"),
+                    ("pull", "Pull"),
+                ],
+            ),
+            (
+                "Translation X",
+                [
+                    ("x_pos", "X+"), ("x_neg", "X−"),
+                ],
+            ),
+            (
+                "Translation Y",
+                [
+                    ("y_pos", "Y+"), ("y_neg", "Y−"),
+                ],
+            ),
+            (
+                "Translation Z",
+                [
+                    ("z_pos", "Z+"), ("z_neg", "Z−"),
+                ],
+            ),
+            (
+                "Rotation RX",
+                [
+                    ("rx_pos", "RX+"), ("rx_neg", "RX−"),
+                ],
+            ),
+            (
+                "Rotation RY",
+                [
+                    ("ry_pos", "RY+"), ("ry_neg", "RY−"),
+                ],
+            ),
+            (
+                "Rotation RZ",
+                [
+                    ("rz_pos", "RZ+"), ("rz_neg", "RZ−"),
+                ],
+            ),
         ]
-        for idx, (label_key, label_text) in enumerate(teaching_specs):
-            button = QPushButton(label_text)
-            button.setCheckable(True)
-            button.setMinimumHeight(30)
-            button.setMinimumWidth(96)
-            self.ai_teaching_label_buttons[label_key] = button
-            teaching_grid.addWidget(button, idx // 4, idx % 4)
+        for row_label, specs in teaching_rows:
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(theme.SPACE_XS)
+            for label_key, label_text in specs:
+                button = QPushButton(label_text)
+                button.setCheckable(True)
+                button.setMinimumWidth(0)
+                self.ai_teaching_label_buttons[label_key] = button
+                row_layout.addWidget(button, 1)
+            teaching_list.add_stacked(row_label, row_widget)
+        teaching_list.add(
+            components.SettingsRow("Current", self.ai_teaching_label_status)
+        )
 
-        teaching_grid.addWidget(self.ai_teaching_label_status, 5, 0, 1, 4)
-        training_layout.addWidget(self.ai_teaching_label_group)
+        self.ai_data_basic_group = components.CollapsibleGroup(
+            "Basic recording",
+            expanded=True,
+        )
+        self.ai_data_basic_group.add(record_group)
+        self.ai_data_advanced_group = components.CollapsibleGroup(
+            "Advanced labels"
+        )
+        self.ai_data_advanced_group.add(self.ai_teaching_label_group)
+        training_layout.addWidget(self.ai_data_basic_group)
+        training_layout.addWidget(self.ai_data_advanced_group)
         training_layout.addStretch()
 
-        self.ai_sub_tabs.addTab(ai_model_page, "AI Model")
-        self.ai_sub_tabs.addTab(rule_based_page, "Rule Based")
+        self.ai_run_tab_index = self.ai_sub_tabs.addTab(
+            self._scrollable(ai_model_page), "Run"
+        )
         self.ai_data_training_tab_index = self.ai_sub_tabs.addTab(
-            training_page,
-            "Data Training",
+            self._scrollable(training_page),
+            "Data",
         )
         layout.addWidget(self.ai_sub_tabs)
 
-    def setup_tab4(self, layout):
-        # --- HP-200 Force Meter ---
-        force_meter_group = QGroupBox("HP-200 Force Meter")
-        force_meter_layout = QVBoxLayout(force_meter_group)
+        # The deterministic controllers live in their own Control workspace,
+        # but they share dialogs and status labels with the learned-policy
+        # controls above, so the page is built here and handed to setup_tabs.
+        self.control_page = rule_based_page
 
-        connection_grid = QGridLayout()
-        connection_grid.addWidget(QLabel("Serial port"), 0, 0)
+    def setup_tab4(self, layout):
+        layout.setSpacing(theme.SPACE_LG)
+
+        # --- HP-200 Force Meter ---
+        force_meter_group, force_meter_list = components.section(
+            "Force meter",
+            "HP-200 load cell, read over serial.",
+        )
         self.force_meter_port_combo = QComboBox()
         self.force_meter_port_combo.setSizeAdjustPolicy(
             QComboBox.AdjustToMinimumContentsLength
         )
-        self.force_meter_port_combo.setMinimumContentsLength(28)
-        connection_grid.addWidget(self.force_meter_port_combo, 0, 1)
-        self.force_meter_refresh_button = QPushButton("Refresh Ports")
-        connection_grid.addWidget(self.force_meter_refresh_button, 0, 2)
+        # Short enough that a verbose USB product string cannot widen the whole
+        # control panel; the full text stays available as the item's tooltip.
+        self.force_meter_port_combo.setMinimumContentsLength(18)
+        self.force_meter_refresh_button = components.IconButton(
+            "refresh", "Rescan serial ports"
+        )
+        port_row = QWidget()
+        port_layout = QHBoxLayout(port_row)
+        port_layout.setContentsMargins(0, 0, 0, 0)
+        port_layout.setSpacing(theme.SPACE_SM)
+        port_layout.addWidget(self.force_meter_port_combo, 1)
+        port_layout.addWidget(self.force_meter_refresh_button)
 
-        connection_grid.addWidget(QLabel("Protocol"), 1, 0)
+        self.force_meter_connect_button = QPushButton("Connect")
+        self.force_meter_connect_button.setCheckable(True)
+        connect_row = QWidget()
+        connect_layout = QHBoxLayout(connect_row)
+        connect_layout.setContentsMargins(0, 0, 0, 0)
+        connect_layout.setSpacing(theme.SPACE_SM)
+        connect_layout.addWidget(self.force_meter_connect_button)
+
         self.force_meter_protocol_combo = QComboBox()
         self.force_meter_protocol_combo.addItem(
             "HP-200 Modbus RTU (official)", "modbus_rtu"
@@ -4430,103 +5021,134 @@ class UI(
         self.force_meter_protocol_combo.addItem(
             "Legacy text stream", "text_stream"
         )
-        connection_grid.addWidget(self.force_meter_protocol_combo, 1, 1, 1, 2)
-
-        connection_grid.addWidget(QLabel("Baud rate"), 2, 0)
         self.force_meter_baud_combo = QComboBox()
         for baud_rate in (9600, 19200, 38400, 115200, 4800, 2400):
             self.force_meter_baud_combo.addItem(str(baud_rate), baud_rate)
-        connection_grid.addWidget(self.force_meter_baud_combo, 2, 1)
-        self.force_meter_connect_button = QPushButton("Connect HP-200")
-        self.force_meter_connect_button.setCheckable(True)
-        connection_grid.addWidget(self.force_meter_connect_button, 2, 2)
-        connection_grid.setColumnStretch(1, 1)
-        force_meter_layout.addLayout(connection_grid)
 
-        reading_row = QHBoxLayout()
+        # The big number first -- that is what you look at -- then the port and
+        # the connect action. Protocol and baud rate are set once per meter, so
+        # they go behind a disclosure.
         self.force_meter_value_label = QLabel("+0.0000 N")
-        self.force_meter_value_label.setAlignment(Qt.AlignCenter)
-        self.force_meter_value_label.setMinimumWidth(190)
-        self.force_meter_value_label.setStyleSheet(
-            f"color: {theme.TEXT_PRIMARY}; font-size: 24px; font-weight: 600;"
+        self.force_meter_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.force_meter_value_label.setStyleSheet(theme.readout_style("title"))
+        self.force_meter_native_label = QLabel("No sample")
+        self.force_meter_native_label.setStyleSheet(
+            theme.type_style("caption", color=theme.INFO)
         )
-        reading_row.addWidget(self.force_meter_value_label)
-
-        reading_details = QVBoxLayout()
-        self.force_meter_native_label = QLabel("Meter: no sample")
-        self.force_meter_native_label.setStyleSheet(theme.INFO_LABEL_STYLE)
         self.force_meter_stats_label = QLabel("Min -- N   Max -- N   Peak |F| -- N")
-        self.force_meter_stats_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
-        reading_details.addWidget(self.force_meter_native_label)
-        reading_details.addWidget(self.force_meter_stats_label)
-        reading_row.addLayout(reading_details, stretch=1)
-        force_meter_layout.addLayout(reading_row)
+        self.force_meter_stats_label.setStyleSheet(theme.readout_style("caption"))
+
+        force_meter_list.add(
+            components.SettingsRow("Reading", self.force_meter_value_label)
+        )
+        force_meter_list.add(
+            components.SettingsRow("Range", self.force_meter_stats_label)
+        )
+        force_meter_list.add(components.SettingsRow("Port", port_row))
+        force_meter_list.add(
+            components.SettingsRow("Connection", connect_row)
+        )
+        force_meter_list.add(
+            components.SettingsRow("Meter", self.force_meter_native_label)
+        )
+
+        force_meter_link_group = components.CollapsibleGroup("Link settings")
+        link_list = components.InsetList()
+        link_list.add(
+            components.SettingsRow("Protocol", self.force_meter_protocol_combo)
+        )
+        link_list.add(
+            components.SettingsRow("Baud rate", self.force_meter_baud_combo)
+        )
+        force_meter_link_group.add(link_list)
+        force_meter_group.layout().addWidget(force_meter_link_group)
+
+        # --- Live force graph ---
+        graph_group, graph_list = components.section("Force over time")
+        graph_header = graph_group.layout().itemAt(0).widget()
+        self.force_meter_clear_graph_button = components.IconButton(
+            "trash", "Clear the graph"
+        )
+        graph_header.add_action(self.force_meter_clear_graph_button)
 
         self.force_meter_chart = ForceMeterChartWidget(time_window_seconds=30.0)
-        force_meter_layout.addWidget(self.force_meter_chart)
+        graph_list.add(self.force_meter_chart)
 
-        graph_controls = QHBoxLayout()
-        graph_controls.addWidget(QLabel("Graph window"))
         self.force_meter_graph_window_combo = QComboBox()
         for window_seconds in (10, 30, 60, 120):
             self.force_meter_graph_window_combo.addItem(
                 f"{window_seconds} s", window_seconds
             )
         self.force_meter_graph_window_combo.setCurrentIndex(1)
-        graph_controls.addWidget(self.force_meter_graph_window_combo)
-        self.force_meter_clear_graph_button = QPushButton("Clear Graph")
-        graph_controls.addWidget(self.force_meter_clear_graph_button)
-        graph_controls.addStretch()
-        force_meter_layout.addLayout(graph_controls)
+        graph_list.add(
+            components.SettingsRow("Window", self.force_meter_graph_window_combo)
+        )
 
-        force_controls = QHBoxLayout()
-        self.force_meter_zero_button = QPushButton("Zero Display")
+        force_controls = QWidget()
+        force_controls_layout = QHBoxLayout(force_controls)
+        force_controls_layout.setContentsMargins(0, 0, 0, 0)
+        force_controls_layout.setSpacing(theme.SPACE_SM)
+        self.force_meter_zero_button = QPushButton("Zero")
         self.force_meter_zero_button.setEnabled(False)
-        self.force_meter_clear_zero_button = QPushButton("Clear Zero")
+        self.force_meter_clear_zero_button = QPushButton("Clear zero")
         self.force_meter_clear_zero_button.setEnabled(False)
-        self.force_meter_reset_stats_button = QPushButton("Reset Statistics")
-        force_controls.addWidget(self.force_meter_zero_button)
-        force_controls.addWidget(self.force_meter_clear_zero_button)
-        force_controls.addWidget(self.force_meter_reset_stats_button)
-        force_controls.addStretch()
-        force_meter_layout.addLayout(force_controls)
+        self.force_meter_reset_stats_button = QPushButton("Reset range")
+        force_controls_layout.addWidget(self.force_meter_zero_button)
+        force_controls_layout.addWidget(self.force_meter_clear_zero_button)
+        force_controls_layout.addWidget(self.force_meter_reset_stats_button)
+        graph_list.add_stacked("Calibrate", force_controls)
 
         self.force_meter_status_label = QLabel("Disconnected")
         self.force_meter_status_label.setWordWrap(True)
-        self.force_meter_status_label.setStyleSheet(theme.MUTED_LABEL_STYLE)
-        force_meter_layout.addWidget(self.force_meter_status_label)
+        self.force_meter_status_label.setStyleSheet(theme.type_style("caption"))
+        force_meter_list.add(
+            components.SettingsRow("State", self.force_meter_status_label)
+        )
+
         layout.addWidget(force_meter_group)
+        layout.addWidget(graph_group)
 
         self._refresh_force_meter_ports()
 
         # --- Gripper Manual Control ---
-        gripper_group = QGroupBox("Gripper Manual Control")
-        gripper_layout = QVBoxLayout()
+        gripper_group, gripper_list = components.section(
+            "Gripper",
+            "Two-finger gripper on the arm's tool flange.",
+        )
 
-        slider_row = QHBoxLayout()
+        slider_row = QWidget()
+        slider_layout = QHBoxLayout(slider_row)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(theme.SPACE_SM)
         self.gripper_slider = QSlider(Qt.Horizontal)
         self.gripper_slider.setRange(0, 100)
         self.gripper_slider.setValue(0)
         self.gripper_slider.setTickPosition(QSlider.TicksBelow)
         self.gripper_slider.setTickInterval(10)
+        self.gripper_slider.setMinimumWidth(140)
 
         self.gripper_label = QLabel("0.00 (Open)")
-        self.gripper_label.setFixedWidth(80)
+        self.gripper_label.setFixedWidth(88)
+        self.gripper_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.gripper_label.setStyleSheet(theme.readout_style())
 
-        slider_row.addWidget(QLabel("Open"))
-        slider_row.addWidget(self.gripper_slider)
-        slider_row.addWidget(QLabel("Closed"))
-        slider_row.addWidget(self.gripper_label)
+        slider_layout.addWidget(self.gripper_slider, 1)
+        slider_layout.addWidget(self.gripper_label)
+        gripper_list.add(
+            components.SettingsRow(
+                "Aperture", slider_row, hint="0 is fully open."
+            )
+        )
 
-        btn_row = QHBoxLayout()
-        self.btn_grip_open = QPushButton("Fully Open")
-        self.btn_grip_close = QPushButton("Fully Close")
-        btn_row.addWidget(self.btn_grip_open)
-        btn_row.addWidget(self.btn_grip_close)
-
-        gripper_layout.addLayout(slider_row)
-        gripper_layout.addLayout(btn_row)
-        gripper_group.setLayout(gripper_layout)
+        btn_row = QWidget()
+        btn_layout = QHBoxLayout(btn_row)
+        btn_layout.setContentsMargins(0, 0, 0, 0)
+        btn_layout.setSpacing(theme.SPACE_SM)
+        self.btn_grip_open = QPushButton("Open")
+        self.btn_grip_close = QPushButton("Close")
+        btn_layout.addWidget(self.btn_grip_open)
+        btn_layout.addWidget(self.btn_grip_close)
+        gripper_list.add(components.SettingsRow("Fully", btn_row))
         layout.addWidget(gripper_group)
 
         # Connections
@@ -4536,19 +5158,28 @@ class UI(
         self.btn_grip_close.clicked.connect(lambda: self.set_gripper_manual(100))
 
         # --- AI Camera Section ---
-        camera_group = QGroupBox("AI Camera")
-        camera_layout = QVBoxLayout()
-        self.live_yolo_button = QPushButton("Start Live Object Detection")
+        camera_group, camera_list = components.section(
+            "Camera",
+            "YOLO object detection from the wrist camera.",
+        )
+        self.live_yolo_button = QPushButton("Start")
         self.live_yolo_button.clicked.connect(self.toggle_yolo_camera)
 
-        self.auto_center_button = QPushButton("Auto-Center on object")
+        self.auto_center_button = QPushButton("Enable")
         self.auto_center_button.setCheckable(True)
         self.auto_center_button.setEnabled(False)
         self.auto_center_button.clicked.connect(self.toggle_centering_mode)
 
-        camera_layout.addWidget(self.live_yolo_button)
-        camera_layout.addWidget(self.auto_center_button)
-        camera_group.setLayout(camera_layout)
+        camera_list.add(
+            components.SettingsRow("Object detection", self.live_yolo_button)
+        )
+        camera_list.add(
+            components.SettingsRow(
+                "Auto-centre",
+                self.auto_center_button,
+                hint="Move the arm to keep the detected object centred.",
+            )
+        )
         layout.addWidget(camera_group)
         layout.addStretch()
 
@@ -4566,33 +5197,58 @@ class UI(
         hand_motion_layout.setContentsMargins(0, 0, 0, 0)
         hand_motion_layout.setSpacing(8)
 
-        self.hand_state_label = QLabel("RH56F1 status: idle")
-        hand_monitor_layout.addWidget(self.hand_state_label)
+        hand_group, hand_list = components.section(
+            "Hand",
+            "RH56F1 connection and the 3D model used for visualization.",
+        )
+        self.hand_state_label = QLabel("Idle")
+        self.hand_state_label.setWordWrap(True)
+        self.hand_state_label.setStyleSheet(theme.type_style("caption"))
+        self.hand_connection_label = QLabel(
+            "Offline · start the RH56F1 ROS nodes"
+        )
+        self.hand_connection_label.setWordWrap(True)
+        self.hand_connection_label.setStyleSheet(theme.type_style("caption"))
+        hand_list.add(
+            components.SettingsRow("Connection", self.hand_connection_label)
+        )
+        hand_list.add(
+            components.SettingsRow("Activity", self.hand_state_label)
+        )
 
-        model_group = QGroupBox("3D Hand Model")
-        model_layout = QHBoxLayout(model_group)
-        self.hand_model_show_button = QPushButton("Import 3D Hand Model")
-        model_layout.addWidget(self.hand_model_show_button)
-        self.hand_model_status_label = QLabel("resource/dexterous_hand")
-        self.hand_model_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        model_layout.addWidget(self.hand_model_status_label, stretch=1)
-        hand_monitor_layout.addWidget(model_group)
+        self.hand_model_show_button = QPushButton("Import")
+        # Path length is not ours to control, so it elides rather than forcing
+        # the panel wider.
+        self.hand_model_status_label = components.ElidedLabel(
+            "resource/dexterous_hand"
+        )
+        self.hand_model_status_label.setStyleSheet(theme.type_style("caption"))
+        model_row = components.SettingsRow(
+            "3D model", self.hand_model_show_button
+        )
+        model_row.set_hint("resource/dexterous_hand")
+        hand_list.add(model_row)
 
-        tactile_group = QGroupBox("Tactile Sensor Readout")
-        tactile_layout = QVBoxLayout(tactile_group)
-
-        tactile_control_row = QHBoxLayout()
-        self.hand_tactile_live_button = QPushButton("Start Live Tactile")
+        # Live-tactile controls belong in the section header, beside the title
+        # they act on, rather than as another row of full-width buttons.
+        tactile_group, tactile_list = components.section(
+            "Tactile readout",
+            "Per-region normal and tangential force from the hand's fingertips.",
+        )
+        tactile_header = tactile_group.layout().itemAt(0).widget()
+        self.hand_tactile_live_button = QPushButton("Start Live")
         self.hand_tactile_live_button.setCheckable(True)
-        tactile_control_row.addWidget(self.hand_tactile_live_button)
-
-        self.hand_tactile_refresh_button = QPushButton("Refresh Display")
-        tactile_control_row.addWidget(self.hand_tactile_refresh_button)
+        self.hand_tactile_live_button.setToolTip(
+            "Stream /touch_data continuously into the table below."
+        )
+        tactile_header.add_action(self.hand_tactile_live_button)
+        self.hand_tactile_refresh_button = components.IconButton(
+            "refresh", "Read /touch_data once and update the table"
+        )
+        tactile_header.add_action(self.hand_tactile_refresh_button)
 
         self.hand_tactile_status_label = QLabel("No tactile data")
-        self.hand_tactile_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        tactile_control_row.addWidget(self.hand_tactile_status_label, stretch=1)
-        tactile_layout.addLayout(tactile_control_row)
+        self.hand_tactile_status_label.setStyleSheet(theme.type_style("caption"))
 
         self.hand_tactile_table = QTableWidget(8, 5)
         self.hand_tactile_table.setHorizontalHeaderLabels(
@@ -4601,7 +5257,6 @@ class UI(
         self.hand_tactile_table.verticalHeader().hide()
         self.hand_tactile_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.hand_tactile_table.setSelectionMode(QTableWidget.NoSelection)
-        self.hand_tactile_table.setMinimumHeight(245)
         header = self.hand_tactile_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         for col in range(1, 5):
@@ -4623,8 +5278,29 @@ class UI(
                 item = QTableWidgetItem("--")
                 item.setTextAlignment(Qt.AlignCenter)
                 self.hand_tactile_table.setItem(row, col, item)
+        components.fit_table_height(
+            self.hand_tactile_table, len(self._hand_tactile_region_names)
+        )
 
-        tactile_layout.addWidget(self.hand_tactile_table)
+        # A grid of "--" reads as broken hardware. When nothing is publishing,
+        # say so instead.
+        self.hand_tactile_stack = components.EmptyStateStack(
+            self.hand_tactile_table,
+            components.EmptyState(
+                "No tactile data",
+                glyph="hand",
+                hint="Start the hand's tactile node, then press Start Live.",
+            ),
+        )
+        tactile_list.add(self.hand_tactile_stack)
+        # Hidden while the empty state is up, which already carries the reason;
+        # once frames flow this reports the topic state instead.
+        self.hand_tactile_stream_row = tactile_list.add(
+            components.SettingsRow("Stream", self.hand_tactile_status_label)
+        )
+        self.hand_tactile_stream_row.setVisible(False)
+
+        hand_monitor_layout.addWidget(hand_group)
         hand_monitor_layout.addWidget(tactile_group)
         hand_monitor_layout.addStretch()
 
@@ -4632,50 +5308,72 @@ class UI(
         self.hand_tactile_timer.setInterval(100)
         self.hand_tactile_timer.timeout.connect(self._refresh_hand_tactile_display)
 
-        speed_force_group = QGroupBox("Global Speed / Force")
-        sf_layout = QGridLayout(speed_force_group)
-        sf_layout.addWidget(QLabel("Speed (all):"), 0, 0)
+        # Three sections instead of five bordered groups: what the whole hand
+        # does, where the individual fingers go, and saved poses.
+        motion_group, motion_list = components.section(
+            "Whole hand",
+            "Applies to all six actuators at once.",
+        )
+
+        speed_row_widget = QWidget()
+        speed_row = QHBoxLayout(speed_row_widget)
+        speed_row.setContentsMargins(0, 0, 0, 0)
+        speed_row.setSpacing(theme.SPACE_SM)
         self.hand_speed_spin = QSpinBox()
         self.hand_speed_spin.setRange(0, 3000)
         self.hand_speed_spin.setValue(300)
-        sf_layout.addWidget(self.hand_speed_spin, 0, 1)
-        self.hand_apply_speed_button = QPushButton("Apply Speed")
-        sf_layout.addWidget(self.hand_apply_speed_button, 0, 2)
-        sf_layout.addWidget(QLabel("Force (all):"), 1, 0)
+        self.hand_apply_speed_button = QPushButton("Apply")
+        speed_row.addWidget(self.hand_speed_spin)
+        speed_row.addWidget(self.hand_apply_speed_button)
+        motion_list.add(components.SettingsRow("Speed", speed_row_widget))
+
+        force_row_widget = QWidget()
+        force_row = QHBoxLayout(force_row_widget)
+        force_row.setContentsMargins(0, 0, 0, 0)
+        force_row.setSpacing(theme.SPACE_SM)
         self.hand_force_spin = QSpinBox()
         self.hand_force_spin.setRange(0, 12000)
         self.hand_force_spin.setValue(2000)
-        sf_layout.addWidget(self.hand_force_spin, 1, 1)
-        self.hand_apply_force_button = QPushButton("Apply Force")
-        sf_layout.addWidget(self.hand_apply_force_button, 1, 2)
-        hand_motion_layout.addWidget(speed_force_group)
+        self.hand_apply_force_button = QPushButton("Apply")
+        force_row.addWidget(self.hand_force_spin)
+        force_row.addWidget(self.hand_apply_force_button)
+        motion_list.add(components.SettingsRow("Force", force_row_widget))
 
-        open_close_group = QGroupBox("Quick Actions")
-        oc_layout = QHBoxLayout(open_close_group)
-        self.hand_open_all_button = QPushButton("Open All")
-        self.hand_close_all_button = QPushButton("Close All")
-        self.hand_read_angles_button = QPushButton("Read Actual Angles")
-        oc_layout.addWidget(self.hand_open_all_button)
-        oc_layout.addWidget(self.hand_close_all_button)
-        oc_layout.addWidget(self.hand_read_angles_button)
-        hand_motion_layout.addWidget(open_close_group)
+        grip_row_widget = QWidget()
+        grip_row = QHBoxLayout(grip_row_widget)
+        grip_row.setContentsMargins(0, 0, 0, 0)
+        grip_row.setSpacing(theme.SPACE_SM)
+        self.hand_open_all_button = QPushButton("Open")
+        self.hand_close_all_button = QPushButton("Close")
+        self.hand_read_angles_button = QPushButton("Read angles")
+        grip_row.addWidget(self.hand_open_all_button)
+        grip_row.addWidget(self.hand_close_all_button)
+        grip_row.addWidget(self.hand_read_angles_button)
+        motion_list.add(components.SettingsRow("Grip", grip_row_widget))
 
-        thumb_group = QGroupBox("Thumb Rotation Presets")
-        thumb_layout = QHBoxLayout(thumb_group)
-        self.hand_thumb_left_button = QPushButton("Thumb Left")
-        self.hand_thumb_center_button = QPushButton("Thumb Center")
-        self.hand_thumb_right_button = QPushButton("Thumb Right")
-        thumb_layout.addWidget(self.hand_thumb_left_button)
-        thumb_layout.addWidget(self.hand_thumb_center_button)
-        thumb_layout.addWidget(self.hand_thumb_right_button)
-        hand_motion_layout.addWidget(thumb_group)
+        thumb_row_widget = QWidget()
+        thumb_row = QHBoxLayout(thumb_row_widget)
+        thumb_row.setContentsMargins(0, 0, 0, 0)
+        thumb_row.setSpacing(theme.SPACE_SM)
+        self.hand_thumb_left_button = QPushButton("Left")
+        self.hand_thumb_center_button = QPushButton("Center")
+        self.hand_thumb_right_button = QPushButton("Right")
+        thumb_row.addWidget(self.hand_thumb_left_button)
+        thumb_row.addWidget(self.hand_thumb_center_button)
+        thumb_row.addWidget(self.hand_thumb_right_button)
+        motion_list.add(
+            components.SettingsRow("Thumb rotation", thumb_row_widget)
+        )
+        hand_motion_layout.addWidget(motion_group)
 
         # Per-finger sliders. Drag a slider to set the target angle; the
         # right-most "Send" button sends just that finger (others left
         # untouched). Range is tuned per actuator so the usable open/close
         # range falls in the middle of the slider.
-        slider_group = QGroupBox("Finger Position Sliders")
-        slider_outer = QVBoxLayout(slider_group)
+        slider_group, slider_list = components.section(
+            "Finger positions",
+            "Drag to set a target angle, then send that finger or all six.",
+        )
 
         # name, angle index, slider min, slider max, default open/close hints
         self._hand_slider_specs = [
@@ -4694,37 +5392,44 @@ class UI(
         self._hand_angle_open_values = []
         self._hand_angle_close_values = []
 
-        sliders_grid = QGridLayout()
-        sliders_grid.setHorizontalSpacing(8)
-        sliders_grid.setVerticalSpacing(4)
-        for row, (name, idx, lo, hi, open_v, close_v) in enumerate(
-            self._hand_slider_specs
-        ):
-            name_label = QLabel(f"{name}\n(angle{idx})")
-            name_label.setMinimumWidth(110)
-
+        for name, idx, lo, hi, open_v, close_v in self._hand_slider_specs:
             slider = QSlider(Qt.Horizontal)
             slider.setRange(int(lo), int(hi))
             slider.setSingleStep(1)
             slider.setPageStep(max(10, (hi - lo) // 20))
             slider.setValue(int(open_v))
             slider.setTracking(True)
+            slider.setMinimumWidth(120)
 
+            # Fixed-width figures: this tracks the slider as you drag, and a
+            # proportional font would shuffle the send button sideways.
             value_label = QLabel(str(int(open_v)))
-            value_label.setMinimumWidth(48)
+            value_label.setMinimumWidth(44)
             value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            value_label.setStyleSheet(theme.readout_style())
 
+            # Labelled, not an icon: a paper-plane glyph does not say "send
+            # this one actuator", and in a list the repeated word forms a
+            # readable column -- the same shape as the Read column in
+            # Diagnostics. All six share a column, so it costs width once.
             send_btn = QPushButton("Send")
-            send_btn.setFixedWidth(56)
+            send_btn.setMinimumWidth(64)
             send_btn.setToolTip(
-                f"Send angle{idx}={slider.value()} only; the other five\n"
-                f"actuators stay where they are."
+                f"Send angle{idx} only; the other five actuators stay where "
+                f"they are."
             )
 
-            sliders_grid.addWidget(name_label, row, 0)
-            sliders_grid.addWidget(slider, row, 1)
-            sliders_grid.addWidget(value_label, row, 2)
-            sliders_grid.addWidget(send_btn, row, 3)
+            control = QWidget()
+            control_row = QHBoxLayout(control)
+            control_row.setContentsMargins(0, 0, 0, 0)
+            control_row.setSpacing(theme.SPACE_SM)
+            control_row.addWidget(slider, 1)
+            control_row.addWidget(value_label)
+            control_row.addWidget(send_btn)
+            # angle index as the hint, so the label stays plain language.
+            slider_list.add(
+                components.SettingsRow(name, control, hint=f"angle{idx}")
+            )
 
             self.hand_angle_sliders.append(slider)
             self._hand_angle_value_labels.append(value_label)
@@ -4732,10 +5437,16 @@ class UI(
             self._hand_angle_open_values.append(int(open_v))
             self._hand_angle_close_values.append(int(close_v))
 
-        slider_outer.addLayout(sliders_grid)
-
-        # Action / quick preset row.
-        bottom_row = QHBoxLayout()
+        # Preset and send actions as two rows of the same list, so they read as
+        # belonging to the sliders above rather than as loose buttons.
+        preset_row_widget = QWidget()
+        preset_row = QHBoxLayout(preset_row_widget)
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(theme.SPACE_SM)
+        bottom_row_widget = QWidget()
+        bottom_row = QHBoxLayout(bottom_row_widget)
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(theme.SPACE_SM)
         self.hand_sliders_live_check = QCheckBox("Live update (drag to send)")
         self.hand_sliders_live_check.setToolTip(
             "When enabled, first synchronize all sliders from the hand's\n"
@@ -4749,41 +5460,42 @@ class UI(
             "Snap all six sliders to their suggested OPEN position. Does not\n"
             "send anything until you press 'Send All'."
         )
-        bottom_row.addWidget(self.hand_sliders_load_open_button)
+        preset_row.addWidget(self.hand_sliders_load_open_button)
 
         self.hand_sliders_load_close_button = QPushButton("Load Close")
         self.hand_sliders_load_close_button.setToolTip(
             "Snap all six sliders to their suggested CLOSE position. Does\n"
             "not send anything until you press 'Send All'."
         )
-        bottom_row.addWidget(self.hand_sliders_load_close_button)
+        preset_row.addWidget(self.hand_sliders_load_close_button)
 
         self.hand_sliders_sync_button = QPushButton("Sync From Actual")
         self.hand_sliders_sync_button.setToolTip(
             "Read /Getangleact and set every slider to the live actual\n"
             "angle. Useful when starting from an unknown pose."
         )
-        bottom_row.addWidget(self.hand_sliders_sync_button)
+        preset_row.addWidget(self.hand_sliders_sync_button)
+        preset_row.addStretch(1)
 
         bottom_row.addStretch(1)
 
         self.hand_send_custom_angles_button = QPushButton("Send All")
-        self.hand_send_custom_angles_button.setStyleSheet(
-            "QPushButton { font-weight: bold; padding: 4px 12px; }"
-        )
+        components.apply_variant(self.hand_send_custom_angles_button, "primary")
         self.hand_send_custom_angles_button.setToolTip(
             "Send the current value of all six sliders in one go."
         )
         bottom_row.addWidget(self.hand_send_custom_angles_button)
 
-        slider_outer.addLayout(bottom_row)
+        slider_list.add_stacked("Presets", preset_row_widget)
+        slider_list.add(bottom_row_widget)
         hand_motion_layout.addWidget(slider_group)
 
-        pose_group = QGroupBox("Saved Finger Poses")
-        pose_layout = QVBoxLayout(pose_group)
+        pose_group, pose_list = components.section("Saved poses")
 
-        pose_selection_row = QHBoxLayout()
-        pose_selection_row.addWidget(QLabel("Pose:"))
+        pose_selection_widget = QWidget()
+        pose_selection_row = QHBoxLayout(pose_selection_widget)
+        pose_selection_row.setContentsMargins(0, 0, 0, 0)
+        pose_selection_row.setSpacing(theme.SPACE_SM)
         self.hand_pose_preset_combo = QComboBox()
         self.hand_pose_preset_combo.setEditable(True)
         self.hand_pose_preset_combo.setInsertPolicy(QComboBox.NoInsert)
@@ -4803,9 +5515,12 @@ class UI(
             "Save all six current slider values under the selected name."
         )
         pose_selection_row.addWidget(self.hand_pose_save_button)
-        pose_layout.addLayout(pose_selection_row)
+        pose_list.add(components.SettingsRow("Pose", pose_selection_widget))
 
-        pose_action_row = QHBoxLayout()
+        pose_action_widget = QWidget()
+        pose_action_row = QHBoxLayout(pose_action_widget)
+        pose_action_row.setContentsMargins(0, 0, 0, 0)
+        pose_action_row.setSpacing(theme.SPACE_SM)
         self.hand_pose_load_button = QPushButton("Load")
         self.hand_pose_load_button.setToolTip(
             "Load the saved values into the sliders without moving the hand."
@@ -4819,20 +5534,29 @@ class UI(
         pose_action_row.addWidget(self.hand_pose_load_send_button)
 
         self.hand_pose_delete_button = QPushButton("Delete")
+        components.apply_variant(self.hand_pose_delete_button, "danger")
         self.hand_pose_delete_button.setToolTip("Delete the selected saved pose.")
         pose_action_row.addWidget(self.hand_pose_delete_button)
 
+        pose_action_row.addStretch(1)
+        pose_list.add(pose_action_widget)
+
         self.hand_pose_status_label = QLabel("No saved poses")
-        self.hand_pose_status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        pose_action_row.addWidget(self.hand_pose_status_label, stretch=1)
-        pose_layout.addLayout(pose_action_row)
+        self.hand_pose_status_label.setStyleSheet(theme.type_style("caption"))
+        pose_list.add(
+            components.SettingsRow("Stored", self.hand_pose_status_label)
+        )
 
         hand_motion_layout.addWidget(pose_group)
         self._load_hand_pose_presets()
         hand_motion_layout.addStretch()
 
-        self.hand_sub_tabs.addTab(hand_monitor_page, "Tactile / Model")
-        self.hand_sub_tabs.addTab(hand_motion_page, "Motion Controls")
+        self.hand_sub_tabs.addTab(
+            self._scrollable(hand_monitor_page), "Tactile / Model"
+        )
+        self.hand_sub_tabs.addTab(
+            self._scrollable(hand_motion_page), "Motion Controls"
+        )
         layout.addWidget(self.hand_sub_tabs)
 
     def _set_button_active(self, btn: QPushButton, active: bool):
@@ -4859,7 +5583,7 @@ class UI(
         t = col("t_sec")
         dialog = QDialog(self)
         dialog.setWindowTitle("Proximity Recording Viewer")
-        dialog.resize(920, 720)
+        components.size_to_screen(dialog, 920, 720)
         layout = QVBoxLayout(dialog)
         tabs = QTabWidget(dialog)
         layout.addWidget(tabs)
