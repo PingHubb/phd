@@ -6,10 +6,11 @@ reports the real value after the stylesheet has been applied. The duplication
 is the point of failure, so it is pinned here.
 """
 
+import inspect
 import re
 from pathlib import Path
 
-from phd.ui import theme
+from phd.ui import components, theme
 
 QSS = (
     Path(__file__).resolve().parents[1]
@@ -19,6 +20,13 @@ QSS = (
 
 def _qss():
     return QSS.read_text()
+
+
+def test_collapsible_groups_start_expanded():
+    default = inspect.signature(components.CollapsibleGroup).parameters[
+        "expanded"
+    ].default
+    assert default is True
 
 
 def test_list_item_padding_token_matches_the_stylesheet():

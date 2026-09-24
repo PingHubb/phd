@@ -414,6 +414,22 @@ class NullMeshLab:
         return None
 
 
+class _DeferredPlotter:
+    """Stand-in for the hidden mesh view until something actually draws it.
+
+    Creating a second VTK window during startup costs a few tenths of a
+    second and the widget stays hidden. The real interactor is built on the
+    first attribute access.
+    """
+
+    def __init__(self, owner):
+        self._owner = owner
+
+    def __getattr__(self, name):
+        plotter = self._owner._ensure_secondary_plotter()
+        return getattr(plotter, name)
+
+
 class PlotterWidget(QWidget):
     filesDropped = pyqtSignal(list)
 
@@ -1374,13 +1390,89 @@ class _MainControlPanelSplitterHandle(QSplitterHandle):
 
 
 class _WidthFittingScrollArea(QScrollArea):
-    """Scroll area that reports its page's natural width as its own.
+    """Scroll area that keeps a dense page readable in a short panel.
 
     A plain QScrollArea advertises a small fixed width hint regardless of what
     it contains, which would let the control panel be sized narrower than its
-    widest control row and clip the labels at the right edge. Height is left
-    alone -- vertical scrolling is the whole point of the wrapper.
+    widest control row and clip the labels at the right edge.
+
+    Height is the other half of the same problem. With ``widgetResizable``
+    set, Qt shrinks the page down to its *minimum* size, not its natural
+    size. A list or table whose minimum is well below its size hint is then
+    crushed, and no scrollbar appears. The page is pinned to its layout's
+    size hint instead, so a short window scrolls.
     """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._locking_content_height = False
+        self._lock_serial = 0
+        self._watched = set()
+
+    def setWidget(self, widget):  # noqa: N802 - Qt override
+        super().setWidget(widget)
+        self._watch(widget)
+        self._lock_content_height()
+
+    def _watch(self, obj):
+        """Listen for show, hide and relayout anywhere inside the page.
+
+        Closing a disclosure updates a child layout, not the page itself.
+        The page's own layout hint only drops on that later child event.
+        """
+        if obj is None or obj in self._watched:
+            return
+        self._watched.add(obj)
+        obj.installEventFilter(self)
+        for child in obj.findChildren(QtCore.QObject):
+            if child not in self._watched:
+                self._watched.add(child)
+                child.installEventFilter(self)
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt override
+        event_type = event.type()
+        if event_type == QtCore.QEvent.ChildAdded:
+            self._watch(event.child())
+        elif event_type in (
+            QtCore.QEvent.LayoutRequest,
+            QtCore.QEvent.Show,
+            QtCore.QEvent.Hide,
+        ):
+            # Only the latest request is applied. Earlier ones still see the
+            # pre-collapse height.
+            self._schedule_content_height_lock()
+        return super().eventFilter(watched, event)
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._lock_content_height()
+
+    def _schedule_content_height_lock(self):
+        self._lock_serial += 1
+        serial = self._lock_serial
+        QTimer.singleShot(0, lambda serial=serial: self._apply_scheduled_content_height_lock(serial))
+
+    def _apply_scheduled_content_height_lock(self, serial):
+        if serial != self._lock_serial:
+            return
+        self._lock_content_height()
+
+    def _lock_content_height(self):
+        """Stop the page being squeezed shorter than its own content."""
+        page = self.widget()
+        if page is None or self._locking_content_height:
+            return
+        layout = page.layout()
+        if layout is None:
+            return
+        needed = int(layout.sizeHint().height())
+        if needed <= 0 or page.minimumHeight() == needed:
+            return
+        self._locking_content_height = True
+        try:
+            page.setMinimumHeight(needed)
+        finally:
+            self._locking_content_height = False
 
     def sizeHint(self):
         hint = super().sizeHint()
@@ -1832,9 +1924,9 @@ class UI(
         self.widget_plotter = PlotterWidget()
         layout_plotter = QGridLayout(self.widget_plotter)
         layout_plotter.setContentsMargins(0, 0, 0, 0)
-        self.plotter = QtInteractor(self.widget_plotter)
-        self.plotter.background_color = theme.VIEWPORT_BG
-        layout_plotter.addWidget(self.plotter.interactor)
+        # The mesh-lab view stays hidden. Build its VTK window on first use.
+        self._secondary_plotter = None
+        self.plotter = _DeferredPlotter(self)
         self.widget_plotter.setVisible(False)
 
         self.widget_plotter_2 = PlotterWidget()
@@ -1903,6 +1995,21 @@ class UI(
         )
         self._sync_main_control_panel_handle()
 
+    def _ensure_secondary_plotter(self):
+        """Create the hidden mesh-lab view the first time it is drawn into."""
+        plotter = getattr(self, "_secondary_plotter", None)
+        if plotter is not None:
+            return plotter
+        plotter = QtInteractor(self.widget_plotter)
+        plotter.background_color = theme.VIEWPORT_BG
+        self.widget_plotter.layout().addWidget(plotter.interactor)
+        self._secondary_plotter = plotter
+        mesh = getattr(self, "mesh_functions", None)
+        attach = getattr(mesh, "attach_secondary_plotter", None)
+        if callable(attach):
+            attach(plotter)
+        return plotter
+
     def resizeEvent(self, event):
         """Keep the control panel at its content width as the window resizes.
 
@@ -1957,9 +2064,9 @@ class UI(
     def _scrollable(page: QWidget) -> QScrollArea:
         """Wrap a dense control page so it scrolls instead of crushing its rows.
 
-        Several pages contain widgets with a large minimum height (the force
-        meter chart, the tactile tables). Without this, a short window makes Qt
-        squeeze the column past its minimum and rows visibly overlap.
+        Sensor, AI and Hand use this on each sub-page, same as Control, Tools
+        and TM Robot. The wrapper keeps the page at its natural height, so a
+        short window scrolls instead of squeezing lists and tables together.
         """
         area = _WidthFittingScrollArea()
         area.setWidgetResizable(True)
@@ -2017,18 +2124,34 @@ class UI(
         robots_layout.addWidget(self.robots_sub_tabs)
         self.robots_tab_index = self.tab_widget.addTab(robots_tab, "Robots")
 
-        # Tabs 3 and 4: Control, then AI. setup_tab3 builds both pages -- the
-        # deterministic controllers and the learned-policy controls share
-        # dialogs and status labels -- and leaves the Control page on
-        # self.control_page for us to mount as its own workspace. Control
-        # comes first because it is what you reach for before a policy runs.
-        tab3 = QWidget()
-        tab3_layout = QVBoxLayout(tab3)
-        self.setup_tab3(tab3_layout)
-        self.control_tab_index = self.tab_widget.addTab(
-            self._scrollable(self.control_page), "Control"
+        # Control and AI are placeholders until opened. Both pages are dense
+        # forms, and the session starts on Sensor.
+        self._control_workspace_ready = False
+        self._control_workspace_building = False
+        self._control_host = QWidget()
+        self._control_host_layout = QVBoxLayout(self._control_host)
+        self._control_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._control_placeholder = components.EmptyState(
+            "Control tools are not loaded yet",
+            glyph="sliders",
+            hint="Opening this workspace prepares the tactile controllers.",
         )
-        self.ai_tab_index = self.tab_widget.addTab(tab3, "AI")
+        self._control_host_layout.addWidget(self._control_placeholder)
+        self.control_tab_index = self.tab_widget.addTab(
+            self._control_host, "Control"
+        )
+        self._ai_workspace_ready = False
+        self._ai_workspace_building = False
+        self._ai_host = QWidget()
+        self._ai_host_layout = QVBoxLayout(self._ai_host)
+        self._ai_host_layout.setContentsMargins(0, 0, 0, 0)
+        self._ai_placeholder = components.EmptyState(
+            "AI controls are not loaded yet",
+            glyph="ai",
+            hint="Opening this workspace prepares the learned-policy controls.",
+        )
+        self._ai_host_layout.addWidget(self._ai_placeholder)
+        self.ai_tab_index = self.tab_widget.addTab(self._ai_host, "AI")
 
         # Tab 4: Dexterous Hand
         tab4 = QWidget()
@@ -2067,6 +2190,10 @@ class UI(
         QTimer.singleShot(0, self._ensure_humanoid_viewer)
 
     def _on_main_tab_changed(self, index):
+        if int(index) == int(getattr(self, "control_tab_index", -1)):
+            QTimer.singleShot(0, self._ensure_control_workspace)
+        if int(index) == int(getattr(self, "ai_tab_index", -1)):
+            QTimer.singleShot(0, self._ensure_ai_workspace)
         if int(index) != int(getattr(self, "robots_tab_index", -1)):
             self._release_humanoid_viewport()
             return
@@ -2074,6 +2201,71 @@ class UI(
             getattr(self, "humanoid_tab_index", -1)
         ):
             QTimer.singleShot(0, self._ensure_humanoid_viewer)
+
+    def _ensure_control_workspace(self):
+        """Build the Control page the first time it is shown."""
+        if getattr(self, "_control_workspace_ready", False):
+            return
+        if getattr(self, "_control_workspace_building", False):
+            return
+        self._control_workspace_building = True
+        try:
+            self._build_control_workspace()
+            placeholder = self._control_placeholder
+            self._control_host_layout.removeWidget(placeholder)
+            placeholder.hide()
+            placeholder.deleteLater()
+            self._control_host_layout.addWidget(
+                self._scrollable(self.control_page)
+            )
+            connect_control = getattr(self, "_connect_control_workspace", None)
+            if callable(connect_control):
+                connect_control()
+            if hasattr(self, "_set_button_active"):
+                self._set_button_active(self.direct_finger_motion_button, False)
+                self._set_button_active(self.console_control_button, False)
+                self._set_button_active(self.console_control_sensor_button, False)
+                self._set_button_active(
+                    self.console_control_sensor_v2_button, False
+                )
+                self.admittance_control_button.setChecked(False)
+                self._set_button_active(self.admittance_control_button, False)
+            self._control_workspace_ready = True
+            if hasattr(self, "_fit_main_control_panel"):
+                self._fit_main_control_panel()
+        finally:
+            self._control_workspace_building = False
+
+    def _ensure_ai_workspace(self):
+        """Build the learned-policy page the first time it is shown."""
+        if getattr(self, "_ai_workspace_ready", False):
+            return
+        if getattr(self, "_ai_workspace_building", False):
+            return
+        self._ai_workspace_building = True
+        try:
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(0, 0, 0, 0)
+            self.setup_tab3(layout)
+            placeholder = self._ai_placeholder
+            self._ai_host_layout.removeWidget(placeholder)
+            placeholder.hide()
+            placeholder.deleteLater()
+            self._ai_host_layout.addWidget(page)
+            connect_ai = getattr(self, "_connect_ai_workspace", None)
+            if callable(connect_ai):
+                connect_ai()
+            sync_buttons = getattr(self, "_apply_ai_toggle_buttons", None)
+            if callable(sync_buttons):
+                sync_buttons()
+            if getattr(self, "ai_sub_tabs", None) is not None:
+                components.segmented(self.ai_sub_tabs)
+            self._ai_workspace_ready = True
+            if hasattr(self, "_fit_main_control_panel"):
+                self._fit_main_control_panel()
+        finally:
+            self._ai_workspace_building = False
 
     def _ensure_humanoid_viewer(self):
         if self._is_shutting_down:
@@ -4162,6 +4354,124 @@ class UI(
         # Keep the groups at their natural height at the top of the page.
         layout.addStretch(1)
 
+    def _build_control_workspace(self):
+        """Build the deterministic Control page. AI stays deferred."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        self.proximity_control_button = QPushButton("Follow")
+        self.proximity_record_button = QPushButton("Record data")
+        self.direct_finger_motion_button = QPushButton("Start")
+        self.console_control_button = QPushButton("PS5")
+        self.console_control_sensor_button = QPushButton("Sensor")
+        self.console_control_sensor_v2_button = QPushButton("Sensor V2")
+        self.direct_finger_motion_tool_pose_record_menu_button = QPushButton("Record")
+        self.load_tool_pose_path_button = QPushButton("Load")
+        self.clear_tool_pose_path_button = QPushButton("Clear")
+        self.console_control_button.setToolTip("Console Control (PS5)")
+        self.console_control_sensor_button.setToolTip("Console Control (Sensor)")
+        self.console_control_sensor_v2_button.setToolTip(
+            "Console Control (Sensor V2)"
+        )
+        components.apply_variant(self.clear_tool_pose_path_button, "danger")
+
+        rule_based_group, rule_based_list = components.section(
+            "Tactile motion",
+            "Deterministic controllers driven straight from the sensor.",
+        )
+        console_group, console_list = components.section(
+            "Controller input",
+            "Drive the arm from a gamepad or from the sensor itself.",
+        )
+        tool_path_group, tool_path_list = components.section(
+            "Tool path",
+            "Record and review where the tool actually travelled.",
+        )
+        admittance_group, admittance_list = components.section(
+            "Pressure admittance",
+            "The arm yields to pressure on the sensor.",
+        )
+        self.admittance_control_button = QPushButton("Start")
+        self.admittance_control_button.setCheckable(True)
+        self.admittance_control_button.setToolTip(
+            "Start pressure-based robot admittance using the selected sensor and "
+            "its saved robot-link mapping. The 3D robot window is not required."
+        )
+        self.admittance_control_status_label = QLabel("Idle")
+        self.admittance_control_status_label.setStyleSheet(
+            theme.type_style("caption")
+        )
+        self.admittance_control_status_label.setWordWrap(True)
+        admittance_list.add(
+            components.SettingsRow(
+                "Admittance",
+                self.admittance_control_button,
+                hint="Uses the selected sensor and its saved robot-link "
+                     "mapping; the 3D robot window is not required.",
+            )
+        )
+        admittance_list.add(
+            components.SettingsRow("State", self.admittance_control_status_label)
+        )
+
+        proximity_row = QWidget()
+        proximity_row_layout = QHBoxLayout(proximity_row)
+        proximity_row_layout.setContentsMargins(0, 0, 0, 0)
+        proximity_row_layout.setSpacing(6)
+        proximity_row_layout.addWidget(self.proximity_control_button, 1)
+        proximity_row_layout.addWidget(self.proximity_record_button, 1)
+        rule_based_list.add(
+            components.SettingsRow(
+                "Proximity",
+                proximity_row,
+                hint="Keeps the finger centred over the sensor at the taught "
+                     "hover distance.",
+            )
+        )
+        rule_based_list.add(
+            components.SettingsRow(
+                "Direct finger motion",
+                self.direct_finger_motion_button,
+                hint="Moves the arm from the tracked contact centroid.",
+            )
+        )
+
+        console_row = QWidget()
+        console_row_layout = QHBoxLayout(console_row)
+        console_row_layout.setContentsMargins(0, 0, 0, 0)
+        console_row_layout.setSpacing(6)
+        for button in (
+            self.console_control_button,
+            self.console_control_sensor_button,
+            self.console_control_sensor_v2_button,
+        ):
+            button.setMinimumWidth(0)
+            console_row_layout.addWidget(button, 1)
+        console_list.add_stacked("Source", console_row)
+
+        tool_pose_row = QWidget()
+        tool_pose_row_layout = QHBoxLayout(tool_pose_row)
+        tool_pose_row_layout.setContentsMargins(0, 0, 0, 0)
+        tool_pose_row_layout.setSpacing(6)
+        for button in (
+            self.direct_finger_motion_tool_pose_record_menu_button,
+            self.load_tool_pose_path_button,
+            self.clear_tool_pose_path_button,
+        ):
+            button.setMinimumWidth(0)
+            tool_pose_row_layout.addWidget(button, 1)
+        tool_path_list.add_stacked("Path", tool_pose_row)
+        self._build_direct_finger_motion_settings_dialog()
+        self._build_console_control_settings_dialog()
+
+        layout.setSpacing(theme.SPACE_LG)
+        layout.addWidget(rule_based_group)
+        layout.addWidget(console_group)
+        layout.addWidget(tool_path_group)
+        layout.addWidget(admittance_group)
+        layout.addStretch()
+        self.control_page = page
+
     def setup_tab3(self, layout):
         self.ai_sub_tabs = QTabWidget()
         self.ai_sub_tabs.setUsesScrollButtons(False)
@@ -4170,14 +4480,8 @@ class UI(
         ai_model_page = QWidget()
         ai_model_layout = QVBoxLayout(ai_model_page)
 
-        # Keep deterministic controls separate from learned-policy controls.
-        rule_based_page = QWidget()
-        rule_based_page_layout = QVBoxLayout(rule_based_page)
-
         self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict")
         self.btn_toggle_3lvl_latch = QPushButton("Latch off")
-        self.proximity_control_button = QPushButton("Proximity Control")
-        self.proximity_record_button = QPushButton("Record Proximity Data")
 
         self.proximity_settings_dialog = QDialog(self.widget_func)
         self.proximity_settings_dialog.setWindowTitle("Proximity Control Settings")
@@ -4379,53 +4683,6 @@ class UI(
             "Detection tuning and checkpoint selection.",
         )
 
-        rule_based_group, rule_based_list = components.section(
-            "Tactile motion",
-            "Deterministic controllers driven straight from the sensor.",
-        )
-        console_group, console_list = components.section(
-            "Controller input",
-            "Drive the arm from a gamepad or from the sensor itself.",
-        )
-        tool_path_group, tool_path_list = components.section(
-            "Tool path",
-            "Record and review where the tool actually travelled.",
-        )
-        admittance_group, admittance_list = components.section(
-            "Pressure admittance",
-            "The arm yields to pressure on the sensor.",
-        )
-        self.admittance_control_button = QPushButton("Start Admittance Control")
-        self.admittance_control_button.setCheckable(True)
-        self.admittance_control_button.setToolTip(
-            "Start pressure-based robot admittance using the selected sensor and "
-            "its saved robot-link mapping. The 3D robot window is not required."
-        )
-        self.admittance_control_button.setText("Start")
-        self.admittance_control_status_label = QLabel("Idle")
-        self.admittance_control_status_label.setStyleSheet(
-            theme.type_style("caption")
-        )
-        self.admittance_control_status_label.setWordWrap(True)
-        admittance_list.add(
-            components.SettingsRow(
-                "Admittance",
-                self.admittance_control_button,
-                hint="Uses the selected sensor and its saved robot-link "
-                     "mapping; the 3D robot window is not required.",
-            )
-        )
-        admittance_list.add(
-            components.SettingsRow("State", self.admittance_control_status_label)
-        )
-
-        self.direct_finger_motion_button = QPushButton("Direct Finger Motion")
-        self.console_control_button = QPushButton("Console Control (PS5)")
-        self.console_control_sensor_button = QPushButton("Console Control (Sensor)")
-        self.console_control_sensor_v2_button = QPushButton("Console Control (Sensor V2)")
-        self.direct_finger_motion_tool_pose_record_menu_button = QPushButton("Tool Pose Recording")
-        self.load_tool_pose_path_button = QPushButton("Load Tool Pose Path")
-        self.clear_tool_pose_path_button = QPushButton("Clear Tool Pose Path")
         self.ai_direct_finger_motion_button = QPushButton("AI DFM Record (No Robot)")
         self.ai_direct_finger_motion_robot_button = QPushButton("AI DFM Record + Robot")
         self.ai_direct_finger_motion_execution_button = QPushButton("AI Direct Finger Motion (Execute)")
@@ -4449,7 +4706,12 @@ class UI(
             "Localized Only",
             "localized",
         )
-        self.ai_proximity_detection_mode_combo.setCurrentIndex(0)
+        localized_mode_index = (
+            self.ai_proximity_detection_mode_combo.findData("localized")
+        )
+        self.ai_proximity_detection_mode_combo.setCurrentIndex(
+            localized_mode_index
+        )
         self.ai_proximity_detection_mode_combo.setToolTip(
             "Choose whether detection uses the CNN-GRU, the localized "
             "statistical detector, or both."
@@ -4590,67 +4852,6 @@ class UI(
             1,
         )
         threelevel_row_layout.addWidget(self.btn_toggle_3lvl_latch, 1)
-        proximity_row = QWidget()
-        proximity_row_layout = QHBoxLayout(proximity_row)
-        proximity_row_layout.setContentsMargins(0, 0, 0, 0)
-        proximity_row_layout.setSpacing(6)
-        self.proximity_control_button.setMinimumWidth(0)
-        self.proximity_record_button.setMinimumWidth(0)
-        self.proximity_control_button.setText("Follow")
-        self.proximity_record_button.setText("Record data")
-        proximity_row_layout.addWidget(self.proximity_control_button, 1)
-        proximity_row_layout.addWidget(self.proximity_record_button, 1)
-        rule_based_list.add(
-            components.SettingsRow(
-                "Proximity",
-                proximity_row,
-                hint="Keeps the finger centred over the sensor at the taught "
-                     "hover distance.",
-            )
-        )
-        self.direct_finger_motion_button.setText("Start")
-        rule_based_list.add(
-            components.SettingsRow(
-                "Direct finger motion",
-                self.direct_finger_motion_button,
-                hint="Moves the arm from the tracked contact centroid.",
-            )
-        )
-
-        console_row = QWidget()
-        console_row_layout = QHBoxLayout(console_row)
-        console_row_layout.setContentsMargins(0, 0, 0, 0)
-        console_row_layout.setSpacing(6)
-        # The shared "Console Control" prefix moves into the row label:
-        # repeating it on all three buttons made this the widest row in the app.
-        for button, short_text in (
-            (self.console_control_button, "PS5"),
-            (self.console_control_sensor_button, "Sensor"),
-            (self.console_control_sensor_v2_button, "Sensor V2"),
-        ):
-            button.setToolTip(button.text())
-            button.setText(short_text)
-            button.setMinimumWidth(0)
-            console_row_layout.addWidget(button, 1)
-        console_list.add_stacked("Source", console_row)
-
-        tool_pose_row = QWidget()
-        tool_pose_row_layout = QHBoxLayout(tool_pose_row)
-        tool_pose_row_layout.setContentsMargins(0, 0, 0, 0)
-        tool_pose_row_layout.setSpacing(6)
-        self.direct_finger_motion_tool_pose_record_menu_button.setText("Record")
-        self.load_tool_pose_path_button.setText("Load")
-        self.clear_tool_pose_path_button.setText("Clear")
-        components.apply_variant(self.clear_tool_pose_path_button, "danger")
-        self.direct_finger_motion_tool_pose_record_menu_button.setMinimumWidth(0)
-        self.load_tool_pose_path_button.setMinimumWidth(0)
-        self.clear_tool_pose_path_button.setMinimumWidth(0)
-        tool_pose_row_layout.addWidget(self.direct_finger_motion_tool_pose_record_menu_button, 1)
-        tool_pose_row_layout.addWidget(self.load_tool_pose_path_button, 1)
-        tool_pose_row_layout.addWidget(self.clear_tool_pose_path_button, 1)
-        tool_path_list.add_stacked("Path", tool_pose_row)
-        self._build_direct_finger_motion_settings_dialog()
-        self._build_console_control_settings_dialog()
         ai_proximity_row = QWidget()
         ai_proximity_row_layout = QHBoxLayout(ai_proximity_row)
         ai_proximity_row_layout.setContentsMargins(0, 0, 0, 0)
@@ -4736,12 +4937,6 @@ class UI(
         ai_model_layout.addWidget(self.ai_basic_controls_group)
         ai_model_layout.addWidget(self.ai_advanced_controls_group)
         ai_model_layout.addStretch()
-        rule_based_page_layout.setSpacing(theme.SPACE_LG)
-        rule_based_page_layout.addWidget(rule_based_group)
-        rule_based_page_layout.addWidget(console_group)
-        rule_based_page_layout.addWidget(tool_path_group)
-        rule_based_page_layout.addWidget(admittance_group)
-        rule_based_page_layout.addStretch()
 
         # ─── Subtab "Data" ───
         training_page = QWidget()
@@ -4976,18 +5171,13 @@ class UI(
         )
         layout.addWidget(self.ai_sub_tabs)
 
-        # The deterministic controllers live in their own Control workspace,
-        # but they share dialogs and status labels with the learned-policy
-        # controls above, so the page is built here and handed to setup_tabs.
-        self.control_page = rule_based_page
-
     def setup_tab4(self, layout):
         layout.setSpacing(theme.SPACE_LG)
 
-        # --- HP-200 Force Meter ---
+        # --- Serial force meter ---
         force_meter_group, force_meter_list = components.section(
             "Force meter",
-            "HP-200 load cell, read over serial.",
+            "Live force from the DYLY-compatible transmitter or HP-200.",
         )
         self.force_meter_port_combo = QComboBox()
         self.force_meter_port_combo.setSizeAdjustPolicy(
@@ -5016,6 +5206,9 @@ class UI(
 
         self.force_meter_protocol_combo = QComboBox()
         self.force_meter_protocol_combo.addItem(
+            "Force transmitter (DYLY-106)", "force_transmitter_rtu"
+        )
+        self.force_meter_protocol_combo.addItem(
             "HP-200 Modbus RTU (official)", "modbus_rtu"
         )
         self.force_meter_protocol_combo.addItem(
@@ -5024,11 +5217,14 @@ class UI(
         self.force_meter_baud_combo = QComboBox()
         for baud_rate in (9600, 19200, 38400, 115200, 4800, 2400):
             self.force_meter_baud_combo.addItem(str(baud_rate), baud_rate)
+        self.force_meter_baud_combo.setCurrentIndex(
+            self.force_meter_baud_combo.findData(19200)
+        )
 
         # The big number first -- that is what you look at -- then the port and
         # the connect action. Protocol and baud rate are set once per meter, so
         # they go behind a disclosure.
-        self.force_meter_value_label = QLabel("+0.0000 N")
+        self.force_meter_value_label = QLabel("+0.0 g")
         self.force_meter_value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.force_meter_value_label.setStyleSheet(theme.readout_style("title"))
         self.force_meter_native_label = QLabel("No sample")

@@ -1,4 +1,4 @@
-"""Serial readers and protocol parsers for HANDPI HP-series force meters."""
+"""Serial readers and protocol parsers for supported force meters."""
 
 from __future__ import annotations
 
@@ -26,11 +26,18 @@ class ForceReading:
 
 
 PROTOCOL_MODBUS_RTU = "modbus_rtu"
+PROTOCOL_FORCE_TRANSMITTER_RTU = "force_transmitter_rtu"
 PROTOCOL_TEXT_STREAM = "text_stream"
 
 HP200_SLAVE_ADDRESS = 1
 HP200_REGISTER_COUNT = 13
 HP200_POLL_INTERVAL_SECONDS = 0.2
+
+FORCE_TRANSMITTER_SLAVE_ADDRESS = 1
+FORCE_TRANSMITTER_DECIMAL_REGISTER = 12
+FORCE_TRANSMITTER_VALUE_REGISTER = 2000
+FORCE_TRANSMITTER_REGISTER_COUNT = 2
+FORCE_TRANSMITTER_POLL_INTERVAL_SECONDS = 0.05
 
 _HP200_UNIT_CODES = {
     0: "N",
@@ -136,13 +143,12 @@ def modbus_crc16(payload: bytes) -> int:
     return crc & 0xFFFF
 
 
-def build_hp200_read_request(
-    slave_address: int = HP200_SLAVE_ADDRESS,
-    start_register: int = 0,
-    register_count: int = HP200_REGISTER_COUNT,
+def build_modbus_read_request(
+    slave_address: int,
+    start_register: int,
+    register_count: int,
 ) -> bytes:
-    """Build the read request used by the official HP-200 application."""
-
+    """Build a Modbus RTU function-03 holding-register request."""
     if not 1 <= int(slave_address) <= 247:
         raise ValueError("Modbus slave address must be between 1 and 247")
     if not 0 <= int(start_register) <= 0xFFFF:
@@ -159,6 +165,61 @@ def build_hp200_read_request(
     )
     crc = modbus_crc16(payload)
     return payload + struct.pack("<H", crc)
+
+
+def build_hp200_read_request(
+    slave_address: int = HP200_SLAVE_ADDRESS,
+    start_register: int = 0,
+    register_count: int = HP200_REGISTER_COUNT,
+) -> bytes:
+    """Build the read request used by the official HP-200 application."""
+    return build_modbus_read_request(
+        slave_address,
+        start_register,
+        register_count,
+    )
+
+
+def build_force_transmitter_read_request(
+    slave_address: int = FORCE_TRANSMITTER_SLAVE_ADDRESS,
+    start_register: int = FORCE_TRANSMITTER_VALUE_REGISTER,
+) -> bytes:
+    """Read the transmitter's 32-bit signed live-force value."""
+    return build_modbus_read_request(
+        slave_address,
+        start_register,
+        FORCE_TRANSMITTER_REGISTER_COUNT,
+    )
+
+
+def decode_modbus_signed_int32(registers) -> int:
+    """Decode two high-word-first Modbus registers as one signed integer."""
+    values = [int(value) for value in registers]
+    if len(values) < 2:
+        raise ValueError("32-bit Modbus value requires two registers")
+    if any(value < 0 or value > 0xFFFF for value in values[:2]):
+        raise ValueError("Modbus reply contains a non-16-bit register value")
+    return struct.unpack(">i", struct.pack(">HH", values[0], values[1]))[0]
+
+
+def decode_force_transmitter_registers(
+    registers,
+    decimal_places: int = 1,
+) -> ForceReading:
+    """Decode the DYLY-compatible transmitter's display value in grams."""
+    decimal_places = int(decimal_places)
+    if not 0 <= decimal_places <= 5:
+        raise ValueError(
+            f"Force transmitter returned invalid decimal places {decimal_places}"
+        )
+    raw_value = decode_modbus_signed_int32(registers)
+    grams = float(raw_value) / (10 ** decimal_places)
+    return ForceReading(
+        force_newtons=force_to_newtons(grams, "g"),
+        native_value=grams,
+        native_unit="g",
+        raw_text=f"{grams:+.{decimal_places}f} g (Modbus)",
+    )
 
 
 def decode_hp200_registers(registers) -> ForceReading:
@@ -289,6 +350,95 @@ class Hp200ModbusRtuParser:
         return readings
 
 
+class ForceTransmitterModbusRtuParser:
+    """Parse 32-bit live-force replies from the measuring transmitter."""
+
+    def __init__(
+        self,
+        slave_address: int = FORCE_TRANSMITTER_SLAVE_ADDRESS,
+        decimal_places: int = 1,
+    ):
+        self.slave_address = int(slave_address)
+        self.decimal_places = int(decimal_places)
+        self._buffer = bytearray()
+        self._notices = deque(maxlen=8)
+
+    def _add_notice(self, message: str):
+        if not self._notices or self._notices[-1] != message:
+            self._notices.append(str(message))
+
+    def pop_notice(self) -> Optional[str]:
+        return self._notices.popleft() if self._notices else None
+
+    def feed(self, payload: bytes) -> List[ForceReading]:
+        self._buffer.extend(bytes(payload or b""))
+        readings = []
+
+        while self._buffer:
+            try:
+                frame_start = self._buffer.index(self.slave_address)
+            except ValueError:
+                self._buffer.clear()
+                break
+            if frame_start:
+                del self._buffer[:frame_start]
+            if len(self._buffer) < 2:
+                break
+
+            function_code = self._buffer[1]
+            if function_code == 0x83:
+                frame_size = 5
+            elif function_code == 0x03:
+                if len(self._buffer) < 3:
+                    break
+                byte_count = self._buffer[2]
+                if byte_count > 250 or byte_count % 2:
+                    del self._buffer[0]
+                    continue
+                frame_size = 5 + byte_count
+            else:
+                del self._buffer[0]
+                continue
+
+            if len(self._buffer) < frame_size:
+                break
+            frame = bytes(self._buffer[:frame_size])
+            received_crc = struct.unpack("<H", frame[-2:])[0]
+            if received_crc != modbus_crc16(frame[:-2]):
+                self._add_notice(
+                    "Modbus CRC mismatch; check baud rate, wiring, and A/B polarity"
+                )
+                del self._buffer[0]
+                continue
+            del self._buffer[:frame_size]
+
+            if function_code == 0x83:
+                self._add_notice(
+                    f"Force transmitter returned Modbus exception code {frame[2]}"
+                )
+                continue
+            if frame[2] != FORCE_TRANSMITTER_REGISTER_COUNT * 2:
+                self._add_notice(
+                    "Force transmitter returned an unexpected register count"
+                )
+                continue
+
+            registers = struct.unpack(">HH", frame[3:-2])
+            try:
+                readings.append(
+                    decode_force_transmitter_registers(
+                        registers,
+                        self.decimal_places,
+                    )
+                )
+            except ValueError as exc:
+                self._add_notice(str(exc))
+
+        if len(self._buffer) > 1024:
+            del self._buffer[:-1024]
+        return readings
+
+
 class Hp200StreamParser:
     """Incrementally parse newline-delimited or unit-terminated samples."""
 
@@ -335,7 +485,7 @@ class Hp200StreamParser:
 
 
 class Hp200ForceMeterWorker(QObject):
-    """Own the HP-200 serial port and read it outside the Qt event loop."""
+    """Own a force-meter serial port and read it outside the Qt event loop."""
 
     connected = pyqtSignal(str, int, str)
     sample_ready = pyqtSignal(float, float, str, str, float)
@@ -350,17 +500,28 @@ class Hp200ForceMeterWorker(QObject):
         protocol: str = PROTOCOL_MODBUS_RTU,
         display_hz: float = 30.0,
         slave_address: int = HP200_SLAVE_ADDRESS,
-        poll_interval: float = HP200_POLL_INTERVAL_SECONDS,
+        poll_interval: Optional[float] = None,
     ):
         super().__init__()
         self.port = str(port)
         self.baud_rate = int(baud_rate)
         protocol = str(protocol or PROTOCOL_MODBUS_RTU).strip().lower()
-        if protocol not in (PROTOCOL_MODBUS_RTU, PROTOCOL_TEXT_STREAM):
-            raise ValueError(f"Unsupported HP-200 protocol: {protocol}")
+        supported = (
+            PROTOCOL_FORCE_TRANSMITTER_RTU,
+            PROTOCOL_MODBUS_RTU,
+            PROTOCOL_TEXT_STREAM,
+        )
+        if protocol not in supported:
+            raise ValueError(f"Unsupported force-meter protocol: {protocol}")
         self.protocol = protocol
         self.slave_address = int(slave_address)
-        self.poll_interval = max(0.05, float(poll_interval))
+        if poll_interval is None:
+            poll_interval = (
+                FORCE_TRANSMITTER_POLL_INTERVAL_SECONDS
+                if protocol == PROTOCOL_FORCE_TRANSMITTER_RTU
+                else HP200_POLL_INTERVAL_SECONDS
+            )
+        self.poll_interval = max(0.02, float(poll_interval))
         self.display_interval = 1.0 / max(1.0, float(display_hz))
         self._stop_event = threading.Event()
 
@@ -376,13 +537,48 @@ class Hp200ForceMeterWorker(QObject):
         duration = sample_times[-1] - sample_times[0]
         return (len(sample_times) - 1) / duration if duration > 0.0 else 0.0
 
+    @staticmethod
+    def _read_modbus_int32(
+        meter,
+        slave_address: int,
+        register: int,
+        fallback: int,
+    ) -> int:
+        """Read one 32-bit setting, falling back without blocking startup."""
+        request = build_modbus_read_request(slave_address, register, 2)
+        buffer = bytearray()
+        for _attempt in range(3):
+            meter.reset_input_buffer()
+            meter.write(request)
+            meter.flush()
+            deadline = time.monotonic() + 0.35
+            while time.monotonic() < deadline:
+                payload = meter.read(meter.in_waiting or 1)
+                if payload:
+                    buffer.extend(payload)
+                while len(buffer) >= 9:
+                    try:
+                        start = buffer.index(int(slave_address))
+                    except ValueError:
+                        buffer.clear()
+                        break
+                    if start:
+                        del buffer[:start]
+                    if len(buffer) < 9:
+                        break
+                    frame = bytes(buffer[:9])
+                    del buffer[:9]
+                    if (
+                        frame[:3] == bytes((int(slave_address), 0x03, 0x04))
+                        and struct.unpack("<H", frame[-2:])[0]
+                        == modbus_crc16(frame[:-2])
+                    ):
+                        return decode_modbus_signed_int32(
+                            struct.unpack(">HH", frame[3:7])
+                        )
+        return int(fallback)
+
     def run(self):
-        if self.protocol == PROTOCOL_MODBUS_RTU:
-            parser = Hp200ModbusRtuParser(self.slave_address)
-            request = build_hp200_read_request(self.slave_address)
-        else:
-            parser = Hp200StreamParser()
-            request = None
         sample_times = deque()
         next_display_time = 0.0
         next_poll_time = 0.0
@@ -405,6 +601,26 @@ class Hp200ForceMeterWorker(QObject):
                 exclusive=True,
             ) as meter:
                 meter.reset_input_buffer()
+                if self.protocol == PROTOCOL_FORCE_TRANSMITTER_RTU:
+                    decimal_places = self._read_modbus_int32(
+                        meter,
+                        self.slave_address,
+                        FORCE_TRANSMITTER_DECIMAL_REGISTER,
+                        fallback=1,
+                    )
+                    parser = ForceTransmitterModbusRtuParser(
+                        self.slave_address,
+                        decimal_places,
+                    )
+                    request = build_force_transmitter_read_request(
+                        self.slave_address
+                    )
+                elif self.protocol == PROTOCOL_MODBUS_RTU:
+                    parser = Hp200ModbusRtuParser(self.slave_address)
+                    request = build_hp200_read_request(self.slave_address)
+                else:
+                    parser = Hp200StreamParser()
+                    request = None
                 self.connected.emit(self.port, self.baud_rate, self.protocol)
 
                 while not self._stop_event.is_set():
@@ -431,7 +647,10 @@ class Hp200ForceMeterWorker(QObject):
 
                     if now - last_unparsed_notice >= 1.0:
                         preview = None
-                        if self.protocol == PROTOCOL_MODBUS_RTU:
+                        if self.protocol in (
+                            PROTOCOL_FORCE_TRANSMITTER_RTU,
+                            PROTOCOL_MODBUS_RTU,
+                        ):
                             preview = parser.pop_notice()
                             if preview is None and now - last_valid_sample >= 1.5:
                                 preview = (

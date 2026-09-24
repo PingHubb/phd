@@ -20,7 +20,12 @@ from phd.dependence.paths import icon_path, resource_path, stylesheet_path
 from phd.ui import components, icons, theme
 from phd.ui.ui_ping import UI
 from phd.ui import experiment_tasks
+from phd.ui.calibration_graph_analysis import (
+    CalibrationGraphAnalysisDialog,
+    load_calibration_recording,
+)
 from phd.ui.calibration_result_dialog import CalibrationResultDialog
+from phd.ui.camera_preview_window import CameraPreviewWindow
 from phd.ui.plotter_video_recorder import PlotterVideoRecorder
 from phd.ui.heatmap_signal_recording import (
     HeatmapSignalPlayback,
@@ -470,9 +475,11 @@ class MyMainWindow(MainWindow):
         self._sensor_scene_ready = False
         self._sensor_update_backend_enabled = True
         self.experiments_window = None
+        self.camera_preview_window = None
         self._sidebar_active_control_id = None
         self._sensor_capture_result_dialog = None
         self._calibration_result_dialog = None
+        self._calibration_graph_analysis_dialog = None
         self._sidebar_active_task = None  # experiment_tasks.ExperimentTask, set while running
         self._sigraph_heatmap_recorder = None
         self._sigraph_heatmap_signal_recorder = None
@@ -608,6 +615,10 @@ class MyMainWindow(MainWindow):
         self.action_toggle_controls.setToolTip(
             'Open or focus the Experiment Controls window'
         )
+        self.action_camera_preview = QAction(icons.icon('camera'), 'Camera', self)
+        self.action_camera_preview.setToolTip(
+            'Open a live RealSense camera window'
+        )
 
         self.action_window_experiments = QAction(
             icons.icon('flask'), 'Experiments', self
@@ -645,6 +656,7 @@ class MyMainWindow(MainWindow):
 
         window_menu = menu.addMenu('Window')
         window_menu.addAction(self.action_window_experiments)
+        window_menu.addAction(self.action_camera_preview)
         window_menu.addAction(self.action_window_log)
         window_menu.addAction(self.action_window_sensor_signal)
         window_menu.addSeparator()
@@ -663,6 +675,7 @@ class MyMainWindow(MainWindow):
         parameter_menu.addAction(self.action_sensor_params)
         function_menu.addSeparator()
         function_menu.addAction(self.action_toggle_controls)
+        function_menu.addAction(self.action_camera_preview)
         function_menu.addSeparator()
         function_menu.addAction(self.action_exit)
 
@@ -690,6 +703,7 @@ class MyMainWindow(MainWindow):
         self.toolbar_parameter_button.setMenu(parameter_popup_menu)
         toolbar.addWidget(self.toolbar_parameter_button)
         toolbar.addAction(self.action_toggle_controls)
+        toolbar.addAction(self.action_camera_preview)
         toolbar.addSeparator()
         toolbar.addAction(self.action_exit)
         spacer = QWidget()
@@ -1325,6 +1339,9 @@ class MyMainWindow(MainWindow):
         self.action_toggle_controls.triggered.connect(
             self.open_experiments_window
         )
+        self.action_camera_preview.triggered.connect(
+            self.open_camera_preview_window
+        )
         self.action_window_experiments.triggered.connect(
             self.open_experiments_window
         )
@@ -1523,6 +1540,29 @@ class MyMainWindow(MainWindow):
     def open_experiments_window(self):
         """Open or focus the reusable modeless experiment-controls window."""
         self._set_sidebar_visible(True)
+
+    def open_camera_preview_window(self):
+        """Open or focus the live RealSense color window."""
+        window = getattr(self, "camera_preview_window", None)
+        if window is not None:
+            try:
+                visible = window.isVisible()
+            except RuntimeError:
+                window = None
+            else:
+                if visible:
+                    window.show()
+                    self._focus_window(window)
+                    return
+        window = CameraPreviewWindow(self)
+        window.destroyed.connect(self._clear_camera_preview_window)
+        self.camera_preview_window = window
+        window.show()
+        self._focus_window(window)
+
+    def _clear_camera_preview_window(self, *_args):
+        """Drop the preview handle after Qt deletes the closed window."""
+        self.camera_preview_window = None
 
     def open_application_log_window(self):
         """Open or focus the modeless application-log window."""
@@ -1772,6 +1812,7 @@ class MyMainWindow(MainWindow):
         self._update_sidebar_task_info()
         self._update_sidebar_task_param_visibility()
         self._update_sidebar_task_action_labels()
+        self._refresh_calibration_controls()
 
     def _update_sidebar_task_action_labels(self):
         start_button = getattr(self, "sidebar_btn_start", None)
@@ -1965,24 +2006,43 @@ class MyMainWindow(MainWindow):
         )
         self.calibration_initial_position_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_initial_position_label)
+        self.calibration_remember_position_button = QPushButton(
+            "Remember Initial Position"
+        )
+        self.calibration_remember_position_button.setToolTip(
+            "Save the robot's current joint and TCP pose as the start and "
+            "return position for every calibration trial."
+        )
+        calibration_layout.addWidget(
+            self.calibration_remember_position_button
+        )
 
         calibration_form = QFormLayout()
         self.calibration_taxel_spin = QSpinBox()
         self.calibration_taxel_spin.setRange(0, 79)
         self.calibration_taxel_spin.setValue(int(calibration_task.taxel_index))
         self.calibration_taxel_spin.setToolTip(
-            "Top-down, column-major cell index used by the Sensor Signal Viewer"
+            "Physical taxel under the indenter and the initially displayed "
+            "node. Every taxel signal is recorded for later graph selection. "
+            "Indices follow the Sensor Signal Viewer: top-down, column-major."
         )
-        calibration_form.addRow("Taxel index (8x10)", self.calibration_taxel_spin)
+        calibration_form.addRow(
+            "Physical target taxel (8x10)",
+            self.calibration_taxel_spin,
+        )
 
         self.calibration_signal_combo = QComboBox()
         self.calibration_signal_combo.addItem(
-            "Relative change (%)", "diff_percent_ave"
-        )
-        self.calibration_signal_combo.addItem(
             "Difference (counts)", "diff_ave"
         )
+        self.calibration_signal_combo.addItem(
+            "Relative change (%)", "diff_percent_ave"
+        )
         self.calibration_signal_combo.addItem("Raw value", "raw_ave")
+        self.calibration_signal_combo.setToolTip(
+            "Difference (counts) is the signed sensor response: raw value "
+            "minus calibration value. Positive and negative values are kept."
+        )
         signal_index = self.calibration_signal_combo.findData(
             calibration_task.signal_field
         )
@@ -1991,9 +2051,9 @@ class MyMainWindow(MainWindow):
         calibration_form.addRow("Plotted signal", self.calibration_signal_combo)
 
         self.calibration_speed_spin = QDoubleSpinBox()
-        self.calibration_speed_spin.setRange(0.05, 2.0)
+        self.calibration_speed_spin.setRange(0.01, 2.0)
         self.calibration_speed_spin.setDecimals(2)
-        self.calibration_speed_spin.setSingleStep(0.05)
+        self.calibration_speed_spin.setSingleStep(0.01)
         self.calibration_speed_spin.setSuffix(" mm/s")
         self.calibration_speed_spin.setValue(
             float(calibration_task.approach_speed_m_s) * 1000.0
@@ -2001,35 +2061,50 @@ class MyMainWindow(MainWindow):
         calibration_form.addRow("Base -Z speed", self.calibration_speed_spin)
 
         self.calibration_force_threshold_spin = QDoubleSpinBox()
-        self.calibration_force_threshold_spin.setRange(0.01, 5.0)
-        self.calibration_force_threshold_spin.setDecimals(2)
-        self.calibration_force_threshold_spin.setSingleStep(0.05)
-        self.calibration_force_threshold_spin.setSuffix(" N")
+        self.calibration_force_threshold_spin.setRange(
+            0.1,
+            float(calibration_task.MAX_CONTACT_THRESHOLD_G),
+        )
+        self.calibration_force_threshold_spin.setDecimals(1)
+        self.calibration_force_threshold_spin.setSingleStep(1.0)
+        self.calibration_force_threshold_spin.setSuffix(" g")
         self.calibration_force_threshold_spin.setValue(
-            float(calibration_task.contact_threshold_n)
+            float(calibration_task.contact_threshold_g)
         )
         self.calibration_force_threshold_spin.setToolTip(
-            "Stop when the absolute force change from the stationary baseline reaches this value"
+            "Stop base -Z motion when the absolute DYLY force change from the "
+            "stationary baseline reaches this value."
         )
         calibration_form.addRow(
-            "Contact threshold", self.calibration_force_threshold_spin
+            "Max contact threshold", self.calibration_force_threshold_spin
         )
 
         self.calibration_max_travel_spin = QDoubleSpinBox()
-        self.calibration_max_travel_spin.setRange(0.5, 200.0)
+        self.calibration_max_travel_spin.setRange(0.0, 200.0)
         self.calibration_max_travel_spin.setDecimals(1)
         self.calibration_max_travel_spin.setSingleStep(0.5)
         self.calibration_max_travel_spin.setSuffix(" mm")
+        self.calibration_max_travel_spin.setSpecialValueText("No limit")
+        self.calibration_max_travel_spin.setToolTip(
+            "Maximum downward travel for one contact trial. Set to No limit "
+            "to disable the distance guard; force freshness, contact threshold, "
+            "and Stop remain active."
+        )
         self.calibration_max_travel_spin.setValue(
             float(calibration_task.max_travel_m) * 1000.0
         )
         calibration_form.addRow("Maximum travel", self.calibration_max_travel_spin)
 
         self.calibration_timeout_spin = QDoubleSpinBox()
-        self.calibration_timeout_spin.setRange(2.0, 1800.0)
+        self.calibration_timeout_spin.setRange(0.0, 1800.0)
         self.calibration_timeout_spin.setDecimals(1)
         self.calibration_timeout_spin.setSingleStep(10.0)
         self.calibration_timeout_spin.setSuffix(" s")
+        self.calibration_timeout_spin.setSpecialValueText("No limit")
+        self.calibration_timeout_spin.setToolTip(
+            "Maximum time for one contact trial. Set to No limit to disable "
+            "the timer; force freshness, maximum travel, and Stop remain active."
+        )
         self.calibration_timeout_spin.setValue(float(calibration_task.timeout_sec))
         calibration_form.addRow("Timeout", self.calibration_timeout_spin)
 
@@ -2044,9 +2119,11 @@ class MyMainWindow(MainWindow):
         calibration_layout.addLayout(calibration_form)
 
         calibration_note = QLabel(
-            "Requires live HP-200 data and an updated 8x10 sensor. "
-            "Between trials the robot returns to the remembered pose and the "
-            "sensor recalibrates automatically. Stop remains available."
+            "Run first returns to the remembered pose, measures the DYLY "
+            "baseline, and moves in base -Z until the gram threshold is "
+            "reached. It holds for 1 s, returns in base +Z at the same speed, "
+            "and completes the trial only at the initial height. The tactile "
+            "sensor recalibrates between repetitions. Stop remains available."
         )
         calibration_note.setWordWrap(True)
         calibration_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
@@ -2058,13 +2135,17 @@ class MyMainWindow(MainWindow):
             f"color: {theme.TEXT_MUTED}; font-weight: 600;"
         )
         calibration_layout.addWidget(self.calibration_progress_label)
-
-        self.calibration_start_approach_button = QPushButton(
-            "Start Contact Test + Record"
+        self.calibration_live_force_label = QLabel(
+            "Force: -- g   |   Contact change: -- g"
         )
-        self.calibration_start_approach_button.setObjectName("btnRunRecord")
-        calibration_layout.addWidget(self.calibration_start_approach_button)
+        self.calibration_live_force_label.setStyleSheet(
+            theme.readout_style("caption")
+        )
+        calibration_layout.addWidget(self.calibration_live_force_label)
 
+        self.calibration_remember_position_button.clicked.connect(
+            self._remember_calibration_initial_position
+        )
         self.calibration_taxel_spin.valueChanged.connect(
             lambda value: setattr(calibration_task, "taxel_index", int(value))
         )
@@ -2082,7 +2163,7 @@ class MyMainWindow(MainWindow):
         )
         self.calibration_force_threshold_spin.valueChanged.connect(
             lambda value: setattr(
-                calibration_task, "contact_threshold_n", float(value)
+                calibration_task, "contact_threshold_g", float(value)
             )
         )
         self.calibration_max_travel_spin.valueChanged.connect(
@@ -2099,9 +2180,6 @@ class MyMainWindow(MainWindow):
         self.calibration_repeat_spin.valueChanged.connect(
             lambda _value: self._refresh_calibration_progress()
         )
-        self.calibration_start_approach_button.clicked.connect(
-            self._start_calibration_contact_approach
-        )
         self._task_param_widgets[calibration_task.id] = calibration_panel
         parent_layout.addWidget(calibration_panel)
         self._refresh_calibration_controls()
@@ -2113,7 +2191,11 @@ class MyMainWindow(MainWindow):
     def _refresh_calibration_controls(self):
         task = self._calibration_task()
         label = getattr(self, "calibration_initial_position_label", None)
-        button = getattr(self, "calibration_start_approach_button", None)
+        button = getattr(
+            self,
+            "calibration_remember_position_button",
+            None,
+        )
         if task is None:
             return
         initial_position = getattr(task, "initial_position", None)
@@ -2139,6 +2221,14 @@ class MyMainWindow(MainWindow):
                 )
         if button is not None:
             button.setEnabled(
+                not bool(getattr(task, "_test_active", False))
+            )
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if (
+            start_button is not None
+            and self._current_sidebar_control_id() == task.id
+        ):
+            start_button.setEnabled(
                 initial_position is not None
                 and not bool(getattr(task, "_test_active", False))
             )
@@ -2159,10 +2249,13 @@ class MyMainWindow(MainWindow):
         phase = str(getattr(task, "_phase", "idle") if phase is None else phase)
         phase_labels = {
             "idle": "Ready",
+            "connecting_force_meter": "Connecting force transmitter",
             "force_baseline": "Force baseline",
             "approaching": "Approaching",
-            "returning": "Returning to initial position",
+            "contact_hold": "Contact reached; holding",
+            "returning": "Returning in base +Z",
             "recalibrating": "Updating sensor calibration",
+            "recovering_force_meter": "Recovering force transmitter",
         }
         status = str(detail or phase_labels.get(phase, phase.replace("_", " ").title()))
         if current > 0:
@@ -2180,7 +2273,7 @@ class MyMainWindow(MainWindow):
             "calibration_max_travel_spin",
             "calibration_timeout_spin",
             "calibration_repeat_spin",
-            "calibration_start_approach_button",
+            "calibration_remember_position_button",
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2191,12 +2284,29 @@ class MyMainWindow(MainWindow):
         if not running:
             self._refresh_calibration_controls()
 
-    def _start_calibration_contact_approach(self):
+    def _refresh_calibration_live_force(
+        self,
+        force_g=None,
+        force_delta_g=None,
+    ):
+        label = getattr(self, "calibration_live_force_label", None)
+        if label is None:
+            return
+        force_text = "--" if force_g is None else f"{float(force_g):+.1f}"
+        delta_text = (
+            "--"
+            if force_delta_g is None
+            else f"{float(force_delta_g):+.1f}"
+        )
+        label.setText(
+            f"Force: {force_text} g   |   Contact change: {delta_text} g"
+        )
+
+    def _remember_calibration_initial_position(self):
         task = self._calibration_task()
         if task is None or self._current_sidebar_control_id() != task.id:
             return
-        task.request_contact_approach()
-        self._start_sidebar_control()
+        task.capture_initial_position(self)
 
     def _show_calibration_result(self, result):
         dialog = getattr(self, "_calibration_result_dialog", None)
@@ -2206,6 +2316,52 @@ class MyMainWindow(MainWindow):
             result, parent=self
         )
         self._calibration_result_dialog.show()
+
+    def _open_calibration_graph_analysis(self):
+        """Select saved calibration data and open its offline analysis."""
+        start_directory = resource_path("calibration_recordings")
+        selected_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Select calibration recording or graph",
+            start_directory,
+            "Calibration data or graph (*.csv *.json *.png)",
+        )
+        if not selected_path:
+            return
+        try:
+            loaded = load_calibration_recording(selected_path)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(
+                self,
+                "Graph Analysis",
+                f"The calibration recording could not be loaded.\n\n{exc}",
+            )
+            self._append_sidebar_control_message(
+                f"Graph Analysis could not load {selected_path}: {exc}"
+            )
+            return
+
+        dialog = getattr(self, "_calibration_graph_analysis_dialog", None)
+        if dialog is not None:
+            dialog.close()
+        dialog = CalibrationGraphAnalysisDialog(loaded, parent=self)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(
+            lambda _object=None, dialog=dialog: self._graph_analysis_closed(
+                dialog
+            )
+        )
+        self._calibration_graph_analysis_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        self._append_sidebar_control_message(
+            f"Graph Analysis loaded {len(loaded['datasets'])} trial(s)."
+        )
+
+    def _graph_analysis_closed(self, dialog):
+        if self._calibration_graph_analysis_dialog is dialog:
+            self._calibration_graph_analysis_dialog = None
 
     def _sigraph_scanning_task(self):
         return experiment_tasks.get_task("sigraph2026_scanning")
@@ -3318,6 +3474,12 @@ class MyMainWindow(MainWindow):
         if experiments_window is not None:
             experiments_window.remember_geometry()
             experiments_window.hide()
+        camera_window = getattr(self, "camera_preview_window", None)
+        if camera_window is not None:
+            try:
+                camera_window.close()
+            except RuntimeError:
+                self.camera_preview_window = None
         if self.sensor_window:
             self.sensor_window.close()
 

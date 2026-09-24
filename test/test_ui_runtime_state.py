@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from phd.ui.ui_initial import MyMainWindow
 from phd.ui.ui_ping import UI
+from phd.ui.ui_ping_ui_interactions import UiInteractionsMixin
 
 
 class _Widget:
@@ -58,6 +59,23 @@ class _StatusIndicator:
 
     def setVisible(self, visible):
         self.visible = bool(visible)
+
+
+def test_force_meter_port_identity_uses_stable_chip_symlink(tmp_path):
+    tty = tmp_path / "ttyUSB7"
+    tty.touch()
+    by_id = tmp_path / "by-id"
+    by_id.mkdir()
+    stable = by_id / "usb-FTDI_FT232R_USB_UART_AG0K5VFJ-if00-port0"
+    stable.symlink_to(tty)
+
+    identity = UiInteractionsMixin._stable_serial_port_identity(
+        str(tty),
+        str(by_id),
+    )
+
+    assert identity == str(stable)
+    assert "ttyUSB7" not in identity
 
 
 def test_sensor_update_requires_a_ready_scene_and_idle_backend():

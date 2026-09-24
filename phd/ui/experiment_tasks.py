@@ -36,6 +36,10 @@ from typing import List, Optional
 import numpy as np
 
 from phd.dependence.paths import resource_path
+from phd.ui.calibration_analysis import (
+    analyze_calibration_rows,
+    taxel_signal_column,
+)
 
 
 _DEFAULT_STORAGE_PATH = object()
@@ -157,17 +161,53 @@ class SensorPeakChangeTask(ExperimentTask):
             host._show_sensor_capture_result(captured)
 
 
+class CalibrationGraphAnalysisTask(ExperimentTask):
+    """Open an existing calibration recording for detailed offline analysis."""
+
+    id = "graph_analysis"
+    label = "Graph Analysis"
+    description = (
+        "Select a saved calibration CSV, JSON, or exported graph to examine "
+        "event distances, fitted equations, residuals, hysteresis, acquisition "
+        "quality, and repeat-trial consistency."
+    )
+    start_button_label = "Select Recording"
+    tick_interval_ms = None
+
+    def on_start(self, host) -> bool:
+        opener = getattr(host, "_open_calibration_graph_analysis", None)
+        if not callable(opener):
+            host._append_sidebar_control_message(
+                "Graph Analysis is unavailable in this window."
+            )
+            return False
+        opener()
+        return False
+
+
 class CalibrationTask(ExperimentTask):
     """Characterize one tactile taxel against a force-meter reference."""
 
     id = "calibration"
     label = "Calibration"
     description = (
-        "Approach one tactile taxel while recording synchronized sensor and "
-        "force-meter values, then optionally return, recalibrate, and repeat."
+        "Return to a remembered pose, approach one tactile taxel in base -Z "
+        "while recording DYLY force and sensor values, then hold, return, "
+        "recalibrate, and repeat."
     )
-    start_button_label = "Remember Initial Position"
+    start_button_label = "Run"
     tick_interval_ms = 50
+    NEWTONS_PER_GRAM = 0.00980665
+    MAX_CONTACT_THRESHOLD_G = 2000.0
+    SIGNAL_MATRIX_SOURCES = {
+        "raw": ("rawData", False),
+        "calibration": ("calData", False),
+        "diff": ("diffData", False),
+        "diff_percent": ("diffPerData", False),
+        "raw_ave": ("rawDataAve", True),
+        "diff_ave": ("diffDataAve", True),
+        "diff_percent_ave": ("diffPerDataAve", True),
+    }
 
     def __init__(
         self,
@@ -193,26 +233,42 @@ class CalibrationTask(ExperimentTask):
         self.last_persistence_error = ""
         self.sensor_rows = 8
         self.sensor_columns = 10
-        self.taxel_index = 14
-        self.signal_field = "diff_percent_ave"
-        self.approach_speed_m_s = 0.0002
-        self.contact_threshold_n = 0.10
-        self.max_travel_m = 0.020
-        self.timeout_sec = 120.0
+        self.taxel_index = 35
+        # Keep the plotted response in the sensor's native count unit.  The
+        # underlying diffDataAve value is signed: raw - calibration.
+        self.signal_field = "diff_ave"
+        self.approach_speed_m_s = 0.0001
+        self.contact_threshold_n = (
+            self.MAX_CONTACT_THRESHOLD_G * self.NEWTONS_PER_GRAM
+        )
+        self.contact_hold_sec = 1.0
+        self.max_travel_m = 0.0
+        self.timeout_sec = 0.0
         self.repeat_count = 1
         self.return_velocity_rad_s = 0.20
         self.return_timeout_sec = 90.0
+        self.return_timeout_factor = 4.0
+        self.return_stall_timeout_sec = 120.0
+        self.return_progress_epsilon_m = 0.00001
         self.return_settle_sec = 0.75
         self.return_arrival_tolerance_rad = float(np.radians(0.5))
+        self.return_height_tolerance_m = 0.0001
         self.recalibration_timeout_sec = 45.0
-        self.start_position_tolerance_m = 0.003
-        self.start_joint_tolerance_rad = float(np.radians(3.0))
         self.force_baseline_duration_sec = 1.0
         self.force_baseline_min_samples = 3
         self.force_sample_stale_sec = 1.0
-        self._contact_approach_requested = False
+        self.force_connection_timeout_sec = 10.0
+        # A force dropout during a force-sensitive phase pauses the robot and
+        # keeps the current trial alive. A living reader gets a short chance
+        # to recover by itself; after that, reconnection is retried until the
+        # stream is stable again or the operator presses Stop.
+        self.force_pause_reconnect_delay_sec = 2.0
+        self.force_pause_retry_interval_sec = 5.0
+        self.force_resume_stable_sec = 0.5
+        self.force_resume_min_samples = 3
         self._test_active = False
         self._phase = "idle"
+        self._force_connection_started_at: Optional[float] = None
         self._started_at: Optional[float] = None
         self._approach_started_at: Optional[float] = None
         self._start_tool_position = None
@@ -230,9 +286,87 @@ class CalibrationTask(ExperimentTask):
         self._batch_completed = False
         self._return_started_at: Optional[float] = None
         self._return_arrived_at: Optional[float] = None
+        self._current_return_timeout_sec = float(self.return_timeout_sec)
+        self._return_best_remaining_m: Optional[float] = None
+        self._return_last_progress_at: Optional[float] = None
+        self._return_purpose = ""
+        self._contact_hold_started_at: Optional[float] = None
         self._recalibration_started_at: Optional[float] = None
+        self._force_recovery_started_at: Optional[float] = None
+        self._force_recovery_restart_attempted = False
+        self._force_paused_phase = ""
+        self._force_pause_started_at: Optional[float] = None
+        self._force_pause_last_restart_at: Optional[float] = None
+        self._force_pause_restart_attempts = 0
+        self._force_resume_candidate_at: Optional[float] = None
+        self._force_resume_last_sample_at: Optional[float] = None
+        self._force_resume_sample_count = 0
+        self._force_pause_count = 0
+        self._force_pause_total_sec = 0.0
         self.last_result: Optional[dict] = None
         self.load_initial_position()
+
+    @property
+    def contact_threshold_g(self) -> float:
+        """Contact threshold in the gram-force unit shown by the transmitter."""
+        return float(self.contact_threshold_n) / self.NEWTONS_PER_GRAM
+
+    @contact_threshold_g.setter
+    def contact_threshold_g(self, value: float) -> None:
+        self.contact_threshold_n = (
+            min(
+                self.MAX_CONTACT_THRESHOLD_G,
+                max(0.0, float(value)),
+            )
+            * self.NEWTONS_PER_GRAM
+        )
+
+    @staticmethod
+    def _folder_number(value: float) -> str:
+        """Return a compact, filename-safe decimal value."""
+        text = f"{float(value):.6f}".rstrip("0").rstrip(".")
+        if text in {"", "-0"}:
+            text = "0"
+        return text.replace("-", "neg").replace(".", "p")
+
+    @staticmethod
+    def _folder_token(value) -> str:
+        token = "".join(
+            character
+            if character.isalnum() or character in {"-", "_"}
+            else "-"
+            for character in str(value).strip()
+        )
+        while "--" in token:
+            token = token.replace("--", "-")
+        return token.strip("-_") or "unknown"
+
+    def _experiment_folder_name(self, timestamp: str) -> str:
+        """Name one calibration folder from time and all seven settings."""
+        speed_mm_s = abs(float(self.approach_speed_m_s)) * 1000.0
+        threshold_g = float(self.contact_threshold_g)
+        travel_mm = max(0.0, float(self.max_travel_m)) * 1000.0
+        timeout_s = max(0.0, float(self.timeout_sec))
+        travel_token = (
+            f"{self._folder_number(travel_mm)}mm"
+            if travel_mm > 0.0
+            else "unlimited"
+        )
+        timeout_token = (
+            f"{self._folder_number(timeout_s)}s"
+            if timeout_s > 0.0
+            else "unlimited"
+        )
+        return (
+            f"calibration_{self._folder_token(timestamp)}_"
+            f"taxel-{int(self.taxel_index)}_"
+            f"signal-{self._folder_token(self.signal_field)}_"
+            f"speed-{self._folder_number(speed_mm_s)}mmps_"
+            f"threshold-{self._folder_number(threshold_g)}g_"
+            f"travel-{travel_token}_"
+            f"timeout-{timeout_token}_"
+            f"reps-{max(1, int(self.repeat_count))}"
+        )
 
     @staticmethod
     def _robot_api(host):
@@ -356,9 +490,6 @@ class CalibrationTask(ExperimentTask):
             host._refresh_calibration_controls()
         return saved
 
-    def request_contact_approach(self) -> None:
-        self._contact_approach_requested = True
-
     def _update_progress(self, host, detail: str = "") -> None:
         callback = getattr(host, "_refresh_calibration_progress", None)
         if callable(callback):
@@ -402,6 +533,18 @@ class CalibrationTask(ExperimentTask):
             return None
         return raw_force, sample_at
 
+    def _fresh_force_reading(self, host, now=None):
+        """Return a force sample only while its reader and timestamp are live."""
+        now = time.monotonic() if now is None else float(now)
+        reading = self._read_force_meter(host)
+        if (
+            reading is None
+            or not self._force_meter_reader_running(self._ui_ros(host))
+            or now - float(reading[1]) > float(self.force_sample_stale_sec)
+        ):
+            return None
+        return reading
+
     @staticmethod
     def _matrix_value(data_obj, name, row, column):
         matrix = getattr(data_obj, name, None)
@@ -433,7 +576,7 @@ class CalibrationTask(ExperimentTask):
         display_row = index % rows
         column = index // rows
         source_row = rows - 1 - display_row
-        return {
+        values = {
             "frame_sequence": int(getattr(data_obj, "frame_sequence", 0) or 0),
             "cell_index": index,
             "display_row": display_row,
@@ -460,6 +603,40 @@ class CalibrationTask(ExperimentTask):
                 data_obj, "diffPerDataAve", display_row, column
             ),
         }
+        source = self.SIGNAL_MATRIX_SOURCES.get(str(self.signal_field))
+        if source is not None:
+            matrix_name, uses_display_rows = source
+            try:
+                signal_matrix = np.asarray(
+                    getattr(data_obj, matrix_name),
+                    dtype=float,
+                )
+            except (AttributeError, TypeError, ValueError):
+                signal_matrix = None
+            for taxel_index in range(rows * columns):
+                taxel_display_row = taxel_index % rows
+                taxel_column = taxel_index // rows
+                taxel_row = (
+                    taxel_display_row
+                    if uses_display_rows
+                    else rows - 1 - taxel_display_row
+                )
+                value = None
+                if signal_matrix is not None:
+                    try:
+                        candidate = float(
+                            signal_matrix[taxel_row, taxel_column]
+                        )
+                    except (IndexError, TypeError, ValueError):
+                        candidate = None
+                    if candidate is not None and np.isfinite(candidate):
+                        value = candidate
+                column_name = taxel_signal_column(
+                    self.signal_field,
+                    taxel_index,
+                )
+                values[column_name] = value
+        return values
 
     @staticmethod
     def _send_base_z_velocity(api, velocity_m_s: float) -> bool:
@@ -516,10 +693,162 @@ class CalibrationTask(ExperimentTask):
     def _fail_start(self, host, message: str) -> bool:
         self._test_active = False
         self._phase = "idle"
+        self._force_connection_started_at = None
         host._append_sidebar_control_message(message)
         if hasattr(host, "_set_calibration_controls_running"):
             host._set_calibration_controls_running(False)
         return False
+
+    def _validate_start_prerequisites(self, host) -> bool:
+        if self.initial_position is None:
+            return self._fail_start(
+                host,
+                "Remember the Calibration initial position before pressing Run.",
+            )
+        api = self._robot_api(host)
+        if (
+            api is None
+            or not hasattr(api, "get_current_positions")
+            or not hasattr(api, "send_positions_joint_angle")
+        ):
+            return self._fail_start(
+                host,
+                "Robot joint feedback or position control is unavailable; "
+                "Calibration did not start.",
+            )
+        saved_joints = self._finite_values(
+            self.initial_position.get("joints_rad"), 6
+        )
+        if saved_joints is None:
+            return self._fail_start(
+                host,
+                "The remembered Calibration position is invalid. Remember it "
+                "again before pressing Run.",
+            )
+        taxel = self._read_taxel(host)
+        if taxel is None or int(taxel.get("frame_sequence", 0)) <= 0:
+            return self._fail_start(
+                host,
+                f"A live {self.sensor_rows}x{self.sensor_columns} sensor is required "
+                f"before testing taxel {self.taxel_index}.",
+            )
+        sensor = getattr(self._ui_ros(host), "sensor_functions", None)
+        if bool(getattr(sensor, "_sensor_calibration_in_progress", False)):
+            return self._fail_start(
+                host,
+                "Wait for the active sensor calibration to finish before "
+                "starting the Calibration experiment.",
+            )
+        return True
+
+    @staticmethod
+    def _force_meter_reader_running(ui_ros) -> bool:
+        thread = getattr(ui_ros, "_force_meter_thread", None)
+        if thread is None:
+            return False
+        try:
+            return bool(thread.isRunning())
+        except RuntimeError:
+            return False
+
+    def _begin_force_meter_connection(self, host) -> bool:
+        ui_ros = self._ui_ros(host)
+        if ui_ros is None:
+            return self._fail_start(
+                host,
+                "Calibration could not access the force-transmitter controls.",
+            )
+
+        reader_running = self._force_meter_reader_running(ui_ros)
+        if not reader_running:
+            refresh_ports = getattr(ui_ros, "_refresh_force_meter_ports", None)
+            if callable(refresh_ports):
+                refresh_ports()
+            start_reader = getattr(ui_ros, "_start_force_meter", None)
+            if not callable(start_reader) or not bool(start_reader()):
+                status_label = getattr(ui_ros, "force_meter_status_label", None)
+                status = (
+                    str(status_label.text()).strip()
+                    if status_label is not None and hasattr(status_label, "text")
+                    else ""
+                )
+                detail = f" ({status})" if status else ""
+                return self._fail_start(
+                    host,
+                    "Calibration could not automatically start the force "
+                    f"transmitter{detail}.",
+                )
+
+        self._test_active = False
+        self._phase = "connecting_force_meter"
+        self._force_connection_started_at = time.monotonic()
+        self._stop_reason = ""
+        self._samples = []
+        self._trial_result_saved = False
+        if hasattr(host, "_set_calibration_controls_running"):
+            host._set_calibration_controls_running(True)
+        self._update_progress(
+            host,
+            "Connecting force transmitter; waiting for a fresh sample",
+        )
+        host._append_sidebar_control_message(
+            "Calibration is connecting the force transmitter automatically. "
+            "Robot motion will begin only after fresh force data is received."
+        )
+        return True
+
+    def _tick_force_meter_connection(self, host, now: float) -> None:
+        force_reading = self._read_force_meter(host)
+        if (
+            force_reading is not None
+            and self._force_meter_reader_running(self._ui_ros(host))
+            and now - float(force_reading[1])
+            <= float(self.force_sample_stale_sec)
+        ):
+            host._append_sidebar_control_message(
+                "Force transmitter connected and live data received. "
+                "Starting Calibration."
+            )
+            self._force_connection_started_at = None
+            if not self._start_calibration_cycle(host):
+                host._stop_sidebar_control(
+                    show_result=False,
+                    message="Calibration did not start",
+                )
+            return
+
+        ui_ros = self._ui_ros(host)
+        error_message = str(
+            getattr(ui_ros, "_force_meter_error_message", "") or ""
+        ).strip()
+        started_at = self._force_connection_started_at
+        elapsed = 0.0 if started_at is None else now - float(started_at)
+        reader_stopped = (
+            elapsed >= 0.5 and not self._force_meter_reader_running(ui_ros)
+        )
+        timed_out = elapsed >= float(self.force_connection_timeout_sec)
+        if not error_message and not reader_stopped and not timed_out:
+            return
+
+        if error_message:
+            detail = error_message
+        elif reader_stopped:
+            detail = "the force-transmitter reader stopped before sending data"
+        else:
+            detail = (
+                "no fresh force sample was received within "
+                f"{self.force_connection_timeout_sec:.0f} seconds"
+            )
+        self._phase = "idle"
+        self._force_connection_started_at = None
+        host._append_sidebar_control_message(
+            f"Calibration did not start: {detail}. Check the serial port, "
+            "transmitter power, RS-485 A/B wiring, protocol, and baud rate."
+        )
+        host._stop_sidebar_control(
+            show_result=False,
+            message="Calibration did not start (force transmitter unavailable)",
+        )
 
     def _begin_trial(self, host, now: float, tool_position) -> None:
         self._phase = "force_baseline"
@@ -534,7 +863,16 @@ class CalibrationTask(ExperimentTask):
         self._trial_result_saved = False
         self._return_started_at = None
         self._return_arrived_at = None
+        self._return_best_remaining_m = None
+        self._return_last_progress_at = None
+        self._return_purpose = ""
+        self._contact_hold_started_at = None
         self._recalibration_started_at = None
+        self._force_recovery_started_at = None
+        self._force_recovery_restart_attempted = False
+        self._clear_force_pause_state()
+        self._force_pause_count = 0
+        self._force_pause_total_sec = 0.0
         self._update_progress(host, "Measuring force baseline")
         host._append_sidebar_control_message(
             f"Calibration trial {self._trial_number}/{self._batch_total}: "
@@ -542,122 +880,97 @@ class CalibrationTask(ExperimentTask):
             "clear of the sensor."
         )
 
-    def _start_contact_approach(self, host) -> bool:
-        if self.initial_position is None:
-            return self._fail_start(
-                host,
-                "Remember the Calibration initial position before starting the approach.",
-            )
-        api = self._robot_api(host)
-        tool_pose = self._read_tool_pose(api)
-        if tool_pose is None:
-            return self._fail_start(
-                host, "Current robot TCP feedback is unavailable; approach not started."
-            )
-        try:
-            current_joints = self._finite_values(api.get_current_positions(), 6)
-        except Exception:
-            current_joints = None
-        saved_joints = self._finite_values(
-            self.initial_position.get("joints_rad"), 6
-        )
-        saved_tool_position = self._finite_values(
-            self.initial_position.get("tool_position_m"), 3
-        )
-        if current_joints is None or saved_joints is None:
-            return self._fail_start(
-                host,
-                "Current or remembered joint feedback is unavailable. Remember "
-                "the initial position again before approaching.",
-            )
-        joint_error = float(
-            np.max(
-                np.abs(
-                    np.asarray(current_joints, dtype=float)
-                    - np.asarray(saved_joints, dtype=float)
-                )
-            )
-        )
-        tool_error = (
-            float(
-                np.linalg.norm(
-                    np.asarray(tool_pose[0], dtype=float)
-                    - np.asarray(saved_tool_position, dtype=float)
-                )
-            )
-            if saved_tool_position is not None
-            else 0.0
-        )
-        if (
-            joint_error > float(self.start_joint_tolerance_rad)
-            or tool_error > float(self.start_position_tolerance_m)
-        ):
-            return self._fail_start(
-                host,
-                "Robot is not at the remembered Calibration initial position. "
-                "Return it safely or remember the current position again.",
-            )
-        taxel = self._read_taxel(host)
-        if taxel is None or int(taxel.get("frame_sequence", 0)) <= 0:
-            return self._fail_start(
-                host,
-                f"A live {self.sensor_rows}x{self.sensor_columns} sensor is required "
-                f"before testing taxel {self.taxel_index}.",
-            )
+    def _start_calibration_cycle(self, host) -> bool:
+        if not self._validate_start_prerequisites(host):
+            return False
         force_reading = self._read_force_meter(host)
         now = time.monotonic()
         if (
             force_reading is None
+            or not self._force_meter_reader_running(self._ui_ros(host))
             or now - float(force_reading[1]) > float(self.force_sample_stale_sec)
         ):
             return self._fail_start(
                 host,
-                "Fresh HP-200 data is required. Connect the force meter in the Extra tab.",
-            )
-
-        sensor = getattr(self._ui_ros(host), "sensor_functions", None)
-        if bool(getattr(sensor, "_sensor_calibration_in_progress", False)):
-            return self._fail_start(
-                host,
-                "Wait for the active sensor calibration to finish before "
-                "starting the Calibration experiment.",
+                "Fresh force-transmitter data is required. Connect the DYLY "
+                "force meter in the Tools tab.",
             )
 
         self._test_active = True
+        self._force_connection_started_at = None
         self._batch_total = max(1, int(self.repeat_count))
         self._trial_number = 1
         self._batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._batch_directory = (
             self.output_directory
-            / (
-                f"calibration_taxel{int(self.taxel_index)}_batch_"
-                f"{self._batch_id}"
-            )
-            if self.output_directory is not None and self._batch_total > 1
+            / self._experiment_folder_name(self._batch_id)
+            if self.output_directory is not None
             else None
         )
         self._batch_results = []
         self._batch_completed = False
         self.last_result = None
-        self._begin_trial(host, now, tool_pose[0])
+        self._started_at = None
+        self._approach_started_at = None
+        self._contact_hold_started_at = None
+        self._return_best_remaining_m = None
+        self._return_last_progress_at = None
+        self._return_purpose = ""
+        self._force_recovery_started_at = None
+        self._force_recovery_restart_attempted = False
+        self._clear_force_pause_state()
+        self._force_pause_count = 0
+        self._force_pause_total_sec = 0.0
         if hasattr(host, "_set_calibration_controls_running"):
             host._set_calibration_controls_running(True)
-        return True
+        return self._begin_return_to_initial(
+            host,
+            now,
+            purpose="start",
+        )
 
     def _append_sample(self, now, force_raw_n, taxel, tool_position) -> None:
         if self._started_at is None or self._force_baseline_n is None:
             return
         elapsed = max(0.0, float(now) - float(self._started_at))
-        force_delta = float(force_raw_n) - float(self._force_baseline_n)
+        force_sample_fresh = force_raw_n is not None
+        force_raw_n = float(force_raw_n) if force_sample_fresh else None
+        force_delta = (
+            force_raw_n - float(self._force_baseline_n)
+            if force_sample_fresh
+            else None
+        )
+        force_raw_g = (
+            force_raw_n / self.NEWTONS_PER_GRAM
+            if force_sample_fresh
+            else None
+        )
+        force_baseline_g = (
+            float(self._force_baseline_n) / self.NEWTONS_PER_GRAM
+        )
+        force_delta_g = (
+            force_delta / self.NEWTONS_PER_GRAM
+            if force_delta is not None
+            else None
+        )
         start_z = float(self._start_tool_position[2])
         current_z = float(tool_position[2])
         sample = {
             "elapsed_s": elapsed,
             "phase": self._phase,
-            "force_raw_n": float(force_raw_n),
+            "force_sample_fresh": force_sample_fresh,
+            "force_raw_n": force_raw_n,
             "force_baseline_n": float(self._force_baseline_n),
             "force_delta_n": force_delta,
-            "force_delta_abs_n": abs(force_delta),
+            "force_delta_abs_n": (
+                abs(force_delta) if force_delta is not None else None
+            ),
+            "force_raw_g": force_raw_g,
+            "force_baseline_g": force_baseline_g,
+            "force_delta_g": force_delta_g,
+            "force_delta_abs_g": (
+                abs(force_delta_g) if force_delta_g is not None else None
+            ),
             "tool_z_m": current_z,
             "travel_down_mm": max(0.0, start_z - current_z) * 1000.0,
             **taxel,
@@ -669,62 +982,327 @@ class CalibrationTask(ExperimentTask):
         self._stop_robot(self._robot_api(host))
         host._stop_sidebar_control(show_result=True, message=message)
 
-    def _begin_return_to_initial(self, host, now: float) -> bool:
-        api = self._robot_api(host)
-        saved_joints = self._finite_values(
-            (self.initial_position or {}).get("joints_rad"), 6
+    def _clear_force_pause_state(self) -> None:
+        self._force_paused_phase = ""
+        self._force_pause_started_at = None
+        self._force_pause_last_restart_at = None
+        self._force_pause_restart_attempts = 0
+        self._force_resume_candidate_at = None
+        self._force_resume_last_sample_at = None
+        self._force_resume_sample_count = 0
+
+    def _begin_force_pause(self, host, now: float) -> None:
+        """Stop motion while preserving the active calibration trial."""
+        if self._phase == "paused_force_meter":
+            return
+        self._force_paused_phase = str(self._phase)
+        self._force_pause_started_at = float(now)
+        self._force_pause_last_restart_at = None
+        self._force_pause_restart_attempts = 0
+        self._force_resume_candidate_at = None
+        self._force_resume_last_sample_at = None
+        self._force_resume_sample_count = 0
+        self._force_pause_count += 1
+        self._stop_robot(self._robot_api(host))
+        self._phase = "paused_force_meter"
+        live_force_callback = getattr(
+            host,
+            "_refresh_calibration_live_force",
+            None,
         )
-        if (
-            api is None
-            or saved_joints is None
-            or not hasattr(api, "send_positions_joint_angle")
+        if callable(live_force_callback):
+            live_force_callback(None, None)
+        self._update_progress(
+            host,
+            "Paused safely; waiting for stable force data",
+        )
+        host._append_sidebar_control_message(
+            "Force data became stale. Robot motion is paused and the current "
+            "trial is preserved. Calibration will resume automatically after "
+            "the force stream is stable again; press Stop to cancel."
+        )
+
+    def _restart_force_meter_for_pause(self, host, now: float) -> None:
+        ui_ros = self._ui_ros(host)
+        if ui_ros is None:
+            return
+        last_attempt = self._force_pause_last_restart_at
+        if last_attempt is not None and (
+            now - float(last_attempt)
+            < float(self.force_pause_retry_interval_sec)
         ):
+            return
+
+        pause_started_at = self._force_pause_started_at
+        paused_for = (
+            0.0
+            if pause_started_at is None
+            else now - float(pause_started_at)
+        )
+        reader_running = self._force_meter_reader_running(ui_ros)
+        if reader_running and (
+            paused_for < float(self.force_pause_reconnect_delay_sec)
+        ):
+            return
+
+        self._force_pause_last_restart_at = float(now)
+        self._force_pause_restart_attempts += 1
+        stop_reader = getattr(ui_ros, "_stop_force_meter", None)
+        if callable(stop_reader):
+            try:
+                stop_reader()
+            except Exception:
+                pass
+        refresh_ports = getattr(ui_ros, "_refresh_force_meter_ports", None)
+        if callable(refresh_ports):
+            try:
+                refresh_ports()
+            except Exception:
+                pass
+        start_reader = getattr(ui_ros, "_start_force_meter", None)
+        started = False
+        if callable(start_reader):
+            try:
+                started = bool(start_reader())
+            except Exception:
+                started = False
+        status = "started" if started else "waiting for the port"
+        self._update_progress(
+            host,
+            "Paused; force reconnection attempt "
+            f"{self._force_pause_restart_attempts} {status}",
+        )
+        if self._force_pause_restart_attempts == 1:
+            host._append_sidebar_control_message(
+                "Automatic force-transmitter reconnection started. The robot "
+                "will remain stopped until several fresh samples confirm a "
+                "stable stream."
+            )
+
+    @staticmethod
+    def _shift_timestamp(value, duration: float):
+        return None if value is None else float(value) + float(duration)
+
+    def _resume_from_force_pause(self, host, now: float) -> None:
+        resume_phase = str(self._force_paused_phase or "approaching")
+        pause_started_at = self._force_pause_started_at
+        pause_duration = (
+            0.0
+            if pause_started_at is None
+            else max(0.0, float(now) - float(pause_started_at))
+        )
+        self._force_pause_total_sec += pause_duration
+
+        if resume_phase == "force_baseline":
+            # Re-measure a complete stationary baseline after reconnection.
+            self._started_at = float(now)
+            self._force_baseline_samples = []
+            self._last_force_sample_at = None
+        else:
+            # A paused interval must not consume the trial or contact-hold
+            # timeout and should not create an artificial gap in elapsed time.
+            self._started_at = self._shift_timestamp(
+                self._started_at,
+                pause_duration,
+            )
+            self._approach_started_at = self._shift_timestamp(
+                self._approach_started_at,
+                pause_duration,
+            )
+            self._contact_hold_started_at = self._shift_timestamp(
+                self._contact_hold_started_at,
+                pause_duration,
+            )
+
+        self._phase = resume_phase
+        self._clear_force_pause_state()
+        phase_detail = {
+            "force_baseline": "Re-measuring force baseline",
+            "approaching": "Force restored; resuming approach",
+            "contact_hold": "Force restored; resuming contact hold",
+        }.get(resume_phase, "Force restored; resuming calibration")
+        self._update_progress(host, phase_detail)
+        host._append_sidebar_control_message(
+            "Force stream is stable again. Resuming calibration trial "
+            f"{self._trial_number}/{self._batch_total} from the paused "
+            f"position after {pause_duration:.1f} s."
+        )
+
+    def _tick_force_pause(self, host, now: float) -> None:
+        reading = self._fresh_force_reading(host, now)
+        if reading is None:
+            self._force_resume_candidate_at = None
+            self._force_resume_last_sample_at = None
+            self._force_resume_sample_count = 0
+            self._restart_force_meter_for_pause(host, now)
+            return
+
+        sample_at = float(reading[1])
+        if self._force_resume_candidate_at is None:
+            self._force_resume_candidate_at = float(now)
+        if sample_at != self._force_resume_last_sample_at:
+            self._force_resume_last_sample_at = sample_at
+            self._force_resume_sample_count += 1
+        stable_for = now - float(self._force_resume_candidate_at)
+        required_samples = max(1, int(self.force_resume_min_samples))
+        if stable_for < float(self.force_resume_stable_sec) or (
+            self._force_resume_sample_count < required_samples
+        ):
+            self._update_progress(
+                host,
+                "Force data returned; confirming a stable stream",
+            )
+            return
+        self._resume_from_force_pause(host, now)
+
+    def _begin_return_to_initial(
+        self,
+        host,
+        now: float,
+        *,
+        purpose: str,
+    ) -> bool:
+        api = self._robot_api(host)
+        purpose = str(purpose)
+        if api is None:
             self._request_stop(
                 host,
                 "return_unavailable",
-                "Calibration batch stopped: the robot cannot return to the "
-                "remembered initial position.",
+                "Calibration batch stopped: robot control is unavailable for "
+                "the return motion.",
             )
             return False
         self._stop_robot(api)
-        try:
-            sent = bool(
-                api.send_positions_joint_angle(
-                    saved_joints,
-                    velocity=float(self.return_velocity_rad_s),
-                    acc_time=0.2,
-                    blend_percentage=0,
-                    fine_goal=True,
-                )
-            )
-        except Exception as exc:
-            self._request_stop(
-                host,
-                "return_command_failed",
-                f"Calibration batch stopped: return command failed ({exc}).",
-            )
-            return False
-        if not sent:
-            self._request_stop(
-                host,
-                "return_command_failed",
-                "Calibration batch stopped: the robot rejected the return command.",
-            )
-            return False
         self._phase = "returning"
-        self._stop_reason = ""
-        self._samples = []
+        self._return_purpose = purpose
+        if purpose == "start":
+            self._samples = []
         self._return_started_at = float(now)
         self._return_arrived_at = None
-        self._update_progress(host, "Returning to the initial position")
-        host._append_sidebar_control_message(
-            f"Calibration trial {self._trial_number}/{self._batch_total} "
-            "complete. Returning to the remembered initial position."
-        )
+        self._return_best_remaining_m = None
+        self._return_last_progress_at = float(now)
+        self._current_return_timeout_sec = float(self.return_timeout_sec)
+
+        if purpose == "start":
+            saved_joints = self._finite_values(
+                (self.initial_position or {}).get("joints_rad"), 6
+            )
+            if (
+                saved_joints is None
+                or not hasattr(api, "send_positions_joint_angle")
+            ):
+                self._request_stop(
+                    host,
+                    "return_unavailable",
+                    "Calibration batch stopped: the robot cannot return to "
+                    "the remembered initial pose before trial 1.",
+                )
+                return False
+            try:
+                sent = bool(
+                    api.send_positions_joint_angle(
+                        saved_joints,
+                        velocity=float(self.return_velocity_rad_s),
+                        acc_time=0.2,
+                        blend_percentage=0,
+                        fine_goal=True,
+                    )
+                )
+            except Exception as exc:
+                self._request_stop(
+                    host,
+                    "return_command_failed",
+                    f"Calibration batch stopped: initial-pose return command "
+                    f"failed ({exc}).",
+                )
+                return False
+            if not sent:
+                self._request_stop(
+                    host,
+                    "return_command_failed",
+                    "Calibration batch stopped: the robot rejected the "
+                    "initial-pose return command.",
+                )
+                return False
+            self._update_progress(host, "Returning to the initial pose")
+            message = (
+                "Calibration Run started. Returning to the remembered "
+                "initial position before trial 1."
+            )
+        else:
+            target_position = self._finite_values(self._start_tool_position, 3)
+            current_pose = self._read_tool_pose(api)
+            if target_position is None or current_pose is None:
+                self._request_stop(
+                    host,
+                    "return_unavailable",
+                    "Calibration batch stopped: current or initial TCP height "
+                    "is unavailable for the base +Z return.",
+                )
+                return False
+            return_speed_m_s = abs(float(self.approach_speed_m_s))
+            if return_speed_m_s <= 0.0:
+                self._request_stop(
+                    host,
+                    "return_unavailable",
+                    "Calibration batch stopped: the base +Z return speed must "
+                    "be greater than zero.",
+                )
+                return False
+            return_distance_m = max(
+                0.0,
+                float(target_position[2]) - float(current_pose[0][2]),
+            )
+            expected_return_sec = return_distance_m / return_speed_m_s
+            self._current_return_timeout_sec = max(
+                float(self.return_timeout_sec),
+                expected_return_sec * float(self.return_timeout_factor) + 60.0,
+            )
+            self._return_best_remaining_m = return_distance_m
+            if not self._send_base_z_velocity(
+                api,
+                return_speed_m_s,
+            ):
+                self._request_stop(
+                    host,
+                    "return_command_failed",
+                    "Calibration batch stopped: the robot rejected the base "
+                    "+Z return command.",
+                )
+                return False
+            return_speed_mm_s = abs(float(self.approach_speed_m_s)) * 1000.0
+            self._update_progress(
+                host,
+                f"Returning in base +Z at {return_speed_mm_s:.3f} mm/s",
+            )
+            message = (
+                f"Calibration trial {self._trial_number}/{self._batch_total}: "
+                f"returning in base +Z at {return_speed_mm_s:.3f} mm/s. "
+                "The trial completes after the initial height is reached."
+            )
+        host._append_sidebar_control_message(message)
         return True
 
     def _tick_return_to_initial(self, host, now: float) -> None:
         api = self._robot_api(host)
+        purpose = str(self._return_purpose)
+        if (
+            self._return_started_at is not None
+            and now - float(self._return_started_at)
+            >= float(self._current_return_timeout_sec)
+        ):
+            self._request_stop(
+                host,
+                "return_timeout",
+                "Calibration batch stopped: returning to the initial position "
+                "timed out.",
+            )
+            return
+
+        if purpose != "start":
+            self._tick_vertical_return_to_initial(host, now, api, purpose)
+            return
+
         current_joints = None
         if api is not None and hasattr(api, "get_current_positions"):
             try:
@@ -744,18 +1322,6 @@ class CalibrationTask(ExperimentTask):
                 "during the return motion.",
             )
             return
-        if (
-            self._return_started_at is not None
-            and now - float(self._return_started_at)
-            >= float(self.return_timeout_sec)
-        ):
-            self._request_stop(
-                host,
-                "return_timeout",
-                "Calibration batch stopped: returning to the initial position "
-                "timed out.",
-            )
-            return
         joint_error = float(
             np.max(
                 np.abs(
@@ -773,7 +1339,115 @@ class CalibrationTask(ExperimentTask):
             return
         if now - float(self._return_arrived_at) < float(self.return_settle_sec):
             return
-        self._start_sensor_recalibration(host, now)
+        tool_pose = self._read_tool_pose(api)
+        if tool_pose is None:
+            self._request_stop(
+                host,
+                "feedback_unavailable",
+                "Calibration stopped: TCP feedback was unavailable at "
+                "the initial position.",
+            )
+            return
+        self._begin_trial(host, now, tool_pose[0])
+
+    def _tick_vertical_return_to_initial(
+        self,
+        host,
+        now: float,
+        api,
+        purpose: str,
+    ) -> None:
+        tool_pose = self._read_tool_pose(api)
+        target_position = self._finite_values(self._start_tool_position, 3)
+        if tool_pose is None or target_position is None:
+            self._request_stop(
+                host,
+                "return_feedback_unavailable",
+                "Calibration batch stopped: TCP feedback was unavailable "
+                "during the base +Z return.",
+            )
+            return
+        current_z = float(tool_pose[0][2])
+        target_z = float(target_position[2])
+        remaining_m = target_z - current_z
+        if remaining_m > float(self.return_height_tolerance_m):
+            best_remaining = self._return_best_remaining_m
+            if (
+                best_remaining is None
+                or remaining_m
+                <= best_remaining - float(self.return_progress_epsilon_m)
+            ):
+                self._return_best_remaining_m = remaining_m
+                self._return_last_progress_at = float(now)
+            elif (
+                self._return_last_progress_at is not None
+                and now - float(self._return_last_progress_at)
+                >= float(self.return_stall_timeout_sec)
+            ):
+                self._request_stop(
+                    host,
+                    "return_stalled",
+                    "Calibration batch stopped: no upward TCP progress was "
+                    "detected during the base +Z return.",
+                )
+                return
+            self._return_arrived_at = None
+            if not self._send_base_z_velocity(
+                api,
+                abs(float(self.approach_speed_m_s)),
+            ):
+                self._request_stop(
+                    host,
+                    "return_command_failed",
+                    "Calibration batch stopped: the robot rejected the base "
+                    "+Z return command.",
+                )
+            return
+
+        if self._return_arrived_at is None:
+            self._stop_robot(api)
+            self._return_arrived_at = float(now)
+            self._update_progress(
+                host,
+                "Initial height reached; settling before completing trial",
+            )
+            return
+        if now - float(self._return_arrived_at) < float(self.return_settle_sec):
+            return
+        self._finish_returned_trial(host, now, purpose)
+
+    def _finish_returned_trial(self, host, now: float, purpose: str) -> None:
+        try:
+            result = self._save_current_trial(host)
+        except Exception as exc:
+            self._request_stop(
+                host,
+                "save_failed",
+                "Calibration batch stopped: trial data could not be "
+                f"saved after the return ({exc}).",
+            )
+            return
+        if result is None:
+            self._request_stop(
+                host,
+                "save_failed",
+                "Calibration batch stopped: no trial samples were available "
+                "after the return.",
+            )
+            return
+
+        if purpose == "complete":
+            self._batch_completed = True
+            host._stop_sidebar_control(
+                show_result=True,
+                message=(
+                    "Calibration batch complete. Final trial completed after "
+                    "the robot returned to the initial height using base +Z "
+                    "motion."
+                ),
+            )
+        else:
+            self._start_sensor_recalibration(host, now)
 
     def _start_sensor_recalibration(self, host, now: float) -> None:
         sensor = getattr(self._ui_ros(host), "sensor_functions", None)
@@ -856,13 +1530,91 @@ class CalibrationTask(ExperimentTask):
                 "sensor calibration.",
             )
             return
-        self._trial_number += 1
-        self._begin_trial(host, now, tool_pose[0])
+        self._begin_next_trial_or_force_recovery(host, now, tool_pose[0])
+
+    def _begin_next_trial_or_force_recovery(
+        self,
+        host,
+        now: float,
+        tool_position,
+    ) -> None:
+        if self._fresh_force_reading(host, now) is not None:
+            self._trial_number += 1
+            self._begin_trial(host, now, tool_position)
+            return
+        self._phase = "recovering_force_meter"
+        self._force_recovery_started_at = float(now)
+        self._force_recovery_restart_attempted = False
+        self._update_progress(
+            host,
+            "Initial height reached; recovering force transmitter",
+        )
+        host._append_sidebar_control_message(
+            "The force stream became stale during the completed return. "
+            "The robot is stopped at the initial height; reconnecting the "
+            f"force transmitter before trial {self._trial_number + 1}/"
+            f"{self._batch_total}."
+        )
+
+    def _tick_force_recovery(self, host, now: float) -> None:
+        reading = self._fresh_force_reading(host, now)
+        if reading is not None:
+            tool_pose = self._read_tool_pose(self._robot_api(host))
+            if tool_pose is None:
+                self._request_stop(
+                    host,
+                    "feedback_unavailable",
+                    "Calibration batch stopped: TCP feedback was unavailable "
+                    "after force-transmitter recovery.",
+                )
+                return
+            self._force_recovery_started_at = None
+            self._force_recovery_restart_attempted = False
+            self._trial_number += 1
+            host._append_sidebar_control_message(
+                "Fresh force data received. Starting calibration trial "
+                f"{self._trial_number}/{self._batch_total}."
+            )
+            self._begin_trial(host, now, tool_pose[0])
+            return
+
+        if not self._force_recovery_restart_attempted:
+            self._force_recovery_restart_attempted = True
+            ui_ros = self._ui_ros(host)
+            stop_reader = getattr(ui_ros, "_stop_force_meter", None)
+            if callable(stop_reader):
+                try:
+                    stop_reader()
+                except Exception:
+                    pass
+            refresh_ports = getattr(ui_ros, "_refresh_force_meter_ports", None)
+            if callable(refresh_ports):
+                refresh_ports()
+            start_reader = getattr(ui_ros, "_start_force_meter", None)
+            if not callable(start_reader) or not bool(start_reader()):
+                self._request_stop(
+                    host,
+                    "force_meter_recovery_failed",
+                    "Calibration batch stopped: the force transmitter could "
+                    "not be reconnected before the next trial.",
+                )
+                return
+
+        started_at = self._force_recovery_started_at
+        elapsed = 0.0 if started_at is None else now - float(started_at)
+        if elapsed >= float(self.force_connection_timeout_sec):
+            self._request_stop(
+                host,
+                "force_meter_recovery_timeout",
+                "Calibration batch stopped safely at the initial height: no "
+                "fresh force sample arrived after reconnection.",
+            )
 
     def _save_result(self) -> Optional[dict]:
         if not self._samples:
             return None
         rows = list(self._samples)
+        analysis = analyze_calibration_rows(rows, self.signal_field)
         trial_number = max(1, int(self._trial_number))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         stem = (
@@ -883,7 +1635,7 @@ class CalibrationTask(ExperimentTask):
                 writer.writerows(rows)
             metadata_path = result_directory / f"{stem}.json"
             metadata = {
-                "version": 2,
+                "version": 7,
                 "batch_id": self._batch_id,
                 "trial_number": trial_number,
                 "requested_trials": int(self._batch_total),
@@ -891,13 +1643,32 @@ class CalibrationTask(ExperimentTask):
                 "sensor_shape": [self.sensor_rows, self.sensor_columns],
                 "taxel_index": int(self.taxel_index),
                 "signal_field": self.signal_field,
+                "recorded_taxel_indices": list(
+                    range(self.sensor_rows * self.sensor_columns)
+                ),
                 "approach_speed_m_s": float(self.approach_speed_m_s),
+                "return_speed_m_s": float(abs(self.approach_speed_m_s)),
+                "return_height_tolerance_m": float(
+                    self.return_height_tolerance_m
+                ),
                 "contact_threshold_n": float(self.contact_threshold_n),
+                "contact_threshold_g": float(self.contact_threshold_g),
+                "contact_hold_sec": float(self.contact_hold_sec),
                 "max_travel_m": float(self.max_travel_m),
                 "timeout_sec": float(self.timeout_sec),
                 "force_baseline_n": self._force_baseline_n,
+                "force_baseline_g": (
+                    None
+                    if self._force_baseline_n is None
+                    else float(self._force_baseline_n)
+                    / self.NEWTONS_PER_GRAM
+                ),
                 "initial_position": self.initial_position,
+                "experiment_directory": str(result_directory),
+                "force_pause_count": int(self._force_pause_count),
+                "force_pause_total_s": float(self._force_pause_total_sec),
                 "sample_count": len(rows),
+                "analysis": analysis,
                 "csv_path": str(csv_path),
             }
             with metadata_path.open("w", encoding="utf-8") as stream:
@@ -915,7 +1686,26 @@ class CalibrationTask(ExperimentTask):
             "requested_trials": int(self._batch_total),
             "taxel_index": int(self.taxel_index),
             "signal_field": self.signal_field,
+            "sensor_shape": [self.sensor_rows, self.sensor_columns],
+            "recorded_taxel_indices": list(
+                range(self.sensor_rows * self.sensor_columns)
+            ),
+            "approach_speed_m_s": float(self.approach_speed_m_s),
+            "return_speed_m_s": float(abs(self.approach_speed_m_s)),
+            "return_height_tolerance_m": float(
+                self.return_height_tolerance_m
+            ),
             "contact_threshold_n": float(self.contact_threshold_n),
+            "contact_threshold_g": float(self.contact_threshold_g),
+            "contact_hold_sec": float(self.contact_hold_sec),
+            "experiment_directory": (
+                str(self._batch_directory)
+                if self._batch_directory is not None
+                else ""
+            ),
+            "force_pause_count": int(self._force_pause_count),
+            "force_pause_total_s": float(self._force_pause_total_sec),
+            "analysis": analysis,
         }
         result["summary"] = self._summarize_trial(result)
         return result
@@ -935,16 +1725,31 @@ class CalibrationTask(ExperimentTask):
     def _summarize_trial(self, result: dict) -> dict:
         rows = list(result.get("rows") or [])
         force_values = self._finite_row_values(rows, "force_delta_abs_n")
+        force_values_g = self._finite_row_values(rows, "force_delta_abs_g")
         travel_values = self._finite_row_values(rows, "travel_down_mm")
         duration_values = self._finite_row_values(rows, "elapsed_s")
         signal_field = str(result.get("signal_field") or self.signal_field)
         signal_values = self._finite_row_values(rows, signal_field)
+        analysis = dict(
+            result.get("analysis")
+            or analyze_calibration_rows(rows, signal_field)
+        )
+        signal_onset = analysis.get("signal_onset") or {}
+        contact_onset = analysis.get("contact_onset") or {}
+        signal_distance_fit = analysis.get("signal_distance_fit") or {}
+        force_distance_fit = analysis.get("force_distance_fit") or {}
+        force_signal_fit = analysis.get("force_signal_fit") or {}
         return {
             "trial_number": int(result.get("trial_number", 0)),
             "stop_reason": str(result.get("stop_reason", "")),
+            "force_pause_count": int(result.get("force_pause_count", 0)),
+            "force_pause_total_s": float(
+                result.get("force_pause_total_s", 0.0)
+            ),
             "sample_count": len(rows),
             "duration_s": max(duration_values, default=0.0),
             "peak_force_change_n": max(force_values, default=0.0),
+            "peak_force_change_g": max(force_values_g, default=0.0),
             "contact_travel_mm": max(travel_values, default=0.0),
             "signal_min": min(signal_values, default=0.0),
             "signal_max": max(signal_values, default=0.0),
@@ -952,6 +1757,17 @@ class CalibrationTask(ExperimentTask):
                 (abs(value) for value in signal_values), default=0.0
             ),
             "signal_final": signal_values[-1] if signal_values else 0.0,
+            "signal_onset_distance_mm": signal_onset.get("distance_mm"),
+            "contact_onset_distance_mm": contact_onset.get("distance_mm"),
+            "signal_distance_slope": signal_distance_fit.get("slope"),
+            "signal_distance_intercept": signal_distance_fit.get("intercept"),
+            "signal_distance_r_squared": signal_distance_fit.get("r_squared"),
+            "force_distance_slope": force_distance_fit.get("slope"),
+            "force_distance_intercept": force_distance_fit.get("intercept"),
+            "force_distance_r_squared": force_distance_fit.get("r_squared"),
+            "force_signal_slope": force_signal_fit.get("slope"),
+            "force_signal_intercept": force_signal_fit.get("intercept"),
+            "force_signal_r_squared": force_signal_fit.get("r_squared"),
             "csv_path": str(result.get("csv_path", "")),
             "metadata_path": str(result.get("metadata_path", "")),
         }
@@ -998,7 +1814,7 @@ class CalibrationTask(ExperimentTask):
 
         metadata_path = result_directory / f"{summary_stem}.json"
         metadata = {
-            "version": 1,
+            "version": 2,
             "batch_id": self._batch_id,
             "status": (
                 "complete"
@@ -1011,12 +1827,22 @@ class CalibrationTask(ExperimentTask):
             "sensor_shape": [self.sensor_rows, self.sensor_columns],
             "taxel_index": int(self.taxel_index),
             "signal_field": self.signal_field,
+            "recorded_taxel_indices": list(
+                range(self.sensor_rows * self.sensor_columns)
+            ),
             "approach_speed_m_s": float(self.approach_speed_m_s),
+            "return_speed_m_s": float(abs(self.approach_speed_m_s)),
+            "return_height_tolerance_m": float(
+                self.return_height_tolerance_m
+            ),
             "contact_threshold_n": float(self.contact_threshold_n),
+            "contact_threshold_g": float(self.contact_threshold_g),
+            "contact_hold_sec": float(self.contact_hold_sec),
             "max_travel_m": float(self.max_travel_m),
             "timeout_sec": float(self.timeout_sec),
             "return_velocity_rad_s": float(self.return_velocity_rad_s),
             "initial_position": self.initial_position,
+            "experiment_directory": str(result_directory),
             "summary_csv_path": str(summary_path),
             "trials": summary_rows,
         }
@@ -1024,11 +1850,9 @@ class CalibrationTask(ExperimentTask):
             json.dump(metadata, stream, indent=2)
             stream.write("\n")
 
-        graph_directory = result_directory / (
-            "graphs"
-            if self._batch_directory is not None
-            else f"{self._batch_id}_graphs"
-        )
+        # PNG exports live beside the CSV/JSON files: one experiment, one
+        # self-contained directory with no separate graph output folder.
+        graph_directory = result_directory
         return str(summary_path), str(metadata_path), str(graph_directory)
 
     def _build_final_result(self) -> Optional[dict]:
@@ -1048,6 +1872,11 @@ class CalibrationTask(ExperimentTask):
             "batch_summary_path": summary_path,
             "batch_metadata_path": metadata_path,
             "graph_directory": graph_directory,
+            "experiment_directory": (
+                str(self._batch_directory)
+                if self._batch_directory is not None
+                else ""
+            ),
         }
         if self._batch_total == 1 and len(self._batch_results) == 1:
             result = dict(self._batch_results[0])
@@ -1057,7 +1886,13 @@ class CalibrationTask(ExperimentTask):
             **common,
             "taxel_index": int(self.taxel_index),
             "signal_field": self.signal_field,
+            "sensor_shape": [self.sensor_rows, self.sensor_columns],
+            "recorded_taxel_indices": list(
+                range(self.sensor_rows * self.sensor_columns)
+            ),
             "contact_threshold_n": float(self.contact_threshold_n),
+            "contact_threshold_g": float(self.contact_threshold_g),
+            "contact_hold_sec": float(self.contact_hold_sec),
             "trial_results": list(self._batch_results),
             "rows": list(self._batch_results[-1].get("rows") or []),
             "stop_reason": str(
@@ -1066,35 +1901,95 @@ class CalibrationTask(ExperimentTask):
         }
 
     def on_start(self, host) -> bool:
-        if self._contact_approach_requested:
-            self._contact_approach_requested = False
-            return self._start_contact_approach(host)
-        self.capture_initial_position(host)
-        return False
+        if not self._validate_start_prerequisites(host):
+            return False
+        force_reading = self._read_force_meter(host)
+        now = time.monotonic()
+        if (
+            force_reading is not None
+            and self._force_meter_reader_running(self._ui_ros(host))
+            and now - float(force_reading[1])
+            <= float(self.force_sample_stale_sec)
+        ):
+            return self._start_calibration_cycle(host)
+        return self._begin_force_meter_connection(host)
 
     def on_tick(self, host) -> None:
-        if not self._test_active or self._started_at is None:
+        if self._phase == "connecting_force_meter":
+            self._tick_force_meter_connection(host, time.monotonic())
+            return
+        if not self._test_active:
             return
         now = time.monotonic()
-        force_reading = self._read_force_meter(host)
-        if (
-            force_reading is None
-            or now - float(force_reading[1]) > float(self.force_sample_stale_sec)
-        ):
-            self._request_stop(
-                host,
-                "force_meter_stale",
-                "Calibration stopped: HP-200 data became stale.",
-            )
+        if self._phase == "paused_force_meter":
+            self._tick_force_pause(host, now)
             return
-        force_raw_n, force_sample_at = force_reading
-
-        if self._phase == "returning":
-            self._tick_return_to_initial(host, now)
+        if self._phase == "recovering_force_meter":
+            self._tick_force_recovery(host, now)
             return
         if self._phase == "recalibrating":
             self._tick_sensor_recalibration(host, now)
             return
+
+        force_reading = self._fresh_force_reading(host, now)
+        if self._phase == "returning":
+            force_raw_n = force_reading[0] if force_reading is not None else None
+            live_force_callback = getattr(
+                host,
+                "_refresh_calibration_live_force",
+                None,
+            )
+            if callable(live_force_callback):
+                if force_raw_n is None:
+                    live_force_callback(None, None)
+                else:
+                    force_delta_g = (
+                        None
+                        if self._force_baseline_n is None
+                        else (
+                            float(force_raw_n) - float(self._force_baseline_n)
+                        )
+                        / self.NEWTONS_PER_GRAM
+                    )
+                    live_force_callback(
+                        float(force_raw_n) / self.NEWTONS_PER_GRAM,
+                        force_delta_g,
+                    )
+            if self._return_purpose != "start":
+                taxel = self._read_taxel(host)
+                tool_pose = self._read_tool_pose(self._robot_api(host))
+                if taxel is not None and tool_pose is not None:
+                    self._append_sample(
+                        now,
+                        force_raw_n,
+                        taxel,
+                        tool_pose[0],
+                    )
+            self._tick_return_to_initial(host, now)
+            return
+
+        if force_reading is None:
+            self._begin_force_pause(host, now)
+            return
+        force_raw_n, force_sample_at = force_reading
+        live_force_callback = getattr(
+            host,
+            "_refresh_calibration_live_force",
+            None,
+        )
+        if callable(live_force_callback):
+            force_delta_g = (
+                None
+                if self._force_baseline_n is None
+                else (
+                    float(force_raw_n) - float(self._force_baseline_n)
+                )
+                / self.NEWTONS_PER_GRAM
+            )
+            live_force_callback(
+                float(force_raw_n) / self.NEWTONS_PER_GRAM,
+                force_delta_g,
+            )
 
         if self._phase == "force_baseline":
             if force_sample_at != self._last_force_sample_at:
@@ -1113,7 +2008,7 @@ class CalibrationTask(ExperimentTask):
                 self._request_stop(
                     host,
                     "insufficient_force_samples",
-                    "Calibration stopped: not enough fresh HP-200 baseline samples.",
+                    "Calibration stopped: not enough fresh DYLY baseline samples.",
                 )
                 return
             self._force_baseline_n = float(
@@ -1122,8 +2017,10 @@ class CalibrationTask(ExperimentTask):
             self._phase = "approaching"
             self._approach_started_at = now
             self._update_progress(host, "Approaching the selected taxel")
+            baseline_g = self._force_baseline_n / self.NEWTONS_PER_GRAM
             host._append_sidebar_control_message(
-                f"Force baseline: {self._force_baseline_n:+.4f} N. "
+                f"Force baseline: {baseline_g:+.1f} g "
+                f"({self._force_baseline_n:+.4f} N). "
                 f"Approaching taxel {self.taxel_index} at "
                 f"{self.approach_speed_m_s * 1000.0:.3f} mm/s."
             )
@@ -1140,51 +2037,64 @@ class CalibrationTask(ExperimentTask):
         tool_position, _quaternion = tool_pose
         self._append_sample(now, force_raw_n, taxel, tool_position)
         force_delta_abs = abs(float(force_raw_n) - float(self._force_baseline_n))
+        force_delta_abs_g = force_delta_abs / self.NEWTONS_PER_GRAM
         travel_down_m = max(
             0.0,
             float(self._start_tool_position[2]) - float(tool_position[2]),
         )
 
-        if force_delta_abs >= float(self.contact_threshold_n):
+        if self._phase == "contact_hold":
+            if (
+                self._contact_hold_started_at is None
+                or now - float(self._contact_hold_started_at)
+                < float(self.contact_hold_sec)
+            ):
+                return
+            purpose = (
+                "complete"
+                if self._trial_number >= self._batch_total
+                else "next_trial"
+            )
+            self._begin_return_to_initial(
+                host,
+                now,
+                purpose=purpose,
+            )
+            return
+
+        if (
+            self._phase == "approaching"
+            and force_delta_abs >= float(self.contact_threshold_n)
+        ):
             self._stop_reason = "contact_threshold"
             self._stop_robot(self._robot_api(host))
-            try:
-                result = self._save_current_trial(host)
-            except Exception as exc:
-                self._request_stop(
-                    host,
-                    "save_failed",
-                    f"Calibration batch stopped: trial data could not be saved ({exc}).",
-                )
-                return
-            if result is None:
-                self._request_stop(
-                    host,
-                    "save_failed",
-                    "Calibration batch stopped: no trial samples were available to save.",
-                )
-                return
-            if self._trial_number >= self._batch_total:
-                self._batch_completed = True
-                host._stop_sidebar_control(
-                    show_result=True,
-                    message=(
-                        f"Contact detected at {force_delta_abs:.3f} N; robot "
-                        f"stopped. Calibration batch complete: "
-                        f"{self._batch_total} trial(s)."
-                    ),
-                )
-                return
-            self._begin_return_to_initial(host, now)
+            self._phase = "contact_hold"
+            self._contact_hold_started_at = float(now)
+            self._update_progress(
+                host,
+                f"Contact {force_delta_abs_g:.1f} g; holding "
+                f"{self.contact_hold_sec:.1f} s",
+            )
+            host._append_sidebar_control_message(
+                f"Contact threshold reached at {force_delta_abs_g:.1f} g "
+                f"({force_delta_abs:.4f} N). Robot stopped; holding for "
+                f"{self.contact_hold_sec:.1f} s before returning."
+            )
             return
-        if travel_down_m >= float(self.max_travel_m):
+        if (
+            float(self.max_travel_m) > 0.0
+            and travel_down_m >= float(self.max_travel_m)
+        ):
             self._request_stop(
                 host,
                 "max_travel",
                 f"Calibration stopped at the {self.max_travel_m * 1000.0:.1f} mm travel limit.",
             )
             return
-        if now - float(self._started_at) >= float(self.timeout_sec):
+        if (
+            float(self.timeout_sec) > 0.0
+            and now - float(self._started_at) >= float(self.timeout_sec)
+        ):
             self._request_stop(
                 host,
                 "timeout",
@@ -1207,7 +2117,15 @@ class CalibrationTask(ExperimentTask):
             self._stop_reason = "manual_stop"
         self._test_active = False
         self._phase = "idle"
+        self._force_connection_started_at = None
         self._approach_started_at = None
+        self._contact_hold_started_at = None
+        self._return_best_remaining_m = None
+        self._return_last_progress_at = None
+        self._return_purpose = ""
+        self._force_recovery_started_at = None
+        self._force_recovery_restart_attempted = False
+        self._clear_force_pause_state()
         self._update_progress(
             host,
             "Complete" if self._batch_completed else "Stopped",
@@ -1790,6 +2708,7 @@ TASKS: List[ExperimentTask] = [
     SensorPeakChangeTask(),
     Sigraph2026ScanningTask(),
     CalibrationTask(),
+    CalibrationGraphAnalysisTask(),
 ]
 
 

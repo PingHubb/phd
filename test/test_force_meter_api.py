@@ -3,9 +3,12 @@ import struct
 
 from phd.dependence.force_meter_api import (
     HP200_REGISTER_COUNT,
+    ForceTransmitterModbusRtuParser,
     Hp200ModbusRtuParser,
     Hp200StreamParser,
+    build_force_transmitter_read_request,
     build_hp200_read_request,
+    decode_force_transmitter_registers,
     decode_hp200_registers,
     force_to_newtons,
     modbus_crc16,
@@ -80,6 +83,30 @@ def test_official_hp200_read_request():
     assert build_hp200_read_request().hex(" ") == "01 03 00 00 00 0d 84 0f"
 
 
+def test_force_transmitter_live_value_request_matches_manual():
+    assert (
+        build_force_transmitter_read_request().hex(" ")
+        == "01 03 07 d0 00 02 c4 86"
+    )
+
+
+def test_decode_force_transmitter_applies_decimal_places_and_grams():
+    registers = struct.unpack(">HH", struct.pack(">i", 1234))
+    reading = decode_force_transmitter_registers(registers, decimal_places=1)
+
+    assert reading.native_value == 123.4
+    assert reading.native_unit == "g"
+    assert math.isclose(reading.force_newtons, 123.4 * 0.00980665)
+
+
+def test_decode_force_transmitter_preserves_negative_force():
+    registers = struct.unpack(">HH", struct.pack(">i", -125))
+    reading = decode_force_transmitter_registers(registers, decimal_places=1)
+
+    assert reading.native_value == -12.5
+    assert reading.force_newtons < 0.0
+
+
 def test_decode_hp200_registers_uses_high_word_first_ieee_float():
     reading = decode_hp200_registers(_hp200_registers(-12.5))
 
@@ -113,3 +140,16 @@ def test_modbus_parser_rejects_bad_crc():
 
     assert parser.feed(response) == []
     assert "CRC mismatch" in parser.pop_notice()
+
+
+def test_force_transmitter_parser_handles_fragmented_reply():
+    parser = ForceTransmitterModbusRtuParser(decimal_places=1)
+    registers = struct.unpack(">HH", struct.pack(">i", 875))
+    response = _modbus_response(registers)
+
+    assert parser.feed(response[:4]) == []
+    readings = parser.feed(response[4:])
+
+    assert len(readings) == 1
+    assert readings[0].native_value == 87.5
+    assert readings[0].native_unit == "g"

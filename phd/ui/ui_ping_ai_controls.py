@@ -64,30 +64,16 @@ class AiControlsMixin:
         self._admittance_control_active = False
         self._hier_mode_is_continues = True
 
-        self._set_button_active(self.predict_threelevel_hierarchical_transformer_gesture_button, False)
-        self._set_button_active(self.direct_finger_motion_button, False)
-        self._set_button_active(self.console_control_button, False)
+        finger_button = getattr(self, "direct_finger_motion_button", None)
+        if finger_button is not None:
+            self._set_button_active(finger_button, False)
+        console_button = getattr(self, "console_control_button", None)
+        if console_button is not None:
+            self._set_button_active(console_button, False)
         if hasattr(self, "console_control_sensor_button"):
             self._set_button_active(self.console_control_sensor_button, False)
         if hasattr(self, "console_control_sensor_v2_button"):
             self._set_button_active(self.console_control_sensor_v2_button, False)
-        self._set_button_active(self.ai_direct_finger_motion_button, False)
-        if hasattr(self, "ai_direct_finger_motion_robot_button"):
-            self._set_button_active(self.ai_direct_finger_motion_robot_button, False)
-        self._set_button_active(self.ai_direct_finger_motion_execution_button, False)
-        if hasattr(self, "ai_proximity_detection_button"):
-            self.ai_proximity_detection_button.setChecked(False)
-            self._set_button_active(
-                self.ai_proximity_detection_button,
-                False,
-            )
-        if hasattr(self, "ai_proximity_admittance_button"):
-            self.ai_proximity_admittance_button.setChecked(False)
-            self.ai_proximity_admittance_button.setEnabled(False)
-            self._set_button_active(
-                self.ai_proximity_admittance_button,
-                False,
-            )
         if hasattr(self, "admittance_control_button"):
             self.admittance_control_button.setChecked(False)
             self._set_button_active(self.admittance_control_button, False)
@@ -106,11 +92,46 @@ class AiControlsMixin:
             self._set_button_active(self.send_position_PTP_T_toolframe_button, False)
             self._set_button_active(self.send_script_button, False)
 
-        three = self._get_sensor_helper("threelevel_hierarchical_transformer_class")
-        latch_on = bool(getattr(three, "latch_mode", False)) if three else False
+        self._apply_ai_toggle_buttons()
 
-        self._set_button_active(self.btn_toggle_3lvl_latch, latch_on)
-        self.btn_toggle_3lvl_latch.setText(f"Latch {'on' if latch_on else 'off'}")
+    def _apply_ai_toggle_buttons(self):
+        """Refresh learned-policy buttons once that page exists."""
+        predict_button = getattr(
+            self,
+            "predict_threelevel_hierarchical_transformer_gesture_button",
+            None,
+        )
+        if predict_button is None:
+            return
+        self._set_button_active(predict_button, False)
+        record_button = getattr(self, "ai_direct_finger_motion_button", None)
+        if record_button is not None:
+            self._set_button_active(record_button, False)
+        robot_record = getattr(self, "ai_direct_finger_motion_robot_button", None)
+        if robot_record is not None:
+            self._set_button_active(robot_record, False)
+        execute_button = getattr(
+            self, "ai_direct_finger_motion_execution_button", None
+        )
+        if execute_button is not None:
+            self._set_button_active(execute_button, False)
+        detection = getattr(self, "ai_proximity_detection_button", None)
+        if detection is not None:
+            detection.setChecked(False)
+            self._set_button_active(detection, False)
+        retreat = getattr(self, "ai_proximity_admittance_button", None)
+        if retreat is not None:
+            retreat.setChecked(False)
+            retreat.setEnabled(False)
+            self._set_button_active(retreat, False)
+        three = self._get_sensor_helper(
+            "threelevel_hierarchical_transformer_class"
+        )
+        latch_on = bool(getattr(three, "latch_mode", False)) if three else False
+        latch = getattr(self, "btn_toggle_3lvl_latch", None)
+        if latch is not None:
+            self._set_button_active(latch, latch_on)
+            latch.setText(f"Latch {'on' if latch_on else 'off'}")
         self._update_anchor_button_label()
         self._refresh_ai_proximity_model_preview()
 
@@ -160,8 +181,8 @@ class AiControlsMixin:
     def _ai_proximity_detection_mode(self):
         combo = getattr(self, "ai_proximity_detection_mode_combo", None)
         if combo is None:
-            return "hybrid"
-        return str(combo.currentData() or "hybrid")
+            return "localized"
+        return str(combo.currentData() or "localized")
 
     def _on_ai_proximity_detection_mode_changed(self, _index=None):
         mode = self._ai_proximity_detection_mode()

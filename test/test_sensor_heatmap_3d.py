@@ -375,6 +375,41 @@ def test_signal_viewer_diff_per_data_uses_five_decimal_places():
     assert values == ["1.23457", "-0.50000", "0.00000"]
 
 
+def test_signal_viewer_difference_counts_show_explicit_signs():
+    values = SensorSignalWindow._format_signed_diff_values(
+        [10.0, -20.0, 0.0, 1.234567]
+    )
+
+    assert values == ["▲ +10", "▼ −20", "• 0", "▲ +1.23457"]
+
+
+def test_signal_viewer_uses_signed_counts_without_changing_heatmap_magnitude():
+    viewer = SensorSignalWindow.__new__(SensorSignalWindow)
+    viewer._has_sensor_source = lambda: True
+    viewer._using_shared_sensor_data = False
+    viewer._current_raw_list = lambda: [110.0, 180.0]
+    viewer.calibration_data = [100.0, 200.0]
+    viewer._read_shared_heatmap_list = lambda: []
+    viewer._heatmap_value = lambda difference, _percent: difference
+    viewer.display_mode = "diff"
+    captured = {}
+    viewer._update_thresholds = lambda values: captured.update(
+        thresholds=list(values)
+    )
+    viewer._render_table = lambda display, differences, *_args, **_kwargs: (
+        captured.update(
+            display=list(display),
+            differences=list(differences),
+        )
+    )
+
+    viewer.refresh_data()
+
+    assert captured["display"] == ["▲ +10", "▼ −20"]
+    assert captured["differences"] == [10.0, 20.0]
+    assert captured["thresholds"] == [10.0, 20.0]
+
+
 def test_signal_tracker_y_axis_is_symmetric_around_zero():
     limit = SensorSignalHistoryChart._symmetric_limit(
         [-2.0, 1.0, 6.0]

@@ -205,7 +205,7 @@ class CameraControlMixin:
         self._close_camera_window()
         self._shutdown_optional_call(
             "_stop_force_meter",
-            "HP-200 force meter",
+            "Force meter",
         )
         self._shutdown_optional_call(
             "_stop_admittance_control",

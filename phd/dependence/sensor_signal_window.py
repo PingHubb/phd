@@ -194,15 +194,33 @@ class CellDelegate(QStyledItemDelegate):
 
         main_text = index.data(Qt.DisplayRole)
         if main_text is not None:
-            main_font = QFont(option.font)
-            main_font.setBold(is_selected)
-            painter.setFont(main_font)
-            painter.setPen(
-                QColor(theme.SUCCESS_HOVER)
-                if is_selected
-                else QColor(Qt.black)
+            main_text = str(main_text)
+            signed_difference_mode = bool(
+                self.window is not None
+                and getattr(self.window, "display_mode", "") == "diff"
             )
-            painter.drawText(option.rect, Qt.AlignCenter, str(main_text))
+            main_font = QFont(option.font)
+            main_font.setBold(is_selected or signed_difference_mode)
+            if signed_difference_mode:
+                main_font.setPointSizeF(main_font.pointSizeF() + 1.0)
+            painter.setFont(main_font)
+            polarity_color = None
+            if signed_difference_mode and main_text.startswith("▲"):
+                polarity_color = QColor(theme.SUCCESS_PRESSED)
+            elif signed_difference_mode and main_text.startswith("▼"):
+                polarity_color = QColor(theme.ACCENT_PRESSED)
+            elif signed_difference_mode:
+                polarity_color = QColor(theme.TEXT_SECONDARY)
+            painter.setPen(
+                polarity_color
+                if polarity_color is not None
+                else (
+                    QColor(theme.SUCCESS_HOVER)
+                    if is_selected
+                    else QColor(Qt.black)
+                )
+            )
+            painter.drawText(option.rect, Qt.AlignCenter, main_text)
 
         cal_text = index.data(CALIBRATION_ROLE)
         if cal_text is not None:
@@ -2491,6 +2509,7 @@ class SensorSignalWindow(QWidget):
         n = len(raw_list)
 
         diff_list = self._build_diff_list(raw_list)
+        signed_diff_list = self._build_signed_diff_list(raw_list)
         percent_list = self._build_percent_list(raw_list)
         diff_per_list = self._build_signed_percent_list(raw_list)
         heatmap_list = (
@@ -2506,7 +2525,7 @@ class SensorSignalWindow(QWidget):
         self._update_thresholds(diff_list)
 
         if self.display_mode == "diff":
-            display_list = diff_list
+            display_list = self._format_signed_diff_values(signed_diff_list)
         elif self.display_mode == "diff_per":
             display_list = self._format_diff_per_values(diff_per_list)
         elif self.display_mode == "cal":
@@ -2528,7 +2547,7 @@ class SensorSignalWindow(QWidget):
         """Return raw minus calibration without discarding signal polarity."""
         n = len(raw_list)
         if len(self.calibration_data) != n:
-            return []
+            return [0.0] * n
         values = []
         for index in range(n):
             try:
@@ -2578,6 +2597,30 @@ class SensorSignalWindow(QWidget):
             if cal_val != 0.0:
                 out[i] = (raw_val - cal_val) / cal_val * 100.0
         return out
+
+    @staticmethod
+    def _format_signed_diff_values(values):
+        """Format count differences with an explicit positive/negative sign."""
+        formatted = []
+        for value in values:
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                number = 0.0
+            if not math.isfinite(number) or abs(number) < 5e-10:
+                number = 0.0
+            magnitude = abs(number)
+            if magnitude.is_integer():
+                magnitude_text = f"{magnitude:.0f}"
+            else:
+                magnitude_text = f"{magnitude:.5f}".rstrip("0").rstrip(".")
+            if number > 0.0:
+                formatted.append(f"▲ +{magnitude_text}")
+            elif number < 0.0:
+                formatted.append(f"▼ −{magnitude_text}")
+            else:
+                formatted.append("• 0")
+        return formatted
 
     @staticmethod
     def _format_diff_per_values(values):

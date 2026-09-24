@@ -581,13 +581,14 @@ def section(title: str, subtitle: str = "") -> tuple[QWidget, InsetList]:
 class CollapsibleGroup(QWidget):
     """Disclosure container for advanced parameters.
 
-    Keeps rarely-used settings out of the way without hiding them in a dialog,
-    so the frequently used actions stay visible without scrolling.
+    All sections start open so each tab exposes its complete set of controls.
+    The disclosure arrow still lets an operator collapse sections they do not
+    need during a session.
     """
 
     toggled = pyqtSignal(bool)
 
-    def __init__(self, title: str, parent=None, *, expanded: bool = False):
+    def __init__(self, title: str, parent=None, *, expanded: bool = True):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)

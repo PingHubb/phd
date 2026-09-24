@@ -6,7 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 
-from PyQt5.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt5.QtCore import QObject, QSettings, QThread, Qt, pyqtSignal
 from PyQt5.QtWidgets import QFileDialog, QMessageBox
 
 from phd.dependence.paths import resource_path
@@ -16,6 +16,7 @@ from phd.ui import components, theme
 _HAND_POSE_PRESET_PATH = resource_path(
     "config", "dexterous_hand_pose_presets.json"
 )
+_FORCE_METER_PORT_KEY = "force_meter/preferred_port_by_id"
 
 
 class _HandAsyncSignals(QObject):
@@ -49,111 +50,6 @@ class UiInteractionsMixin:
         self.position_script_widget.transmit_script.connect(self._on_transmit_robot_script)
         self.show_robot_button.pressed.connect(self._on_show_robot)
         self.buildScene.pressed.connect(self._on_build_scene)
-        self.record_gesture_button.pressed.connect(self.start_record_gesture)
-        self.record_trigger_mode_combo.currentIndexChanged.connect(
-            self._on_record_trigger_mode_selected
-        )
-        self.predict_threelevel_hierarchical_transformer_gesture_button.pressed.connect(
-            self._on_toggle_threelevel_predict
-        )
-        self.btn_toggle_3lvl_latch.pressed.connect(self.on_toggle_threelevel_latch)
-        self.proximity_control_button.pressed.connect(self._on_toggle_proximity_control)
-        self.proximity_record_button.pressed.connect(self._on_toggle_proximity_recording)
-        self.admittance_control_button.toggled.connect(
-            self._on_toggle_admittance_control
-        )
-        self.apply_proximity_settings_button.clicked.connect(
-            self._apply_proximity_settings_from_ui
-        )
-        self.reload_proximity_settings_button.clicked.connect(
-            self._load_proximity_settings_into_ui
-        )
-        self.close_proximity_settings_button.clicked.connect(self.proximity_settings_dialog.close)
-        self._load_proximity_settings_into_ui()
-        self.direct_finger_motion_button.pressed.connect(self._on_toggle_direct_finger_motion)
-        self.console_control_button.pressed.connect(self._on_toggle_console_control)
-        self.console_control_sensor_button.pressed.connect(
-            self._on_toggle_console_control_sensor_placeholder
-        )
-        self.console_control_sensor_v2_button.pressed.connect(
-            self._on_toggle_console_control_sensor_v2
-        )
-        self.direct_finger_motion_tool_pose_record_menu_button.pressed.connect(
-            self._toggle_direct_finger_motion_tool_pose_recording
-        )
-        self.load_tool_pose_path_button.clicked.connect(self._load_direct_finger_motion_tool_pose_path_from_dialog)
-        # Confirm on the click, not inside the clear method: that method is
-        # also called internally (e.g. before loading a new path) where a modal
-        # prompt would be wrong.
-        self.clear_tool_pose_path_button.clicked.connect(
-            self._confirm_clear_direct_finger_motion_tool_pose_path
-        )
-        self.apply_direct_finger_motion_settings_button.clicked.connect(
-            self._apply_direct_finger_motion_settings_from_ui
-        )
-        self.reload_direct_finger_motion_settings_button.clicked.connect(
-            self._load_direct_finger_motion_settings_into_ui
-        )
-        self.apply_console_control_settings_button.clicked.connect(
-            self._apply_console_control_settings_from_ui
-        )
-        self.reload_console_control_settings_button.clicked.connect(
-            self._load_console_control_settings_into_ui
-        )
-        if hasattr(self, "ai_teaching_label_buttons"):
-            for teaching_label, button in self.ai_teaching_label_buttons.items():
-                if teaching_label == "auto":
-                    button.clicked.connect(
-                        lambda _checked=False, label=teaching_label: self._set_ai_teaching_label(label)
-                    )
-                else:
-                    button.pressed.connect(
-                        lambda label=teaching_label: self._set_ai_teaching_label(label)
-                    )
-                    button.released.connect(
-                        lambda label="auto": self._set_ai_teaching_label(label)
-                    )
-            self._update_ai_teaching_label_ui()
-        self.ai_direct_finger_motion_button.pressed.connect(
-            lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=False)
-        )
-        if hasattr(self, "ai_direct_finger_motion_robot_button"):
-            self.ai_direct_finger_motion_robot_button.pressed.connect(
-                lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=True)
-            )
-        self.ai_proximity_environment_record_button.clicked.connect(
-            self._on_toggle_ai_proximity_environment_recording
-        )
-        self.ai_direct_finger_motion_execution_button.pressed.connect(
-            self._on_toggle_ai_direct_finger_motion_execution
-        )
-        self.ai_direct_execution_velocity_scale_spin.valueChanged.connect(
-            self._on_ai_direct_execution_velocity_scale_changed
-        )
-        self.ai_direct_execution_select_model_button.clicked.connect(
-            self._on_select_ai_direct_execution_model
-        )
-        self.ai_direct_execution_use_default_button.clicked.connect(
-            self._on_use_default_ai_direct_execution_model
-        )
-        self.ai_proximity_select_model_button.clicked.connect(
-            self._on_select_ai_proximity_model
-        )
-        self.ai_proximity_use_auto_model_button.clicked.connect(
-            self._on_use_auto_ai_proximity_model
-        )
-        self.ai_proximity_detection_button.clicked.connect(
-            self._on_toggle_ai_proximity_detection
-        )
-        self.ai_proximity_admittance_button.toggled.connect(
-            self._on_toggle_ai_proximity_admittance_control
-        )
-        self.ai_proximity_detection_mode_combo.currentIndexChanged.connect(
-            self._on_ai_proximity_detection_mode_changed
-        )
-        self.ai_proximity_sensitivity_combo.currentIndexChanged.connect(
-            self._on_ai_proximity_sensitivity_changed
-        )
         self.grid_rows_spin.valueChanged.connect(
             self._update_ai_dfm_session_placeholder
         )
@@ -170,7 +66,6 @@ class UiInteractionsMixin:
         self.sensor_transparent_screenshot_button.clicked.connect(
             self._on_capture_transparent_sensor_plotter
         )
-        self.btn_toggle_anchor_axes.pressed.connect(self._on_toggle_anchor_axes)
         self.hand_open_all_button.clicked.connect(self._on_hand_open_all)
         self.hand_close_all_button.clicked.connect(self._on_hand_close_all)
         self.hand_apply_speed_button.clicked.connect(self._on_hand_apply_speed)
@@ -244,6 +139,8 @@ class UiInteractionsMixin:
             return
 
         current_path = combo.currentData()
+        settings = QSettings("PingLab", "PingLab")
+        preferred_path = str(settings.value(_FORCE_METER_PORT_KEY, "") or "")
         try:
             from serial.tools import list_ports
 
@@ -301,6 +198,8 @@ class UiInteractionsMixin:
         combo.blockSignals(False)
 
         selected_index = combo.findData(current_path) if current_path else -1
+        if selected_index < 0 and preferred_path:
+            selected_index = combo.findData(preferred_path)
         if selected_index < 0:
             for index in range(combo.count()):
                 identity = (
@@ -320,19 +219,65 @@ class UiInteractionsMixin:
                 "Disconnected: no serial port detected"
             )
 
+    @staticmethod
+    def _stable_serial_port_identity(
+        port: str,
+        by_id_directory: str = "/dev/serial/by-id",
+    ) -> str:
+        """Return a chip-specific by-id path, never a changing tty number."""
+        port = str(port or "")
+        if not port:
+            return ""
+        real_path = os.path.realpath(port)
+        if not os.path.isdir(by_id_directory):
+            return ""
+        for filename in sorted(os.listdir(by_id_directory)):
+            stable_path = os.path.join(by_id_directory, filename)
+            if os.path.realpath(stable_path) == real_path:
+                return stable_path
+        return ""
+
+    def _remember_force_meter_port(self, port: str):
+        stable_path = self._stable_serial_port_identity(port)
+        if not stable_path:
+            return
+        settings = QSettings("PingLab", "PingLab")
+        settings.setValue(_FORCE_METER_PORT_KEY, stable_path)
+        settings.sync()
+
     def _on_force_meter_protocol_changed(self, _index=None):
         protocol = str(self.force_meter_protocol_combo.currentData() or "")
-        preferred_baud = 9600 if protocol == "modbus_rtu" else 2400
+        preferred_baud = {
+            "force_transmitter_rtu": 19200,
+            "modbus_rtu": 9600,
+            "text_stream": 2400,
+        }.get(protocol, 9600)
         baud_index = self.force_meter_baud_combo.findData(preferred_baud)
         if baud_index >= 0:
             self.force_meter_baud_combo.setCurrentIndex(baud_index)
+        if getattr(self, "_force_meter_last_raw_newtons", None) is None:
+            self._set_force_meter_primary_value(0.0)
+
+    def _force_meter_uses_grams(self) -> bool:
+        return (
+            str(self.force_meter_protocol_combo.currentData() or "")
+            == "force_transmitter_rtu"
+        )
+
+    def _set_force_meter_primary_value(self, force_newtons: float):
+        force_newtons = float(force_newtons)
+        if self._force_meter_uses_grams():
+            grams = force_newtons / 0.00980665
+            self.force_meter_value_label.setText(f"{grams:+.1f} g")
+        else:
+            self.force_meter_value_label.setText(f"{force_newtons:+.4f} N")
 
     def _set_force_meter_running_ui(self, running: bool):
         running = bool(running)
         button = self.force_meter_connect_button
         button.blockSignals(True)
         button.setChecked(running)
-        button.setText("Disconnect HP-200" if running else "Connect HP-200")
+        button.setText("Disconnect" if running else "Connect")
         button.blockSignals(False)
         self._set_button_active(button, running)
         self.force_meter_port_combo.setEnabled(not running)
@@ -350,15 +295,15 @@ class UiInteractionsMixin:
         thread = getattr(self, "_force_meter_thread", None)
         if thread is not None and thread.isRunning():
             self._set_force_meter_running_ui(True)
-            return
+            return True
 
         port = str(self.force_meter_port_combo.currentData() or "")
         if not port or not os.path.exists(port):
             self.force_meter_status_label.setText(
-                "Select an available HP-200 serial port"
+                "Select an available force-meter serial port"
             )
             self._set_force_meter_running_ui(False)
-            return
+            return False
 
         try:
             baud_rate = int(self.force_meter_baud_combo.currentData())
@@ -369,7 +314,7 @@ class UiInteractionsMixin:
                 f"Force-meter reader unavailable: {exc}"
             )
             self._set_force_meter_running_ui(False)
-            return
+            return False
 
         self._force_meter_last_raw_newtons = None
         self._force_meter_last_sample_monotonic = None
@@ -380,7 +325,7 @@ class UiInteractionsMixin:
         self._force_meter_error_message = ""
         self.force_meter_chart.clear()
         self.force_meter_chart.set_tare(0.0)
-        self.force_meter_value_label.setText("+0.0000 N")
+        self._set_force_meter_primary_value(0.0)
         self.force_meter_native_label.setText("Meter: waiting for sample")
         self._update_force_meter_statistics_label()
         self.force_meter_zero_button.setEnabled(False)
@@ -416,13 +361,17 @@ class UiInteractionsMixin:
             f"Connecting to {port} at {baud_rate} baud..."
         )
         thread.start()
+        return True
 
     def _on_force_meter_connected(
         self, worker, port: str, baud_rate: int, protocol: str
     ):
         if worker is not getattr(self, "_force_meter_worker", None):
             return
-        if protocol == "modbus_rtu":
+        self._remember_force_meter_port(port)
+        if protocol == "force_transmitter_rtu":
+            detail = "polling slave 1, live-force register 2000"
+        elif protocol == "modbus_rtu":
             detail = "polling slave 1, holding registers 0-12"
         else:
             detail = "waiting for legacy text output"
@@ -459,11 +408,17 @@ class UiInteractionsMixin:
             absolute_force if current_peak is None else max(current_peak, absolute_force)
         )
 
-        self.force_meter_value_label.setText(f"{displayed_force:+.4f} N")
-        self.force_meter_native_label.setText(
-            f"Meter: {float(native_value):+.4g} {native_unit}   "
-            f"Stream: {float(sample_rate):.1f} Hz"
-        )
+        self._set_force_meter_primary_value(displayed_force)
+        if str(native_unit) == "g":
+            self.force_meter_native_label.setText(
+                f"Force: {displayed_force:+.4f} N   "
+                f"Stream: {float(sample_rate):.1f} Hz"
+            )
+        else:
+            self.force_meter_native_label.setText(
+                f"Meter: {float(native_value):+.4g} {native_unit}   "
+                f"Stream: {float(sample_rate):.1f} Hz"
+            )
         self._update_force_meter_statistics_label()
         self.force_meter_zero_button.setEnabled(True)
         self.force_meter_clear_zero_button.setEnabled(abs(tare) > 1e-12)
@@ -473,14 +428,16 @@ class UiInteractionsMixin:
         if worker is not getattr(self, "_force_meter_worker", None):
             return
         self.force_meter_status_label.setText(
-            f"HP-200 communication: {preview}"
+            f"Force-meter communication: {preview}"
         )
 
     def _on_force_meter_error(self, worker, message: str):
         if worker is not getattr(self, "_force_meter_worker", None):
             return
         self._force_meter_error_message = str(message)
-        self.force_meter_status_label.setText(f"HP-200 connection error: {message}")
+        self.force_meter_status_label.setText(
+            f"Force-meter connection error: {message}"
+        )
 
     def _on_force_meter_thread_finished(self, thread, worker):
         if thread is not getattr(self, "_force_meter_thread", None):
@@ -493,7 +450,7 @@ class UiInteractionsMixin:
         error_message = str(getattr(self, "_force_meter_error_message", ""))
         if error_message:
             self.force_meter_status_label.setText(
-                f"HP-200 connection error: {error_message}"
+                f"Force-meter connection error: {error_message}"
             )
         elif not getattr(self, "_is_shutting_down", False):
             self.force_meter_status_label.setText("Disconnected")
@@ -506,7 +463,9 @@ class UiInteractionsMixin:
         if thread is not None and thread.isRunning():
             thread.quit()
             if not thread.wait(max(0, int(wait_timeout_ms))):
-                self.force_meter_status_label.setText("HP-200 reader is still stopping")
+                self.force_meter_status_label.setText(
+                    "Force-meter reader is still stopping"
+                )
                 self._set_force_meter_running_ui(True)
                 return False
 
@@ -524,7 +483,7 @@ class UiInteractionsMixin:
         self._force_meter_tare_newtons = float(raw_force)
         self.force_meter_chart.set_tare(float(raw_force))
         self._reset_force_meter_statistics(include_current=True)
-        self.force_meter_value_label.setText("+0.0000 N")
+        self._set_force_meter_primary_value(0.0)
         self.force_meter_clear_zero_button.setEnabled(True)
         self.force_meter_status_label.setText(
             f"Software zero applied at {float(raw_force):+.1f} N"
@@ -557,7 +516,7 @@ class UiInteractionsMixin:
         self._reset_force_meter_statistics(include_current=True)
         raw_force = getattr(self, "_force_meter_last_raw_newtons", None)
         if raw_force is not None:
-            self.force_meter_value_label.setText(f"{float(raw_force):+.4f} N")
+            self._set_force_meter_primary_value(float(raw_force))
         self.force_meter_clear_zero_button.setEnabled(False)
         self.force_meter_status_label.setText("Software zero cleared")
 
@@ -931,7 +890,133 @@ class UiInteractionsMixin:
                     self._console_control_sensor_v2_active,
                 )
 
+    def _connect_control_workspace(self):
+        """Wire the Control page after its buttons exist."""
+        self.proximity_control_button.pressed.connect(
+            self._on_toggle_proximity_control
+        )
+        self.proximity_record_button.pressed.connect(
+            self._on_toggle_proximity_recording
+        )
+        self.admittance_control_button.toggled.connect(
+            self._on_toggle_admittance_control
+        )
+        self.direct_finger_motion_button.pressed.connect(
+            self._on_toggle_direct_finger_motion
+        )
+        self.console_control_button.pressed.connect(self._on_toggle_console_control)
+        self.console_control_sensor_button.pressed.connect(
+            self._on_toggle_console_control_sensor_placeholder
+        )
+        self.console_control_sensor_v2_button.pressed.connect(
+            self._on_toggle_console_control_sensor_v2
+        )
+        self.direct_finger_motion_tool_pose_record_menu_button.pressed.connect(
+            self._toggle_direct_finger_motion_tool_pose_recording
+        )
+        self.load_tool_pose_path_button.clicked.connect(
+            self._load_direct_finger_motion_tool_pose_path_from_dialog
+        )
+        # Confirm on the click, not inside the clear method: that method is
+        # also called internally (e.g. before loading a new path) where a modal
+        # prompt would be wrong.
+        self.clear_tool_pose_path_button.clicked.connect(
+            self._confirm_clear_direct_finger_motion_tool_pose_path
+        )
+        self.apply_direct_finger_motion_settings_button.clicked.connect(
+            self._apply_direct_finger_motion_settings_from_ui
+        )
+        self.reload_direct_finger_motion_settings_button.clicked.connect(
+            self._load_direct_finger_motion_settings_into_ui
+        )
+        self.apply_console_control_settings_button.clicked.connect(
+            self._apply_console_control_settings_from_ui
+        )
+        self.reload_console_control_settings_button.clicked.connect(
+            self._load_console_control_settings_into_ui
+        )
+
+    def _connect_ai_workspace(self):
+        """Wire learned-policy controls after that page has been built."""
+        self.record_gesture_button.pressed.connect(self.start_record_gesture)
+        self.record_trigger_mode_combo.currentIndexChanged.connect(
+            self._on_record_trigger_mode_selected
+        )
+        self.predict_threelevel_hierarchical_transformer_gesture_button.pressed.connect(
+            self._on_toggle_threelevel_predict
+        )
+        self.btn_toggle_3lvl_latch.pressed.connect(self.on_toggle_threelevel_latch)
+        self.apply_proximity_settings_button.clicked.connect(
+            self._apply_proximity_settings_from_ui
+        )
+        self.reload_proximity_settings_button.clicked.connect(
+            self._load_proximity_settings_into_ui
+        )
+        self.close_proximity_settings_button.clicked.connect(
+            self.proximity_settings_dialog.close
+        )
+        self._load_proximity_settings_into_ui()
+        if hasattr(self, "ai_teaching_label_buttons"):
+            for teaching_label, button in self.ai_teaching_label_buttons.items():
+                if teaching_label == "auto":
+                    button.clicked.connect(
+                        lambda _checked=False, label=teaching_label: self._set_ai_teaching_label(label)
+                    )
+                else:
+                    button.pressed.connect(
+                        lambda label=teaching_label: self._set_ai_teaching_label(label)
+                    )
+                    button.released.connect(
+                        lambda label="auto": self._set_ai_teaching_label(label)
+                    )
+            self._update_ai_teaching_label_ui()
+        self.ai_direct_finger_motion_button.pressed.connect(
+            lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=False)
+        )
+        if hasattr(self, "ai_direct_finger_motion_robot_button"):
+            self.ai_direct_finger_motion_robot_button.pressed.connect(
+                lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=True)
+            )
+        self.ai_proximity_environment_record_button.clicked.connect(
+            self._on_toggle_ai_proximity_environment_recording
+        )
+        self.ai_direct_finger_motion_execution_button.pressed.connect(
+            self._on_toggle_ai_direct_finger_motion_execution
+        )
+        self.ai_direct_execution_velocity_scale_spin.valueChanged.connect(
+            self._on_ai_direct_execution_velocity_scale_changed
+        )
+        self.ai_direct_execution_select_model_button.clicked.connect(
+            self._on_select_ai_direct_execution_model
+        )
+        self.ai_direct_execution_use_default_button.clicked.connect(
+            self._on_use_default_ai_direct_execution_model
+        )
+        self.ai_proximity_select_model_button.clicked.connect(
+            self._on_select_ai_proximity_model
+        )
+        self.ai_proximity_use_auto_model_button.clicked.connect(
+            self._on_use_auto_ai_proximity_model
+        )
+        self.ai_proximity_detection_button.clicked.connect(
+            self._on_toggle_ai_proximity_detection
+        )
+        self.ai_proximity_admittance_button.toggled.connect(
+            self._on_toggle_ai_proximity_admittance_control
+        )
+        self.ai_proximity_detection_mode_combo.currentIndexChanged.connect(
+            self._on_ai_proximity_detection_mode_changed
+        )
+        self.ai_proximity_sensitivity_combo.currentIndexChanged.connect(
+            self._on_ai_proximity_sensitivity_changed
+        )
+        self.btn_toggle_anchor_axes.pressed.connect(self._on_toggle_anchor_axes)
+        self._update_ai_dfm_session_placeholder()
+
     def open_proximity_settings_dialog(self):
+        ensure = getattr(self, "_ensure_ai_workspace", None)
+        if callable(ensure):
+            ensure()
         dialog = getattr(self, "proximity_settings_dialog", None)
         if dialog is None:
             return

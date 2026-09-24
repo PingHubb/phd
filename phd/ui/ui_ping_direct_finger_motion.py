@@ -883,6 +883,9 @@ class DirectFingerMotionMixin:
         self._load_direct_finger_motion_settings_into_ui()
 
     def open_direct_finger_motion_settings_dialog(self):
+        ensure = getattr(self, "_ensure_control_workspace", None)
+        if callable(ensure):
+            ensure()
         if not hasattr(self, "direct_finger_motion_settings_dialog"):
             self._build_direct_finger_motion_settings_dialog()
         self._load_direct_finger_motion_settings_into_ui()
@@ -1041,6 +1044,9 @@ class DirectFingerMotionMixin:
         self._load_console_control_settings_into_ui()
 
     def open_console_control_settings_dialog(self):
+        ensure = getattr(self, "_ensure_control_workspace", None)
+        if callable(ensure):
+            ensure()
         if not hasattr(self, "console_control_settings_dialog"):
             self._build_console_control_settings_dialog()
         self._load_console_control_settings_into_ui()
@@ -4813,6 +4819,8 @@ class DirectFingerMotionMixin:
 
         try:
             settings = helper.get_settings()
+            if not isinstance(settings, dict):
+                return
             for name, widget in self.direct_finger_motion_inputs.items():
                 if name in settings:
                     if isinstance(widget, QCheckBox):

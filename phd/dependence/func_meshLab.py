@@ -100,10 +100,18 @@ class MyMeshLab():
             self._robot_dialog_admittance_tick
         )
 
+    def _camera_source_plotter(self):
+        """Prefer the hidden mesh view once it exists, otherwise the live one."""
+        hidden = getattr(self.parent, "_secondary_plotter", None)
+        if hidden is not None:
+            return hidden
+        return self.plotter_2
+
     def saveCameraPara(self):
-        self.camera_pos = self.plotter.camera.position
-        self.camera_focal = self.plotter.camera.focal_point
-        self.camera_view_angle = self.plotter.camera.view_angle
+        source = self._camera_source_plotter()
+        self.camera_pos = source.camera.position
+        self.camera_focal = source.camera.focal_point
+        self.camera_view_angle = source.camera.view_angle
 
     def _apply_camera_parameters(self, plotter, camera_pos, camera_focal, camera_view_angle):
         plotter.camera.position = camera_pos
@@ -121,37 +129,52 @@ class MyMeshLab():
         if camera_pos is None or camera_focal is None or camera_view_angle is None:
             return
 
-        self._apply_camera_parameters(self.plotter, camera_pos, camera_focal, camera_view_angle)
-        self._apply_camera_parameters(self.plotter_2, camera_pos, camera_focal, camera_view_angle)
+        self._apply_camera_parameters(
+            self.plotter_2, camera_pos, camera_focal, camera_view_angle
+        )
+        hidden = getattr(self.parent, "_secondary_plotter", None)
+        if hidden is not None:
+            self._apply_camera_parameters(
+                hidden, camera_pos, camera_focal, camera_view_angle
+            )
 
     def creatPlaneXY(self):
-        self.plotter.camera.position = (1, -1, 1)
-        self.plotter_2.camera.position = (1, -1, 1)
+        """Draw the reference grid on the live view.
 
+        The hidden mesh-lab view is created later. Touching it here would
+        build a second VTK window during startup.
+        """
+        self.plotter_2.camera.position = (1, -1, 1)
         self.saveCameraPara()
         self.referenceAxisActors = []
         self.referenceAxisActors_2 = []
+        self._add_reference_grid(
+            self.plotter_2, self.referenceAxisActors_2, "actorPlaneXY_2"
+        )
+        hidden = getattr(self.parent, "_secondary_plotter", None)
+        if hidden is not None:
+            self.attach_secondary_plotter(hidden)
+        self._apply_secondary_background_reference_visibility(render=False)
+
+    def attach_secondary_plotter(self, plotter):
+        """Finish reference geometry once the hidden mesh view exists."""
+        self.plotter = plotter
+        plotter.camera.position = (1, -1, 1)
+        self.referenceAxisActors = []
+        self._add_reference_grid(
+            plotter, self.referenceAxisActors, "actorPlaneXY"
+        )
+
+    def _add_reference_grid(self, plotter, axis_actors, plane_attr):
         line = pv.Line((-50, 0, 0), (50, 0, 0))
-
-        # 添加X轴线段，并设置为红色
-        self.referenceAxisActors.append(
-            self.plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
+        axis_actors.append(
+            plotter.add_mesh(line, color='r', line_width=2, label='X Axis')
         )
-        self.referenceAxisActors_2.append(
-            self.plotter_2.add_mesh(line, color='r', line_width=2, label='X Axis')
-        )
-
         line = pv.Line((0, -50, 0), (0, 50, 0))
-
-        # 添加Y轴线段，并设置为绿色
-        self.referenceAxisActors.append(
-            self.plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
+        axis_actors.append(
+            plotter.add_mesh(line, color='g', line_width=2, label='Y Axis')
         )
-        self.referenceAxisActors_2.append(
-            self.plotter_2.add_mesh(line, color='g', line_width=2, label='Y Axis')
-        )
-
-        planeXY = pv.Plane(
+        plane_xy = pv.Plane(
             center=(0, 0, 0),
             direction=(0, 0, 1),
             i_size=100,
@@ -159,10 +182,11 @@ class MyMeshLab():
             i_resolution=100,
             j_resolution=100,
         )
-
-        self.actorPlaneXY = self.plotter.add_mesh(planeXY, color='gray', style='wireframe')
-        self.actorPlaneXY_2 = self.plotter_2.add_mesh(planeXY, color='gray', style='wireframe')
-        self._apply_secondary_background_reference_visibility(render=False)
+        setattr(
+            self,
+            plane_attr,
+            plotter.add_mesh(plane_xy, color='gray', style='wireframe'),
+        )
 
     @staticmethod
     def _set_actor_visible(actor, visible):
