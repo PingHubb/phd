@@ -1,0 +1,118 @@
+{
+  "version": 6,
+  "batch_id": "20260924_110350_859976",
+  "trial_number": 1,
+  "requested_trials": 1,
+  "stop_reason": "contact_threshold",
+  "sensor_shape": [
+    8,
+    10
+  ],
+  "taxel_index": 35,
+  "signal_field": "diff_ave",
+  "approach_speed_m_s": 0.0005,
+  "return_speed_m_s": 0.0005,
+  "return_height_tolerance_m": 0.0001,
+  "contact_threshold_n": 19.6133,
+  "contact_threshold_g": 1999.9999999999998,
+  "contact_hold_sec": 1.0,
+  "max_travel_m": 0.0,
+  "timeout_sec": 0.0,
+  "force_baseline_n": 0.014709975,
+  "force_baseline_g": 1.5,
+  "initial_position": {
+    "saved_at": "2026-09-23T06:01:55.255667+00:00",
+    "joints_rad": [
+      -0.7181432258608053,
+      -0.2700152231172871,
+      -1.750383399111082,
+      0.46109658192203845,
+      -1.5712908758093243,
+      0.0649456398152189
+    ],
+    "tool_position_m": [
+      -0.5275173950195312,
+      0.29643591308593753,
+      0.2652586975097656
+    ],
+    "tool_quaternion_wxyz": [
+      0.004802127744661649,
+      0.3849788809504916,
+      -0.9229107703545367,
+      -0.001977562850348132
+    ]
+  },
+  "experiment_directory": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_20260924_110350_859976_taxel-35_signal-diff_ave_speed-0p5mmps_threshold-2000g_travel-unlimited_timeout-unlimited_reps-1",
+  "force_pause_count": 0,
+  "force_pause_total_s": 0.0,
+  "sample_count": 2416,
+  "analysis": {
+    "signal_field": "diff_ave",
+    "signal_baseline": 3.333333333333333,
+    "signal_change_threshold": 10.8724,
+    "contact_detection_threshold_g": 10.0,
+    "peak_force_g": 2494.6,
+    "max_distance_mm": 37.21797180175781,
+    "signal_onset": {
+      "row_index": 462,
+      "elapsed_s": 24.10229576099664,
+      "distance_mm": 14.391418457031236,
+      "signal": -11.0,
+      "force_g": 0.0
+    },
+    "contact_onset": {
+      "row_index": 1093,
+      "elapsed_s": 55.64770724484697,
+      "distance_mm": 35.13545227050782,
+      "signal": -529.3333333333334,
+      "force_g": 13.9
+    },
+    "contact_release": {
+      "row_index": 1423,
+      "elapsed_s": 72.13346686284058,
+      "distance_mm": 32.490112304687486,
+      "signal": -63.666666666666664,
+      "force_g": 3.0
+    },
+    "contact_release_threshold_g": 3.0,
+    "contact_release_force_floor_g": 0.7999999999999999,
+    "contact_release_force_noise_g": 0.0,
+    "signal_distance_fit": {
+      "slope": -11.529939705289625,
+      "intercept": 222.97793320167406,
+      "r_squared": 0.511394876504357,
+      "sample_count": 631,
+      "rmse": 67.92586816489093,
+      "mae": 46.14174303902481,
+      "max_abs_error": 372.0078045136579,
+      "pearson_r": -0.7151187848912633,
+      "x_min": 14.391418457031236,
+      "x_max": 35.13545227050782
+    },
+    "force_distance_fit": {
+      "slope": 1278.5979296620217,
+      "intercept": -45288.61622567672,
+      "r_squared": 0.974342495129439,
+      "sample_count": 105,
+      "rmse": 120.2500578778499,
+      "mae": 91.0318048031838,
+      "max_abs_error": 378.39969486664484,
+      "pearson_r": 0.9870878862236324,
+      "x_min": 35.13545227050782,
+      "x_max": 37.21797180175781
+    },
+    "force_signal_fit": {
+      "slope": 1.1956615876912495,
+      "intercept": 465.222928600958,
+      "r_squared": 0.9469994583839259,
+      "sample_count": 105,
+      "rmse": 172.8296450140739,
+      "mae": 151.30650269180168,
+      "max_abs_error": 367.09680442324884,
+      "pearson_r": 0.9731389717732644,
+      "x_min": -529.3333333333334,
+      "x_max": 1445.6666666666667
+    }
+  },
+  "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_20260924_110350_859976_taxel-35_signal-diff_ave_speed-0p5mmps_threshold-2000g_travel-unlimited_timeout-unlimited_reps-1/trial_0001.csv"
+}

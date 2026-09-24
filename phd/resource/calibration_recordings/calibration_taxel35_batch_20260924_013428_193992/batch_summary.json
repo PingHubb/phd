@@ -1,0 +1,99 @@
+{
+  "version": 2,
+  "batch_id": "20260924_013428_193992",
+  "status": "aborted",
+  "requested_trials": 4,
+  "recorded_trials": 2,
+  "sensor_shape": [
+    8,
+    10
+  ],
+  "taxel_index": 35,
+  "signal_field": "diff_ave",
+  "approach_speed_m_s": 1.0000000000000011e-05,
+  "return_speed_m_s": 1.0000000000000011e-05,
+  "return_height_tolerance_m": 0.0001,
+  "contact_threshold_n": 19.6133,
+  "contact_threshold_g": 1999.9999999999998,
+  "contact_hold_sec": 1.0,
+  "max_travel_m": 0.0,
+  "timeout_sec": 0.0,
+  "return_velocity_rad_s": 0.2,
+  "initial_position": {
+    "saved_at": "2026-09-23T06:01:55.255667+00:00",
+    "joints_rad": [
+      -0.7181432258608053,
+      -0.2700152231172871,
+      -1.750383399111082,
+      0.46109658192203845,
+      -1.5712908758093243,
+      0.0649456398152189
+    ],
+    "tool_position_m": [
+      -0.5275173950195312,
+      0.29643591308593753,
+      0.2652586975097656
+    ],
+    "tool_quaternion_wxyz": [
+      0.004802127744661649,
+      0.3849788809504916,
+      -0.9229107703545367,
+      -0.001977562850348132
+    ]
+  },
+  "summary_csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_taxel35_batch_20260924_013428_193992/batch_summary.csv",
+  "trials": [
+    {
+      "trial_number": 1,
+      "stop_reason": "contact_threshold",
+      "sample_count": 181456,
+      "duration_s": 9073.928696905961,
+      "peak_force_change_n": 21.97277999,
+      "peak_force_change_g": 2240.6,
+      "contact_travel_mm": 35.88555908203123,
+      "signal_min": -344.0,
+      "signal_max": 787.0,
+      "signal_peak_abs": 787.0,
+      "signal_final": 2.0,
+      "signal_onset_distance_mm": 0.0,
+      "contact_onset_distance_mm": 33.86056518554687,
+      "signal_distance_slope": -3.5575227836134613,
+      "signal_distance_intercept": 39.47758232618201,
+      "signal_distance_r_squared": 0.5014925271771402,
+      "force_distance_slope": 1088.4702884535525,
+      "force_distance_intercept": -37021.83772894209,
+      "force_distance_r_squared": 0.9759779154160134,
+      "force_signal_slope": 1.8099541789515838,
+      "force_signal_intercept": 664.5293558514653,
+      "force_signal_r_squared": 0.9914193635805535,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_taxel35_batch_20260924_013428_193992/trial_0001.csv",
+      "metadata_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_taxel35_batch_20260924_013428_193992/trial_0001.json"
+    },
+    {
+      "trial_number": 2,
+      "stop_reason": "force_meter_stale",
+      "sample_count": 25400,
+      "duration_s": 1270.9499276569113,
+      "peak_force_change_n": 0.0,
+      "peak_force_change_g": 0.0,
+      "contact_travel_mm": 16.707916259765614,
+      "signal_min": -25.0,
+      "signal_max": 14.0,
+      "signal_peak_abs": 25.0,
+      "signal_final": -8.0,
+      "signal_onset_distance_mm": 0.0,
+      "contact_onset_distance_mm": null,
+      "signal_distance_slope": -0.5292015363693161,
+      "signal_distance_intercept": -0.5719292628746409,
+      "signal_distance_r_squared": 0.3023648318698433,
+      "force_distance_slope": 0.0,
+      "force_distance_intercept": 0.0,
+      "force_distance_r_squared": 1.0,
+      "force_signal_slope": 0.0,
+      "force_signal_intercept": 0.0,
+      "force_signal_r_squared": 1.0,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_taxel35_batch_20260924_013428_193992/trial_0002.csv",
+      "metadata_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_taxel35_batch_20260924_013428_193992/trial_0002.json"
+    }
+  ]
+}

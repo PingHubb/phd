@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "parts": [
+    {"number": "1", "part_name": "head_link"},
+    {"number": "3", "part_name": "left_hand_palm_link"},
+    {"number": "4", "part_name": "left_hip_roll_link"},
+    {"number": "5", "part_name": "left_hip_yaw_link"},
+    {"number": "6", "part_name": "left_knee_link"},
+    {"number": "7", "part_name": "left_shoulder_pitch_link"},
+    {"number": "8", "part_name": "left_shoulder_yaw_link"},
+    {"number": "9", "part_name": "pelvis_contour_link"},
+    {"number": "10", "part_name": "torso_link_rev_1_0"},
+    {"number": "11", "part_name": "torso_link_rev_1_0"}
+  ]
+}

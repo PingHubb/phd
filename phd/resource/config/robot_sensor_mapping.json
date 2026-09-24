@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "mappings": {
+    "2d_10x10": {
+      "link_index": 5,
+      "translation_m": [
+        0.0,
+        0.0,
+        0.033
+      ],
+      "rotation_deg": [
+        90.0,
+        -90.0,
+        180.0
+      ],
+      "scale": 0.2,
+      "horizontal_scale": 1.0,
+      "vertical_scale": 1.35,
+      "opacity": 0.8,
+      "admittance_max_speed_mps": 0.1,
+      "admittance_contact_threshold_pct": 3.0,
+      "admittance_full_scale_pct": 12.0,
+      "admittance_smoothing_alpha": 0.35,
+      "admittance_reverse_direction": false,
+      "admittance_direction_mode": "centre_directed",
+      "admittance_control_center_m": [
+        -0.0169,
+        0.0,
+        0.0
+      ]
+    }
+  }
+}

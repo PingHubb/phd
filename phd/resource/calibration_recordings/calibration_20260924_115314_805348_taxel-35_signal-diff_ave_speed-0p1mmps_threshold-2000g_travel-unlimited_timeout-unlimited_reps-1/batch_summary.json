@@ -1,0 +1,76 @@
+{
+  "version": 2,
+  "batch_id": "20260924_115314_805348",
+  "status": "complete",
+  "requested_trials": 1,
+  "recorded_trials": 1,
+  "sensor_shape": [
+    8,
+    10
+  ],
+  "taxel_index": 35,
+  "signal_field": "diff_ave",
+  "approach_speed_m_s": 0.0001,
+  "return_speed_m_s": 0.0001,
+  "return_height_tolerance_m": 0.0001,
+  "contact_threshold_n": 19.6133,
+  "contact_threshold_g": 1999.9999999999998,
+  "contact_hold_sec": 1.0,
+  "max_travel_m": 0.0,
+  "timeout_sec": 0.0,
+  "return_velocity_rad_s": 0.2,
+  "initial_position": {
+    "saved_at": "2026-09-24T03:53:13.272240+00:00",
+    "joints_rad": [
+      -0.7177948178111956,
+      -0.4104039763626527,
+      -1.8607061788481594,
+      0.7115028334197744,
+      -1.5715041950126396,
+      0.06600253609976287
+    ],
+    "tool_position_m": [
+      -0.52809130859375,
+      0.29655764770507814,
+      0.158807861328125
+    ],
+    "tool_quaternion_wxyz": [
+      0.004899926695376951,
+      0.38485436270005685,
+      -0.9229626370204441,
+      -0.0017552473845833011
+    ]
+  },
+  "experiment_directory": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_20260924_115314_805348_taxel-35_signal-diff_ave_speed-0p1mmps_threshold-2000g_travel-unlimited_timeout-unlimited_reps-1",
+  "summary_csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_20260924_115314_805348_taxel-35_signal-diff_ave_speed-0p1mmps_threshold-2000g_travel-unlimited_timeout-unlimited_reps-1/batch_summary.csv",
+  "trials": [
+    {
+      "trial_number": 1,
+      "stop_reason": "contact_threshold",
+      "force_pause_count": 0,
+      "force_pause_total_s": 0.0,
+      "sample_count": 15079,
+      "duration_s": 754.937426337041,
+      "peak_force_change_n": 21.12156277,
+      "peak_force_change_g": 2153.8,
+      "contact_travel_mm": 39.57312774658203,
+      "signal_min": -406.3333333333333,
+      "signal_max": 1234.0,
+      "signal_peak_abs": 1234.0,
+      "signal_final": 45.0,
+      "signal_onset_distance_mm": 2.3919677734375036,
+      "contact_onset_distance_mm": 37.633079528808594,
+      "signal_distance_slope": -3.5743784830488847,
+      "signal_distance_intercept": 38.291167241875115,
+      "signal_distance_r_squared": 0.5103454477472316,
+      "force_distance_slope": 1035.8242484480606,
+      "force_distance_intercept": -39134.43776848375,
+      "force_distance_r_squared": 0.9476168070077464,
+      "force_signal_slope": 1.1769937468274154,
+      "force_signal_intercept": 420.94897924991386,
+      "force_signal_r_squared": 0.967993637635328,
+      "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_20260924_115314_805348_taxel-35_signal-diff_ave_speed-0p1mmps_threshold-2000g_travel-unlimited_timeout-unlimited_reps-1/trial_0001.csv",
+      "metadata_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_20260924_115314_805348_taxel-35_signal-diff_ave_speed-0p1mmps_threshold-2000g_travel-unlimited_timeout-unlimited_reps-1/trial_0001.json"
+    }
+  ]
+}

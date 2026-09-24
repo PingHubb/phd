@@ -1,0 +1,105 @@
+{
+  "version": 5,
+  "batch_id": "20260924_013428_193992",
+  "trial_number": 1,
+  "requested_trials": 4,
+  "stop_reason": "contact_threshold",
+  "sensor_shape": [
+    8,
+    10
+  ],
+  "taxel_index": 35,
+  "signal_field": "diff_ave",
+  "approach_speed_m_s": 1.0000000000000011e-05,
+  "return_speed_m_s": 1.0000000000000011e-05,
+  "return_height_tolerance_m": 0.0001,
+  "contact_threshold_n": 19.6133,
+  "contact_threshold_g": 1999.9999999999998,
+  "contact_hold_sec": 1.0,
+  "max_travel_m": 0.0,
+  "timeout_sec": 0.0,
+  "force_baseline_n": 0.0,
+  "force_baseline_g": 0.0,
+  "initial_position": {
+    "saved_at": "2026-09-23T06:01:55.255667+00:00",
+    "joints_rad": [
+      -0.7181432258608053,
+      -0.2700152231172871,
+      -1.750383399111082,
+      0.46109658192203845,
+      -1.5712908758093243,
+      0.0649456398152189
+    ],
+    "tool_position_m": [
+      -0.5275173950195312,
+      0.29643591308593753,
+      0.2652586975097656
+    ],
+    "tool_quaternion_wxyz": [
+      0.004802127744661649,
+      0.3849788809504916,
+      -0.9229107703545367,
+      -0.001977562850348132
+    ]
+  },
+  "sample_count": 181456,
+  "analysis": {
+    "signal_field": "diff_ave",
+    "signal_baseline": 9.333333333333332,
+    "signal_change_threshold": 4.942000000000008,
+    "contact_detection_threshold_g": 10.0,
+    "peak_force_g": 2218.6,
+    "max_distance_mm": 35.84448242187499,
+    "signal_onset": {
+      "row_index": 10,
+      "elapsed_s": 1.525768063031137,
+      "distance_mm": 0.0,
+      "signal": 15.0,
+      "force_g": 0.0
+    },
+    "contact_onset": {
+      "row_index": 51537,
+      "elapsed_s": 2577.850046907086,
+      "distance_mm": 33.86056518554687,
+      "signal": -312.0,
+      "force_g": 16.3
+    },
+    "signal_distance_fit": {
+      "slope": -3.5575227836134613,
+      "intercept": 39.47758232618201,
+      "r_squared": 0.5014925271771402,
+      "sample_count": 51527,
+      "rmse": 36.40180277944704,
+      "mae": 24.5007524507413,
+      "max_abs_error": 229.465178874358,
+      "pearson_r": -0.7081613708591715,
+      "x_min": 0.0,
+      "x_max": 33.86056518554687
+    },
+    "force_distance_fit": {
+      "slope": 1088.4702884535525,
+      "intercept": -37021.83772894209,
+      "r_squared": 0.9759779154160134,
+      "sample_count": 7670,
+      "rmse": 98.5860027756259,
+      "mae": 85.57040251647103,
+      "max_abs_error": 279.3222742671773,
+      "pearson_r": 0.9879159455216893,
+      "x_min": 33.82650756835937,
+      "x_max": 35.84448242187499
+    },
+    "force_signal_fit": {
+      "slope": 1.8099541789515838,
+      "intercept": 664.5293558514653,
+      "r_squared": 0.9914193635805535,
+      "sample_count": 7670,
+      "rmse": 58.920939421897124,
+      "mae": 49.64994775547969,
+      "max_abs_error": 227.9775490366742,
+      "pearson_r": 0.9957004386764902,
+      "x_min": -344.0,
+      "x_max": 744.0
+    }
+  },
+  "csv_path": "/home/ping2/ros2_ws/src/phd/phd/resource/calibration_recordings/calibration_taxel35_batch_20260924_013428_193992/trial_0001.csv"
+}

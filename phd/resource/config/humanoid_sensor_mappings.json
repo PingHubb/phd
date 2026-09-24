@@ -1,0 +1,121 @@
+{
+  "version": 2,
+  "auto_device_assignments": {
+    "usb:303a:1001:f4:12:fa:68:ec:20": {
+      "part": "sensor:robot_arm_end_effector",
+      "serial_number": "F4:12:FA:68:EC:20",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM0"
+    },
+    "usb:303a:1001:48:f6:ee:22:7e:68": {
+      "part": "signal:1:head_link",
+      "serial_number": "48:F6:EE:22:7E:68",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM1"
+    },
+    "usb:303a:1001:1c:db:d4:17:33:58": {
+      "part": "signal:11:torso_link",
+      "serial_number": "1C:DB:D4:17:33:58",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM2"
+    },
+    "usb:303a:1001:1c:db:d4:17:4a:20": {
+      "part": "signal:3:right_rubber_hand",
+      "serial_number": "1C:DB:D4:17:4A:20",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM3"
+    },
+    "usb:303a:1001:1c:db:d4:17:2a:70": {
+      "part": "signal:3:left_rubber_hand",
+      "serial_number": "1C:DB:D4:17:2A:70",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM4"
+    },
+    "usb:303a:1001:dc:54:75:e9:d6:6c": {
+      "part": "sensor:testing_8x10",
+      "serial_number": "DC:54:75:E9:D6:6C",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM4"
+    }
+  },
+  "mappings": {
+    "signal:11:torso_link|ttyACM1|17x16": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": true
+    },
+    "signal:10:torso_link|ttyACM2|16x15": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": true,
+      "flip_vertical_mapping": true
+    },
+    "signal:1:head_link|ttyACM1|14x9": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": true
+    },
+    "signal:11:torso_link|ttyACM2|17x16": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": true
+    },
+    "signal:10:torso_link|ttyACM4|16x15": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": true,
+      "flip_vertical_mapping": true
+    },
+    "signal:11:torso_link|ttyACM3|17x16": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": true
+    },
+    "signal:10:torso_link|ttyACM5|16x15": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": false,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": false
+    },
+    "signal:3:right_rubber_hand|ttyACM5|8x7": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": false
+    },
+    "signal:1:head_link|usb:303a:1001:48:f6:ee:22:7e:68|14x9": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": true
+    },
+    "signal:11:torso_link|usb:303a:1001:1c:db:d4:17:33:58|17x16": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": true
+    },
+    "signal:3:right_rubber_hand|usb:303a:1001:1c:db:d4:17:4a:20|8x7": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": false
+    },
+    "signal:3:left_rubber_hand|usb:303a:1001:1c:db:d4:17:2a:70|8x7": {
+      "swap_drive_sensor": false,
+      "transpose_point_mapping": true,
+      "flip_horizontal_mapping": false,
+      "flip_vertical_mapping": false
+    }
+  }
+}
