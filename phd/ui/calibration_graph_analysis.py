@@ -50,6 +50,19 @@ SIGNAL_FIELD_PREFERENCE = (
 )
 
 
+def _dataset_sensor_shape(dataset, default=(8, 10)):
+    """Return the physical taxel grid stored with one recording."""
+    metadata = dict((dataset or {}).get("metadata") or {})
+    shape = metadata.get("sensor_shape")
+    try:
+        rows, columns = map(int, shape[:2])
+    except (TypeError, ValueError):
+        return tuple(map(int, default))
+    if rows <= 0 or columns <= 0:
+        return tuple(map(int, default))
+    return rows, columns
+
+
 def _finite(value):
     try:
         value = float(value)
@@ -168,6 +181,17 @@ def _load_csv(path, preferred_signal=None, metadata=None):
                     f"{summary.get('csv_path')}"
                 )
             trial_metadata = dict(metadata or {})
+            metadata_path = _resolve_reference(
+                summary.get("metadata_path"), path.parent
+            )
+            if metadata_path is not None:
+                try:
+                    with metadata_path.open("r", encoding="utf-8") as stream:
+                        trial_payload = json.load(stream)
+                    if isinstance(trial_payload, dict):
+                        trial_metadata.update(trial_payload)
+                except (OSError, ValueError, TypeError):
+                    pass
             trial_metadata.update(summary)
             datasets.append(
                 _trial_dataset(
@@ -193,6 +217,47 @@ def _load_json(path):
         raise ValueError("Calibration JSON must contain an object at its root.")
 
     preferred_signal = payload.get("signal_field")
+    taxel_results = payload.get("taxel_results")
+    if isinstance(taxel_results, list):
+        datasets = []
+        common_metadata = dict(payload)
+        common_metadata.pop("taxel_results", None)
+        for index, result in enumerate(taxel_results, start=1):
+            if not isinstance(result, dict):
+                continue
+            summary_path = _resolve_reference(
+                result.get("batch_summary_path"), path.parent
+            )
+            if summary_path is None:
+                continue
+            if summary_path.suffix.lower() == ".json":
+                datasets.extend(_load_json(summary_path))
+                continue
+            taxel_metadata = dict(common_metadata)
+            taxel_metadata.update(result)
+            datasets.extend(
+                _load_csv(
+                    summary_path,
+                    preferred_signal=preferred_signal,
+                    metadata=taxel_metadata,
+                )
+            )
+        if not datasets:
+            summary_path = _resolve_reference(
+                payload.get("summary_csv_path"), path.parent
+            )
+            if summary_path is not None:
+                datasets = _load_csv(
+                    summary_path,
+                    preferred_signal=preferred_signal,
+                    metadata=common_metadata,
+                )
+        if not datasets:
+            raise ValueError(
+                "The full-taxel summary contains no usable trial recordings."
+            )
+        return datasets
+
     trials = payload.get("trials")
     if isinstance(trials, list):
         datasets = []
@@ -510,6 +575,14 @@ def analyze_calibration_dataset(dataset):
             "force_distance": core.get("force_distance_fit"),
             "force_signal": core.get("force_signal_fit"),
         },
+        "approximations": {
+            "signal_distance": core.get("signal_distance_smooth_fit"),
+            "force_distance": core.get("force_distance_smooth_fit"),
+            "force_signal": core.get("force_signal_smooth_fit"),
+        },
+        "segmented_approximations": dict(
+            core.get("segmented_smooth_fits") or {}
+        ),
         "hysteresis": {
             "signal_distance": _hysteresis_metrics(rows, signal_field),
             "force_distance": _hysteresis_metrics(
@@ -629,7 +702,7 @@ def build_trial_report(analysis):
         "physical_target_taxel_index",
         metadata.get("taxel_index", "not available"),
     )
-    signal_unit = "%" if "%" in analysis["signal_label"] else "counts"
+    signal_unit = "%" if "%" in analysis["signal_label"] else "sensor units"
     signal_onset = events.get("signal_onset") or {}
     contact_onset = events.get("contact_onset") or {}
     warnings = []
@@ -921,11 +994,7 @@ class CalibrationGraphAnalysisDialog(QDialog):
         selector_layout.addWidget(self.trial_selector, 1)
         layout.addLayout(selector_layout)
 
-        sensor_shape = first_metadata.get("sensor_shape") or [8, 10]
-        try:
-            sensor_rows, sensor_columns = map(int, sensor_shape[:2])
-        except (TypeError, ValueError):
-            sensor_rows, sensor_columns = 8, 10
+        sensor_rows, sensor_columns = _dataset_sensor_shape(self.datasets[0])
         taxel_panel = QWidget(self)
         taxel_layout = QVBoxLayout(taxel_panel)
         taxel_layout.setContentsMargins(0, 0, 8, 0)
@@ -1088,12 +1157,35 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self._select_trial(self._current_index())
 
     def _select_taxel(self, taxel_index):
-        self._apply_taxel(int(taxel_index))
+        taxel_index = int(taxel_index)
+        matching_indices = [
+            index
+            for index, dataset in enumerate(self.datasets)
+            if taxel_index in self._available_taxels(dataset)
+        ]
+        if not matching_indices:
+            self.status_label.setText(
+                f"Taxel {taxel_index} has no recorded calibration data."
+            )
+            return
+        current_index = self._current_index()
+        if current_index not in matching_indices:
+            self.trial_selector.blockSignals(True)
+            self.trial_selector.setCurrentIndex(matching_indices[0])
+            self.trial_selector.blockSignals(False)
+        self._apply_taxel(taxel_index)
 
     def _select_trial(self, index):
         index = max(0, min(int(index), len(self.datasets) - 1))
         dataset = self.datasets[index]
-        available = self._available_taxels(dataset)
+        sensor_rows, sensor_columns = _dataset_sensor_shape(dataset)
+        self.taxel_map.set_grid_shape(sensor_rows, sensor_columns)
+        taxel_count = sensor_rows * sensor_columns
+        available = [
+            taxel
+            for taxel in self._available_taxels(dataset)
+            if 0 <= int(taxel) < taxel_count
+        ]
         if self.selected_taxel_index not in available and available:
             original_taxel = self._original_taxel(dataset)
             fallback = (

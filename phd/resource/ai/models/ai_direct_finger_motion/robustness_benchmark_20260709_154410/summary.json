@@ -1,8 +1,8 @@
 {
   "model": "phd/resource/ai/models/ai_direct_finger_motion/cnn_gru_spatial_softmax_augmented_20260709/best_model.pt",
   "trials": [
-    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation/trial_0005_20260623_163003.npz",
-    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_v1/trial_0003_20260624_153324.npz"
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_first_trial_no_rotation_10x10/trial_0005_20260623_163003.npz",
+    "/home/ping2/ros2_ws/src/phd/phd/resource/ai/data/ai_direct_finger_motion/session_fixed_speed_push_focus_10x10_v1/trial_0003_20260624_153324.npz"
   ],
   "sanity_check": {
     "per_trial": [

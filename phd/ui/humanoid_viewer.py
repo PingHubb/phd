@@ -31,6 +31,7 @@ from phd.dependence.paths import resource_path
 from phd.dependence.sensor_serial import SensorReadWorker
 from phd.dependence.humanoid_sensor_registry import (
     HUMANOID_SENSOR_MAPPING_FILE,
+    is_realsense_camera_port,
     stable_usb_port_identity as _stable_usb_port_identity,
 )
 from phd.dependence.humanoid_signal_parts import (
@@ -62,6 +63,7 @@ def _ttyacm_port_details():
             if os.path.basename(str(port.device)).lower().startswith(
                 "ttyacm"
             )
+            and not is_realsense_camera_port(port)
         ),
         key=lambda port: os.path.basename(str(port.device)).lower(),
     )

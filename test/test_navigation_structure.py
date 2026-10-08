@@ -199,4 +199,5 @@ def test_robots_subtab_index_is_captured_for_the_arm_gate():
         )
     )
     assert calls["TM Robot"] == "tm_robot_tab_index"
+    assert calls["Robot Dog"] == "robot_dog_tab_index"
     assert calls["Humanoid"] == "humanoid_tab_index"

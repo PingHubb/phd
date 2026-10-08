@@ -7,6 +7,49 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from PyQt5.QtGui import QImage
 
 
+def median_depth_in_box(
+    depth_data: Any,
+    box: Any,
+    depth_scale: float,
+    sample_fraction: float = 0.12,
+    minimum_radius: int = 2,
+    maximum_radius: int = 10,
+) -> float:
+    """Estimate object depth from a small valid-pixel patch at box centre.
+
+    A single RealSense depth pixel is frequently zero or noisy. The local
+    median is stable enough for robot approach control while still following
+    small objects.
+    """
+    np = import_module("numpy")
+    depth = np.asarray(depth_data)
+    if depth.ndim != 2 or depth.size == 0:
+        return 0.0
+    try:
+        x1, y1, x2, y2 = [float(value) for value in box]
+        scale = float(depth_scale)
+    except (TypeError, ValueError):
+        return 0.0
+    if not np.isfinite([x1, y1, x2, y2, scale]).all() or scale <= 0:
+        return 0.0
+
+    center_x = int(round((x1 + x2) * 0.5))
+    center_y = int(round((y1 + y2) * 0.5))
+    center_x = max(0, min(depth.shape[1] - 1, center_x))
+    center_y = max(0, min(depth.shape[0] - 1, center_y))
+    short_side = max(0.0, min(abs(x2 - x1), abs(y2 - y1)))
+    radius = int(round(short_side * max(0.0, float(sample_fraction))))
+    radius = max(int(minimum_radius), min(int(maximum_radius), radius))
+    patch = depth[
+        max(0, center_y - radius) : min(depth.shape[0], center_y + radius + 1),
+        max(0, center_x - radius) : min(depth.shape[1], center_x + radius + 1),
+    ]
+    valid = patch[np.isfinite(patch) & (patch > 0)]
+    if valid.size == 0:
+        return 0.0
+    return float(np.median(valid)) * scale
+
+
 class YoloWorker(QThread):
     """
     Handles Intel RealSense connection and YOLO object detection.
@@ -18,6 +61,7 @@ class YoloWorker(QThread):
 
     image_signal = pyqtSignal(QImage)
     data_signal = pyqtSignal(list, tuple)  # Sends [objects, (width, height)]
+    error_signal = pyqtSignal(str)
     finished_signal = pyqtSignal()
 
     def __init__(self, dev_source: Any = None, model_path: str = "yolov8n.pt", frame_timeout_ms: int = 5000):
@@ -35,6 +79,12 @@ class YoloWorker(QThread):
         self._cv2: Optional[Any] = None
         self._np: Optional[Any] = None
         self._rs: Optional[Any] = None
+        self._depth_scale = 0.001
+
+    def _report_error(self, message: str) -> None:
+        text = str(message)
+        print(f"[CameraAPI] {text}")
+        self.error_signal.emit(text)
 
     # ------------------------------------------------------------------
     # Dependency / setup helpers
@@ -48,14 +98,16 @@ class YoloWorker(QThread):
             ultralytics = import_module("ultralytics")
             yolo_cls = getattr(ultralytics, "YOLO")
         except Exception as exc:
-            print(f"[CameraAPI] Dependency import failed: {exc}")
+            self._report_error(f"Dependency import failed: {exc}")
             return False
 
         try:
             self._model = yolo_cls(self.model_path)
             print(f"[CameraAPI] YOLO model loaded: {self.model_path}")
         except Exception as exc:
-            print(f"[CameraAPI] Error loading YOLO model '{self.model_path}': {exc}")
+            self._report_error(
+                f"Error loading YOLO model '{self.model_path}': {exc}"
+            )
             self._model = None
             return False
 
@@ -66,33 +118,71 @@ class YoloWorker(QThread):
         if self._rs is None:
             return False
 
-        try:
+        profiles = (
+            (640, 480, 30),
+            (640, 360, 30),
+            (1280, 720, 30),
+        )
+        last_error = "No compatible color/depth stream profile was found."
+        for width, height, fps in profiles:
+            if not self.running:
+                return False
             pipeline = self._rs.pipeline()
             config = self._rs.config()
+            try:
+                config.enable_stream(
+                    self._rs.stream.color,
+                    width,
+                    height,
+                    self._rs.format.bgr8,
+                    fps,
+                )
+                config.enable_stream(
+                    self._rs.stream.depth,
+                    width,
+                    height,
+                    self._rs.format.z16,
+                    fps,
+                )
+                profile = pipeline.start(config)
+            except Exception as exc:
+                last_error = str(exc)
+                try:
+                    pipeline.stop()
+                except Exception:
+                    pass
+                continue
 
-            config.enable_stream(self._rs.stream.color, 640, 480, self._rs.format.bgr8, 30)
-            config.enable_stream(self._rs.stream.depth, 640, 480, self._rs.format.z16, 30)
-
-            pipeline.start(config)
             self._pipeline = pipeline
             self._align = self._rs.align(self._rs.stream.color)
-            print("[CameraAPI] RealSense Camera Started.")
+            try:
+                self._depth_scale = float(
+                    profile.get_device().first_depth_sensor().get_depth_scale()
+                )
+            except Exception:
+                self._depth_scale = 0.001
+            print(
+                "[CameraAPI] RealSense Camera Started "
+                f"({width}x{height} at {fps} FPS)."
+            )
             return True
-        except Exception as exc:
-            print(f"[CameraAPI] Could not start RealSense: {exc}")
-            self._pipeline = None
-            self._align = None
-            return False
+
+        self._report_error(f"Could not start RealSense: {last_error}")
+        self._pipeline = None
+        self._align = None
+        return False
 
     # ------------------------------------------------------------------
     # Frame processing helpers
     # ------------------------------------------------------------------
     def _get_aligned_frames(self) -> Optional[Tuple[Any, Any]]:
-        if self._pipeline is None or self._align is None:
+        pipeline = self._pipeline
+        align = self._align
+        if pipeline is None or align is None:
             return None
 
-        frames = self._pipeline.wait_for_frames(timeout_ms=self.frame_timeout_ms)
-        aligned_frames = self._align.process(frames)
+        frames = pipeline.wait_for_frames(timeout_ms=self.frame_timeout_ms)
+        aligned_frames = align.process(frames)
         color_frame = aligned_frames.get_color_frame()
         depth_frame = aligned_frames.get_depth_frame()
 
@@ -123,6 +213,7 @@ class YoloWorker(QThread):
 
         color_frame, depth_frame = aligned
         frame = self._np.asanyarray(color_frame.get_data())
+        depth_data = self._np.asanyarray(depth_frame.get_data())
         height, width, _ = frame.shape
         frame_size = (width, height)
 
@@ -138,12 +229,11 @@ class YoloWorker(QThread):
                 name = self._model.names[cls_id]
                 conf = float(box.conf[0])
 
-                cx = int((x1 + x2) / 2)
-                cy = int((y1 + y2) / 2)
-
-                dist_meters = 0.0
-                if 0 <= cx < width and 0 <= cy < height:
-                    dist_meters = depth_frame.get_distance(cx, cy)
+                dist_meters = median_depth_in_box(
+                    depth_data,
+                    (x1, y1, x2, y2),
+                    self._depth_scale,
+                )
 
                 detected_objects.append(
                     {
@@ -183,12 +273,18 @@ class YoloWorker(QThread):
                     else:
                         consecutive_errors += 1
                 except Exception as exc:
+                    if not self.running:
+                        break
                     consecutive_errors += 1
-                    print(f"[CameraAPI] Stream Error ({consecutive_errors}): {exc}")
+                    self._report_error(
+                        f"Stream error ({consecutive_errors}/10): {exc}"
+                    )
 
                 # Prevent endless noisy loops if the camera is repeatedly failing.
                 if consecutive_errors >= 10:
-                    print("[CameraAPI] Too many consecutive camera errors. Stopping worker.")
+                    self._report_error(
+                        "Too many consecutive camera errors; detection stopped."
+                    )
                     break
         finally:
             self.running = False

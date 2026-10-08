@@ -60,6 +60,10 @@ from phd.dependence.sensor_heatmap import (
     normalize_heatmap_3d_palette,
     normalize_heatmap_response_mode,
 )
+from phd.dependence.humanoid_sensor_registry import (
+    is_force_transmitter_port,
+    is_realsense_camera_port,
+)
 from phd.dependence.paths import resource_path
 from phd.dependence.sensor_protocol import (
     DEFAULT_SENSOR_BAUD_RATE,
@@ -278,7 +282,12 @@ class SerialPortDialog(QDialog):
         except Exception:
             return []
 
-        all_port_names = [p.device for p in ports]
+        all_port_names = [
+            p.device
+            for p in ports
+            if not is_realsense_camera_port(p)
+            and not is_force_transmitter_port(p)
+        ]
         acm_ports = sorted(name for name in all_port_names if "ttyACM" in name)
         other_ports = sorted(name for name in all_port_names if "ttyACM" not in name)
         return acm_ports + other_ports

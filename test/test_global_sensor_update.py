@@ -161,3 +161,49 @@ def test_delayed_camera_lift_is_blocked_after_software_stop():
     CameraControlMixin.perform_lift_action(camera)
 
     assert not camera.is_lifting
+
+
+def test_camera_requires_three_stable_depth_frames_before_gripping(monkeypatch):
+    class _Gripper:
+        def __init__(self):
+            self.close_calls = 0
+
+        @staticmethod
+        def get_pos_string():
+            return "open"
+
+        def close(self, soft=False):
+            assert soft
+            self.close_calls += 1
+
+    camera = type("_Camera", (), {})()
+    camera._is_shutting_down = False
+    camera._software_motion_stopped = False
+    camera.centering_active = True
+    camera.manual_mode_active = False
+    camera.grab_triggered = False
+    camera.is_lifting = False
+    camera._target_reached_frames = 0
+    camera.gripper = _Gripper()
+    camera.velocities = []
+    camera.send_velocity_command = lambda *values: camera.velocities.append(values)
+    camera.check_grip_result = lambda: None
+    monkeypatch.setattr(
+        "phd.ui.ui_ping_camera_control.QTimer.singleShot",
+        lambda *_args: None,
+    )
+    detection = {
+        "name": "mouse",
+        "box": [300, 220, 340, 260],
+        "depth": 0.17,
+        "conf": 0.9,
+    }
+
+    for _attempt in range(2):
+        CameraControlMixin.process_yolo_data(camera, [detection], (640, 480))
+    assert camera.gripper.close_calls == 0
+
+    CameraControlMixin.process_yolo_data(camera, [detection], (640, 480))
+
+    assert camera.gripper.close_calls == 1
+    assert camera.grab_triggered

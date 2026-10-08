@@ -1,4 +1,5 @@
 import copy
+import json
 import os
 import time
 from datetime import datetime
@@ -11,7 +12,7 @@ from PyQt5.QtWidgets import (
     QFrame, QMessageBox, QStyle, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QToolButton, QSizePolicy, QMenu, QDoubleSpinBox, QFormLayout, QSpinBox,
     QCheckBox, QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
-    QFileDialog,
+    QFileDialog, QScrollArea, QTabWidget, QTreeWidget, QTreeWidgetItem,
 )
 from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath, QPixmap, QFont
 import numpy as np
@@ -24,7 +25,12 @@ from phd.ui.calibration_graph_analysis import (
     CalibrationGraphAnalysisDialog,
     load_calibration_recording,
 )
-from phd.ui.calibration_result_dialog import CalibrationResultDialog
+from phd.ui.calibration_result_dialog import (
+    CalibrationResultDialog,
+    CalibrationTaxelMap,
+    FullTaxelCalibrationResultDialog,
+)
+from phd.ui.taxel_position_navigation import MappedTaxelMoveTask, prepare_taxel_map
 from phd.ui.camera_preview_window import CameraPreviewWindow
 from phd.ui.plotter_video_recorder import PlotterVideoRecorder
 from phd.ui.heatmap_signal_recording import (
@@ -424,14 +430,14 @@ class SensorCaptureResultDialog(QDialog):
 class ExperimentControlsWindow(QDialog):
     """Reusable modeless home for the experiment controls panel."""
 
-    _GEOMETRY_KEY = "windows/experiment_controls_geometry"
+    _GEOMETRY_KEY = "windows/experiment_controls_geometry_wide"
 
     def __init__(self, controls: QWidget, parent=None):
         super().__init__(parent, Qt.Window)
         self._settings = QSettings("PingLab", "PingLab")
         self.setWindowTitle("Experiment Controls")
         self.setModal(False)
-        self.setMinimumSize(380, 520)
+        self.setMinimumSize(860, 620)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -439,7 +445,7 @@ class ExperimentControlsWindow(QDialog):
 
         saved_geometry = self._settings.value(self._GEOMETRY_KEY)
         if not saved_geometry or not self.restoreGeometry(saved_geometry):
-            components.size_to_screen(self, 440, 760)
+            components.size_to_screen(self, 1080, 820)
 
     def remember_geometry(self) -> None:
         self._settings.setValue(self._GEOMETRY_KEY, self.saveGeometry())
@@ -479,7 +485,11 @@ class MyMainWindow(MainWindow):
         self._sidebar_active_control_id = None
         self._sensor_capture_result_dialog = None
         self._calibration_result_dialog = None
+        self._full_taxel_calibration_result_dialog = None
         self._calibration_graph_analysis_dialog = None
+        self._taxel_navigation_result = None
+        self._taxel_mapping_anchor_updated_after_load = False
+        self._taxel_navigation_source_path = None
         self._sidebar_active_task = None  # experiment_tasks.ExperimentTask, set while running
         self._sigraph_heatmap_recorder = None
         self._sigraph_heatmap_signal_recorder = None
@@ -617,7 +627,7 @@ class MyMainWindow(MainWindow):
         )
         self.action_camera_preview = QAction(icons.icon('camera'), 'Camera', self)
         self.action_camera_preview.setToolTip(
-            'Open a live RealSense camera window'
+            'Open the RealSense window for color, depth, infrared, or point cloud'
         )
 
         self.action_window_experiments = QAction(
@@ -875,32 +885,65 @@ class MyMainWindow(MainWindow):
             f"QFrame#experimentPanel {{ background-color: {theme.WINDOW_BG}; "
             "border: none; }"
         )
-        # Wider than the legacy 250 px so longer task descriptions / labels
-        # (e.g. "Save per-point sensor CSV", "Per-point dwell:", J=[...]° log lines)
-        # are not clipped by the splitter handle.
-        sidebar.setMinimumWidth(330)
-
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(12)
+        layout.setSpacing(8)
 
-        # Available tasks first — this is what the user picks on every run, so keep
-        # it pinned to the top of the sidebar.
+        self.experiment_controls_splitter = QSplitter(Qt.Horizontal)
+        self.experiment_controls_splitter.setChildrenCollapsible(False)
+        self.experiment_controls_splitter.setHandleWidth(8)
+
+        task_column = QWidget()
+        task_column.setMinimumWidth(210)
+        task_layout = QVBoxLayout(task_column)
+        task_layout.setContentsMargins(0, 0, 0, 0)
+        task_layout.setSpacing(8)
         tasks_header = QLabel("Available Tasks")
         font = tasks_header.font()
         font.setBold(True)
         tasks_header.setFont(font)
-        layout.addWidget(tasks_header)
+        task_layout.addWidget(tasks_header)
 
-        self.sidebar_task_list = QListWidget()
-        self.sidebar_task_list.setSelectionMode(QListWidget.SingleSelection)
-        for label_text, task_id, description in experiment_tasks.task_definitions():
-            item = QListWidgetItem(label_text)
-            item.setData(Qt.UserRole, task_id)
-            item.setData(Qt.UserRole + 1, description)
-            self.sidebar_task_list.addItem(item)
-        self.sidebar_task_list.setCurrentRow(0)
-        layout.addWidget(self.sidebar_task_list, stretch=1)
+        self.sidebar_task_list = QTreeWidget()
+        self.sidebar_task_list.setHeaderHidden(True)
+        self.sidebar_task_list.setSelectionMode(QTreeWidget.SingleSelection)
+        self.sidebar_task_list.setRootIsDecorated(True)
+        self.sidebar_task_list.setIndentation(16)
+        grouped_tasks: dict = {}
+        for label_text, task_id, description, category in experiment_tasks.task_definitions():
+            grouped_tasks.setdefault(category, []).append(
+                (label_text, task_id, description)
+            )
+        first_task_item = None
+        for category in experiment_tasks.SIDEBAR_CATEGORIES:
+            tasks = grouped_tasks.get(category) or []
+            if not tasks:
+                continue
+            header = QTreeWidgetItem([category])
+            header.setFlags(Qt.ItemIsEnabled)
+            header_font = header.font(0)
+            header_font.setBold(True)
+            header.setFont(0, header_font)
+            self.sidebar_task_list.addTopLevelItem(header)
+            for label_text, task_id, description in tasks:
+                item = QTreeWidgetItem([label_text])
+                item.setData(0, Qt.UserRole, task_id)
+                item.setData(0, Qt.UserRole + 1, description)
+                header.addChild(item)
+                if first_task_item is None:
+                    first_task_item = item
+            header.setExpanded(
+                category not in experiment_tasks.COLLAPSED_SIDEBAR_CATEGORIES
+            )
+        if first_task_item is not None:
+            self.sidebar_task_list.setCurrentItem(first_task_item)
+        task_layout.addWidget(self.sidebar_task_list, stretch=1)
+
+        detail_column = QWidget()
+        detail_column.setMinimumWidth(520)
+        detail_layout = QVBoxLayout(detail_column)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(8)
 
         self.sidebar_task_info = QLabel()
         self.sidebar_task_info.setWordWrap(True)
@@ -908,14 +951,12 @@ class MyMainWindow(MainWindow):
             f"color: {theme.TEXT_MUTED}; background-color: {theme.SURFACE_RAISED}; "
             f"border: 1px solid {theme.BORDER_SUBTLE}; padding: 8px; border-radius: 6px;"
         )
-        layout.addWidget(self.sidebar_task_info)
+        detail_layout.addWidget(self.sidebar_task_info)
         self._update_sidebar_task_info()
 
-        # ─── Task-specific parameter controls ────────────────────────────────
         # Each task may expose a custom widget under this container; only the
-        # widget that matches the currently-selected task is shown. New tasks
-        # can register their own group by extending ``_task_param_widgets``.
-        self._build_sidebar_task_param_widgets(layout)
+        # widget that matches the currently-selected task is shown.
+        self._build_sidebar_task_param_widgets(detail_layout)
         self._update_sidebar_task_param_visibility()
 
         # Container for task execution and recording buttons
@@ -954,8 +995,26 @@ class MyMainWindow(MainWindow):
         record_layout.addWidget(self.sigraph_scanning_reverse_record_button)
         record_layout.addStretch()
         btn_layout.addLayout(record_layout)
-        layout.addWidget(btn_container)
+        detail_layout.addWidget(btn_container)
+        for index in range(detail_layout.count()):
+            item = detail_layout.itemAt(index)
+            widget = None if item is None else item.widget()
+            if widget is None or widget in {
+                self.sidebar_task_info,
+                btn_container,
+            }:
+                detail_layout.setStretch(index, 0)
+                continue
+            widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            detail_layout.setStretch(index, 1)
         self._update_sidebar_task_action_labels()
+
+        self.experiment_controls_splitter.addWidget(task_column)
+        self.experiment_controls_splitter.addWidget(detail_column)
+        self.experiment_controls_splitter.setStretchFactor(0, 0)
+        self.experiment_controls_splitter.setStretchFactor(1, 1)
+        self.experiment_controls_splitter.setSizes([240, 800])
+        layout.addWidget(self.experiment_controls_splitter, stretch=1)
 
         return sidebar
 
@@ -978,6 +1037,18 @@ class MyMainWindow(MainWindow):
         self.status_experiment = components.StatusDot("Experiment", "active")
         self.status_experiment.setVisible(False)
         status.addWidget(self.status_experiment)
+
+        self.status_calibration_travel = QLabel(
+            "Z travel: — mm | Max: — mm"
+        )
+        self.status_calibration_travel.setObjectName("statusMetric")
+        self.status_calibration_travel.setToolTip(
+            "Measured from live robot TCP Z feedback relative to the current "
+            "calibration trial's starting height. This is displacement, not "
+            "cumulative round-trip path length."
+        )
+        self.status_calibration_travel.setVisible(False)
+        status.addWidget(self.status_calibration_travel)
 
         self.status_experiment_stop_button = QPushButton("Stop")
         self.status_experiment_stop_button.setObjectName("btnStop")
@@ -1187,6 +1258,7 @@ class MyMainWindow(MainWindow):
             )
         self.status_mode.setText(active_mode)
         self._refresh_session_strip(ui, active_mode, connected, sensor_hz)
+        self._sync_taxel_maps_to_streaming_sensor()
 
     @staticmethod
     def _selected_sensor_summary(
@@ -1543,6 +1615,19 @@ class MyMainWindow(MainWindow):
 
     def open_camera_preview_window(self):
         """Open or focus the live RealSense color window."""
+        camera_ui = getattr(self, "ui_ros", None)
+        worker = getattr(camera_ui, "yolo_worker", None)
+        if worker is not None and worker.isRunning():
+            camera_ui._stop_auto_centering()
+            camera_ui._stop_yolo_worker()
+            camera_ui._close_camera_window()
+            camera_ui._set_live_camera_ui_state(False)
+            log_display = getattr(camera_ui, "log_display", None)
+            if log_display is not None:
+                log_display.append(
+                    "Object detection stopped so the RealSense preview can "
+                    "use the camera."
+                )
         window = getattr(self, "camera_preview_window", None)
         if window is not None:
             try:
@@ -1769,6 +1854,7 @@ class MyMainWindow(MainWindow):
         """Keep a compact stop affordance visible when the popup is hidden."""
         indicator = getattr(self, "status_experiment", None)
         stop_button = getattr(self, "status_experiment_stop_button", None)
+        travel_label = getattr(self, "status_calibration_travel", None)
         if indicator is None or stop_button is None:
             return
 
@@ -1785,17 +1871,66 @@ class MyMainWindow(MainWindow):
         indicator.setVisible(running)
         stop_button.setVisible(running)
         stop_button.setEnabled(running)
+        if travel_label is not None:
+            travel_label.setVisible(
+                running
+                and str(getattr(task, "id", ""))
+                in {"calibration", "full_taxel_calibration"}
+            )
+        self._refresh_taxel_navigation_controls()
 
     def _current_sidebar_task_item(self):
-        return getattr(self, "sidebar_task_list", None).currentItem() if hasattr(self, "sidebar_task_list") else None
+        tree = getattr(self, "sidebar_task_list", None)
+        return tree.currentItem() if tree is not None else None
+
+    def _sidebar_item_value(self, item, role):
+        if item is None:
+            return None
+        return item.data(0, role)
+
+    def select_sidebar_task(self, task_id: str) -> bool:
+        """Select a task by id, expanding its category when needed."""
+        tree = getattr(self, "sidebar_task_list", None)
+        if tree is None:
+            return False
+        for category_index in range(tree.topLevelItemCount()):
+            category = tree.topLevelItem(category_index)
+            for child_index in range(category.childCount()):
+                item = category.child(child_index)
+                if self._sidebar_item_value(item, Qt.UserRole) != task_id:
+                    continue
+                category.setExpanded(True)
+                tree.setCurrentItem(item)
+                return True
+        return False
 
     def _current_sidebar_control_id(self):
         item = self._current_sidebar_task_item()
-        return item.data(Qt.UserRole) if item is not None else None
+        task_id = self._sidebar_item_value(item, Qt.UserRole)
+        if task_id == "calibration" and self._calibration_mode_is_full_taxel():
+            return "full_taxel_calibration"
+        return task_id
+
+    def _calibration_mode_is_full_taxel(self) -> bool:
+        tabs = getattr(self, "calibration_mode_tabs", None)
+        full_index = getattr(self, "_calibration_full_taxel_tab_index", None)
+        return (
+            tabs is not None
+            and full_index is not None
+            and tabs.currentIndex() == int(full_index)
+        )
+
+    def _on_calibration_mode_changed(self, _index):
+        if self._current_sidebar_task_item() is None:
+            return
+        item = self._current_sidebar_task_item()
+        if self._sidebar_item_value(item, Qt.UserRole) != "calibration":
+            return
+        self._on_sidebar_task_changed()
 
     def _current_sidebar_control_label(self):
         item = self._current_sidebar_task_item()
-        return item.text() if item is not None else "No Task"
+        return item.text(0) if item is not None else "No Task"
 
     def _update_sidebar_task_info(self):
         label = getattr(self, "sidebar_task_info", None)
@@ -1805,14 +1940,16 @@ class MyMainWindow(MainWindow):
         if item is None:
             label.setText("Select a task from the list.")
             return
-        description = item.data(Qt.UserRole + 1) or ""
-        label.setText(f"Task: {item.text()}\n\n{description}")
+        description = self._sidebar_item_value(item, Qt.UserRole + 1) or ""
+        label.setText(f"Task: {item.text(0)}\n\n{description}")
 
     def _on_sidebar_task_changed(self, _current=None, _previous=None):
         self._update_sidebar_task_info()
         self._update_sidebar_task_param_visibility()
         self._update_sidebar_task_action_labels()
         self._refresh_calibration_controls()
+        self._refresh_full_taxel_calibration_controls()
+        self._refresh_taxel_mapping_controls()
 
     def _update_sidebar_task_action_labels(self):
         start_button = getattr(self, "sidebar_btn_start", None)
@@ -1821,6 +1958,14 @@ class MyMainWindow(MainWindow):
         task = experiment_tasks.get_task(self._current_sidebar_control_id())
         start_button.setText(
             str(getattr(task, "start_button_label", "Start") or "Start")
+        )
+        # Reset stale enablement inherited from the previously selected task.
+        # Hardware tasks apply their stricter prerequisites immediately after
+        # this method; one-shot offline tasks such as Graph Analysis remain
+        # available without any connected device.
+        start_button.setEnabled(
+            task is not None
+            and getattr(self, "_sidebar_active_task", None) is None
         )
         reverse_button = getattr(self, "sigraph_scanning_reverse_button", None)
         if reverse_button is not None:
@@ -1997,25 +2142,41 @@ class MyMainWindow(MainWindow):
             return
         calibration_panel = QFrame()
         calibration_panel.setFrameShape(QFrame.StyledPanel)
-        calibration_layout = QVBoxLayout(calibration_panel)
+        calibration_outer = QVBoxLayout(calibration_panel)
+        calibration_outer.setContentsMargins(0, 0, 0, 0)
+        calibration_outer.setSpacing(0)
+        self.calibration_mode_tabs = QTabWidget()
+        self.calibration_mode_tabs.setDocumentMode(True)
+        single_page = QWidget()
+        calibration_layout = QVBoxLayout(single_page)
         calibration_layout.setContentsMargins(8, 8, 8, 8)
         calibration_layout.setSpacing(8)
 
         self.calibration_initial_position_label = QLabel(
-            "Initial position: not remembered"
+            "Load a taxel position map, then select a taxel."
         )
         self.calibration_initial_position_label.setWordWrap(True)
         calibration_layout.addWidget(self.calibration_initial_position_label)
-        self.calibration_remember_position_button = QPushButton(
-            "Remember Initial Position"
-        )
-        self.calibration_remember_position_button.setToolTip(
-            "Save the robot's current joint and TCP pose as the start and "
-            "return position for every calibration trial."
+        self.calibration_taxel_map = CalibrationTaxelMap(rows=8, columns=10)
+        self.calibration_taxel_map.set_taxels([])
+        self.calibration_taxel_map.taxelSelected.connect(
+            self._select_single_calibration_taxel
         )
         calibration_layout.addWidget(
-            self.calibration_remember_position_button
+            self.calibration_taxel_map, alignment=Qt.AlignHCenter
         )
+        self.calibration_load_map_button = QPushButton(
+            "Load Taxel Position Map…"
+        )
+        self.calibration_load_map_button.setToolTip(
+            "Use a taxel_position_map.json from Taxel Position Mapping. "
+            "The selected taxel's saved start pose is the calibration "
+            "initial position."
+        )
+        self.calibration_load_map_button.clicked.connect(
+            self._load_single_calibration_map
+        )
+        calibration_layout.addWidget(self.calibration_load_map_button)
 
         calibration_form = QFormLayout()
         self.calibration_taxel_spin = QSpinBox()
@@ -2026,22 +2187,23 @@ class MyMainWindow(MainWindow):
             "node. Every taxel signal is recorded for later graph selection. "
             "Indices follow the Sensor Signal Viewer: top-down, column-major."
         )
+        self.calibration_taxel_label = QLabel("Physical target taxel (8x10)")
         calibration_form.addRow(
-            "Physical target taxel (8x10)",
+            self.calibration_taxel_label,
             self.calibration_taxel_spin,
         )
 
         self.calibration_signal_combo = QComboBox()
         self.calibration_signal_combo.addItem(
-            "Difference (counts)", "diff_ave"
+            "Sensor signal change", "diff_ave"
         )
         self.calibration_signal_combo.addItem(
             "Relative change (%)", "diff_percent_ave"
         )
         self.calibration_signal_combo.addItem("Raw value", "raw_ave")
         self.calibration_signal_combo.setToolTip(
-            "Difference (counts) is the signed sensor response: raw value "
-            "minus calibration value. Positive and negative values are kept."
+            "Sensor signal change is the signed response: raw value minus "
+            "calibration value. Positive and negative values are kept."
         )
         signal_index = self.calibration_signal_combo.findData(
             calibration_task.signal_field
@@ -2119,11 +2281,11 @@ class MyMainWindow(MainWindow):
         calibration_layout.addLayout(calibration_form)
 
         calibration_note = QLabel(
-            "Run first returns to the remembered pose, measures the DYLY "
-            "baseline, and moves in base -Z until the gram threshold is "
-            "reached. It holds for 1 s, returns in base +Z at the same speed, "
-            "and completes the trial only at the initial height. The tactile "
-            "sensor recalibrates between repetitions. Stop remains available."
+            "Select one mapped taxel. Run moves to that taxel's saved start "
+            "pose, measures the DYLY baseline, and moves in base -Z until the "
+            "gram threshold is reached. It holds for 1 s, returns in base +Z "
+            "at the same speed, and completes the trial only at that start "
+            "height. The tactile sensor recalibrates between repetitions."
         )
         calibration_note.setWordWrap(True)
         calibration_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
@@ -2143,11 +2305,19 @@ class MyMainWindow(MainWindow):
         )
         calibration_layout.addWidget(self.calibration_live_force_label)
 
-        self.calibration_remember_position_button.clicked.connect(
-            self._remember_calibration_initial_position
-        )
+        def _remember_calibration_taxel(value):
+            if getattr(calibration_task, "position_map", None) is not None:
+                self._select_single_calibration_taxel(int(value))
+                return
+            calibration_task.taxel_index = int(value)
+            sensor_key = str(
+                getattr(calibration_task, "active_sensor_key_name", "") or ""
+            )
+            if sensor_key:
+                calibration_task._taxel_by_sensor[sensor_key] = int(value)
+
         self.calibration_taxel_spin.valueChanged.connect(
-            lambda value: setattr(calibration_task, "taxel_index", int(value))
+            _remember_calibration_taxel
         )
         self.calibration_signal_combo.currentIndexChanged.connect(
             lambda _index: setattr(
@@ -2180,10 +2350,1245 @@ class MyMainWindow(MainWindow):
         self.calibration_repeat_spin.valueChanged.connect(
             lambda _value: self._refresh_calibration_progress()
         )
-        self._task_param_widgets[calibration_task.id] = calibration_panel
-        parent_layout.addWidget(calibration_panel)
+        self._calibration_single_tab_index = self.calibration_mode_tabs.addTab(
+            single_page, "Single taxel"
+        )
         self._refresh_calibration_controls()
         self._refresh_calibration_progress()
+
+        full_calibration_task = experiment_tasks.get_task(
+            "full_taxel_calibration"
+        )
+        if full_calibration_task is None:
+            return
+        full_panel = QFrame()
+        full_panel.setFrameShape(QFrame.StyledPanel)
+        full_layout = QVBoxLayout(full_panel)
+        full_layout.setContentsMargins(8, 8, 8, 8)
+        full_layout.setSpacing(8)
+
+        self.full_taxel_initial_position_label = QLabel(
+            "Initial position: not remembered"
+        )
+        self.full_taxel_initial_position_label.setWordWrap(True)
+        full_layout.addWidget(self.full_taxel_initial_position_label)
+        self.full_taxel_remember_position_button = QPushButton(
+            "Remember Initial Position"
+        )
+        self.full_taxel_remember_position_button.setToolTip(
+            "Save the robot's current joint and TCP pose as the start and "
+            "return position for Full Taxel Calibration. This pose is kept "
+            "separate from Single taxel calibration, and each sensor keeps "
+            "its own pose."
+        )
+        self.full_taxel_remember_position_button.clicked.connect(
+            self._remember_full_taxel_initial_position
+        )
+        full_layout.addWidget(self.full_taxel_remember_position_button)
+
+        self.full_taxel_calibration_map_info = QLabel(
+            "Position map: not loaded"
+        )
+        self.full_taxel_calibration_map_info.setWordWrap(True)
+        full_layout.addWidget(self.full_taxel_calibration_map_info)
+        self.full_taxel_calibration_map = CalibrationTaxelMap(
+            rows=8, columns=10
+        )
+        self.full_taxel_calibration_map.set_taxels([])
+        self.full_taxel_calibration_map.set_interaction_enabled(False)
+        full_layout.addWidget(
+            self.full_taxel_calibration_map,
+            alignment=Qt.AlignHCenter,
+        )
+        self.full_taxel_calibration_load_map_button = QPushButton(
+            "Load Taxel Position Map…"
+        )
+        self.full_taxel_calibration_load_map_button.setToolTip(
+            "Load the taxel_position_map.json created by Taxel Position Mapping. "
+            "Loading a map does not move the robot."
+        )
+        self.full_taxel_calibration_load_map_button.clicked.connect(
+            self._load_full_taxel_calibration_map
+        )
+        full_layout.addWidget(self.full_taxel_calibration_load_map_button)
+
+        signal_form = QFormLayout()
+        self.full_taxel_calibration_signal_combo = QComboBox()
+        self.full_taxel_calibration_signal_combo.addItem(
+            "Sensor signal change", "diff_ave"
+        )
+        self.full_taxel_calibration_signal_combo.addItem(
+            "Relative change (%)", "diff_percent_ave"
+        )
+        self.full_taxel_calibration_signal_combo.addItem(
+            "Raw value", "raw_ave"
+        )
+        signal_index = self.full_taxel_calibration_signal_combo.findData(
+            full_calibration_task.signal_field
+        )
+        if signal_index >= 0:
+            self.full_taxel_calibration_signal_combo.setCurrentIndex(
+                signal_index
+            )
+        self.full_taxel_calibration_signal_combo.setToolTip(
+            "Each taxel folder keeps only that physical target's graph signal. "
+            "Sensor signal change remains signed."
+        )
+        signal_form.addRow(
+            "Plotted signal", self.full_taxel_calibration_signal_combo
+        )
+        full_layout.insertLayout(0, signal_form)
+
+        full_form = QFormLayout()
+
+        self.full_taxel_calibration_speed_spin = QDoubleSpinBox()
+        self.full_taxel_calibration_speed_spin.setRange(0.01, 2.0)
+        self.full_taxel_calibration_speed_spin.setDecimals(2)
+        self.full_taxel_calibration_speed_spin.setSingleStep(0.01)
+        self.full_taxel_calibration_speed_spin.setSuffix(" mm/s")
+        self.full_taxel_calibration_speed_spin.setValue(
+            float(full_calibration_task.approach_speed_m_s) * 1000.0
+        )
+        full_form.addRow(
+            "Base -Z speed", self.full_taxel_calibration_speed_spin
+        )
+
+        self.full_taxel_calibration_route_speed_spin = QDoubleSpinBox()
+        self.full_taxel_calibration_route_speed_spin.setRange(1.0, 100.0)
+        self.full_taxel_calibration_route_speed_spin.setDecimals(1)
+        self.full_taxel_calibration_route_speed_spin.setSingleStep(1.0)
+        self.full_taxel_calibration_route_speed_spin.setSuffix(" mm/s")
+        self.full_taxel_calibration_route_speed_spin.setValue(
+            float(full_calibration_task.line_speed_m_s) * 1000.0
+        )
+        self.full_taxel_calibration_route_speed_spin.setToolTip(
+            "Straight-line speed used only for saved clearance and non-contact "
+            "routing moves between taxels."
+        )
+        full_form.addRow(
+            "Safe routing speed",
+            self.full_taxel_calibration_route_speed_spin,
+        )
+
+        self.full_taxel_calibration_force_threshold_spin = QDoubleSpinBox()
+        self.full_taxel_calibration_force_threshold_spin.setRange(
+            0.1, float(full_calibration_task.MAX_CONTACT_THRESHOLD_G)
+        )
+        self.full_taxel_calibration_force_threshold_spin.setDecimals(1)
+        self.full_taxel_calibration_force_threshold_spin.setSingleStep(1.0)
+        self.full_taxel_calibration_force_threshold_spin.setSuffix(" g")
+        self.full_taxel_calibration_force_threshold_spin.setValue(
+            float(full_calibration_task.contact_threshold_g)
+        )
+        full_form.addRow(
+            "Max contact threshold",
+            self.full_taxel_calibration_force_threshold_spin,
+        )
+
+        self.full_taxel_calibration_route_guard_spin = QDoubleSpinBox()
+        self.full_taxel_calibration_route_guard_spin.setRange(1.0, 2000.0)
+        self.full_taxel_calibration_route_guard_spin.setDecimals(1)
+        self.full_taxel_calibration_route_guard_spin.setSingleStep(1.0)
+        self.full_taxel_calibration_route_guard_spin.setSuffix(" g")
+        self.full_taxel_calibration_route_guard_spin.setValue(
+            float(full_calibration_task.route_force_guard_g)
+        )
+        self.full_taxel_calibration_route_guard_spin.setToolTip(
+            "Stop if force changes unexpectedly during a clearance routing move."
+        )
+        full_form.addRow(
+            "Routing force guard",
+            self.full_taxel_calibration_route_guard_spin,
+        )
+
+        self.full_taxel_calibration_max_travel_spin = QDoubleSpinBox()
+        self.full_taxel_calibration_max_travel_spin.setRange(0.0, 200.0)
+        self.full_taxel_calibration_max_travel_spin.setDecimals(1)
+        self.full_taxel_calibration_max_travel_spin.setSingleStep(0.5)
+        self.full_taxel_calibration_max_travel_spin.setSuffix(" mm")
+        self.full_taxel_calibration_max_travel_spin.setSpecialValueText(
+            "No limit"
+        )
+        self.full_taxel_calibration_max_travel_spin.setValue(
+            float(full_calibration_task.max_travel_m) * 1000.0
+        )
+        full_form.addRow(
+            "Maximum travel", self.full_taxel_calibration_max_travel_spin
+        )
+
+        self.full_taxel_calibration_timeout_spin = QDoubleSpinBox()
+        self.full_taxel_calibration_timeout_spin.setRange(0.0, 1800.0)
+        self.full_taxel_calibration_timeout_spin.setDecimals(1)
+        self.full_taxel_calibration_timeout_spin.setSingleStep(10.0)
+        self.full_taxel_calibration_timeout_spin.setSuffix(" s")
+        self.full_taxel_calibration_timeout_spin.setSpecialValueText(
+            "No limit"
+        )
+        self.full_taxel_calibration_timeout_spin.setValue(
+            float(full_calibration_task.timeout_sec)
+        )
+        full_form.addRow(
+            "Timeout", self.full_taxel_calibration_timeout_spin
+        )
+
+        self.full_taxel_calibration_repeat_spin = QSpinBox()
+        self.full_taxel_calibration_repeat_spin.setRange(1, 1000)
+        self.full_taxel_calibration_repeat_spin.setValue(
+            int(full_calibration_task.repeat_count)
+        )
+        self.full_taxel_calibration_repeat_spin.setToolTip(
+            "Number of times to scan every mapped taxel. Each scan visits all "
+            "taxels once before the next scan starts."
+        )
+        full_form.addRow(
+            "Full scans",
+            self.full_taxel_calibration_repeat_spin,
+        )
+        full_layout.addLayout(full_form)
+
+        full_note = QLabel(
+            "Each full scan visits every mapped taxel once: route at the saved "
+            "clearance height, descend to its non-contact start pose, measure "
+            "force baseline, approach in base -Z, return in base +Z, and save "
+            "only that taxel's signal. The sensor recalibrates at clearance "
+            "before the next taxel. The next full scan starts after the whole "
+            "set has been visited."
+        )
+        full_note.setWordWrap(True)
+        full_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        full_layout.addWidget(full_note)
+
+        self.full_taxel_calibration_progress_label = QLabel("Ready")
+        self.full_taxel_calibration_progress_label.setWordWrap(True)
+        self.full_taxel_calibration_progress_label.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-weight: 600;"
+        )
+        full_layout.addWidget(self.full_taxel_calibration_progress_label)
+        self.full_taxel_calibration_live_force_label = QLabel(
+            "Force: -- g   |   Contact change: -- g"
+        )
+        self.full_taxel_calibration_live_force_label.setStyleSheet(
+            theme.readout_style("caption")
+        )
+        full_layout.addWidget(self.full_taxel_calibration_live_force_label)
+
+        self.full_taxel_calibration_signal_combo.currentIndexChanged.connect(
+            lambda _index: setattr(
+                full_calibration_task,
+                "signal_field",
+                str(self.full_taxel_calibration_signal_combo.currentData()),
+            )
+        )
+        self.full_taxel_calibration_speed_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task,
+                "approach_speed_m_s",
+                float(value) / 1000.0,
+            )
+        )
+        self.full_taxel_calibration_route_speed_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task,
+                "line_speed_m_s",
+                float(value) / 1000.0,
+            )
+        )
+        self.full_taxel_calibration_force_threshold_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task,
+                "contact_threshold_g",
+                float(value),
+            )
+        )
+        self.full_taxel_calibration_route_guard_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task,
+                "route_force_guard_g",
+                float(value),
+            )
+        )
+        self.full_taxel_calibration_max_travel_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task,
+                "max_travel_m",
+                float(value) / 1000.0,
+            )
+        )
+        self.full_taxel_calibration_timeout_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task, "timeout_sec", float(value)
+            )
+        )
+        self.full_taxel_calibration_repeat_spin.valueChanged.connect(
+            lambda value: setattr(
+                full_calibration_task, "repeat_count", int(value)
+            )
+        )
+        self.full_taxel_calibration_repeat_spin.valueChanged.connect(
+            lambda _value: self._refresh_full_taxel_calibration_controls()
+        )
+
+        full_scroll = QScrollArea()
+        full_scroll.setFrameShape(QFrame.NoFrame)
+        full_scroll.setWidgetResizable(True)
+        full_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        full_scroll.setWidget(full_panel)
+        self._calibration_full_taxel_tab_index = (
+            self.calibration_mode_tabs.addTab(full_scroll, "Full taxel")
+        )
+        self.calibration_mode_tabs.currentChanged.connect(
+            self._on_calibration_mode_changed
+        )
+        calibration_outer.addWidget(self.calibration_mode_tabs)
+        self._task_param_widgets[calibration_task.id] = calibration_panel
+        self._task_param_widgets[full_calibration_task.id] = calibration_panel
+        parent_layout.addWidget(calibration_panel)
+        self._refresh_full_taxel_calibration_controls()
+        self._refresh_full_taxel_calibration_progress()
+
+        mapping_task = experiment_tasks.get_task("taxel_position_mapping")
+        if mapping_task is None:
+            return
+        mapping_panel = QFrame()
+        mapping_panel.setFrameShape(QFrame.StyledPanel)
+        mapping_layout = QVBoxLayout(mapping_panel)
+        mapping_layout.setContentsMargins(8, 8, 8, 8)
+        mapping_layout.setSpacing(8)
+
+        navigation_title = QLabel("Click a mapped taxel to move above it")
+        navigation_title.setWordWrap(True)
+        mapping_layout.addWidget(navigation_title)
+        self.taxel_mapping_map_info = QLabel("No position map yet. Run mapping or load a saved map.")
+        self.taxel_mapping_map_info.setWordWrap(True)
+        mapping_layout.addWidget(self.taxel_mapping_map_info)
+        self.taxel_mapping_map = CalibrationTaxelMap(rows=8, columns=10)
+        self.taxel_mapping_map.set_taxels([])
+        self.taxel_mapping_map.taxelSelected.connect(self._move_above_mapped_taxel)
+        mapping_layout.addWidget(self.taxel_mapping_map, alignment=Qt.AlignHCenter)
+        self.taxel_mapping_load_map_button = QPushButton("Load Saved Map…")
+        self.taxel_mapping_load_map_button.clicked.connect(self._load_taxel_position_map)
+        mapping_layout.addWidget(self.taxel_mapping_load_map_button)
+        self.taxel_mapping_resume_button = QPushButton("Resume Loaded Map")
+        self.taxel_mapping_resume_button.setEnabled(False)
+        self.taxel_mapping_resume_button.setToolTip(
+            "Load an incomplete taxel_position_map.json first. Resume keeps "
+            "its measured taxels and verifies Taxel 35 before moving on."
+        )
+        self.taxel_mapping_resume_button.clicked.connect(
+            self._resume_loaded_taxel_map
+        )
+        mapping_layout.addWidget(self.taxel_mapping_resume_button)
+        self.taxel_mapping_relocate_button = QPushButton(
+            "Relocate Loaded Map from New Anchor"
+        )
+        self.taxel_mapping_relocate_button.setEnabled(False)
+        self.taxel_mapping_relocate_button.setToolTip(
+            "Load a completed map, move the sensor, position the robot safely "
+            "and approximately above its centre taxel, remember the new anchor, "
+            "then use this button. A new map is saved; the original is kept."
+        )
+        self.taxel_mapping_relocate_button.clicked.connect(
+            self._relocate_loaded_taxel_map
+        )
+        mapping_layout.addWidget(self.taxel_mapping_relocate_button)
+        self.taxel_mapping_move_status_label = QLabel(
+            "Moves use the saved clearance Z height. Grey cells are unmapped. "
+            "Use saved maps only with the same sensor placement, robot base and tool."
+        )
+        self.taxel_mapping_move_status_label.setWordWrap(True)
+        self.taxel_mapping_move_status_label.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        mapping_layout.addWidget(self.taxel_mapping_move_status_label)
+
+        self.taxel_mapping_anchor_label = QLabel(
+            "Taxel 35 anchor: not remembered"
+        )
+        self.taxel_mapping_anchor_label.setWordWrap(True)
+        mapping_layout.addWidget(self.taxel_mapping_anchor_label)
+        self.taxel_mapping_anchor_button = QPushButton(
+            "Remember Current Pose Above Taxel 35"
+        )
+        self.taxel_mapping_anchor_button.setToolTip(
+            "Save the current TCP pose above Taxel 35. Its height is the safe "
+            "travel height for the whole run and may be well above the skin."
+        )
+        mapping_layout.addWidget(self.taxel_mapping_anchor_button)
+
+        mapping_form = QFormLayout()
+        self.taxel_mapping_detection_combo = QComboBox()
+        self.taxel_mapping_detection_combo.addItem(
+            "Robust downward signal change (recommended)", "robust_shift"
+        )
+        self.taxel_mapping_detection_combo.addItem(
+            "Lower baseline envelope (legacy)", "adaptive_range"
+        )
+        self.taxel_mapping_detection_combo.addItem(
+            "Fixed downward signal change", "fixed"
+        )
+        detection_index = self.taxel_mapping_detection_combo.findData(
+            str(mapping_task.proximity_detection_mode)
+        )
+        self.taxel_mapping_detection_combo.setCurrentIndex(
+            max(0, detection_index)
+        )
+        self.taxel_mapping_detection_combo.setToolTip(
+            "Robust mode learns the normal variation of rolling medians at "
+            "the safe anchor and detects a persistent downward distribution shift."
+        )
+        mapping_form.addRow(
+            "Proximity detection", self.taxel_mapping_detection_combo
+        )
+
+        self.taxel_mapping_signal_threshold_spin = QDoubleSpinBox()
+        self.taxel_mapping_signal_threshold_spin.setRange(1.0, 1000000.0)
+        self.taxel_mapping_signal_threshold_spin.setDecimals(1)
+        self.taxel_mapping_signal_threshold_spin.setSingleStep(10.0)
+        self.taxel_mapping_signal_threshold_spin.setSuffix(" sensor units")
+        self.taxel_mapping_signal_threshold_spin.setValue(
+            float(mapping_task.signal_threshold_counts)
+        )
+        self.taxel_mapping_signal_threshold_spin.setToolTip(
+            "Required decrease in the signed sensor signal when Fixed "
+            "downward signal change is selected."
+        )
+        mapping_form.addRow(
+            "Fixed signal change", self.taxel_mapping_signal_threshold_spin
+        )
+
+        self.taxel_mapping_adaptive_percent_spin = QDoubleSpinBox()
+        self.taxel_mapping_adaptive_percent_spin.setRange(0.0, 500.0)
+        self.taxel_mapping_adaptive_percent_spin.setDecimals(1)
+        self.taxel_mapping_adaptive_percent_spin.setSingleStep(5.0)
+        self.taxel_mapping_adaptive_percent_spin.setSuffix(" %")
+        self.taxel_mapping_adaptive_percent_spin.setValue(
+            float(mapping_task.adaptive_margin_fraction) * 100.0
+        )
+        self.taxel_mapping_adaptive_percent_spin.setToolTip(
+            "Extra margin outside the recorded baseline range. With a -5 to "
+            "+5 range, 30% places the legacy downward trigger at -8."
+        )
+        mapping_form.addRow(
+            "Legacy envelope margin",
+            self.taxel_mapping_adaptive_percent_spin,
+        )
+
+        self.taxel_mapping_adaptive_min_spin = QDoubleSpinBox()
+        self.taxel_mapping_adaptive_min_spin.setRange(0.1, 1000.0)
+        self.taxel_mapping_adaptive_min_spin.setDecimals(1)
+        self.taxel_mapping_adaptive_min_spin.setSingleStep(0.5)
+        self.taxel_mapping_adaptive_min_spin.setSuffix(" sensor units")
+        self.taxel_mapping_adaptive_min_spin.setValue(
+            float(mapping_task.adaptive_min_margin_counts)
+        )
+        self.taxel_mapping_adaptive_min_spin.setToolTip(
+            "Minimum persistent downward sensor change in robust mode, or minimum "
+            "margin below the baseline minimum in legacy-envelope mode."
+        )
+        mapping_form.addRow(
+            "Minimum downward signal change",
+            self.taxel_mapping_adaptive_min_spin,
+        )
+
+        self.taxel_mapping_baseline_frames_spin = QSpinBox()
+        self.taxel_mapping_baseline_frames_spin.setRange(3, 200)
+        self.taxel_mapping_baseline_frames_spin.setValue(
+            int(mapping_task.baseline_frame_count)
+        )
+        self.taxel_mapping_baseline_frames_spin.setToolTip(
+            "Number of stationary fresh frames used to learn the safe-anchor distribution."
+        )
+        mapping_form.addRow(
+            "Baseline frames", self.taxel_mapping_baseline_frames_spin
+        )
+
+        self.taxel_mapping_probe_window_spin = QSpinBox()
+        self.taxel_mapping_probe_window_spin.setRange(3, 51)
+        self.taxel_mapping_probe_window_spin.setSingleStep(2)
+        self.taxel_mapping_probe_window_spin.setValue(
+            int(mapping_task.probe_window_frames)
+        )
+        self.taxel_mapping_probe_window_spin.setToolTip(
+            "Window used to learn normal rolling-median noise from the "
+            "stationary baseline."
+        )
+        mapping_form.addRow(
+            "Baseline smoothing window", self.taxel_mapping_probe_window_spin
+        )
+
+        self.taxel_mapping_probe_sample_frames_spin = QSpinBox()
+        self.taxel_mapping_probe_sample_frames_spin.setRange(3, 100)
+        self.taxel_mapping_probe_sample_frames_spin.setValue(
+            int(mapping_task.probe_sample_frames)
+        )
+        self.taxel_mapping_probe_sample_frames_spin.setToolTip(
+            "At every downward Z level, the robot stops and takes this many "
+            "fresh sensor frames. Their median is used for proximity detection."
+        )
+        mapping_form.addRow(
+            "Frames per probe level",
+            self.taxel_mapping_probe_sample_frames_spin,
+        )
+
+        self.taxel_mapping_probe_step_spin = QDoubleSpinBox()
+        self.taxel_mapping_probe_step_spin.setRange(0.1, 5.0)
+        self.taxel_mapping_probe_step_spin.setDecimals(2)
+        self.taxel_mapping_probe_step_spin.setSingleStep(0.1)
+        self.taxel_mapping_probe_step_spin.setSuffix(" mm")
+        self.taxel_mapping_probe_step_spin.setValue(
+            float(mapping_task.probe_step_m) * 1000.0
+        )
+        self.taxel_mapping_probe_step_spin.setToolTip(
+            "Vertical distance between stationary sampling levels. A smaller "
+            "step gives a more precise onset position but takes longer."
+        )
+        mapping_form.addRow(
+            "Probe depth step", self.taxel_mapping_probe_step_spin
+        )
+
+        self.taxel_mapping_scan_strength_spin = QDoubleSpinBox()
+        self.taxel_mapping_scan_strength_spin.setRange(1.0, 10.0)
+        self.taxel_mapping_scan_strength_spin.setDecimals(2)
+        self.taxel_mapping_scan_strength_spin.setSingleStep(0.25)
+        self.taxel_mapping_scan_strength_spin.setSuffix(" × onset")
+        self.taxel_mapping_scan_strength_spin.setValue(
+            float(mapping_task.centre_scan_signal_multiplier)
+        )
+        self.taxel_mapping_scan_strength_spin.setToolTip(
+            "After remembering the first confirmed proximity height, descend "
+            "until the downward signal change reaches this multiple of the "
+            "learned onset threshold. The stronger level is used for XY scans."
+        )
+        mapping_form.addRow(
+            "Centre-scan signal strength",
+            self.taxel_mapping_scan_strength_spin,
+        )
+
+        self.taxel_mapping_scan_extra_descent_spin = QDoubleSpinBox()
+        self.taxel_mapping_scan_extra_descent_spin.setRange(0.5, 20.0)
+        self.taxel_mapping_scan_extra_descent_spin.setDecimals(1)
+        self.taxel_mapping_scan_extra_descent_spin.setSingleStep(0.5)
+        self.taxel_mapping_scan_extra_descent_spin.setSuffix(" mm")
+        self.taxel_mapping_scan_extra_descent_spin.setValue(
+            float(mapping_task.centre_scan_max_extra_descent_m) * 1000.0
+        )
+        self.taxel_mapping_scan_extra_descent_spin.setToolTip(
+            "Safety limit after proximity onset. If the requested signal "
+            "strength is not reached within this distance, use the strongest "
+            "safe sampled level instead of descending farther."
+        )
+        mapping_form.addRow(
+            "Maximum descent after onset",
+            self.taxel_mapping_scan_extra_descent_spin,
+        )
+
+        self.taxel_mapping_reference_speed_spin = QDoubleSpinBox()
+        self.taxel_mapping_reference_speed_spin.setRange(
+            0.01, float(mapping_task.MAX_PROBE_SPEED_M_S) * 1000.0
+        )
+        self.taxel_mapping_reference_speed_spin.setDecimals(2)
+        self.taxel_mapping_reference_speed_spin.setSingleStep(0.01)
+        self.taxel_mapping_reference_speed_spin.setSuffix(" mm/s")
+        self.taxel_mapping_reference_speed_spin.setValue(
+            float(mapping_task.reference_probe_speed_m_s) * 1000.0
+        )
+        self.taxel_mapping_reference_speed_spin.setToolTip(
+            "Speed of the single long probe from the anchor that learns the "
+            "sensor height at Taxel 35. Higher speeds increase stopping distance."
+        )
+        mapping_form.addRow(
+            "First probe speed", self.taxel_mapping_reference_speed_spin
+        )
+
+        self.taxel_mapping_reference_descent_spin = QDoubleSpinBox()
+        self.taxel_mapping_reference_descent_spin.setRange(
+            1.0, float(mapping_task.MAX_PROBE_DESCENT_M) * 1000.0
+        )
+        self.taxel_mapping_reference_descent_spin.setDecimals(1)
+        self.taxel_mapping_reference_descent_spin.setSingleStep(1.0)
+        self.taxel_mapping_reference_descent_spin.setSuffix(" mm")
+        self.taxel_mapping_reference_descent_spin.setValue(
+            float(mapping_task.reference_max_descent_m) * 1000.0
+        )
+        self.taxel_mapping_reference_descent_spin.setToolTip(
+            "Furthest the first probe may descend below the anchor. Keep it "
+            "shorter than the anchor-to-skin distance; the force stop is the "
+            "backup if it is not."
+        )
+        mapping_form.addRow(
+            "First probe max descent", self.taxel_mapping_reference_descent_spin
+        )
+
+        self.taxel_mapping_start_margin_spin = QDoubleSpinBox()
+        self.taxel_mapping_start_margin_spin.setRange(0.0, 10.0)
+        self.taxel_mapping_start_margin_spin.setDecimals(1)
+        self.taxel_mapping_start_margin_spin.setSingleStep(0.5)
+        self.taxel_mapping_start_margin_spin.setSuffix(" mm")
+        self.taxel_mapping_start_margin_spin.setValue(
+            float(mapping_task.probe_start_margin_m) * 1000.0
+        )
+        self.taxel_mapping_start_margin_spin.setToolTip(
+            "Every later probe starts this far above the height where the "
+            "first probe detected Taxel 35."
+        )
+        mapping_form.addRow(
+            "Probe start above learned height",
+            self.taxel_mapping_start_margin_spin,
+        )
+
+        self.taxel_mapping_probe_speed_spin = QDoubleSpinBox()
+        self.taxel_mapping_probe_speed_spin.setRange(
+            0.01, float(mapping_task.MAX_PROBE_SPEED_M_S) * 1000.0
+        )
+        self.taxel_mapping_probe_speed_spin.setDecimals(2)
+        self.taxel_mapping_probe_speed_spin.setSingleStep(0.01)
+        self.taxel_mapping_probe_speed_spin.setSuffix(" mm/s")
+        self.taxel_mapping_probe_speed_spin.setValue(
+            float(mapping_task.probe_speed_m_s) * 1000.0
+        )
+        self.taxel_mapping_probe_speed_spin.setToolTip(
+            "Vertical speed between stationary sampling levels. The task "
+            "stops at every level before reading the sensor."
+        )
+        mapping_form.addRow("Probe speed", self.taxel_mapping_probe_speed_spin)
+
+        self.taxel_mapping_confirmation_speed_spin = QDoubleSpinBox()
+        self.taxel_mapping_confirmation_speed_spin.setRange(
+            0.01, float(mapping_task.MAX_PROBE_SPEED_M_S) * 1000.0
+        )
+        self.taxel_mapping_confirmation_speed_spin.setDecimals(2)
+        self.taxel_mapping_confirmation_speed_spin.setSingleStep(0.05)
+        self.taxel_mapping_confirmation_speed_spin.setSuffix(" mm/s")
+        self.taxel_mapping_confirmation_speed_spin.setValue(
+            float(mapping_task.probe_confirmation_speed_m_s) * 1000.0
+        )
+        self.taxel_mapping_confirmation_speed_spin.setToolTip(
+            "Slower speed used to move to the next sampling level after the "
+            "first candidate proximity response."
+        )
+        mapping_form.addRow(
+            "Confirmation speed",
+            self.taxel_mapping_confirmation_speed_spin,
+        )
+
+        self.taxel_mapping_descent_spin = QDoubleSpinBox()
+        self.taxel_mapping_descent_spin.setRange(
+            0.1, float(mapping_task.MAX_PROBE_DESCENT_M) * 1000.0
+        )
+        self.taxel_mapping_descent_spin.setDecimals(2)
+        self.taxel_mapping_descent_spin.setSingleStep(0.5)
+        self.taxel_mapping_descent_spin.setSuffix(" mm")
+        self.taxel_mapping_descent_spin.setValue(
+            float(mapping_task.max_probe_descent_m) * 1000.0
+        )
+        self.taxel_mapping_descent_spin.setToolTip(
+            "Furthest each later probe may descend from its start height. "
+            "Use large values only when the path is clear and the live force "
+            "safety guard is available."
+        )
+        mapping_form.addRow("Probe max descent", self.taxel_mapping_descent_spin)
+
+        self.taxel_mapping_force_guard_spin = QDoubleSpinBox()
+        self.taxel_mapping_force_guard_spin.setRange(1.0, 2000.0)
+        self.taxel_mapping_force_guard_spin.setDecimals(1)
+        self.taxel_mapping_force_guard_spin.setSingleStep(10.0)
+        self.taxel_mapping_force_guard_spin.setSuffix(" g")
+        self.taxel_mapping_force_guard_spin.setValue(
+            float(mapping_task.force_guard_g)
+        )
+        self.taxel_mapping_force_guard_spin.setToolTip(
+            "Stop the complete task if force changes this much from the "
+            "safe-height baseline."
+        )
+        mapping_form.addRow("Unexpected-force stop", self.taxel_mapping_force_guard_spin)
+
+        self.taxel_mapping_coarse_radius_spin = QDoubleSpinBox()
+        self.taxel_mapping_coarse_radius_spin.setRange(1.0, 30.0)
+        self.taxel_mapping_coarse_radius_spin.setDecimals(1)
+        self.taxel_mapping_coarse_radius_spin.setSingleStep(0.5)
+        self.taxel_mapping_coarse_radius_spin.setSuffix(" mm")
+        self.taxel_mapping_coarse_radius_spin.setValue(
+            float(mapping_task.coarse_radius_m) * 1000.0
+        )
+        mapping_form.addRow("Neighbour-search radius", self.taxel_mapping_coarse_radius_spin)
+
+        self.taxel_mapping_coarse_step_spin = QDoubleSpinBox()
+        self.taxel_mapping_coarse_step_spin.setRange(0.1, 5.0)
+        self.taxel_mapping_coarse_step_spin.setDecimals(2)
+        self.taxel_mapping_coarse_step_spin.setSingleStep(0.1)
+        self.taxel_mapping_coarse_step_spin.setSuffix(" mm")
+        self.taxel_mapping_coarse_step_spin.setValue(
+            float(mapping_task.coarse_step_m) * 1000.0
+        )
+        mapping_form.addRow("Neighbour-search step", self.taxel_mapping_coarse_step_spin)
+
+        self.taxel_mapping_local_radius_spin = QDoubleSpinBox()
+        self.taxel_mapping_local_radius_spin.setRange(0.5, 10.0)
+        self.taxel_mapping_local_radius_spin.setDecimals(1)
+        self.taxel_mapping_local_radius_spin.setSingleStep(0.5)
+        self.taxel_mapping_local_radius_spin.setSuffix(" mm")
+        self.taxel_mapping_local_radius_spin.setValue(
+            float(mapping_task.local_radius_m) * 1000.0
+        )
+        self.taxel_mapping_local_radius_spin.setToolTip(
+            "Half-length of the row and column line scans through each taxel. "
+            "It is capped at 0.6 of the measured taxel pitch."
+        )
+        mapping_form.addRow("Local scan half-width", self.taxel_mapping_local_radius_spin)
+
+        self.taxel_mapping_local_step_spin = QDoubleSpinBox()
+        self.taxel_mapping_local_step_spin.setRange(0.1, 2.0)
+        self.taxel_mapping_local_step_spin.setDecimals(2)
+        self.taxel_mapping_local_step_spin.setSingleStep(0.1)
+        self.taxel_mapping_local_step_spin.setSuffix(" mm")
+        self.taxel_mapping_local_step_spin.setValue(
+            float(mapping_task.local_step_m) * 1000.0
+        )
+        mapping_form.addRow("Local scan step", self.taxel_mapping_local_step_spin)
+
+        self.taxel_mapping_line_speed_spin = QSpinBox()
+        self.taxel_mapping_line_speed_spin.setRange(1, 100)
+        self.taxel_mapping_line_speed_spin.setSuffix(" mm/s")
+        self.taxel_mapping_line_speed_spin.setValue(
+            int(round(float(mapping_task.line_speed_m_s) * 1000.0))
+        )
+        self.taxel_mapping_line_speed_spin.setToolTip(
+            "Speed of every straight-line tool move. The robot driver only "
+            "accepts whole mm/s."
+        )
+        mapping_form.addRow("Tool line speed", self.taxel_mapping_line_speed_spin)
+
+        self.taxel_mapping_xy_limit_spin = QDoubleSpinBox()
+        self.taxel_mapping_xy_limit_spin.setRange(10.0, 200.0)
+        self.taxel_mapping_xy_limit_spin.setDecimals(1)
+        self.taxel_mapping_xy_limit_spin.setSingleStep(5.0)
+        self.taxel_mapping_xy_limit_spin.setSuffix(" mm")
+        self.taxel_mapping_xy_limit_spin.setValue(
+            float(mapping_task.max_xy_offset_m) * 1000.0
+        )
+        self.taxel_mapping_xy_limit_spin.setToolTip(
+            "Reject any fitted taxel position farther than this XY distance "
+            "from the remembered Taxel 35 anchor."
+        )
+        mapping_form.addRow("Maximum XY offset", self.taxel_mapping_xy_limit_spin)
+        mapping_layout.addLayout(mapping_form)
+
+        self.taxel_mapping_note = QLabel(
+            "The default robust detector learns 100 safe-anchor frames, then "
+            "moves downward in small steps. At every level the robot stops, "
+            "collects a fresh frame batch, and evaluates its median. It ignores "
+            "positive changes and records the first confirmed proximity Z-position. "
+            "It then continues downward at confirmation speed until the signal "
+            "reaches the configured centre-scan strength (2× by default), giving "
+            "the XY scan a clearer peak. The "
+            "first probe from the anchor "
+            "learns the sensor height at Taxel 35. "
+            "After that, every taxel is approached at the anchor height, "
+            "probed from just above the learned height, centred with row and "
+            "column line scans, and verified using a 20-frame centre sample. "
+            "All moves are straight lines. A missing taxel "
+            "returns to Taxel 35 and retries once; a second failure returns "
+            "to Taxel 35 and stops. The force transmitter connects automatically "
+            "and robot motion waits for a fresh safety reading."
+        )
+        self.taxel_mapping_note.setWordWrap(True)
+        self.taxel_mapping_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        mapping_layout.addWidget(self.taxel_mapping_note)
+        self.taxel_mapping_progress_label = QLabel("Ready | 0/80 located")
+        self.taxel_mapping_progress_label.setWordWrap(True)
+        self.taxel_mapping_progress_label.setStyleSheet(
+            f"color: {theme.TEXT_MUTED}; font-weight: 600;"
+        )
+        mapping_layout.addWidget(self.taxel_mapping_progress_label)
+
+        self.taxel_mapping_anchor_button.clicked.connect(
+            self._remember_taxel_mapping_anchor
+        )
+        self.taxel_mapping_detection_combo.currentIndexChanged.connect(
+            lambda _index: setattr(
+                mapping_task,
+                "proximity_detection_mode",
+                str(self.taxel_mapping_detection_combo.currentData()),
+            )
+        )
+        self.taxel_mapping_signal_threshold_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "signal_threshold_counts", float(value))
+        )
+        self.taxel_mapping_adaptive_percent_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task, "adaptive_margin_fraction", float(value) / 100.0
+            )
+        )
+        self.taxel_mapping_adaptive_min_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task, "adaptive_min_margin_counts", float(value)
+            )
+        )
+        self.taxel_mapping_baseline_frames_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "baseline_frame_count", int(value))
+        )
+        self.taxel_mapping_probe_window_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "probe_window_frames", int(value))
+        )
+        self.taxel_mapping_probe_sample_frames_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "probe_sample_frames", int(value))
+        )
+        self.taxel_mapping_probe_step_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task, "probe_step_m", float(value) / 1000.0
+            )
+        )
+        self.taxel_mapping_scan_strength_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task,
+                "centre_scan_signal_multiplier",
+                float(value),
+            )
+        )
+        self.taxel_mapping_scan_extra_descent_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task,
+                "centre_scan_max_extra_descent_m",
+                float(value) / 1000.0,
+            )
+        )
+        self.taxel_mapping_reference_speed_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task, "reference_probe_speed_m_s", float(value) / 1000.0
+            )
+        )
+        self.taxel_mapping_reference_descent_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task, "reference_max_descent_m", float(value) / 1000.0
+            )
+        )
+        self.taxel_mapping_start_margin_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task, "probe_start_margin_m", float(value) / 1000.0
+            )
+        )
+        self.taxel_mapping_probe_speed_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "probe_speed_m_s", float(value) / 1000.0)
+        )
+        self.taxel_mapping_confirmation_speed_spin.valueChanged.connect(
+            lambda value: setattr(
+                mapping_task,
+                "probe_confirmation_speed_m_s",
+                float(value) / 1000.0,
+            )
+        )
+        self.taxel_mapping_descent_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "max_probe_descent_m", float(value) / 1000.0)
+        )
+        self.taxel_mapping_force_guard_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "force_guard_g", float(value))
+        )
+        self.taxel_mapping_coarse_radius_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "coarse_radius_m", float(value) / 1000.0)
+        )
+        self.taxel_mapping_coarse_step_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "coarse_step_m", float(value) / 1000.0)
+        )
+        self.taxel_mapping_local_radius_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "local_radius_m", float(value) / 1000.0)
+        )
+        self.taxel_mapping_local_step_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "local_step_m", float(value) / 1000.0)
+        )
+        self.taxel_mapping_line_speed_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "line_speed_m_s", float(value) / 1000.0)
+        )
+        self.taxel_mapping_xy_limit_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "max_xy_offset_m", float(value) / 1000.0)
+        )
+        mapping_scroll = QScrollArea()
+        mapping_scroll.setFrameShape(QFrame.NoFrame)
+        mapping_scroll.setWidgetResizable(True)
+        mapping_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        mapping_scroll.setWidget(mapping_panel)
+        self._task_param_widgets[mapping_task.id] = mapping_scroll
+        parent_layout.addWidget(mapping_scroll)
+        self._refresh_taxel_mapping_controls()
+        self._refresh_taxel_mapping_progress()
+
+    def _streaming_sensor_shape(self) -> tuple[int, int]:
+        sensor = getattr(getattr(self, "ui_ros", None), "sensor_functions", None)
+        if sensor is None or not bool(getattr(sensor, "is_connected", False)):
+            return 0, 0
+        try:
+            rows = int(getattr(sensor, "n_row", 0) or 0)
+            columns = int(getattr(sensor, "n_col", 0) or 0)
+        except (TypeError, ValueError):
+            return 0, 0
+        if rows <= 0 or columns <= 0:
+            return 0, 0
+        return rows, columns
+
+    def _sync_taxel_maps_to_streaming_sensor(self) -> None:
+        """Keep both taxel maps on the grid size of the live sensor stream."""
+        if getattr(self, "_sidebar_active_task", None) is not None:
+            return
+        rows, columns = self._streaming_sensor_shape()
+        if rows <= 0 or columns <= 0:
+            return
+        mapping_grid = getattr(self, "taxel_mapping_map", None)
+        if mapping_grid is not None and (mapping_grid.rows, mapping_grid.columns) != (
+            rows,
+            columns,
+        ):
+            mapping_grid.set_grid_shape(rows, columns)
+            self._paint_loaded_taxel_navigation_map()
+        calibration_grid = getattr(self, "calibration_taxel_map", None)
+        if calibration_grid is not None and (
+            calibration_grid.rows,
+            calibration_grid.columns,
+        ) != (rows, columns):
+            self._refresh_calibration_controls()
+
+    def _paint_loaded_taxel_navigation_map(self) -> None:
+        prepared = getattr(self, "_taxel_navigation_result", None)
+        grid = getattr(self, "taxel_mapping_map", None)
+        info = getattr(self, "taxel_mapping_map_info", None)
+        if prepared is None or grid is None:
+            return
+        settings = prepared.get("settings") or {}
+        try:
+            file_rows = int(settings["sensor_rows"])
+            file_columns = int(settings["sensor_columns"])
+        except (KeyError, TypeError, ValueError):
+            file_rows, file_columns = 8, 10
+        if (grid.rows, grid.columns) != (file_rows, file_columns):
+            grid.set_taxels([])
+            if info is not None:
+                info.setText(
+                    f"Streaming sensor is {grid.rows}x{grid.columns}. "
+                    f"The loaded map is {file_rows}x{file_columns}."
+                )
+            return
+        records = list(prepared.get("positions") or [])
+        skip_border = bool(settings.get("skip_outer_border", False))
+        skipped = set()
+        if skip_border:
+            skipped = {
+                index
+                for index in range(file_rows * file_columns)
+                if index % file_rows in (0, file_rows - 1)
+                or index // file_rows in (0, file_columns - 1)
+            }
+        grid.set_taxels(
+            (record["taxel_index"] for record in records),
+            skipped=skipped,
+        )
+        for index, button in grid.buttons.items():
+            if index in skipped:
+                button.setToolTip(
+                    f"Taxel {index}: skipped because it is on the outer border"
+                )
+            else:
+                button.setToolTip(
+                    f"Taxel {index}: no measured position in this map"
+                )
+        for record in records:
+            index = int(record["taxel_index"])
+            if index not in grid.buttons:
+                continue
+            xyz = ", ".join(
+                f"{value * 1000.0:.2f}"
+                for value in record["safe_approach_position_m"]
+            )
+            grid.buttons[index].setToolTip(
+                f"Click to move above Taxel {index}\n"
+                f"Saved clearance TCP: ({xyz}) mm"
+            )
+        if info is None:
+            return
+        source = str(
+            getattr(self, "_taxel_navigation_source_path", None)
+            or prepared.get("json_path")
+            or "Current mapping result"
+        )
+        state = "Completed map" if prepared.get("completed") else "Partial map"
+        target_total = file_rows * file_columns - len(skipped)
+        mapped_target = sum(
+            int(record["taxel_index"]) not in skipped for record in records
+        )
+        region = " · outer border skipped" if skipped else ""
+        info.setText(
+            f"{state} · {mapped_target}/{target_total} target taxels available"
+            f"{region}\n"
+            f"{prepared.get('started_at') or prepared.get('saved_at') or ''}"
+        )
+        info.setToolTip(source)
+
+    def _show_taxel_position_map(self, result, source_path=None):
+        """Display a completed/partial map; loading it never moves the robot."""
+        prepared = prepare_taxel_map(result)
+        self._taxel_navigation_result = prepared
+        self._taxel_mapping_anchor_updated_after_load = False
+        self._taxel_navigation_source_path = str(
+            source_path or prepared.get("json_path") or ""
+        ) or None
+        settings = prepared.get("settings") or {}
+        try:
+            file_rows = int(settings["sensor_rows"])
+            file_columns = int(settings["sensor_columns"])
+        except (KeyError, TypeError, ValueError):
+            file_rows, file_columns = 8, 10
+        live_rows, live_columns = self._streaming_sensor_shape()
+        if live_rows > 0 and live_columns > 0:
+            rows, columns = live_rows, live_columns
+            if (rows, columns) != (file_rows, file_columns):
+                self._append_sidebar_control_message(
+                    f"The loaded map is {file_rows}x{file_columns}, but the "
+                    f"streaming sensor is {rows}x{columns}. The taxel map uses "
+                    "the streaming sensor size."
+                )
+        else:
+            rows, columns = file_rows, file_columns
+        grid = getattr(self, "taxel_mapping_map", None)
+        if grid is not None:
+            grid.set_grid_shape(rows, columns)
+        self._paint_loaded_taxel_navigation_map()
+        self._refresh_taxel_navigation_status(
+            "Click a numbered cell to move above that taxel at the saved clearance height. "
+            "The sensor placement, robot base and tool must match this map."
+        )
+        self._refresh_taxel_navigation_controls()
+        # The same validated map is immediately available to Full Taxel
+        # Calibration. Loading remains a read-only action; no motion starts.
+        try:
+            self._show_full_taxel_calibration_map(
+                prepared,
+                source_path=source_path,
+            )
+        except ValueError:
+            # Older navigation-only maps can still be used to move above a
+            # taxel even when they do not contain the probe-start height that
+            # Full Taxel Calibration requires.
+            pass
+        scroll = self._task_param_widgets.get("taxel_position_mapping")
+        if isinstance(scroll, QScrollArea):
+            scroll.verticalScrollBar().setValue(0)
+
+    def _load_taxel_position_map(self):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message("Stop the current experiment before loading a position map.")
+            return
+        path, _filter = QFileDialog.getOpenFileName(
+            self,
+            "Load taxel position map",
+            resource_path("taxel_position_maps"),
+            "Taxel position map (taxel_position_map.json);;JSON files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                result = json.load(stream)
+            self._show_taxel_position_map(result, source_path=path)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self._append_sidebar_control_message(f"Could not load the taxel map: {exc}")
+            return
+        self._append_sidebar_control_message(f"Taxel position map loaded: {path}")
+
+    def _refresh_taxel_navigation_status(self, detail):
+        label = getattr(self, "taxel_mapping_move_status_label", None)
+        if label is not None:
+            label.setText(str(detail))
+
+    def _refresh_taxel_mapping_live_taxels(
+        self,
+        *,
+        measured,
+        skipped,
+        target_total,
+    ):
+        """Paint newly saved taxels immediately while motion stays locked."""
+        measured = {int(index) for index in measured}
+        skipped = {int(index) for index in skipped}
+        measured_targets = measured - skipped
+        grid = getattr(self, "taxel_mapping_map", None)
+        if grid is None:
+            return
+        grid.set_taxels(measured, skipped=skipped)
+        grid.set_interaction_enabled(False)
+        for index, button in grid.buttons.items():
+            if index in measured:
+                button.setToolTip(
+                    f"Taxel {index}: position saved during this mapping run"
+                )
+            elif index in skipped:
+                button.setToolTip(
+                    f"Taxel {index}: skipped because it is on the outer border"
+                )
+            else:
+                button.setToolTip(f"Taxel {index}: waiting to be mapped")
+        region = " · outer border skipped" if skipped else ""
+        self.taxel_mapping_map_info.setText(
+            f"Mapping live · {len(measured_targets)}/{int(target_total)} target "
+            f"taxels saved{region}\nGreen cells are already saved."
+        )
+
+    def _refresh_taxel_navigation_controls(self):
+        active = getattr(self, "_sidebar_active_task", None)
+        busy = active is not None
+        grid = getattr(self, "taxel_mapping_map", None)
+        if grid is not None:
+            interaction_setter = getattr(
+                grid, "set_interaction_enabled", None
+            )
+            if callable(interaction_setter):
+                interaction_setter(not busy)
+            else:
+                grid.setEnabled(not busy)
+        loader = getattr(self, "taxel_mapping_load_map_button", None)
+        if loader is not None:
+            loader.setEnabled(not busy)
+        resume = getattr(self, "taxel_mapping_resume_button", None)
+        if resume is not None:
+            task = self._taxel_mapping_task()
+            valid, message = (
+                task.validate_resume_result(self._taxel_navigation_result)
+                if task is not None
+                else (False, "Taxel Position Mapping is unavailable.")
+            )
+            resume.setEnabled(not busy and valid)
+            resume.setToolTip(
+                message
+                if valid
+                else "Resume unavailable: " + str(message)
+            )
+        relocate = getattr(self, "taxel_mapping_relocate_button", None)
+        if relocate is not None:
+            task = self._taxel_mapping_task()
+            valid, message = (
+                task.validate_relocation_result(self._taxel_navigation_result)
+                if task is not None
+                else (False, "Taxel Position Mapping is unavailable.")
+            )
+            anchor_ready = bool(getattr(task, "anchor_pose", None)) and bool(
+                getattr(self, "_taxel_mapping_anchor_updated_after_load", False)
+            )
+            relocate.setEnabled(not busy and valid and anchor_ready)
+            if valid and not anchor_ready:
+                message = "Remember a new safe anchor above the centre taxel first."
+            relocate.setToolTip(
+                message
+                if valid and anchor_ready
+                else "Relocation unavailable: " + str(message)
+            )
+        keyboard = getattr(self, "action_keyboard_tool_velocity", None)
+        if keyboard is not None:
+            keyboard.setEnabled(getattr(active, "id", None) != "mapped_taxel_move")
+
+    def _resume_loaded_taxel_map(self):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message(
+                "Stop the current experiment before resuming a position map."
+            )
+            return
+        if self._keyboard_tool_velocity_enabled:
+            self._append_sidebar_control_message(
+                "Turn off keyboard tool velocity before resuming taxel mapping."
+            )
+            return
+        task = self._taxel_mapping_task()
+        if task is None or self._current_sidebar_control_id() != task.id:
+            self._append_sidebar_control_message(
+                "Select Taxel Position Mapping before resuming the loaded map."
+            )
+            return
+        accepted, message = task.request_resume(
+            self._taxel_navigation_result,
+            self._taxel_navigation_source_path,
+        )
+        if not accepted:
+            self._append_sidebar_control_message(
+                f"Taxel mapping cannot resume: {message}"
+            )
+            self._refresh_taxel_navigation_controls()
+            return
+        self._append_sidebar_control_message(message)
+        self._start_sidebar_control()
+        if self._sidebar_active_task is not task:
+            task._resume_request = None
+            task._resume_source_path = None
+            self._refresh_taxel_mapping_controls()
+
+    def _relocate_loaded_taxel_map(self):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message(
+                "Stop the current experiment before relocating a position map."
+            )
+            return
+        if self._keyboard_tool_velocity_enabled:
+            self._append_sidebar_control_message(
+                "Turn off keyboard tool velocity before relocating the map."
+            )
+            return
+        task = self._taxel_mapping_task()
+        if task is None or self._current_sidebar_control_id() != task.id:
+            self._append_sidebar_control_message(
+                "Select Taxel Position Mapping before relocating the loaded map."
+            )
+            return
+        if task.anchor_pose is None:
+            self._append_sidebar_control_message(
+                "Move the robot to a safe pose approximately above the moved "
+                f"sensor's Taxel {task.anchor_taxel}, then remember that anchor."
+            )
+            return
+        accepted, message = task.request_relocation(
+            self._taxel_navigation_result,
+            self._taxel_navigation_source_path,
+        )
+        if not accepted:
+            self._append_sidebar_control_message(
+                f"Taxel map cannot be relocated: {message}"
+            )
+            self._refresh_taxel_navigation_controls()
+            return
+        self._append_sidebar_control_message(message)
+        self._start_sidebar_control()
+        if self._sidebar_active_task is not task:
+            task._relocation_request = None
+            task._relocation_source_path = None
+            self._refresh_taxel_mapping_controls()
+
+    def _move_above_mapped_taxel(self, index, result=None):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message("Stop the current experiment before selecting another taxel.")
+            return
+        if self._keyboard_tool_velocity_enabled:
+            self._append_sidebar_control_message("Turn off keyboard tool velocity before selecting a mapped taxel.")
+            return
+        mapping_task = self._taxel_mapping_task()
+        try:
+            task = MappedTaxelMoveTask(
+                result if result is not None else self._taxel_navigation_result,
+                int(index),
+                line_speed_m_s=mapping_task.line_speed_m_s,
+                force_guard_g=mapping_task.force_guard_g,
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            self._append_sidebar_control_message(f"Cannot move to Taxel {index}: {exc}")
+            return
+        if self._sidebar_control_timer is None:
+            self._sidebar_control_timer = QTimer(self)
+            self._sidebar_control_timer.timeout.connect(self._run_sidebar_control_action)
+        self._sidebar_active_task = task
+        self._sidebar_active_control_id = task.id
+        try:
+            started = task.on_start(self)
+        except Exception as exc:
+            self._stop_sidebar_control(show_result=False, message=f"Taxel move failed: {exc}")
+            return
+        if not started:
+            self._sidebar_active_task = None
+            self._sidebar_active_control_id = None
+            self._refresh_taxel_mapping_controls()
+            self._refresh_experiment_status()
+            return
+        self._sidebar_control_timer.start(task.tick_interval_ms)
+        self._refresh_experiment_status()
 
     def _calibration_task(self):
         return experiment_tasks.get_task("calibration")
@@ -2191,45 +3596,78 @@ class MyMainWindow(MainWindow):
     def _refresh_calibration_controls(self):
         task = self._calibration_task()
         label = getattr(self, "calibration_initial_position_label", None)
-        button = getattr(
-            self,
-            "calibration_remember_position_button",
-            None,
-        )
         if task is None:
             return
-        initial_position = getattr(task, "initial_position", None)
-        if label is not None:
-            if initial_position is None:
-                label.setText("Initial position: not remembered")
-            else:
-                joints_deg = np.degrees(
-                    np.asarray(initial_position.get("joints_rad", []), dtype=float)
-                )
-                tool_position = initial_position.get("tool_position_m")
-                tcp_text = ""
-                if tool_position is not None and len(tool_position) >= 3:
-                    tcp_mm = np.asarray(tool_position[:3], dtype=float) * 1000.0
-                    tcp_text = (
-                        f"\nTCP: ({tcp_mm[0]:.2f}, {tcp_mm[1]:.2f}, "
-                        f"{tcp_mm[2]:.2f}) mm"
-                    )
-                label.setText(
-                    "Initial position remembered\n"
-                    f"J: {[round(value, 2) for value in joints_deg]} deg"
-                    f"{tcp_text}"
-                )
-        if button is not None:
-            button.setEnabled(
-                not bool(getattr(task, "_test_active", False))
+        if hasattr(task, "use_connected_sensor"):
+            task.use_connected_sensor(self)
+        sensor_label = str(
+            getattr(task, "active_sensor_label", "") or "this sensor"
+        )
+        taxel_spin = getattr(self, "calibration_taxel_spin", None)
+        taxel_label = getattr(self, "calibration_taxel_label", None)
+        if taxel_spin is not None and not bool(getattr(task, "_test_active", False)):
+            count = max(1, int(task.sensor_rows) * int(task.sensor_columns))
+            taxel_spin.blockSignals(True)
+            taxel_spin.setRange(0, count - 1)
+            if taxel_spin.value() != int(task.taxel_index):
+                taxel_spin.setValue(int(task.taxel_index))
+            taxel_spin.blockSignals(False)
+        if taxel_label is not None:
+            taxel_label.setText(
+                f"Physical target taxel ({int(task.sensor_rows)}x{int(task.sensor_columns)})"
             )
+        initial_position = getattr(task, "initial_position", None) or {}
+        mapped = initial_position.get("source") == "taxel_position_map"
+        tool_position = task._finite_values(
+            initial_position.get("tool_position_m"), 3
+        )
+        if label is not None:
+            if not mapped or tool_position is None:
+                label.setText(
+                    "Load a taxel position map, then select a taxel. "
+                    "Its saved start pose is the initial position."
+                )
+            else:
+                tcp_mm = np.asarray(tool_position, dtype=float) * 1000.0
+                label.setText(
+                    f"Taxel {int(task.taxel_index)} on {sensor_label}\n"
+                    f"Start TCP: ({tcp_mm[0]:.2f}, {tcp_mm[1]:.2f}, "
+                    f"{tcp_mm[2]:.2f}) mm"
+                )
+        grid = getattr(self, "calibration_taxel_map", None)
+        if grid is not None and not bool(getattr(task, "_test_active", False)):
+            prepared = getattr(task, "position_map", None)
+            settings = (prepared or {}).get("settings") or {}
+            try:
+                file_rows = int(settings["sensor_rows"])
+                file_columns = int(settings["sensor_columns"])
+            except (KeyError, TypeError, ValueError):
+                file_rows = int(task.sensor_rows)
+                file_columns = int(task.sensor_columns)
+            live_rows, live_columns = self._streaming_sensor_shape()
+            if live_rows > 0 and live_columns > 0:
+                rows, columns = live_rows, live_columns
+            else:
+                rows, columns = file_rows, file_columns
+            grid.set_grid_shape(rows, columns)
+            if prepared is not None and (file_rows, file_columns) == (rows, columns):
+                records = list(prepared.get("positions") or [])
+                selected = int(task.taxel_index) if mapped else None
+                grid.set_taxels(
+                    (record["taxel_index"] for record in records),
+                    selected=selected,
+                )
+            elif prepared is not None:
+                grid.set_taxels([])
+            grid.set_interaction_enabled(True)
         start_button = getattr(self, "sidebar_btn_start", None)
         if (
             start_button is not None
             and self._current_sidebar_control_id() == task.id
         ):
             start_button.setEnabled(
-                initial_position is not None
+                mapped
+                and tool_position is not None
                 and not bool(getattr(task, "_test_active", False))
             )
 
@@ -2264,6 +3702,10 @@ class MyMainWindow(MainWindow):
             label.setText(f"Ready | {max(1, total)} repetition(s)")
 
     def _set_calibration_controls_running(self, running):
+        active_task = getattr(self, "_sidebar_active_task", None)
+        if str(getattr(active_task, "id", "")) == "full_taxel_calibration":
+            self._set_full_taxel_calibration_controls_running(running)
+            return
         running = bool(running)
         for name in (
             "calibration_taxel_spin",
@@ -2273,7 +3715,8 @@ class MyMainWindow(MainWindow):
             "calibration_max_travel_spin",
             "calibration_timeout_spin",
             "calibration_repeat_spin",
-            "calibration_remember_position_button",
+            "calibration_load_map_button",
+            "calibration_mode_tabs",
         ):
             widget = getattr(self, name, None)
             if widget is not None:
@@ -2281,6 +3724,9 @@ class MyMainWindow(MainWindow):
         start_button = getattr(self, "sidebar_btn_start", None)
         if start_button is not None:
             start_button.setEnabled(not running)
+        grid = getattr(self, "calibration_taxel_map", None)
+        if grid is not None:
+            grid.set_interaction_enabled(not running)
         if not running:
             self._refresh_calibration_controls()
 
@@ -2289,6 +3735,12 @@ class MyMainWindow(MainWindow):
         force_g=None,
         force_delta_g=None,
     ):
+        active_task = getattr(self, "_sidebar_active_task", None)
+        if str(getattr(active_task, "id", "")) == "full_taxel_calibration":
+            self._refresh_full_taxel_calibration_live_force(
+                force_g, force_delta_g
+            )
+            return
         label = getattr(self, "calibration_live_force_label", None)
         if label is None:
             return
@@ -2302,11 +3754,646 @@ class MyMainWindow(MainWindow):
             f"Force: {force_text} g   |   Contact change: {delta_text} g"
         )
 
-    def _remember_calibration_initial_position(self):
+    def _refresh_calibration_travel(
+        self,
+        current_mm=None,
+        maximum_mm=None,
+    ):
+        """Update the bottom-bar TCP-Z displacement for Calibration."""
+        label = getattr(self, "status_calibration_travel", None)
+        if label is None:
+            return
+        try:
+            current = float(current_mm)
+            maximum = float(maximum_mm)
+        except (TypeError, ValueError):
+            current = maximum = None
+        if (
+            current is None
+            or maximum is None
+            or not np.isfinite(current)
+            or not np.isfinite(maximum)
+        ):
+            label.setText("Z travel: — mm | Max: — mm")
+            return
+        current = max(0.0, current)
+        maximum = max(current, maximum)
+        label.setText(
+            f"Z travel: {current:.2f} mm | Max: {maximum:.2f} mm"
+        )
+
+    def _load_single_calibration_map(self):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message(
+                "Stop the current experiment before loading a position map."
+            )
+            return
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Load map for single-taxel calibration",
+            resource_path("taxel_position_maps"),
+            "Taxel position map (taxel_position_map.json);;JSON files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                result = json.load(stream)
+            prepared = experiment_tasks.FullTaxelCalibrationTask.prepare_position_map(
+                result
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self._append_sidebar_control_message(
+                f"Could not load the calibration taxel map: {exc}"
+            )
+            return
         task = self._calibration_task()
+        if task is None:
+            return
+        task.position_map = prepared
+        if (task.initial_position or {}).get("source") == "taxel_position_map":
+            task.initial_position = None
+        self._refresh_calibration_controls()
+        self._append_sidebar_control_message(
+            f"Single-taxel calibration map loaded: {path}"
+        )
+
+    def _select_single_calibration_taxel(self, index):
+        task = self._calibration_task()
+        if task is None or bool(getattr(task, "_test_active", False)):
+            return
+        prepared = getattr(task, "position_map", None)
+        records = {
+            int(record["taxel_index"]): record
+            for record in list((prepared or {}).get("positions") or [])
+            if isinstance(record, dict)
+        }
+        record = records.get(int(index))
+        if record is None:
+            self._append_sidebar_control_message(
+                f"Taxel {int(index)} has no measured position in the loaded map."
+            )
+            return
+        settings = (prepared or {}).get("settings") or {}
+        try:
+            rows = int(settings["sensor_rows"])
+            columns = int(settings["sensor_columns"])
+            task.use_mapped_taxel(record, rows=rows, columns=columns)
+        except (KeyError, TypeError, ValueError) as exc:
+            self._append_sidebar_control_message(
+                f"Cannot use Taxel {int(index)} as the calibration start: {exc}"
+            )
+            return
+        self._refresh_calibration_controls()
+        start = task.initial_position["tool_position_m"]
+        self._append_sidebar_control_message(
+            f"Single-taxel calibration will start at Taxel {int(index)} "
+            f"TCP {[round(float(value) * 1000.0, 2) for value in start]} mm."
+        )
+        self._move_above_mapped_taxel(int(index), prepared)
+
+    def _remember_full_taxel_initial_position(self):
+        task = self._full_taxel_calibration_task()
         if task is None or self._current_sidebar_control_id() != task.id:
             return
         task.capture_initial_position(self)
+
+    def _full_taxel_calibration_task(self):
+        return experiment_tasks.get_task("full_taxel_calibration")
+
+    @staticmethod
+    def _full_taxel_map_skipped(result):
+        settings = (result or {}).get("settings") or {}
+        if not bool(settings.get("skip_outer_border", False)):
+            return set()
+        try:
+            rows = int(settings.get("sensor_rows") or 8)
+            columns = int(settings.get("sensor_columns") or 10)
+        except (TypeError, ValueError):
+            rows, columns = 8, 10
+        if rows <= 0 or columns <= 0:
+            return set()
+        return {
+            index
+            for index in range(rows * columns)
+            if index % rows in (0, rows - 1)
+            or index // rows in (0, columns - 1)
+        }
+
+    def _show_full_taxel_calibration_map(self, result, source_path=None):
+        task = self._full_taxel_calibration_task()
+        if task is None:
+            return False
+        loaded, message = task.load_position_map(result, source_path)
+        if not loaded:
+            raise ValueError(message)
+        records = task.position_map["positions"]
+        skipped = self._full_taxel_map_skipped(task.position_map)
+        grid = getattr(self, "full_taxel_calibration_map", None)
+        settings = task.position_map.get("settings") or {}
+        if grid is not None and hasattr(grid, "set_grid_shape"):
+            try:
+                grid.set_grid_shape(
+                    int(settings.get("sensor_rows") or grid.rows),
+                    int(settings.get("sensor_columns") or grid.columns),
+                )
+            except (TypeError, ValueError):
+                pass
+        if grid is not None:
+            grid.set_taxels(
+                (record["taxel_index"] for record in records),
+                skipped=skipped,
+            )
+            grid.set_interaction_enabled(False)
+        label = getattr(self, "full_taxel_calibration_map_info", None)
+        if label is not None:
+            state = "Completed map" if task.position_map.get("completed") else "Partial map"
+            source = str(source_path or task.position_map.get("json_path") or "")
+            try:
+                grid_text = (
+                    f"{int(settings.get('sensor_rows'))}x"
+                    f"{int(settings.get('sensor_columns'))}"
+                )
+            except (TypeError, ValueError):
+                grid_text = ""
+            label.setText(
+                f"{state} · {grid_text + ' · ' if grid_text else ''}"
+                f"{len(records)} measured taxels · "
+                f"{len(records) * max(1, int(task.repeat_count))} total trial(s)"
+            )
+            label.setToolTip(source)
+        self._refresh_full_taxel_calibration_controls()
+        self._refresh_full_taxel_calibration_progress()
+        return True
+
+    def _load_full_taxel_calibration_map(self):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message(
+                "Stop the current experiment before loading a position map."
+            )
+            return
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Load map for Full Taxel Calibration",
+            resource_path("taxel_position_maps"),
+            "Taxel position map (taxel_position_map.json);;JSON files (*.json)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                result = json.load(stream)
+            prepared = prepare_taxel_map(result)
+            self._show_full_taxel_calibration_map(
+                prepared, source_path=path
+            )
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self._append_sidebar_control_message(
+                f"Could not load the full-taxel calibration map: {exc}"
+            )
+            return
+        self._append_sidebar_control_message(
+            f"Full Taxel Calibration map loaded: {path}"
+        )
+
+    def _refresh_full_taxel_calibration_controls(self):
+        task = self._full_taxel_calibration_task()
+        if task is None:
+            return
+        result = getattr(task, "position_map", None)
+        records = list((result or {}).get("positions") or [])
+        label = getattr(self, "full_taxel_calibration_map_info", None)
+        if label is not None and result is None:
+            label.setText("Position map: not loaded")
+        elif label is not None and not bool(getattr(task, "_test_active", False)):
+            state = "Completed map" if result.get("completed") else "Partial map"
+            map_settings = result.get("settings") or {}
+            try:
+                grid_text = (
+                    f"{int(map_settings.get('sensor_rows'))}x"
+                    f"{int(map_settings.get('sensor_columns'))}"
+                )
+            except (TypeError, ValueError):
+                grid_text = ""
+            label.setText(
+                f"{state} · {grid_text + ' · ' if grid_text else ''}"
+                f"{len(records)} measured taxels · "
+                f"{len(records) * max(1, int(task.repeat_count))} total trial(s)"
+            )
+        if not bool(getattr(task, "_test_active", False)):
+            task.use_connected_sensor(self)
+        home = task._finite_values(
+            (getattr(task, "initial_position", None) or {}).get("tool_position_m"),
+            3,
+        )
+        home_label = getattr(self, "full_taxel_initial_position_label", None)
+        sensor_label = str(getattr(task, "active_sensor_label", "") or "this sensor")
+        if home_label is not None:
+            pose = getattr(task, "initial_position", None)
+            if home is None or pose is None:
+                home_label.setText(
+                    f"Initial position for {sensor_label}: not remembered"
+                )
+            else:
+                joints_deg = np.degrees(
+                    np.asarray(pose.get("joints_rad", []), dtype=float)
+                )
+                tcp = np.asarray(home, dtype=float) * 1000.0
+                home_label.setText(
+                    f"Initial position for {sensor_label} remembered\n"
+                    f"J: {[round(value, 2) for value in joints_deg]} deg\n"
+                    f"TCP: ({tcp[0]:.2f}, {tcp[1]:.2f}, {tcp[2]:.2f}) mm"
+                )
+        remember_button = getattr(self, "full_taxel_remember_position_button", None)
+        if remember_button is not None:
+            remember_button.setEnabled(not bool(getattr(task, "_test_active", False)))
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if (
+            start_button is not None
+            and self._current_sidebar_control_id() == task.id
+        ):
+            start_button.setEnabled(
+                result is not None
+                and bool(records)
+                and home is not None
+                and not bool(getattr(task, "_test_active", False))
+            )
+
+    def _refresh_full_taxel_calibration_progress(
+        self,
+        *,
+        current_taxel=None,
+        taxel_number=None,
+        taxel_total=None,
+        trial=None,
+        trials=None,
+        phase=None,
+        detail="",
+        completed=None,
+    ):
+        task = self._full_taxel_calibration_task()
+        label = getattr(self, "full_taxel_calibration_progress_label", None)
+        if task is None or label is None:
+            return
+        targets = list(getattr(task, "_targets", []) or [])
+        if not targets:
+            targets = list((getattr(task, "position_map", None) or {}).get("positions") or [])
+        total = len(targets) if taxel_total is None else int(taxel_total)
+        number = max(0, int(getattr(task, "_target_cursor", -1)) + 1) if taxel_number is None else int(taxel_number)
+        trial = int(getattr(task, "_trial_number", 0)) if trial is None else int(trial)
+        trials = max(1, int(getattr(task, "repeat_count", 1))) if trials is None else max(1, int(trials))
+        phase = str(getattr(task, "_phase", "idle") if phase is None else phase)
+        current_taxel = (
+            getattr(task, "taxel_index", None)
+            if current_taxel is None and number > 0
+            else current_taxel
+        )
+        completed = list(
+            getattr(task, "_completed_taxels", [])
+            if completed is None
+            else completed
+        )
+        phase_labels = {
+            "idle": "Ready",
+            "connecting_force_meter": "Connecting force transmitter",
+            "full_moving": "Safe routing move",
+            "force_baseline": "Force baseline",
+            "approaching": "Approaching",
+            "contact_hold": "Contact reached; holding",
+            "returning": "Returning in base +Z",
+            "recalibrating": "Recalibrating before repetition",
+            "full_recalibrating": "Recalibrating at clearance",
+            "recovering_force_meter": "Recovering force transmitter",
+            "paused_force_meter": "Paused for force transmitter",
+        }
+        status = str(
+            detail or phase_labels.get(phase, phase.replace("_", " ").title())
+        )
+        if number > 0 and current_taxel is not None:
+            label.setText(
+                f"Taxel {int(current_taxel)} · {number}/{max(1, total)} | "
+                f"Pass {max(1, trial)}/{trials} | {status}"
+            )
+        elif total > 0:
+            label.setText(
+                f"Ready | {total} taxels × {trials} full scan(s) = "
+                f"{total * trials} trials"
+            )
+        else:
+            label.setText("Ready | Load a taxel position map")
+        grid = getattr(self, "full_taxel_calibration_map", None)
+        if grid is not None:
+            skipped = self._full_taxel_map_skipped(
+                getattr(task, "position_map", None)
+            )
+            active = (
+                None
+                if phase == "idle" or current_taxel is None
+                else int(current_taxel)
+            )
+            if bool(getattr(task, "_test_active", False)):
+                available = set(int(index) for index in completed)
+                if active is not None:
+                    available.add(active)
+            else:
+                available = {
+                    int(record["taxel_index"])
+                    for record in targets
+                }
+            grid.set_taxels(available, selected=active, skipped=skipped)
+            grid.set_interaction_enabled(False)
+
+    def _set_full_taxel_calibration_controls_running(self, running):
+        running = bool(running)
+        for name in (
+            "full_taxel_remember_position_button",
+            "full_taxel_calibration_load_map_button",
+            "full_taxel_calibration_signal_combo",
+            "full_taxel_calibration_speed_spin",
+            "full_taxel_calibration_route_speed_spin",
+            "full_taxel_calibration_force_threshold_spin",
+            "full_taxel_calibration_route_guard_spin",
+            "full_taxel_calibration_max_travel_spin",
+            "full_taxel_calibration_timeout_spin",
+            "full_taxel_calibration_repeat_spin",
+            "calibration_mode_tabs",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not running)
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if start_button is not None:
+            start_button.setEnabled(not running)
+        if not running:
+            self._refresh_full_taxel_calibration_controls()
+
+    def _refresh_full_taxel_calibration_live_force(
+        self, force_g=None, force_delta_g=None
+    ):
+        label = getattr(
+            self, "full_taxel_calibration_live_force_label", None
+        )
+        if label is None:
+            return
+        force_text = "--" if force_g is None else f"{float(force_g):+.1f}"
+        delta_text = (
+            "--"
+            if force_delta_g is None
+            else f"{float(force_delta_g):+.1f}"
+        )
+        label.setText(
+            f"Force: {force_text} g   |   Contact change: {delta_text} g"
+        )
+
+    def _taxel_mapping_task(self):
+        return experiment_tasks.get_task("taxel_position_mapping")
+
+    def _sync_taxel_mapping_settings(self):
+        """Show the settings restored from a loaded partial-map JSON."""
+        task = self._taxel_mapping_task()
+        if task is None:
+            return
+        values = {
+            "taxel_mapping_signal_threshold_spin": task.signal_threshold_counts,
+            "taxel_mapping_adaptive_percent_spin": task.adaptive_margin_fraction * 100.0,
+            "taxel_mapping_adaptive_min_spin": task.adaptive_min_margin_counts,
+            "taxel_mapping_baseline_frames_spin": task.baseline_frame_count,
+            "taxel_mapping_probe_window_spin": task.probe_window_frames,
+            "taxel_mapping_probe_sample_frames_spin": task.probe_sample_frames,
+            "taxel_mapping_probe_step_spin": task.probe_step_m * 1000.0,
+            "taxel_mapping_scan_strength_spin": task.centre_scan_signal_multiplier,
+            "taxel_mapping_scan_extra_descent_spin": (
+                task.centre_scan_max_extra_descent_m * 1000.0
+            ),
+            "taxel_mapping_reference_speed_spin": task.reference_probe_speed_m_s * 1000.0,
+            "taxel_mapping_reference_descent_spin": task.reference_max_descent_m * 1000.0,
+            "taxel_mapping_start_margin_spin": task.probe_start_margin_m * 1000.0,
+            "taxel_mapping_probe_speed_spin": task.probe_speed_m_s * 1000.0,
+            "taxel_mapping_confirmation_speed_spin": task.probe_confirmation_speed_m_s * 1000.0,
+            "taxel_mapping_descent_spin": task.max_probe_descent_m * 1000.0,
+            "taxel_mapping_force_guard_spin": task.force_guard_g,
+            "taxel_mapping_coarse_radius_spin": task.coarse_radius_m * 1000.0,
+            "taxel_mapping_coarse_step_spin": task.coarse_step_m * 1000.0,
+            "taxel_mapping_local_radius_spin": task.local_radius_m * 1000.0,
+            "taxel_mapping_local_step_spin": task.local_step_m * 1000.0,
+            "taxel_mapping_line_speed_spin": round(task.line_speed_m_s * 1000.0),
+            "taxel_mapping_xy_limit_spin": task.max_xy_offset_m * 1000.0,
+        }
+        for name, value in values.items():
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setValue(value)
+        detection_combo = getattr(
+            self, "taxel_mapping_detection_combo", None
+        )
+        if detection_combo is not None:
+            index = detection_combo.findData(
+                str(task.proximity_detection_mode)
+            )
+            if index >= 0:
+                detection_combo.setCurrentIndex(index)
+
+    def _refresh_taxel_mapping_controls(self):
+        task = self._taxel_mapping_task()
+        if task is None:
+            return
+        if hasattr(task, "use_connected_sensor") and not bool(
+            getattr(task, "_active", False)
+        ):
+            task.use_connected_sensor(self)
+        anchor_taxel = int(getattr(task, "anchor_taxel", 35))
+        grid_name = f"{int(task.sensor_rows)}x{int(task.sensor_columns)}"
+        sensor_label = str(getattr(task, "active_sensor_label", "") or grid_name)
+        anchor = getattr(task, "anchor_pose", None)
+        label = getattr(self, "taxel_mapping_anchor_label", None)
+        if label is not None:
+            if anchor is None:
+                label.setText(
+                    f"Taxel {anchor_taxel} anchor for {sensor_label}: not remembered"
+                )
+            else:
+                position = np.asarray(anchor.get("tool_position_m", []), dtype=float)
+                if position.size >= 3:
+                    position_mm = position[:3] * 1000.0
+                    label.setText(
+                        f"Taxel {anchor_taxel} safe anchor for {sensor_label} remembered\n"
+                        f"TCP: ({position_mm[0]:.2f}, {position_mm[1]:.2f}, "
+                        f"{position_mm[2]:.2f}) mm"
+                    )
+                else:
+                    label.setText(
+                        f"Taxel {anchor_taxel} anchor for {sensor_label}: saved pose is invalid"
+                    )
+        anchor_button = getattr(self, "taxel_mapping_anchor_button", None)
+        if anchor_button is not None:
+            anchor_button.setText(
+                f"Remember Current Pose Above Taxel {anchor_taxel}"
+            )
+        note = getattr(self, "taxel_mapping_note", None)
+        if note is not None:
+            note.setText(
+                f"One step-and-sample probe from the anchor learns the sensor "
+                f"height at Taxel {anchor_taxel} on this {grid_name} sensor. "
+                "At each downward level the robot stops and collects a fresh "
+                "batch of sensor frames before deciding whether proximity began. "
+                "After that, every taxel is approached at the anchor height, "
+                "probed from just above the learned height, centred with row and "
+                "column line scans, and verified from a 20-frame sample at its "
+                "centre. All moves are straight lines. A missing taxel "
+                f"returns to Taxel {anchor_taxel} and retries once; a second failure "
+                f"returns to Taxel {anchor_taxel} and stops. A live force transmitter "
+                "is mandatory."
+            )
+        progress = getattr(self, "taxel_mapping_progress_label", None)
+        if progress is not None and not bool(getattr(task, "_active", False)):
+            total = int(task.sensor_rows) * int(task.sensor_columns)
+            progress.setText(f"Ready | 0/{total} located")
+        grid = getattr(self, "taxel_mapping_map", None)
+        if grid is not None and hasattr(grid, "set_grid_shape") and not bool(
+            getattr(task, "_active", False)
+        ):
+            live_rows, live_columns = self._streaming_sensor_shape()
+            loaded = getattr(self, "_taxel_navigation_result", None)
+            loaded_settings = (loaded or {}).get("settings") or {}
+            try:
+                file_rows = int(loaded_settings["sensor_rows"])
+                file_columns = int(loaded_settings["sensor_columns"])
+            except (KeyError, TypeError, ValueError):
+                file_rows = int(task.sensor_rows)
+                file_columns = int(task.sensor_columns)
+            if live_rows > 0 and live_columns > 0:
+                rows, columns = live_rows, live_columns
+            else:
+                rows, columns = file_rows, file_columns
+            grid.set_grid_shape(rows, columns)
+            if loaded is not None and (file_rows, file_columns) == (rows, columns):
+                self._paint_loaded_taxel_navigation_map()
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if (
+            start_button is not None
+            and self._current_sidebar_control_id() == task.id
+            and not bool(getattr(task, "_active", False))
+        ):
+            start_button.setText(str(task.start_button_label))
+        running = bool(getattr(task, "_active", False)) or (
+            getattr(self, "_sidebar_active_task", None) is not None
+        )
+        anchor_button = getattr(self, "taxel_mapping_anchor_button", None)
+        if anchor_button is not None:
+            anchor_button.setEnabled(not running)
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if (
+            start_button is not None
+            and self._current_sidebar_control_id() == task.id
+        ):
+            start_button.setEnabled(anchor is not None and not running)
+        self._refresh_taxel_navigation_controls()
+
+    def _refresh_taxel_mapping_progress(
+        self,
+        mapped=None,
+        total=80,
+        phase=None,
+        detail="",
+        current_taxel=None,
+        attempt=0,
+        max_attempts=2,
+    ):
+        task = self._taxel_mapping_task()
+        label = getattr(self, "taxel_mapping_progress_label", None)
+        if task is None or label is None:
+            return
+        mapped = len(getattr(task, "_positions", {})) if mapped is None else int(mapped)
+        total = int(total)
+        phase = str(getattr(task, "_phase", "idle") if phase is None else phase)
+        phase_text = {
+            "idle": "Ready",
+            "connecting_force_meter": "Connecting force transmitter",
+            "moving": "Robot moving",
+            "sensor_calibrating": "Updating full sensor calibration",
+            "collecting": "Checking sensor stability / collecting frames",
+            "probing": "Searching in base -Z",
+        }.get(phase, phase.replace("_", " ").title())
+        status = str(detail or phase_text)
+        context = []
+        if current_taxel is not None:
+            context.append(f"Taxel {int(current_taxel)}")
+        try:
+            attempt = int(attempt)
+            max_attempts = max(1, int(max_attempts))
+        except (TypeError, ValueError):
+            attempt = 0
+            max_attempts = 2
+        if attempt > 0:
+            context.append(
+                f"attempt {min(attempt, max_attempts)}/{max_attempts}"
+            )
+        context_text = f" | {' | '.join(context)}" if context else ""
+        label.setText(
+            f"{mapped}/{max(1, total)} located{context_text} | {status}"
+        )
+
+    def _set_taxel_mapping_controls_running(self, running):
+        running = bool(running)
+        for name in (
+            "sidebar_task_list",
+            "taxel_mapping_anchor_button",
+            "taxel_mapping_detection_combo",
+            "taxel_mapping_signal_threshold_spin",
+            "taxel_mapping_adaptive_percent_spin",
+            "taxel_mapping_adaptive_min_spin",
+            "taxel_mapping_baseline_frames_spin",
+            "taxel_mapping_probe_window_spin",
+            "taxel_mapping_probe_sample_frames_spin",
+            "taxel_mapping_probe_step_spin",
+            "taxel_mapping_scan_strength_spin",
+            "taxel_mapping_scan_extra_descent_spin",
+            "taxel_mapping_reference_speed_spin",
+            "taxel_mapping_reference_descent_spin",
+            "taxel_mapping_start_margin_spin",
+            "taxel_mapping_probe_speed_spin",
+            "taxel_mapping_confirmation_speed_spin",
+            "taxel_mapping_descent_spin",
+            "taxel_mapping_force_guard_spin",
+            "taxel_mapping_coarse_radius_spin",
+            "taxel_mapping_coarse_step_spin",
+            "taxel_mapping_local_radius_spin",
+            "taxel_mapping_local_step_spin",
+            "taxel_mapping_line_speed_spin",
+            "taxel_mapping_xy_limit_spin",
+            "taxel_mapping_load_map_button",
+            "taxel_mapping_resume_button",
+            "taxel_mapping_relocate_button",
+        ):
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setEnabled(not running)
+        start_button = getattr(self, "sidebar_btn_start", None)
+        if start_button is not None:
+            start_button.setEnabled(not running)
+        if not running:
+            self._refresh_taxel_mapping_controls()
+        else:
+            active = getattr(self, "_sidebar_active_task", None)
+            grid = getattr(self, "taxel_mapping_map", None)
+            if (
+                getattr(active, "id", None) == "taxel_position_mapping"
+                and grid is not None
+                and hasattr(grid, "set_grid_shape")
+            ):
+                grid.set_grid_shape(
+                    int(active.sensor_rows), int(active.sensor_columns)
+                )
+            self._refresh_taxel_navigation_controls()
+
+    def _remember_taxel_mapping_anchor(self):
+        task = self._taxel_mapping_task()
+        if task is None or self._current_sidebar_control_id() != task.id:
+            return
+        saved = task.capture_anchor_pose(self)
+        if saved:
+            self._taxel_mapping_anchor_updated_after_load = True
+            self._refresh_taxel_navigation_controls()
 
     def _show_calibration_result(self, result):
         dialog = getattr(self, "_calibration_result_dialog", None)
@@ -2316,6 +4403,17 @@ class MyMainWindow(MainWindow):
             result, parent=self
         )
         self._calibration_result_dialog.show()
+
+    def _show_full_taxel_calibration_result(self, result):
+        dialog = getattr(
+            self, "_full_taxel_calibration_result_dialog", None
+        )
+        if dialog is not None and dialog.isVisible():
+            dialog.close()
+        self._full_taxel_calibration_result_dialog = (
+            FullTaxelCalibrationResultDialog(result, parent=self)
+        )
+        self._full_taxel_calibration_result_dialog.show()
 
     def _open_calibration_graph_analysis(self):
         """Select saved calibration data and open its offline analysis."""
@@ -3074,8 +5172,18 @@ class MyMainWindow(MainWindow):
         if not widgets:
             return
         current_id = self._current_sidebar_control_id()
+        grouped = {
+            "calibration": "calibration",
+            "full_taxel_calibration": "calibration",
+        }
+        current_group = grouped.get(current_id, current_id)
+        seen = set()
         for task_id, widget in widgets.items():
-            widget.setVisible(task_id == current_id)
+            marker = id(widget)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            widget.setVisible(grouped.get(task_id, task_id) == current_group)
 
     def _show_sensor_capture_result(self, series):
         """Open the capture-result dialog using a series passed in by a task."""
@@ -3108,6 +5216,25 @@ class MyMainWindow(MainWindow):
                 f"Task '{getattr(task, 'label', task.id)}' tick error: {exc}"
             )
             self._stop_sidebar_control(show_result=False, message="Control stopped (tick error)")
+
+    def _disconnect_force_meter_after_task(self, task) -> bool:
+        """Release the force reader after an opted-in experiment ends."""
+        if not bool(
+            getattr(task, "disconnect_force_meter_on_stop", False)
+        ):
+            return False
+        ui_ros = getattr(self, "ui_ros", None)
+        disconnect = getattr(ui_ros, "_stop_force_meter", None)
+        if not callable(disconnect):
+            return False
+        try:
+            return bool(disconnect())
+        except Exception as exc:
+            self._append_sidebar_control_message(
+                "Force transmitter could not be disconnected after the "
+                f"task: {exc}"
+            )
+            return False
 
     def _start_sidebar_control(self):
         if self._sidebar_control_timer is None:
@@ -3180,10 +5307,13 @@ class MyMainWindow(MainWindow):
                 self._append_sidebar_control_message(
                     f"Task '{getattr(task, 'label', task.id)}' stop error: {exc}"
                 )
+            self._disconnect_force_meter_after_task(task)
         self._stop_sigraph_heatmap_recording(
             announce=True, elapsed_s=recording_elapsed_s
         )
         self._stop_sigraph_heatmap_playback(announce=True)
+
+        self._refresh_taxel_mapping_controls()
 
     # --- Keyboard tool-frame velocity (WASD + O/P + Q/E + R/T + Y/U) ------
 

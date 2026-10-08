@@ -20,6 +20,9 @@ class _Widget:
     def setToolTip(self, tooltip):
         self.tooltip = str(tooltip)
 
+    def setVisible(self, visible):
+        self.visible = bool(visible)
+
     def text(self):
         return self._text
 
@@ -76,6 +79,78 @@ def test_force_meter_port_identity_uses_stable_chip_symlink(tmp_path):
 
     assert identity == str(stable)
     assert "ttyUSB7" not in identity
+
+
+def test_force_meter_is_released_only_for_opted_in_tasks():
+    stop_calls = []
+    messages = []
+    window = SimpleNamespace(
+        ui_ros=SimpleNamespace(
+            _stop_force_meter=lambda: stop_calls.append(True) or True,
+        ),
+        _append_sidebar_control_message=messages.append,
+    )
+
+    stopped = MyMainWindow._disconnect_force_meter_after_task(
+        window,
+        SimpleNamespace(disconnect_force_meter_on_stop=True),
+    )
+    untouched = MyMainWindow._disconnect_force_meter_after_task(
+        window,
+        SimpleNamespace(disconnect_force_meter_on_stop=False),
+    )
+
+    assert stopped
+    assert not untouched
+    assert stop_calls == [True]
+    assert messages == []
+
+
+def test_stopping_force_task_runs_cleanup_then_disconnects_reader():
+    events = []
+    task = SimpleNamespace(
+        id="calibration",
+        label="Calibration",
+        disconnect_force_meter_on_stop=True,
+        on_stop=lambda _host, show_result=True: events.append(
+            ("task_stop", bool(show_result))
+        ),
+    )
+    timer = SimpleNamespace(stop=lambda: events.append(("timer_stop", True)))
+    window = SimpleNamespace(
+        _sidebar_active_task=task,
+        _sidebar_active_control_id="calibration",
+        _sidebar_control_timer=timer,
+        ui_ros=SimpleNamespace(
+            _stop_force_meter=lambda: events.append(
+                ("force_disconnect", True)
+            ) or True,
+        ),
+        info_process=_Widget(),
+        _sigraph_heatmap_record_elapsed=lambda: 0.0,
+        _refresh_experiment_status=lambda: None,
+        _append_sidebar_control_message=lambda _message: None,
+        _stop_sigraph_heatmap_recording=lambda **_kwargs: None,
+        _stop_sigraph_heatmap_playback=lambda **_kwargs: None,
+        _refresh_taxel_mapping_controls=lambda: None,
+    )
+    window._disconnect_force_meter_after_task = (
+        MyMainWindow._disconnect_force_meter_after_task.__get__(window)
+    )
+
+    MyMainWindow._stop_sidebar_control(
+        window,
+        show_result=False,
+        message="Calibration stopped",
+    )
+
+    assert events == [
+        ("timer_stop", True),
+        ("task_stop", False),
+        ("force_disconnect", True),
+    ]
+    assert window._sidebar_active_task is None
+    assert window._sidebar_active_control_id is None
 
 
 def test_sensor_update_requires_a_ready_scene_and_idle_backend():
@@ -198,6 +273,7 @@ def test_session_summary_colors_active_and_inactive_services():
 def test_running_experiment_keeps_status_and_stop_visible_in_main_window():
     indicator = _StatusIndicator()
     stop_button = _Widget()
+    travel = _Widget()
     stop_button.visible = False
     stop_button.setVisible = lambda visible: setattr(
         stop_button,
@@ -207,10 +283,16 @@ def test_running_experiment_keeps_status_and_stop_visible_in_main_window():
     window = SimpleNamespace(
         status_experiment=indicator,
         status_experiment_stop_button=stop_button,
+        status_calibration_travel=travel,
         _sidebar_active_task=SimpleNamespace(
             id="sensor_capture",
             label="Sensor Capture",
         ),
+        taxel_mapping_map=_Widget(),
+        taxel_mapping_load_map_button=_Widget(),
+    )
+    window._refresh_taxel_navigation_controls = (
+        MyMainWindow._refresh_taxel_navigation_controls.__get__(window)
     )
 
     MyMainWindow._refresh_experiment_status(window)
@@ -219,12 +301,34 @@ def test_running_experiment_keeps_status_and_stop_visible_in_main_window():
     assert indicator.text == "Experiment: Sensor Capture"
     assert stop_button.visible
     assert stop_button.enabled
+    assert not travel.visible
+    assert not window.taxel_mapping_map.enabled
+    assert not window.taxel_mapping_load_map_button.enabled
+
+    window._sidebar_active_task = SimpleNamespace(
+        id="calibration",
+        label="Calibration",
+    )
+    MyMainWindow._refresh_experiment_status(window)
+    assert travel.visible
 
     window._sidebar_active_task = None
     MyMainWindow._refresh_experiment_status(window)
     assert not indicator.visible
     assert not stop_button.visible
     assert not stop_button.enabled
+    assert not travel.visible
+    assert window.taxel_mapping_map.enabled
+    assert window.taxel_mapping_load_map_button.enabled
+
+
+def test_calibration_travel_status_formats_measured_and_peak_depth():
+    travel = _Widget()
+    window = SimpleNamespace(status_calibration_travel=travel)
+
+    MyMainWindow._refresh_calibration_travel(window, 1.234, 2.345)
+
+    assert travel.text() == "Z travel: 1.23 mm | Max: 2.35 mm"
 
 
 def test_hand_workspace_gates_motion_and_tactile_independently():

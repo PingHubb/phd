@@ -2549,7 +2549,7 @@
       "n_col": 17,
       "reorder_mode": "factory",
       "point_labels_enabled": false,
-      "background_reference_enabled": true,
+      "background_reference_enabled": false,
       "force_scale_n_per_signal": 0.0,
       "geometry": {
         "use_selected_shape": false,
@@ -2594,7 +2594,7 @@
       "n_col": 14,
       "reorder_mode": "factory",
       "point_labels_enabled": false,
-      "background_reference_enabled": true,
+      "background_reference_enabled": false,
       "force_scale_n_per_signal": 0.0,
       "geometry": {
         "use_selected_shape": false,
@@ -2639,7 +2639,7 @@
       "n_col": 8,
       "reorder_mode": "factory",
       "point_labels_enabled": false,
-      "background_reference_enabled": true,
+      "background_reference_enabled": false,
       "force_scale_n_per_signal": 0.0,
       "geometry": {
         "use_selected_shape": false,
@@ -2727,6 +2727,141 @@
       "model": "2d",
       "n_row": 10,
       "n_col": 14,
+      "reorder_mode": "factory",
+      "point_labels_enabled": false,
+      "background_reference_enabled": true,
+      "force_scale_n_per_signal": 0.0,
+      "geometry": {
+        "use_selected_shape": false,
+        "shape": "flat",
+        "bend_axis": "columns",
+        "arc_deg": 0.0,
+        "normal_flip": false,
+        "rotation_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "custom_points": [],
+        "use_custom_heatmap_shape": false,
+        "custom_heatmap_points": [],
+        "custom_heatmap_corners": [],
+        "use_curved_heatmap_edges": false,
+        "custom_heatmap_edge_offsets": []
+      },
+      "stereo_field": {
+        "ignore_noise_enabled": true,
+        "deadband_pct": 0.35,
+        "response_scale_pct": 2.0,
+        "length_scale": 0.35
+      },
+      "heatmap": {
+        "palette_3d": "white_red",
+        "response_mode": "linear_relative",
+        "saturation_pct": 5.0,
+        "noise_floor_pct": 0.5,
+        "proximity_noise_floor": 20.0,
+        "proximity_knee": 100.0,
+        "proximity_saturation": 1000.0,
+        "color_gain_3d": 1.5,
+        "use_absolute_signal": true,
+        "point_grid_response_mode": "legacy_offset"
+      }
+    },
+    "2d_5x5": {
+      "model": "2d",
+      "n_row": 5,
+      "n_col": 5,
+      "reorder_mode": "factory",
+      "point_labels_enabled": false,
+      "background_reference_enabled": false,
+      "force_scale_n_per_signal": 0.0,
+      "geometry": {
+        "use_selected_shape": false,
+        "shape": "flat",
+        "bend_axis": "columns",
+        "arc_deg": 0.0,
+        "normal_flip": false,
+        "rotation_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "custom_points": [],
+        "use_custom_heatmap_shape": false,
+        "custom_heatmap_points": [],
+        "custom_heatmap_corners": [],
+        "use_curved_heatmap_edges": false,
+        "custom_heatmap_edge_offsets": []
+      },
+      "stereo_field": {
+        "ignore_noise_enabled": true,
+        "deadband_pct": 0.35,
+        "response_scale_pct": 2.0,
+        "length_scale": 0.35
+      },
+      "heatmap": {
+        "palette_3d": "white_red",
+        "response_mode": "linear_relative",
+        "saturation_pct": 5.0,
+        "noise_floor_pct": 0.5,
+        "proximity_noise_floor": 20.0,
+        "proximity_knee": 100.0,
+        "proximity_saturation": 1000.0,
+        "color_gain_3d": 1.5,
+        "use_absolute_signal": true,
+        "point_grid_response_mode": "legacy_offset"
+      }
+    },
+    "2d_27x22": {
+      "model": "2d",
+      "n_row": 27,
+      "n_col": 22,
+      "reorder_mode": "factory",
+      "point_labels_enabled": false,
+      "background_reference_enabled": true,
+      "force_scale_n_per_signal": 0.0,
+      "geometry": {
+        "use_selected_shape": false,
+        "shape": "flat",
+        "bend_axis": "columns",
+        "arc_deg": 0.0,
+        "normal_flip": false,
+        "rotation_deg": [
+          0.0,
+          0.0,
+          0.0
+        ],
+        "custom_points": [],
+        "use_custom_heatmap_shape": false,
+        "custom_heatmap_points": [],
+        "custom_heatmap_corners": [],
+        "use_curved_heatmap_edges": false,
+        "custom_heatmap_edge_offsets": []
+      },
+      "stereo_field": {
+        "ignore_noise_enabled": true,
+        "deadband_pct": 0.35,
+        "response_scale_pct": 2.0,
+        "length_scale": 0.35
+      },
+      "heatmap": {
+        "palette_3d": "white_red",
+        "response_mode": "linear_relative",
+        "saturation_pct": 5.0,
+        "noise_floor_pct": 0.5,
+        "proximity_noise_floor": 20.0,
+        "proximity_knee": 100.0,
+        "proximity_saturation": 1000.0,
+        "color_gain_3d": 1.5,
+        "use_absolute_signal": true,
+        "point_grid_response_mode": "legacy_offset"
+      }
+    },
+    "2d_8x8": {
+      "model": "2d",
+      "n_row": 8,
+      "n_col": 8,
       "reorder_mode": "factory",
       "point_labels_enabled": false,
       "background_reference_enabled": true,

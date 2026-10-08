@@ -37,11 +37,26 @@ from phd.ui.calibration_analysis import (
 SIGNAL_LABELS = {
     "raw": "Raw sensor value",
     "raw_ave": "Averaged raw value",
-    "diff": "Sensor difference (counts)",
-    "diff_ave": "Averaged difference (counts)",
+    "diff": "Sensor signal change (sensor units)",
+    "diff_ave": "Averaged signal change (sensor units)",
     "diff_percent": "Relative change (%)",
     "diff_percent_ave": "Averaged relative change (%)",
 }
+
+
+def _sensor_grid_shape(*sources, default=(8, 10)):
+    """Return the first valid sensor shape stored in result dictionaries."""
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        shape = source.get("sensor_shape")
+        try:
+            rows, columns = map(int, shape[:2])
+        except (TypeError, ValueError):
+            continue
+        if rows > 0 and columns > 0:
+            return rows, columns
+    return tuple(map(int, default))
 
 
 class CalibrationTaxelMap(QWidget):
@@ -54,6 +69,9 @@ class CalibrationTaxelMap(QWidget):
         self.rows = max(1, int(rows))
         self.columns = max(1, int(columns))
         self.buttons = {}
+        self._available_taxels = set()
+        self._skipped_taxels = set()
+        self._interaction_enabled = True
         grid = QGridLayout(self)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setHorizontalSpacing(3)
@@ -85,14 +103,110 @@ class CalibrationTaxelMap(QWidget):
             f"color: {theme.TEXT_ON_ACCENT}; border-color: {theme.ACCENT}; }}"
             f"QToolButton:disabled {{ background: {theme.NEUTRAL_SOFT}; "
             f"color: {theme.TEXT_FAINT}; border-color: {theme.BORDER_SUBTLE}; }}"
+            f'QToolButton[taxelState="mapped"] {{ background: {theme.SUCCESS_SOFT}; '
+            f"color: {theme.SUCCESS}; border-color: {theme.SUCCESS_BORDER}; "
+            "font-weight: 600; }"
+            f'QToolButton[taxelState="mapped"]:disabled {{ background: {theme.SUCCESS_SOFT}; '
+            f"color: {theme.SUCCESS}; border-color: {theme.SUCCESS_BORDER}; }}"
+            f'QToolButton[taxelState="skipped"] {{ background: {theme.SURFACE_SUNKEN}; '
+            f"color: {theme.TEXT_DISABLED}; border-color: {theme.BORDER_SUBTLE}; }}"
+            f'QToolButton[taxelState="skipped"]:disabled {{ background: {theme.SURFACE_SUNKEN}; '
+            f"color: {theme.TEXT_DISABLED}; border-color: {theme.BORDER_SUBTLE}; }}"
+            f'QToolButton[taxelState="mapped"]:checked {{ background: {theme.ACCENT}; '
+            f"color: {theme.TEXT_ON_ACCENT}; border: 2px solid "
+            f"{theme.ACCENT_PRESSED}; font-weight: 700; }}"
+            f'QToolButton[taxelState="mapped"]:checked:disabled {{ background: {theme.ACCENT}; '
+            f"color: {theme.TEXT_ON_ACCENT}; border: 2px solid "
+            f"{theme.ACCENT_PRESSED}; font-weight: 700; }}"
         )
 
-    def set_taxels(self, available, selected=None):
-        """Enable recorded taxels and check the selected one."""
-        available = {int(index) for index in available}
+    def _refresh_taxel_states(self, selected=None):
         for index, button in self.buttons.items():
-            button.setEnabled(index in available)
+            if index in self._available_taxels:
+                state = "mapped"
+            elif index in self._skipped_taxels:
+                state = "skipped"
+            else:
+                state = "unmapped"
+            button.setProperty("taxelState", state)
+            button.setEnabled(
+                self._interaction_enabled and index in self._available_taxels
+            )
             button.setChecked(selected is not None and index == int(selected))
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def set_grid_shape(self, rows, columns) -> None:
+        """Rebuild the map when a different sensor grid is loaded."""
+        rows = max(1, int(rows))
+        columns = max(1, int(columns))
+        layout = self.layout()
+        if (
+            rows == self.rows
+            and columns == self.columns
+            and layout is not None
+            and layout.rowCount() == rows
+            and layout.columnCount() == columns
+        ):
+            return
+        if layout is not None:
+            while layout.count():
+                item = layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.setParent(None)
+                    widget.deleteLater()
+            # Drop the old grid completely. Removing its buttons does not
+            # shrink a previous 8x10 layout back to 5x5.
+            QWidget().setLayout(layout)
+        layout = QGridLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setHorizontalSpacing(3)
+        layout.setVerticalSpacing(3)
+        self.rows = rows
+        self.columns = columns
+        self.buttons = {}
+        self._available_taxels = set()
+        self._skipped_taxels = set()
+        for column in range(self.columns):
+            for display_row in range(self.rows):
+                index = column * self.rows + display_row
+                button = QToolButton(self)
+                button.setText(str(index))
+                button.setCheckable(True)
+                button.setAutoExclusive(True)
+                button.setFixedSize(31, 25)
+                button.setToolTip(
+                    f"Taxel {index}: row {display_row}, column {column}"
+                )
+                button.clicked.connect(
+                    lambda _checked=False, value=index: (
+                        self.taxelSelected.emit(value)
+                    )
+                )
+                layout.addWidget(button, display_row, column)
+                self.buttons[index] = button
+
+    def set_taxels(self, available, selected=None, skipped=None):
+        """Show mapped, skipped and pending taxels with distinct states."""
+        self._available_taxels = {int(index) for index in available}
+        self._skipped_taxels = {
+            int(index) for index in (skipped or [])
+        } - self._available_taxels
+        self._refresh_taxel_states(selected=selected)
+
+    def set_interaction_enabled(self, enabled):
+        """Block clicks during motion without hiding mapped-cell status."""
+        selected = next(
+            (
+                index
+                for index, button in self.buttons.items()
+                if button.isChecked()
+            ),
+            None,
+        )
+        self._interaction_enabled = bool(enabled)
+        self._refresh_taxel_states(selected=selected)
 
 
 class CalibrationCurveWidget(QWidget):
@@ -105,6 +219,7 @@ class CalibrationCurveWidget(QWidget):
     DISTANCE_COLOR = "#66bb6a"
     RETURN_COLOR = "#ab47bc"
     FIT_COLOR = "#fdd835"
+    CONTACT_FIT_COLOR = "#ef5350"
     MEAN_COLOR = "#fdd835"
     TRIAL_COLORS = (
         "#42a5f5",
@@ -675,7 +790,17 @@ class CalibrationCurveWidget(QWidget):
         )
 
     @classmethod
-    def _draw_series(cls, painter, points, x_range, y_range, rect, color):
+    def _draw_series(
+        cls,
+        painter,
+        points,
+        x_range,
+        y_range,
+        rect,
+        color,
+        width=2.0,
+        style=Qt.SolidLine,
+    ):
         if not points:
             return
         painter.save()
@@ -686,9 +811,35 @@ class CalibrationCurveWidget(QWidget):
         path.moveTo(*first)
         for x_value, y_value in points[1:]:
             path.lineTo(*cls._map_point(x_value, y_value, x_range, y_range, rect))
-        painter.setPen(QPen(QColor(color), 2))
+        pen = QPen(QColor(color))
+        pen.setWidthF(float(width))
+        pen.setStyle(style)
+        painter.setPen(pen)
         painter.drawPath(path)
         painter.restore()
+
+    @staticmethod
+    def _smooth_points(points):
+        """Return a centred moving-average trace while preserving x values."""
+        points = list(points or [])
+        if len(points) < 5:
+            return points
+        window = max(5, min(21, len(points) // 100 * 2 + 1))
+        if window % 2 == 0:
+            window += 1
+        window = min(window, len(points) if len(points) % 2 else len(points) - 1)
+        if window < 3:
+            return points
+        x_values = np.asarray([point[0] for point in points], dtype=float)
+        y_values = np.asarray([point[1] for point in points], dtype=float)
+        padding = window // 2
+        padded = np.pad(y_values, (padding, padding), mode="edge")
+        smooth = np.convolve(
+            padded,
+            np.full(window, 1.0 / window, dtype=float),
+            mode="valid",
+        )
+        return list(zip(x_values.tolist(), smooth.tolist()))
 
     @classmethod
     def _draw_points(cls, painter, points, x_range, y_range, rect, color):
@@ -925,7 +1076,7 @@ class CalibrationCurveWidget(QWidget):
             12,
             45,
             "Amber: proximity onset   Red: contact onset   "
-            "Blue: peak force   Purple: return begins",
+            "Blue: peak force   Purple: return begins   Faint: raw · bright: smoothed",
         )
 
         for index, (label, field, color, include_zero) in enumerate(specs):
@@ -944,21 +1095,34 @@ class CalibrationCurveWidget(QWidget):
                 nonnegative=include_zero,
             )
             self._draw_grid(painter, panel)
+            raw_color = QColor(color)
+            raw_color.setAlpha(85)
             self._draw_series(
                 painter,
                 points,
                 x_range,
                 y_range,
                 panel,
+                raw_color,
+                width=1.0,
+            )
+            smooth_points = self._smooth_points(points)
+            self._draw_series(
+                painter,
+                smooth_points,
+                x_range,
+                y_range,
+                panel,
                 color,
+                width=2.5,
             )
             self._add_hover_context(
                 panel,
                 x_range,
                 y_range,
-                points,
+                smooth_points,
                 color,
-                label,
+                f"Smoothed {label}",
                 time_axis=True,
             )
             self._draw_vertical_marker(
@@ -1073,7 +1237,7 @@ class CalibrationCurveWidget(QWidget):
                 color.setAlpha(150)
                 self._draw_series(
                     painter,
-                    curve,
+                    self._smooth_points(curve),
                     x_range,
                     y_range,
                     panel,
@@ -1090,7 +1254,7 @@ class CalibrationCurveWidget(QWidget):
             )
             self._draw_series(
                 painter,
-                payload["mean"],
+                self._smooth_points(payload["mean"]),
                 x_range,
                 y_range,
                 panel,
@@ -1100,9 +1264,9 @@ class CalibrationCurveWidget(QWidget):
                 panel,
                 x_range,
                 y_range,
-                payload["mean"],
+                self._smooth_points(payload["mean"]),
                 self.MEAN_COLOR,
-                f"Mean {label}",
+                f"Smoothed mean {label}",
             )
             painter.setPen(QColor(theme.TEXT_PRIMARY))
             painter.drawText(8, int(panel.top() - 8), label)
@@ -1132,6 +1296,7 @@ class CalibrationCurveWidget(QWidget):
                 signal_label,
                 "Sensor Signal vs Travel Distance",
                 "signal_distance_fit",
+                "signal_distance",
             ),
             "force_distance": (
                 "travel_down_mm",
@@ -1140,6 +1305,7 @@ class CalibrationCurveWidget(QWidget):
                 "Force change (g)",
                 "Force vs Travel Distance",
                 "force_distance_fit",
+                "force_distance",
             ),
             "force_signal": (
                 self.signal_field,
@@ -1148,28 +1314,24 @@ class CalibrationCurveWidget(QWidget):
                 "Force change (g)",
                 "Force vs Sensor Signal",
                 "force_signal_fit",
+                "force_signal",
             ),
         }.get(self.mode)
 
-    @staticmethod
-    def _equation_text(fit):
-        if not fit:
-            return "Linear loading fit unavailable (not enough varying samples)"
-        slope = float(fit.get("slope", 0.0))
-        intercept = float(fit.get("intercept", 0.0))
-        sign = "+" if intercept >= 0.0 else "−"
-        return (
-            f"Loading fit: y = {slope:.5g}x {sign} {abs(intercept):.5g}   "
-            f"R² = {float(fit.get('r_squared', 0.0)):.4f}   "
-            f"n = {int(fit.get('sample_count', 0))}"
-        )
-
     def _paint_relationship(self, painter):
         spec = self._relationship_spec()
-        plot_rect = QRectF(self.rect().adjusted(92, 86, -56, -90))
+        plot_rect = QRectF(self.rect().adjusted(92, 48, -56, -90))
         if spec is None or plot_rect.width() <= 0 or plot_rect.height() <= 0:
             return
-        x_field, y_field, x_label, y_label, title, fit_name = spec
+        (
+            x_field,
+            y_field,
+            x_label,
+            y_label,
+            title,
+            _linear_fit_name,
+            _relationship_name,
+        ) = spec
         approach_points = self._finite_points(
             self.rows,
             x_field,
@@ -1206,13 +1368,18 @@ class CalibrationCurveWidget(QWidget):
         self._last_x_range = x_range
         self._last_y_range = y_range
         self._draw_grid(painter, plot_rect)
+        approach_smooth = self._smooth_points(approach_points)
+        return_smooth = self._smooth_points(return_points)
+        loading_raw_color = QColor(self.SIGNAL_COLOR)
+        loading_raw_color.setAlpha(75)
         self._draw_series(
             painter,
             approach_points,
             x_range,
             y_range,
             plot_rect,
-            self.SIGNAL_COLOR,
+            loading_raw_color,
+            width=1.0,
         )
         self._draw_points(
             painter,
@@ -1224,27 +1391,48 @@ class CalibrationCurveWidget(QWidget):
         )
         self._draw_series(
             painter,
-            return_points,
+            approach_smooth,
             x_range,
             y_range,
             plot_rect,
-            self.RETURN_COLOR,
-        )
-        self._add_hover_context(
-            plot_rect,
-            x_range,
-            y_range,
-            approach_points,
             self.SIGNAL_COLOR,
-            "Loading",
+            width=2.5,
+        )
+        return_raw_color = QColor(self.RETURN_COLOR)
+        return_raw_color.setAlpha(75)
+        self._draw_series(
+            painter,
+            return_points,
+            x_range,
+            y_range,
+            plot_rect,
+            return_raw_color,
+            width=1.0,
+        )
+        self._draw_series(
+            painter,
+            return_smooth,
+            x_range,
+            y_range,
+            plot_rect,
+            self.RETURN_COLOR,
+            width=2.5,
         )
         self._add_hover_context(
             plot_rect,
             x_range,
             y_range,
-            return_points,
+            approach_smooth,
+            self.SIGNAL_COLOR,
+            "Smoothed loading",
+        )
+        self._add_hover_context(
+            plot_rect,
+            x_range,
+            y_range,
+            return_smooth,
             self.RETURN_COLOR,
-            "Return",
+            "Smoothed return",
         )
         self._draw_points(
             painter,
@@ -1254,61 +1442,20 @@ class CalibrationCurveWidget(QWidget):
             plot_rect,
             self.RETURN_COLOR,
         )
-
-        fit = self.analysis.get(fit_name)
-        if fit:
-            fit_points = [
-                (
-                    float(fit["x_min"]),
-                    float(fit["slope"]) * float(fit["x_min"])
-                    + float(fit["intercept"]),
-                ),
-                (
-                    float(fit["x_max"]),
-                    float(fit["slope"]) * float(fit["x_max"])
-                    + float(fit["intercept"]),
-                ),
-            ]
-            painter.save()
-            painter.setClipRect(plot_rect)
-            painter.setPen(QPen(QColor(self.FIT_COLOR), 2, Qt.DashLine))
-            path = QPainterPath()
-            path.moveTo(
-                *self._map_point(
-                    fit_points[0][0],
-                    fit_points[0][1],
-                    x_range,
-                    y_range,
-                    plot_rect,
-                )
-            )
-            path.lineTo(
-                *self._map_point(
-                    fit_points[1][0],
-                    fit_points[1][1],
-                    x_range,
-                    y_range,
-                    plot_rect,
-                )
-            )
-            painter.drawPath(path)
-            painter.restore()
 
         painter.setPen(QColor(theme.TEXT_PRIMARY))
         painter.drawText(12, 24, title)
-        painter.setPen(QColor(self.FIT_COLOR if fit else theme.TEXT_MUTED))
-        painter.drawText(12, 47, self._equation_text(fit))
         painter.setPen(QColor(self.SIGNAL_COLOR))
         painter.drawText(
             int(plot_rect.left()),
             int(plot_rect.bottom() + 46),
-            "Approach/loading",
+            "Loading: raw points · smooth line",
         )
         painter.setPen(QColor(self.RETURN_COLOR))
         painter.drawText(
-            int(plot_rect.left() + 170),
+            int(plot_rect.left() + 320),
             int(plot_rect.bottom() + 46),
-            "Return/unloading",
+            "Return: raw points · smooth line",
         )
         painter.setPen(QColor(theme.TEXT_PRIMARY))
         painter.drawText(8, int(plot_rect.top() - 10), y_label)
@@ -1531,11 +1678,7 @@ class CalibrationResultDialog(QDialog):
         )
         self.repeatability_tab_index = repeatability_index
 
-        sensor_shape = self.result.get("sensor_shape") or [8, 10]
-        try:
-            sensor_rows, sensor_columns = map(int, sensor_shape[:2])
-        except (TypeError, ValueError):
-            sensor_rows, sensor_columns = 8, 10
+        sensor_rows, sensor_columns = _sensor_grid_shape(self.result)
         taxel_panel = QWidget(self)
         taxel_layout = QVBoxLayout(taxel_panel)
         taxel_layout.setContentsMargins(0, 0, 8, 0)
@@ -1917,3 +2060,184 @@ class CalibrationResultDialog(QDialog):
         callback = getattr(parent, "_append_sidebar_control_message", None)
         if callable(callback):
             callback(message)
+
+
+class FullTaxelCalibrationResultDialog(QDialog):
+    """Browse one taxel-specific result at a time and export every graph."""
+
+    def __init__(self, result, parent=None):
+        super().__init__(parent)
+        self.result = dict(result or {})
+        self.taxel_results = {
+            int(item.get("taxel_index", -1)): item
+            for item in self.result.get("taxel_results") or []
+            if int(item.get("taxel_index", -1)) >= 0
+        }
+        self._selected_taxel = min(self.taxel_results, default=None)
+        self._detail_dialogs = []
+        self._export_queue = sorted(self.taxel_results)
+        self._export_total = len(self._export_queue)
+        self._exported_taxels = 0
+        self._export_failures = 0
+        self.setWindowTitle("Full Taxel Calibration Result")
+        components.size_to_screen(self, 760, 620)
+        self.setStyleSheet(
+            f"QDialog {{ background: {theme.WINDOW_BG}; color: {theme.TEXT_PRIMARY}; }}"
+        )
+        layout = QVBoxLayout(self)
+        title = QLabel("Full Taxel Force-Signal-Distance Calibration")
+        title.setStyleSheet(
+            f"font-size: 18px; font-weight: 600; color: {theme.TEXT_PRIMARY};"
+        )
+        layout.addWidget(title)
+        requested = int(self.result.get("requested_taxels", 0) or 0)
+        completed = int(self.result.get("completed_taxels", 0) or 0)
+        summary = QLabel(
+            f"Status: {self.result.get('status', 'unknown')}   |   "
+            f"Completed: {completed}/{requested} taxels   |   "
+            f"Full scans: {int(self.result.get('repetitions_per_taxel', 1) or 1)}\n"
+            f"Run folder: {self.result.get('experiment_directory') or 'not saved'}\n"
+            f"Summary: {self.result.get('summary_path') or 'not saved'}"
+        )
+        summary.setWordWrap(True)
+        summary.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        summary.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        layout.addWidget(summary)
+
+        hint = QLabel(
+            "Each green cell has an independent recording. Select one taxel "
+            "to open its detailed graphs; other taxel signals are not included "
+            "in that result."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        layout.addWidget(hint)
+        sensor_rows, sensor_columns = _sensor_grid_shape(
+            self.result,
+            *self.taxel_results.values(),
+        )
+        self.taxel_map = CalibrationTaxelMap(
+            rows=sensor_rows,
+            columns=sensor_columns,
+            parent=self,
+        )
+        self.taxel_map.set_taxels(
+            self.taxel_results,
+            selected=self._selected_taxel,
+        )
+        self.taxel_map.taxelSelected.connect(self._select_taxel)
+        layout.addWidget(self.taxel_map, alignment=Qt.AlignHCenter)
+        self.selection_label = QLabel()
+        self.selection_label.setWordWrap(True)
+        self.selection_label.setStyleSheet(
+            f"color: {theme.ACCENT}; font-weight: 600;"
+        )
+        layout.addWidget(self.selection_label)
+        self.open_button = QPushButton("Open Selected Taxel Graphs")
+        self.open_button.clicked.connect(self._open_selected)
+        self.open_button.setEnabled(self._selected_taxel is not None)
+        layout.addWidget(self.open_button)
+        self.export_status = QLabel("Preparing taxel-specific graph files…")
+        self.export_status.setWordWrap(True)
+        self.export_status.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        layout.addWidget(self.export_status)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.close)
+        layout.addWidget(buttons)
+        self._select_taxel(self._selected_taxel)
+        QTimer.singleShot(0, self._export_next_taxel)
+
+    def _select_taxel(self, index):
+        if index is None or int(index) not in self.taxel_results:
+            self._selected_taxel = None
+            self.selection_label.setText("No completed taxel selected")
+            self.open_button.setEnabled(False)
+            return
+        self._selected_taxel = int(index)
+        item = self.taxel_results[self._selected_taxel]
+        completed = int(item.get("completed_trials", 0) or 0)
+        requested = int(item.get("requested_trials", 1) or 1)
+        self.selection_label.setText(
+            f"Taxel {self._selected_taxel} · {completed}/{requested} trial(s) · "
+            f"{item.get('batch_status', 'unknown')}"
+        )
+        self.open_button.setEnabled(True)
+
+    def _open_selected(self):
+        if self._selected_taxel not in self.taxel_results:
+            return
+        dialog = CalibrationResultDialog(
+            self.taxel_results[self._selected_taxel],
+            parent=self,
+        )
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(
+            lambda _object=None, item=dialog: (
+                self._detail_dialogs.remove(item)
+                if item in self._detail_dialogs
+                else None
+            )
+        )
+        self._detail_dialogs.append(dialog)
+        dialog.show()
+
+    def _export_next_taxel(self):
+        if not self._export_queue:
+            message = (
+                f"Saved graphs for {self._exported_taxels} taxel(s)."
+                if self._exported_taxels
+                else "No taxel graph files were exported."
+            )
+            if self._export_failures:
+                message += f" {self._export_failures} export(s) failed."
+            self.export_status.setText(message)
+            callback = getattr(
+                self.parent(), "_append_sidebar_control_message", None
+            )
+            if callable(callback):
+                callback(message)
+            return
+        taxel = self._export_queue.pop(0)
+        result = self.taxel_results[taxel]
+        trials = list(result.get("trial_results") or [result])
+        output_text = str(result.get("graph_directory") or "")
+        saved_count = 0
+        if output_text:
+            output = Path(output_text).expanduser()
+            for sequence, trial in enumerate(trials, start=1):
+                number = int(trial.get("trial_number", sequence) or sequence)
+                path = output / f"trial_{number:04d}.png"
+                try:
+                    saved = CalibrationResultDialog._export_trial_graph(
+                        trial, path
+                    )
+                except Exception:
+                    saved = False
+                if saved:
+                    trial["graph_path"] = str(path)
+                    saved_count += 1
+                else:
+                    self._export_failures += 1
+            if len(trials) > 1:
+                path = output / "repeatability.png"
+                try:
+                    image = CalibrationResultDialog._render_repeatability(
+                        trials,
+                        str(result.get("signal_field") or "diff_ave"),
+                    )
+                    output.mkdir(parents=True, exist_ok=True)
+                    saved = bool(image.save(str(path), "PNG"))
+                except Exception:
+                    saved = False
+                if saved:
+                    result["repeatability_graph_path"] = str(path)
+                else:
+                    self._export_failures += 1
+        if saved_count:
+            self._exported_taxels += 1
+        processed = self._export_total - len(self._export_queue)
+        self.export_status.setText(
+            f"Exporting taxel-specific graphs: {processed}/"
+            f"{self._export_total} taxels processed"
+        )
+        QTimer.singleShot(0, self._export_next_taxel)

@@ -2,6 +2,7 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import QListWidget, QListWidgetItem
 
 from phd.dependence import func_sensor
+from phd.dependence import humanoid_sensor_registry
 from phd.dependence.func_sensor import MySensor
 from phd.dependence.sensor_api import ArduinoCommander
 from phd.dependence.goodix_usb_sensor import (
@@ -254,6 +255,95 @@ def test_goodix_usb_uses_a_10_by_8_exact_grid_default():
     assert ui.grid_rows_spin.value() == 10
     assert ui.grid_cols_spin.value() == 8
     assert ui.sensor_extra_column_checkbox.checked is False
+
+
+def test_biboard_uses_open_cat_tactile_serial_profile(monkeypatch):
+    port = _Port("ttyACM6")
+    port.vid = 0x1A86
+    port.pid = 0x55D3
+    monkeypatch.setattr(
+        humanoid_sensor_registry,
+        "_current_serial_port",
+        lambda _name: port,
+    )
+
+    profile = humanoid_sensor_registry.biboard_tactile_profile_for_device(
+        "/dev/ttyACM6"
+    )
+
+    assert profile == {
+        "n_row": 8,
+        "n_col": 8,
+        "has_extra_column": False,
+        "baud_rate": 115200,
+    }
+
+
+def test_ui_uses_biboard_profile_as_the_port_default(monkeypatch):
+    monkeypatch.setattr(
+        ui_ping,
+        "biboard_tactile_profile_for_device",
+        lambda _port: {
+            "n_row": 8,
+            "n_col": 8,
+            "has_extra_column": False,
+            "baud_rate": 115200,
+        },
+    )
+    ui = _PortPresetHarness()
+
+    profile = ui._default_sensor_port_profile("/dev/ttyACM6")
+
+    assert profile["n_row"] == 8
+    assert profile["n_col"] == 8
+    assert profile["has_extra_column"] is False
+    assert profile["baud_rate"] == 115200
+
+
+def test_force_transmitter_is_not_listed_as_a_sensor(monkeypatch):
+    sources = _SourceList()
+    sensor = object.__new__(MySensor)
+    sensor.parent = type("_Parent", (), {"serial_channel": sources})()
+    force_meter = _Port("ttyUSB0")
+    force_meter.description = "USB TO RS-485 - USB TO RS-485"
+    force_meter.serial_number = "DA43GJNL"
+    force_meter.vid = 0x0403
+    force_meter.pid = 0x6015
+    monkeypatch.setattr(
+        func_sensor.serial.tools.list_ports,
+        "comports",
+        lambda: [_Port("ttyACM0"), force_meter],
+    )
+    monkeypatch.setattr(func_sensor, "goodix_usb_connected", lambda: False)
+
+    sensor.initChannel()
+
+    labels = [item.text() for item in sources.items]
+    assert labels == ["ttyACM0"]
+    assert sensor.com_options == ["ttyACM0"]
+
+
+def test_realsense_camera_port_is_not_listed_as_a_sensor(monkeypatch):
+    sources = _SourceList()
+    sensor = object.__new__(MySensor)
+    sensor.parent = type("_Parent", (), {"serial_channel": sources})()
+    camera = _Port("ttyACM5")
+    camera.description = "Intel(R) RealSense(TM) Depth Camera 555"
+    camera.vid = 0x8086
+    camera.pid = 0x0B56
+    camera.serial_number = "471300003-02"
+    monkeypatch.setattr(
+        func_sensor.serial.tools.list_ports,
+        "comports",
+        lambda: [_Port("ttyACM0"), camera],
+    )
+    monkeypatch.setattr(func_sensor, "goodix_usb_connected", lambda: False)
+
+    sensor.initChannel()
+
+    labels = [item.text() for item in sources.items]
+    assert labels == ["ttyACM0"]
+    assert sensor.com_options == ["ttyACM0"]
 
 
 def test_goodix_is_after_acm_and_system_ttys_ports_are_hidden(monkeypatch):

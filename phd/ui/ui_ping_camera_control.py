@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import time
 
 from PyQt5.QtCore import Qt, QTimer
@@ -27,6 +26,7 @@ class CameraControlMixin:
                 except Exception as exc:
                     print(f"Failed to exit auto-centering velocity mode: {exc}")
         self._set_auto_center_ui_state(False)
+        self._target_reached_frames = 0
 
     def _set_live_camera_ui_state(self, running: bool):
         self.live_yolo_button.setText(
@@ -44,22 +44,38 @@ class CameraControlMixin:
         self.cam_window = QWidget()
         self.cam_window.setWindowTitle("Live Object Detection")
         self.cam_window.resize(640, 480)
+        self.cam_window.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.cam_window.destroyed.connect(self._camera_window_closed)
 
         self.cam_label = QLabel(self.cam_window)
         self.cam_label.setAlignment(Qt.AlignCenter)
+        self.cam_label.setMinimumSize(640, 480)
 
         layout = QVBoxLayout()
         layout.addWidget(self.cam_label)
         self.cam_window.setLayout(layout)
 
+    def _camera_window_closed(self, *_args):
+        """Treat the title-bar close button like Stop Object Detection."""
+        self.cam_window = None
+        self.cam_label = None
+        self._stop_auto_centering()
+        self._stop_yolo_worker()
+        self._set_live_camera_ui_state(False)
+
     def _close_camera_window(self):
         if self.cam_window is None:
             return
 
-        self.cam_window.close()
-        self.cam_window.deleteLater()
+        window = self.cam_window
         self.cam_window = None
         self.cam_label = None
+        window.close()
+        window.deleteLater()
+
+    def _camera_worker_error(self, message):
+        if not self._is_shutting_down:
+            self.log_display.append(f"⚠️ Camera: {message}")
 
     def _stop_yolo_worker(self):
         worker = self.yolo_worker
@@ -204,6 +220,10 @@ class CameraControlMixin:
         self._stop_yolo_worker()
         self._close_camera_window()
         self._shutdown_optional_call(
+            "_stop_robot_dog_gesture_control",
+            "Robot Dog gesture detection",
+        )
+        self._shutdown_optional_call(
             "_stop_force_meter",
             "Force meter",
         )
@@ -308,18 +328,23 @@ class CameraControlMixin:
             self._set_live_camera_ui_state(False)
             return
 
-        camera_device = "/dev/video8"
-        if not self.yolo_worker and not os.path.exists(camera_device):
-            self.log_display.append(f"⚠️ Camera device not found: {camera_device}")
-            self._set_live_camera_ui_state(False)
-            return
-
         if self.yolo_worker and self.yolo_worker.isRunning():
             self._stop_auto_centering()
             self._stop_yolo_worker()
             self._close_camera_window()
             self._set_live_camera_ui_state(False)
         else:
+            main_window = self.window() if hasattr(self, "window") else None
+            preview = getattr(main_window, "camera_preview_window", None)
+            if preview is not None:
+                try:
+                    preview.close()
+                    self.log_display.append(
+                        "Camera preview closed so object detection can use "
+                        "the RealSense device."
+                    )
+                except RuntimeError:
+                    main_window.camera_preview_window = None
             self._ensure_camera_window()
             worker_class = getattr(self, "_yolo_worker_class", None)
 
@@ -327,9 +352,12 @@ class CameraControlMixin:
                 if worker_class is None:
                     raise RuntimeError("Camera worker is unavailable.")
 
-                self.yolo_worker = worker_class(dev_source=camera_device)
+                self.yolo_worker = worker_class()
                 self.yolo_worker.image_signal.connect(self.update_cam_window)
                 self.yolo_worker.data_signal.connect(self.process_yolo_data)
+                error_signal = getattr(self.yolo_worker, "error_signal", None)
+                if error_signal is not None:
+                    error_signal.connect(self._camera_worker_error)
                 self.yolo_worker.finished_signal.connect(self.reset_yolo_button_state)
                 self.yolo_worker.start()
                 self.cam_window.show()
@@ -352,6 +380,7 @@ class CameraControlMixin:
 
         if self.centering_active:
             self._software_motion_stopped = False
+            self._target_reached_frames = 0
             self._set_auto_center_ui_state(True)
             print("Auto-Centering ACTIVATED. Enabling Robot Velocity Mode...")
 
@@ -362,7 +391,11 @@ class CameraControlMixin:
                     self.robot_api.send_request(self.robot_api.suspend_end_effector_velocity_mode())
                     self.robot_api.send_request(self.robot_api.enable_end_effector_velocity_mode())
             except Exception as exc:
-                print(f"Failed to enable velocity mode: {exc}")
+                self._set_auto_center_ui_state(False)
+                self.log_display.append(
+                    f"❌ Failed to enable auto-centering: {exc}"
+                )
+                self.send_velocity_command(0.0, 0.0, 0.0)
         else:
             print("Auto-Centering STOPPED. Sending 0 velocity...")
             self._stop_auto_centering()
@@ -375,6 +408,7 @@ class CameraControlMixin:
 
         if not self.centering_active:
             self.grab_triggered = False
+            self._target_reached_frames = 0
             return
 
         if self.manual_mode_active:
@@ -402,14 +436,20 @@ class CameraControlMixin:
 
         ready_to_grab = False
 
-        for obj in detections:
-            if obj["name"] != "mouse":
-                continue
+        targets = [obj for obj in detections if obj.get("name") == "mouse"]
+        target = (
+            max(targets, key=lambda item: float(item.get("conf", 0.0)))
+            if targets
+            else None
+        )
+
+        if target is not None:
+            obj = target
 
             x1, y1, x2, y2 = obj["box"]
             obj_cx = (x1 + x2) / 2
             obj_cy = (y1 + y2) / 2
-            current_dist = obj["depth"]
+            current_dist = float(obj.get("depth", 0.0))
 
             diff_x = obj_cx - center_x
             diff_y = obj_cy - center_y
@@ -435,17 +475,24 @@ class CameraControlMixin:
             if aligned_x and aligned_y:
                 if current_dist > 0 and current_dist > target_distance:
                     cmd_z = speed
+                    self._target_reached_frames = 0
                     print(f"Approaching... {current_dist:.3f}m")
                 elif current_dist > 0 and current_dist <= target_distance:
                     cmd_z = 0.0
-                    ready_to_grab = True
-                    print(f"Target Reached! Dist: {current_dist:.3f}m")
+                    self._target_reached_frames = int(
+                        getattr(self, "_target_reached_frames", 0)
+                    ) + 1
+                    ready_to_grab = self._target_reached_frames >= 3
+                    if ready_to_grab:
+                        print(f"Target Reached! Dist: {current_dist:.3f}m")
                 else:
                     cmd_z = 0.0
+                    self._target_reached_frames = 0
             else:
                 cmd_z = 0.0
-
-            break
+                self._target_reached_frames = 0
+        else:
+            self._target_reached_frames = 0
 
         self.send_velocity_command(cmd_x, cmd_y, cmd_z)
 
@@ -453,6 +500,7 @@ class CameraControlMixin:
             print("\n>>> TARGET REACHED <<<")
             print(f"1. Position BEFORE closing: {self.gripper.get_pos_string()}")
             self.grab_triggered = True
+            self._target_reached_frames = 0
             self.gripper.close(soft=True)
             QTimer.singleShot(2000, self.check_grip_result)
 
@@ -566,10 +614,15 @@ class CameraControlMixin:
             return
 
         if self.cam_window is not None and self.cam_window.isVisible() and self.cam_label is not None:
-            self.cam_label.setPixmap(QPixmap.fromImage(qt_image))
-            self.cam_label.resize(qt_image.width(), qt_image.height())
+            pixmap = QPixmap.fromImage(qt_image).scaled(
+                self.cam_label.size(),
+                Qt.KeepAspectRatio,
+                Qt.SmoothTransformation,
+            )
+            self.cam_label.setPixmap(pixmap)
 
     def reset_yolo_button_state(self):
+        self._stop_auto_centering()
         self._close_camera_window()
         self._set_live_camera_ui_state(False)
         if self.yolo_worker is not None and not self.yolo_worker.isRunning():

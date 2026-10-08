@@ -56,6 +56,7 @@ from phd.dependence.goodix_usb_sensor import (
 )
 from phd.dependence.paths import ai_resource_path, resource_path
 from phd.dependence.humanoid_sensor_registry import (
+    biboard_tactile_profile_for_device,
     humanoid_sensor_extra_column_for_device,
     humanoid_sensor_grid_shape_for_device,
 )
@@ -65,6 +66,7 @@ from phd.ui.sensor_zero_mask_window import SensorZeroMaskPanel
 from phd.ui.ui_ping_ai_controls import AiControlsMixin
 from phd.ui.ui_ping_camera_control import CameraControlMixin
 from phd.ui.ui_ping_direct_finger_motion import DirectFingerMotionMixin
+from phd.ui.ui_ping_robot_dog import RobotDogControlsMixin
 from phd.ui.ui_ping_robot_sensor_controls import RobotSensorControlsMixin
 from phd.ui.ui_ping_ui_interactions import UiInteractionsMixin
 
@@ -1491,6 +1493,7 @@ class UI(
     AiControlsMixin,
     CameraControlMixin,
     DirectFingerMotionMixin,
+    RobotDogControlsMixin,
     RobotSensorControlsMixin,
     UiInteractionsMixin,
     QSplitter,
@@ -1532,6 +1535,7 @@ class UI(
         self.is_lifting = False
         self.stationary_mode = False
         self.grab_triggered = False
+        self._target_reached_frames = 0
 
         self.manual_watchdog_timer = QTimer(self)
         self.manual_watchdog_timer.setInterval(500)
@@ -2098,6 +2102,13 @@ class UI(
             self._scrollable(robot_page), "TM Robot"
         )
 
+        robot_dog_page = QWidget()
+        robot_dog_layout = QVBoxLayout(robot_dog_page)
+        self.setup_robot_dog_tab(robot_dog_layout)
+        self.robot_dog_tab_index = self.robots_sub_tabs.addTab(
+            self._scrollable(robot_dog_page), "Robot Dog"
+        )
+
         # The humanoid controls are constructed only when this subtab is opened.
         # The G1 scene is loaded explicitly into the existing sensor viewport.
         self.humanoid_page = QWidget()
@@ -2494,6 +2505,22 @@ class UI(
             self._on_sensor_port_profile_controls_changed
         )
 
+        self.sensor_baud_combo = QComboBox()
+        for baud_rate in (9600, 19200, 38400, 57600, 115200, 230400,
+                          460800, 921600):
+            self.sensor_baud_combo.addItem(str(baud_rate), baud_rate)
+        self.sensor_baud_combo.setCurrentIndex(
+            self.sensor_baud_combo.findData(9600)
+        )
+        self.sensor_baud_combo.setToolTip(
+            "Serial speed for the highlighted sensor port. Standalone sensor "
+            "firmware normally uses 9600; the combined OpenCat/Bittle tactile "
+            "firmware uses 115200."
+        )
+        self.sensor_baud_combo.currentIndexChanged.connect(
+            self._on_sensor_port_profile_controls_changed
+        )
+
         # Packet shape is a property of the hardware: set once per port, then
         # never touched again. Behind a disclosure so the controls you do use
         # every session stay visible without scrolling.
@@ -2509,6 +2536,7 @@ class UI(
                      "highlighted port.",
             )
         )
+        packet_list.add_row("Serial baud", self.sensor_baud_combo)
         packet_list.add(self.sensor_extra_column_checkbox)
         self.sensor_packet_format_group.add(packet_list)
         send_group.layout().addWidget(self.sensor_packet_format_group)
@@ -2662,6 +2690,12 @@ class UI(
     def _default_sensor_grid_shape_for_port(port_name):
         if is_goodix_usb_source(port_name):
             return GOODIX_USB_ROWS, GOODIX_USB_COLUMNS
+        biboard_profile = biboard_tactile_profile_for_device(port_name)
+        if biboard_profile is not None:
+            return (
+                int(biboard_profile["n_row"]),
+                int(biboard_profile["n_col"]),
+            )
         humanoid_shape = humanoid_sensor_grid_shape_for_device(port_name)
         if humanoid_shape is not None:
             return humanoid_shape
@@ -2680,6 +2714,9 @@ class UI(
         return os.path.basename(text).lower()
 
     def _default_sensor_port_profile(self, port_name):
+        biboard_profile = biboard_tactile_profile_for_device(port_name)
+        if biboard_profile is not None:
+            return dict(biboard_profile)
         shape = self._default_sensor_grid_shape_for_port(port_name)
         if shape is None:
             shape = (
@@ -2699,6 +2736,7 @@ class UI(
             "n_row": int(shape[0]),
             "n_col": int(shape[1]),
             "has_extra_column": has_extra_column,
+            "baud_rate": 9600,
         }
 
     def _save_sensor_port_profile_from_controls(self, port_name):
@@ -2707,13 +2745,21 @@ class UI(
         key = self._sensor_port_profile_key(port_name)
         if not key:
             return
-        self._sensor_port_profiles[key] = {
+        baud_combo = getattr(self, "sensor_baud_combo", None)
+        try:
+            baud_rate = int(baud_combo.currentData())
+        except Exception:
+            baud_rate = 9600
+        profile = {
             "n_row": int(self.grid_rows_spin.value()),
             "n_col": int(self.grid_cols_spin.value()),
             "has_extra_column": bool(
                 self.sensor_extra_column_checkbox.isChecked()
             ),
         }
+        if baud_combo is not None:
+            profile["baud_rate"] = baud_rate
+        self._sensor_port_profiles[key] = profile
 
     def get_sensor_port_profile(self, port_name):
         key = self._sensor_port_profile_key(port_name)
@@ -2739,11 +2785,14 @@ class UI(
         if profile is None:
             profile = self._default_sensor_port_profile(port_name)
             self._sensor_port_profiles[key] = dict(profile)
-        widgets = (
+        widgets = [
             self.grid_rows_spin,
             self.grid_cols_spin,
             self.sensor_extra_column_checkbox,
-        )
+        ]
+        baud_combo = getattr(self, "sensor_baud_combo", None)
+        if baud_combo is not None:
+            widgets.append(baud_combo)
         self._sensor_port_profile_updating = True
         for widget in widgets:
             widget.blockSignals(True)
@@ -2753,6 +2802,13 @@ class UI(
             self.sensor_extra_column_checkbox.setChecked(
                 bool(profile["has_extra_column"])
             )
+            if baud_combo is not None:
+                baud_index = baud_combo.findData(
+                    int(profile.get("baud_rate", 9600))
+                )
+                baud_combo.setCurrentIndex(
+                    baud_index if baud_index >= 0 else 0
+                )
         finally:
             for widget in widgets:
                 widget.blockSignals(False)

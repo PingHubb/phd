@@ -1,6 +1,7 @@
 import numpy as np
 
 from phd.ui.calibration_analysis import (
+    _smooth_polynomial_fit,
     analyze_calibration_rows,
     available_taxel_indices,
     calibration_rows_for_taxel,
@@ -45,6 +46,33 @@ def test_calibration_analysis_detects_proximity_then_contact_and_fits_loading():
     assert analysis["force_distance_fit"]["slope"] > 0.0
     assert analysis["force_signal_fit"]["slope"] < 0.0
     assert np.isfinite(analysis["force_signal_fit"]["r_squared"])
+
+
+def test_proximity_onset_threshold_uses_two_times_robust_noise():
+    rows = [
+        _row(index * 0.1, "approaching", index * 0.1, signal, 0.0)
+        for index, signal in enumerate((0.0, 1.0, 2.0, 4.0, 5.0, 6.0))
+    ]
+
+    analysis = analyze_calibration_rows(rows, "diff_ave")
+
+    assert np.isclose(
+        analysis["signal_change_threshold"],
+        2.0 * 1.4826,
+    )
+
+
+def test_smooth_polynomial_fit_recovers_a_quadratic_equation():
+    points = [
+        (x_value, 2.0 * x_value ** 2 - 3.0 * x_value + 4.0)
+        for x_value in np.linspace(-2.0, 3.0, 21)
+    ]
+
+    fit = _smooth_polynomial_fit(points)
+
+    assert fit["degree"] == 2
+    np.testing.assert_allclose(fit["coefficients"], [4.0, -3.0, 2.0])
+    assert np.isclose(fit["r_squared"], 1.0)
 
 
 def test_calibration_analysis_does_not_mix_return_samples_into_loading_fit():

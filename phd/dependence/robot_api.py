@@ -16,6 +16,7 @@ try:
     from geometry_msgs.msg import PoseStamped
     from PyQt5.QtCore import QThread
     from sensor_msgs.msg import JointState
+    from tm_msgs.msg import FeedbackState
     from tm_msgs.srv import SendScript, SetEvent, SetPositions
 
     ROS_AVAILABLE = True
@@ -115,6 +116,8 @@ class RobotController(Node if ROS_AVAILABLE else object):
         self.event_ok = False
         self.current_positions = None
         self.current_tool_pose = None
+        self.current_project_speed_percent = None
+        self.current_feedback_state_time = None
         self.client = None
         self.send_script_client = None
         self.event_client = None
@@ -322,6 +325,12 @@ class RobotController(Node if ROS_AVAILABLE else object):
             self._tool_cb,
             qos_profile_sensor_data,
         )
+        self.create_subscription(
+            FeedbackState,
+            "/feedback_states",
+            self._feedback_state_cb,
+            qos_profile_sensor_data,
+        )
 
     def shutdown(self):
         """Stop the spin thread and tear down the ROS node cleanly."""
@@ -416,19 +425,27 @@ class RobotController(Node if ROS_AVAILABLE else object):
         acc_time=0.0,
         blend_percentage=100,
         fine_goal=False,
+        motion_type=2,
     ):
-        """Send a tool-space PTP via SetPositions service."""
+        """Send a tool-space motion via SetPositions service.
+
+        ``motion_type`` 2 is PTP (joint-interpolated path; ``velocity`` in
+        rad/s). ``motion_type`` 4 is a straight Cartesian line; ``velocity`` is
+        then in m/s and the TM driver truncates it to whole mm/s.
+        """
         self.refresh_availability()
         if not (self.use_ros and self.service_ok and self.client):
+            return False
+        if int(motion_type) not in (2, 4):
             return False
 
         self.ensure_position_mode_ready()
 
         euler = transforms3d.euler.quat2euler(quaternion, axes="sxyz")
-        full = positions + list(euler)
+        full = list(positions) + list(euler)
 
         req = SetPositions.Request()
-        req.motion_type = 2
+        req.motion_type = int(motion_type)
         req.positions = full
         req.velocity = float(velocity)
         req.acc_time = float(acc_time)
@@ -890,6 +907,26 @@ class RobotController(Node if ROS_AVAILABLE else object):
             (position.x, position.y, position.z),
             (orientation.w, orientation.x, orientation.y, orientation.z),
         )
+
+    def _feedback_state_cb(self, msg):
+        try:
+            project_speed = float(msg.project_speed)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if math.isfinite(project_speed):
+            self.current_project_speed_percent = project_speed
+            self.current_feedback_state_time = time.monotonic()
+
+    def get_project_speed_percent(self):
+        """Return the TM project speed override reported by robot feedback."""
+        value = self.current_project_speed_percent
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0.0:
+            return None
+        return min(value, 100.0)
 
     # ------------------------------------------------------------------
     # Frame-aware velocity helpers

@@ -604,8 +604,29 @@ def test_secondary_sensor_raw_data_uses_its_replica_zero_mask():
     raw = np.array([[11.0, 99.0], [31.0, 41.0]])
     sensor._apply_cell_zero_mask_to_raw(raw, secondary_data)
 
-    assert raw[0, 1] == 20.0
+    # Display row 0 is source row 1 after the viewer flip.
+    assert raw[1, 1] == 40.0
+    assert raw[0, 1] == 99.0
     assert raw[0, 0] == 11.0
+
+
+def test_unmasked_display_row_keeps_its_signal_after_vertical_flip():
+    sensor = MySensor.__new__(MySensor)
+    data = SensorDataBuffer(3, 1, window_size=1)
+    data.getCal(np.array([[10.0], [20.0], [30.0]]))
+    sensor._data = data
+    sensor.cell_zero_mask = np.array([[True], [False], [False]])
+    sensor._multi_port_sensor_views = {}
+
+    raw = np.array([[11.0], [22.0], [33.0]])
+    sensor._apply_cell_zero_mask_to_raw(raw, data)
+    data.getRaw(raw)
+    data.calDiff()
+    data.calDiffPer()
+    data.getWin(1)
+
+    assert data.diffPerDataAve[0, 0] == 0.0
+    assert data.diffPerDataAve[2, 0] != 0.0
 
 
 def test_sensor_data_buffer_calculates_safe_percentage_difference():

@@ -1,5 +1,6 @@
 """Protocol constants and parsing shared by tactile sensor transports."""
 
+import threading
 import time
 
 
@@ -17,9 +18,20 @@ SENSOR_FRAME_END = (44444, 44444)
 _SENSOR_ACCUMULATOR_FLOOR = 32
 
 _SERIAL_LINE_BUFFER_ATTR = "_pinglab_serial_line_buffer"
+_SERIAL_WRITE_LOCK_ATTR = "_pinglab_serial_write_lock"
 _SERIAL_BITS_PER_BYTE = 10.0
 _MAX_ASCII_CHARS_PER_VALUE = 6
 _SENSOR_FRAME_OVERHEAD_VALUES = 4
+
+
+def write_serial_bytes(serial_port, payload):
+    """Write one complete payload without interleaving another thread's write."""
+    lock = getattr(serial_port, _SERIAL_WRITE_LOCK_ATTR, None)
+    if lock is None:
+        lock = threading.Lock()
+        setattr(serial_port, _SERIAL_WRITE_LOCK_ATTR, lock)
+    with lock:
+        return serial_port.write(bytes(payload))
 
 
 def sensor_response_timeout_for_values(

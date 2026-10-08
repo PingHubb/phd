@@ -9,6 +9,7 @@ import numpy as np
 
 APPROACH_PHASES = frozenset({"approaching", "contact_hold"})
 RETURN_PHASE = "returning"
+PROXIMITY_NOISE_MULTIPLIER = 2.0
 
 
 def taxel_signal_column(signal_field, taxel_index):
@@ -111,6 +112,58 @@ def _linear_fit(points):
     }
 
 
+def _smooth_polynomial_fit(points, maximum_degree=2):
+    """Fit a stable low-order loading curve in the original axis units."""
+    finite = []
+    for x_value, y_value in points:
+        try:
+            x_value = float(x_value)
+            y_value = float(y_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(x_value) and math.isfinite(y_value):
+            finite.append((x_value, y_value))
+    if len(finite) < 2:
+        return None
+    x_values = np.asarray([point[0] for point in finite], dtype=float)
+    y_values = np.asarray([point[1] for point in finite], dtype=float)
+    unique_x = np.unique(x_values)
+    if unique_x.size < 2 or float(np.ptp(x_values)) <= 1e-12:
+        return None
+    degree = min(
+        max(1, int(maximum_degree)),
+        int(unique_x.size) - 1,
+        len(finite) - 1,
+    )
+    if degree > 1 and len(finite) < 5:
+        degree = 1
+    try:
+        polynomial = np.polynomial.Polynomial.fit(
+            x_values,
+            y_values,
+            degree,
+        ).convert()
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    coefficients = np.asarray(polynomial.coef, dtype=float)
+    predicted = polynomial(x_values)
+    residuals = y_values - predicted
+    residual_sum = float(np.sum(residuals ** 2))
+    total_sum = float(np.sum((y_values - np.mean(y_values)) ** 2))
+    r_squared = 1.0 if total_sum <= 1e-12 else 1.0 - residual_sum / total_sum
+    return {
+        "degree": int(degree),
+        "coefficients": [float(value) for value in coefficients],
+        "r_squared": float(r_squared),
+        "sample_count": len(finite),
+        "rmse": float(np.sqrt(np.mean(residuals ** 2))),
+        "mae": float(np.mean(np.abs(residuals))),
+        "max_abs_error": float(np.max(np.abs(residuals))),
+        "x_min": float(np.min(x_values)),
+        "x_max": float(np.max(x_values)),
+    }
+
+
 def _first_sustained_position(values, threshold, count=2):
     required = max(1, int(count))
     run_start = None
@@ -154,6 +207,10 @@ def analyze_calibration_rows(rows, signal_field="diff_ave"):
             "signal_distance_fit": None,
             "force_distance_fit": None,
             "force_signal_fit": None,
+            "signal_distance_smooth_fit": None,
+            "force_distance_smooth_fit": None,
+            "force_signal_smooth_fit": None,
+            "segmented_smooth_fits": {},
         }
 
     approach_rows = [item[1] for item in indexed_approach]
@@ -175,7 +232,10 @@ def analyze_calibration_rows(rows, signal_field="diff_ave"):
     median_deviation = float(
         np.median(np.abs(baseline_values - signal_baseline))
     )
-    signal_threshold = max(1.0, 4.0 * 1.4826 * median_deviation)
+    signal_threshold = max(
+        1.0,
+        PROXIMITY_NOISE_MULTIPLIER * 1.4826 * median_deviation,
+    )
     signal_departure = np.abs(signals - signal_baseline)
     signal_position = _first_sustained_position(
         signal_departure,
@@ -240,6 +300,46 @@ def analyze_calibration_rows(rows, signal_field="diff_ave"):
         for row in contact_rows
     ]
 
+    proximity_start = int(signal_position or 0)
+    proximity_end = (
+        int(contact_position)
+        if contact_position is not None
+        else len(approach_rows)
+    )
+    segmented_rows = {
+        "proximity": approach_rows[proximity_start:proximity_end],
+        "contact": (
+            approach_rows[int(contact_position) :]
+            if contact_position is not None
+            else []
+        ),
+        "return": [
+            row
+            for row in rows
+            if str(row.get("phase", "")) == RETURN_PHASE
+        ],
+    }
+    relationship_fields = {
+        "signal_distance": ("travel_down_mm", signal_field),
+        "force_distance": ("travel_down_mm", "force_delta_abs_g"),
+        "force_signal": (signal_field, "force_delta_abs_g"),
+    }
+    segmented_smooth_fits = {
+        relationship: {
+            segment: _smooth_polynomial_fit(
+                [
+                    (
+                        _finite_value(row, x_field),
+                        _finite_value(row, y_field),
+                    )
+                    for row in segment_rows
+                ]
+            )
+            for segment, segment_rows in segmented_rows.items()
+        }
+        for relationship, (x_field, y_field) in relationship_fields.items()
+    }
+
     return {
         "signal_field": signal_field,
         "signal_baseline": signal_baseline,
@@ -252,4 +352,14 @@ def analyze_calibration_rows(rows, signal_field="diff_ave"):
         "signal_distance_fit": _linear_fit(signal_distance_points),
         "force_distance_fit": _linear_fit(force_distance_points),
         "force_signal_fit": _linear_fit(force_signal_points),
+        "signal_distance_smooth_fit": _smooth_polynomial_fit(
+            signal_distance_points
+        ),
+        "force_distance_smooth_fit": _smooth_polynomial_fit(
+            force_distance_points
+        ),
+        "force_signal_smooth_fit": _smooth_polynomial_fit(
+            force_signal_points
+        ),
+        "segmented_smooth_fits": segmented_smooth_fits,
     }

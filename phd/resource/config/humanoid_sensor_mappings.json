@@ -42,6 +42,27 @@
       "vid": 12346,
       "pid": 4097,
       "last_port": "ttyACM4"
+    },
+    "usb:303a:1001:dc:54:75:ea:4a:74": {
+      "part": "sensor:dexterous_hand",
+      "serial_number": "DC:54:75:EA:4A:74",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM6"
+    },
+    "usb:303a:1001:48:f6:ee:23:08:9c": {
+      "part": "sensor:testing_5x5_1",
+      "serial_number": "48:F6:EE:23:08:9C",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM6"
+    },
+    "usb:303a:1001:1c:db:d4:17:a7:58": {
+      "part": "sensor:testing_5x5_2",
+      "serial_number": "1C:DB:D4:17:A7:58",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM7"
     }
   },
   "mappings": {

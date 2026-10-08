@@ -44,6 +44,8 @@ from phd.dependence.goodix_usb_sensor import (
 )
 from phd.dependence.humanoid_sensor_registry import (
     humanoid_sensor_annotation,
+    is_force_transmitter_port,
+    is_realsense_camera_port,
     load_humanoid_device_assignments,
 )
 from phd.dependence.sensor_heatmap import (
@@ -914,6 +916,8 @@ class MySensor:
             port
             for port in serial.tools.list_ports.comports()
             if not str(port.name or "").lower().startswith("ttys")
+            and not is_realsense_camera_port(port)
+            and not is_force_transmitter_port(port)
         ]
         self.ser = None
         self.parent.serial_channel.clear()
@@ -2863,6 +2867,17 @@ class MySensor:
             n_col = int(profile.get("n_col", fallback.get("n_col", self.n_col)))
         except Exception:
             n_col = int(fallback.get("n_col", self.n_col))
+        try:
+            baud_rate = int(
+                profile.get(
+                    "baud_rate",
+                    fallback.get("baud_rate", DEFAULT_SENSOR_BAUD_RATE),
+                )
+            )
+        except Exception:
+            baud_rate = int(
+                fallback.get("baud_rate", DEFAULT_SENSOR_BAUD_RATE)
+            )
         return {
             "n_row": max(1, n_row),
             "n_col": max(1, n_col),
@@ -2872,6 +2887,7 @@ class MySensor:
                     fallback.get("has_extra_column", True),
                 )
             ),
+            "baud_rate": max(1, baud_rate),
         }
 
     def _resolve_sensor_port_profiles(self, selected_sources):
@@ -2884,6 +2900,14 @@ class MySensor:
                 getattr(self.parent.grid_cols_spin, "value", lambda: 10)()
             ),
             "has_extra_column": self._raw_packet_has_extra_column(),
+            "baud_rate": int(
+                getattr(
+                    getattr(self.parent, "sensor_baud_combo", None),
+                    "currentData",
+                    lambda: DEFAULT_SENSOR_BAUD_RATE,
+                )()
+                or DEFAULT_SENSOR_BAUD_RATE
+            ),
         }
         profiles = {}
         for source in selected_sources:
@@ -2905,6 +2929,7 @@ class MySensor:
             "n_row": int(self.n_row),
             "n_col": int(self.n_col),
             "has_extra_column": self._raw_packet_has_extra_column(),
+            "baud_rate": DEFAULT_SENSOR_BAUD_RATE,
         }
 
     @staticmethod
@@ -3210,20 +3235,27 @@ class MySensor:
     def _open_serial_ports(self, port_names):
         serial_ports = []
         for port_name in port_names:
+            port_path = str(port_name)
+            if not os.path.isabs(port_path):
+                port_path = os.path.join("/dev", port_path)
+            profile = self._sensor_profile_for_port(port_path)
+            baud_rate = int(
+                profile.get("baud_rate", DEFAULT_SENSOR_BAUD_RATE)
+            )
             try:
                 ser = serial.Serial(
-                    port=f"/dev/{port_name}",
-                    baudrate=DEFAULT_SENSOR_BAUD_RATE,
+                    port=port_path,
+                    baudrate=baud_rate,
                     timeout=DEFAULT_SENSOR_SERIAL_TIMEOUT_SEC,
                 )
                 serial_ports.append(ser)
                 discard_pending_serial_input(ser)
-                print(f"Opened port: /dev/{port_name}")
+                print(f"Opened port: {port_path} at {baud_rate} baud")
             except Exception as exc:
                 self._set_sensor_stream_error(
-                    f"Could not open /dev/{port_name}: {exc}"
+                    f"Could not open {port_path}: {exc}"
                 )
-                print(f"Failed to open /dev/{port_name}: {exc}")
+                print(f"Failed to open {port_path}: {exc}")
         return serial_ports
 
     def _sensor_reader_is_running(self):
@@ -5049,7 +5081,11 @@ class MySensor:
         cal = getattr(data_obj, "calData", None)
         if cal is None or cal.shape != raw_matrix.shape:
             return
-        raw_matrix[mask] = cal[mask]
+        # The plotter and signal viewer show flipud(raw). The saved mask uses
+        # that same top-down row order, so map it back onto the source frame
+        # before clearing cells. Otherwise a visible taxel displays a row
+        # that was already forced to its calibration value.
+        raw_matrix[np.flipud(mask)] = cal[np.flipud(mask)]
 
     def _cell_zero_mask_for_data_object(self, data_obj):
         """Return the mask belonging to the sensor data buffer being updated."""

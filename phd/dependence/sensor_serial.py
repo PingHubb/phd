@@ -20,6 +20,7 @@ from phd.dependence.sensor_protocol import (
     take_complete_sensor_payload,
     trim_sensor_payload_accumulator,
     wait_for_serial_input,
+    write_serial_bytes,
 )
 
 
@@ -63,7 +64,7 @@ class SensorReadWorker(QObject):
     def _request_raw_from_port(self, serial_port):
         port_name = str(getattr(serial_port, "port", "unknown"))
         try:
-            serial_port.write(SENSOR_READ_RAW_COMMAND)
+            write_serial_bytes(serial_port, SENSOR_READ_RAW_COMMAND)
             return True
         except Exception as exc:
             self.error.emit(f"Sensor write failed on {port_name}: {exc}")

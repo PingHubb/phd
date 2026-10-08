@@ -4,6 +4,7 @@ import json
 import numpy as np
 
 from phd.ui.calibration_graph_analysis import (
+    _dataset_sensor_shape,
     analyze_calibration_batch,
     analyze_calibration_dataset,
     build_batch_report,
@@ -102,7 +103,41 @@ def test_professional_analysis_reports_events_models_and_hysteresis():
     assert "ACQUISITION QUALITY" in report
     assert "Non-contact proximity travel window" in report
     assert "LOADING REGRESSION MODELS" in report
+    assert "PIECEWISE SMOOTH APPROXIMATIONS" not in report
     assert "LOADING/RETURN HYSTERESIS" in report
+
+
+def test_piecewise_approximations_separate_proximity_contact_and_return():
+    dataset = {
+        "name": "Trial 0001",
+        "source_path": "/tmp/trial_0001.csv",
+        "signal_field": "diff_ave",
+        "rows": _synthetic_rows(),
+    }
+
+    analysis = analyze_calibration_dataset(dataset)
+    fits = analysis["segmented_approximations"]
+    contact_distance = analysis["events"]["contact_onset"]["distance_mm"]
+
+    for relationship in (
+        "signal_distance",
+        "force_distance",
+        "force_signal",
+    ):
+        assert set(fits[relationship]) == {
+            "proximity",
+            "contact",
+            "return",
+        }
+        assert all(
+            fits[relationship][segment] is not None
+            for segment in fits[relationship]
+        )
+    assert fits["signal_distance"]["proximity"]["x_max"] < contact_distance
+    assert np.isclose(
+        fits["signal_distance"]["contact"]["x_min"],
+        contact_distance,
+    )
 
 
 def test_graph_cursor_interpolates_local_curve_in_both_directions():
@@ -208,3 +243,75 @@ def test_batch_json_loads_trials_and_reports_repeatability(tmp_path):
     assert batch["trial_count"] == 2
     assert batch["repeatability"]["contact_onset_distance_mm"]["count"] == 2
     assert "BATCH REPEATABILITY ANALYSIS" in build_batch_report(batch)
+
+
+def test_full_taxel_summary_uses_each_trial_sensor_shape(tmp_path):
+    trial_directory = tmp_path / "taxel_12"
+    trial_directory.mkdir()
+    trial_path = trial_directory / "trial_0001.csv"
+    rows = _synthetic_rows()
+    for row in rows:
+        row["taxel_012_diff_ave"] = row["diff_ave"]
+        row["cell_index"] = 12
+    _write_csv(trial_path, rows)
+    metadata_path = trial_path.with_suffix(".json")
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "sensor_shape": [5, 5],
+                "taxel_index": 12,
+                "signal_field": "diff_ave",
+                "csv_path": str(trial_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    batch_path = trial_directory / "batch_summary.csv"
+    _write_csv(
+        batch_path,
+        [
+            {
+                "taxel_index": 12,
+                "trial_number": 1,
+                "csv_path": str(trial_path),
+                "metadata_path": str(metadata_path),
+            }
+        ],
+    )
+    full_csv_path = tmp_path / "full_taxel_summary.csv"
+    _write_csv(
+        full_csv_path,
+        [
+            {
+                "taxel_index": 12,
+                "trial_number": 1,
+                "csv_path": str(trial_path),
+                "metadata_path": str(metadata_path),
+            }
+        ],
+    )
+    full_json_path = full_csv_path.with_suffix(".json")
+    full_json_path.write_text(
+        json.dumps(
+            {
+                "task": "full_taxel_calibration",
+                "signal_field": "diff_ave",
+                "summary_csv_path": str(full_csv_path),
+                "taxel_results": [
+                    {
+                        "taxel_index": 12,
+                        "batch_summary_path": str(batch_path),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from_csv = load_calibration_recording(full_csv_path)
+    from_json = load_calibration_recording(full_json_path)
+
+    assert _dataset_sensor_shape(from_csv["datasets"][0]) == (5, 5)
+    assert _dataset_sensor_shape(from_json["datasets"][0]) == (5, 5)
+    assert from_csv["datasets"][0]["metadata"]["taxel_index"] == 12.0
+    assert from_json["datasets"][0]["metadata"]["taxel_index"] == 12.0

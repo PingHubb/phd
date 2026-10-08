@@ -19,6 +19,9 @@ HUMANOID_PART_DISPLAY = {
         (10, 10),
     ),
     "sensor:testing_8x10": ("Testing Sensor", (8, 10)),
+    "sensor:testing_5x5_1": ("Testing Sensor 1", (5, 5)),
+    "sensor:testing_5x5_2": ("Testing Sensor 2", (5, 5)),
+    "sensor:dexterous_hand": ("Dexterous Hand", (27, 22)),
     "signal:1:head_link": ("Head", (9, 14)),
     "signal:10:torso_link": ("Torso Part 10", (15, 16)),
     "signal:11:torso_link": ("Torso Part 11", (16, 17)),
@@ -29,6 +32,97 @@ HUMANOID_PART_DISPLAY = {
 EXTRA_COLUMN_PARTS = {
     "sensor:robot_arm_end_effector",
 }
+
+
+REALSENSE_USB_VID = 0x8086
+REALSENSE_USB_PID = 0x0B56
+FORCE_TRANSMITTER_USB_VID = 0x0403
+FORCE_TRANSMITTER_USB_PID = 0x6015
+FORCE_TRANSMITTER_SERIALS = frozenset({"da43gjnl"})
+BIBOARD_USB_VID = 0x1A86
+BIBOARD_USB_PID = 0x55D3
+BIBOARD_TACTILE_PROFILE = {
+    "n_row": 8,
+    "n_col": 8,
+    "has_extra_column": False,
+    "baud_rate": 115200,
+}
+
+
+def is_realsense_camera_port(port) -> bool:
+    """True for the Intel RealSense serial interface, which is not a tactile sensor."""
+    text = " ".join(
+        str(getattr(port, attr, "") or "")
+        for attr in ("description", "manufacturer", "product", "hwid", "name", "device")
+    ).lower()
+    if "realsense" in text:
+        return True
+    vid = getattr(port, "vid", None)
+    pid = getattr(port, "pid", None)
+    try:
+        return int(vid) == REALSENSE_USB_VID and int(pid) == REALSENSE_USB_PID
+    except (TypeError, ValueError):
+        return False
+
+
+def is_force_transmitter_port(port) -> bool:
+    """True for the RS-485 force transmitter, which is not a tactile sensor."""
+    serial_number = str(getattr(port, "serial_number", "") or "").strip().lower()
+    if serial_number in FORCE_TRANSMITTER_SERIALS:
+        return True
+    text = " ".join(
+        str(getattr(port, attr, "") or "")
+        for attr in ("description", "manufacturer", "product", "hwid")
+    ).lower()
+    vid = getattr(port, "vid", None)
+    pid = getattr(port, "pid", None)
+    try:
+        matches_adapter = (
+            int(vid) == FORCE_TRANSMITTER_USB_VID
+            and int(pid) == FORCE_TRANSMITTER_USB_PID
+        )
+    except (TypeError, ValueError):
+        matches_adapter = False
+    return matches_adapter and ("rs-485" in text or "rs485" in text)
+
+
+def is_biboard_port(port) -> bool:
+    """True for the CH9102/CH343 USB interface used by BiBoard V1."""
+    vid = getattr(port, "vid", None)
+    pid = getattr(port, "pid", None)
+    try:
+        return int(vid) == BIBOARD_USB_VID and int(pid) == BIBOARD_USB_PID
+    except (TypeError, ValueError):
+        return False
+
+
+def assigned_sensor_profile(port_name) -> dict:
+    """Return the saved name, part key, and grid for a connected sensor port."""
+    port = _current_serial_port(port_name)
+    if port is None:
+        return {}
+    identity = stable_usb_port_identity(port)
+    if not identity:
+        return {}
+    assignment = load_humanoid_device_assignments().get(identity, {})
+    part = (
+        str(assignment.get("part") or "")
+        if isinstance(assignment, dict)
+        else ""
+    )
+    display = HUMANOID_PART_DISPLAY.get(part)
+    if display is None:
+        return {
+            "key": identity,
+            "label": os.path.basename(str(port_name or identity)),
+            "shape": None,
+        }
+    shape = display[1]
+    return {
+        "key": part,
+        "label": str(display[0]),
+        "shape": (int(shape[0]), int(shape[1])),
+    }
 
 
 def stable_usb_port_identity(port) -> str:
@@ -168,3 +262,11 @@ def humanoid_sensor_extra_column_for_device(port_name):
     if port is None:
         return None
     return humanoid_sensor_uses_extra_column(port)
+
+
+def biboard_tactile_profile_for_device(port_name):
+    """Return the OpenCat tactile serial profile for a connected BiBoard."""
+    port = _current_serial_port(port_name)
+    if port is None or not is_biboard_port(port):
+        return None
+    return dict(BIBOARD_TACTILE_PROFILE)

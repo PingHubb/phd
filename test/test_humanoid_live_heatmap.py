@@ -322,6 +322,56 @@ def test_testing_sensor_profile_uses_eight_by_ten_without_extra_column():
     assert humanoid_sensor_uses_extra_column(port, assignments) is False
 
 
+def test_five_by_five_testing_sensors_keep_separate_names():
+    first = SimpleNamespace(
+        serial_number="48:F6:EE:23:08:9C",
+        vid=0x303A,
+        pid=0x1001,
+    )
+    second = SimpleNamespace(
+        serial_number="1C:DB:D4:17:A7:58",
+        vid=0x303A,
+        pid=0x1001,
+    )
+    assignments = {
+        "usb:303a:1001:48:f6:ee:23:08:9c": {
+            "part": "sensor:testing_5x5_1"
+        },
+        "usb:303a:1001:1c:db:d4:17:a7:58": {
+            "part": "sensor:testing_5x5_2"
+        },
+    }
+
+    assert humanoid_sensor_annotation(first, assignments) == (
+        "Testing Sensor 1 (5x5)"
+    )
+    assert humanoid_sensor_grid_shape(first, assignments) == (5, 5)
+    assert humanoid_sensor_uses_extra_column(first, assignments) is False
+    assert humanoid_sensor_annotation(second, assignments) == (
+        "Testing Sensor 2 (5x5)"
+    )
+    assert humanoid_sensor_grid_shape(second, assignments) == (5, 5)
+
+
+def test_dexterous_hand_profile_uses_twenty_seven_by_twenty_two():
+    port = SimpleNamespace(
+        serial_number="DC:54:75:EA:4A:74",
+        vid=0x303A,
+        pid=0x1001,
+    )
+    assignments = {
+        "usb:303a:1001:dc:54:75:ea:4a:74": {
+            "part": "sensor:dexterous_hand"
+        }
+    }
+
+    assert humanoid_sensor_annotation(port, assignments) == (
+        "Dexterous Hand (27x22)"
+    )
+    assert humanoid_sensor_grid_shape(port, assignments) == (27, 22)
+    assert humanoid_sensor_uses_extra_column(port, assignments) is False
+
+
 def test_remembered_head_sensor_follows_a_renamed_port(monkeypatch):
     head_identity = "usb:303a:1001:48:f6:ee:22:7e:68"
     renamed_head = SimpleNamespace(

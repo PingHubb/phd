@@ -18,6 +18,7 @@ from phd.dependence.sensor_protocol import (
     take_complete_sensor_payload,
     trim_sensor_payload_accumulator,
     wait_for_serial_input,
+    write_serial_bytes,
 )
 
 try:
@@ -133,7 +134,10 @@ class ArduinoCommander:
             return False
 
         try:
-            self.ser.write((text + "\n").encode("utf-8"))
+            write_serial_bytes(
+                self.ser,
+                (text + "\n").encode("utf-8"),
+            )
             return True
         except Exception as exc:
             print(f"[SensorAPI] Failed to write to sensor serial port: {exc}")
