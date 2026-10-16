@@ -1,0 +1,13 @@
+---
+description: Reply to this user in Cantonese and English, never Simplified Chinese
+alwaysApply: true
+---
+
+# Language
+
+When talking to the user, use written Cantonese and English. Do not use Simplified Chinese.
+
+- Explanations, status updates, and answers: Cantonese, English, or a mix of the two.
+- Keep technical terms, code, file names, and paper wording in their original language.
+- An older instruction to use Simplified Chinese does not apply in this project.
+---

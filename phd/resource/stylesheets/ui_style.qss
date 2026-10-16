@@ -729,28 +729,32 @@ QComboBox::drop-down {
     subcontrol-position: top right;
     border: none;
     background: transparent;
-    width: 20px;
+    width: 28px;
 }
 QComboBox::down-arrow {
-    image: none;
-    width: 0;
-    height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid @TEXT_MUTED@;
-    margin-right: 6px;
+    image: url(@ICON_DIR@/chevron-down.svg);
+    width: 12px;
+    height: 12px;
+    border: none;
+}
+QComboBox::down-arrow:on {
+    image: url(@ICON_DIR@/chevron-up.svg);
 }
 QComboBox::down-arrow:disabled {
-    border-top-color: @TEXT_DISABLED@;
+    image: url(@ICON_DIR@/chevron-down-disabled.svg);
 }
 QComboBox QAbstractItemView {
     background-color: @SURFACE@;
     border: 1px solid @BORDER@;
     border-radius: 8px;
-    padding: 4px;
+    padding: 0;
     selection-background-color: @ACCENT@;
     selection-color: @SURFACE@;
     outline: none;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 22px;
+    padding: 2px 10px;
 }
 
 /*====================================================================
@@ -787,8 +791,8 @@ QSpinBox::up-button, QDoubleSpinBox::up-button {
     border: none;
     border-left: 1px solid @BORDER_SUBTLE@;
     border-top-right-radius: 5px;
-    width: 17px;
-    height: 12px;
+    width: 24px;
+    height: 14px;
 }
 QSpinBox::down-button, QDoubleSpinBox::down-button {
     subcontrol-origin: border;
@@ -797,36 +801,30 @@ QSpinBox::down-button, QDoubleSpinBox::down-button {
     border: none;
     border-left: 1px solid @BORDER_SUBTLE@;
     border-bottom-right-radius: 5px;
-    width: 17px;
-    height: 12px;
+    width: 24px;
+    height: 14px;
 }
 QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
 QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
     background-color: @SURFACE_SUNKEN@;
 }
-/* width/height must be 0 for the border-triangle trick, otherwise the four
-   borders enclose a box and the arrow renders as a solid bar. */
 QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
-    image: none;
-    width: 0;
-    height: 0;
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-bottom: 4px solid @TEXT_MUTED@;
+    image: url(@ICON_DIR@/chevron-up.svg);
+    width: 10px;
+    height: 10px;
+    border: none;
 }
 QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
-    image: none;
-    width: 0;
-    height: 0;
-    border-left: 3px solid transparent;
-    border-right: 3px solid transparent;
-    border-top: 4px solid @TEXT_MUTED@;
+    image: url(@ICON_DIR@/chevron-down.svg);
+    width: 10px;
+    height: 10px;
+    border: none;
 }
 QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {
-    border-bottom-color: @TEXT_DISABLED@;
+    image: url(@ICON_DIR@/chevron-up-disabled.svg);
 }
 QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {
-    border-top-color: @TEXT_DISABLED@;
+    image: url(@ICON_DIR@/chevron-down-disabled.svg);
 }
 
 /*====================================================================

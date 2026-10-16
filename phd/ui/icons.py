@@ -166,6 +166,8 @@ _STROKE_GLYPHS = {
     ),
     "chevron-left": '<path d="M14.9 5.4L8.3 12l6.6 6.6"/>',
     "chevron-right": '<path d="M9.1 5.4L15.7 12l-6.6 6.6"/>',
+    "chevron-up": '<path d="M5.4 14.9L12 8.3l6.6 6.6"/>',
+    "chevron-down": '<path d="M5.4 9.1L12 15.7l6.6 -6.6"/>',
     "check": '<path d="M4.8 12.6l4.7 4.7L19.2 7.1"/>',
     # "transmit this one value" -- used by the per-actuator send buttons.
     "send": (
@@ -312,6 +314,18 @@ def write_stylesheet_assets(target_dir) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     assets = {
         "check-white.svg": svg_markup("check", "#FFFFFF", stroke_width=2.6),
+        "chevron-up.svg": svg_markup(
+            "chevron-up", theme.TEXT_MUTED, stroke_width=2.4
+        ),
+        "chevron-down.svg": svg_markup(
+            "chevron-down", theme.TEXT_MUTED, stroke_width=2.4
+        ),
+        "chevron-up-disabled.svg": svg_markup(
+            "chevron-up", theme.TEXT_DISABLED, stroke_width=2.4
+        ),
+        "chevron-down-disabled.svg": svg_markup(
+            "chevron-down", theme.TEXT_DISABLED, stroke_width=2.4
+        ),
     }
     for filename, markup in assets.items():
         path = directory / filename

@@ -48,6 +48,14 @@ known legacy layout issues are documented in
 
 ## External AI assets
 
+For continuous finger-position and speed training, open **AI → Data → Open Touch
+Tracking workspace**. Camera-free collection and immediate direct tracking are
+now the default; optional independent camera/CSV references remain available.
+Sensor-estimated training targets are explicitly distinguished from physical
+ground truth. The recorder, model comparison and sensor-only preview
+are described in [the Touch Tracking guide](../docs/TOUCH_TRACKING_WORKFLOW.md).
+Existing imitation-policy recordings/models remain separate and unchanged.
+
 Large AI datasets and checkpoints should live outside the Python package.  By
 default the app still uses `phd/resource/ai`, but you can point it at an
 external asset folder:

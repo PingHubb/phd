@@ -1,6 +1,7 @@
 """State and rolling averages for one tactile sensor grid."""
 
 import numpy as np
+import time
 
 
 class SensorDataBuffer:
@@ -21,6 +22,17 @@ class SensorDataBuffer:
         self.diffDataAve = np.zeros((self.n_row, self.n_col))
         self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
         self.frame_sequence = 0
+        self.frame_monotonic_sec = None
+        self._frame_listeners = []
+
+    def add_frame_listener(self, callback):
+        """Subscribe to completed native-layout frames, without UI polling copies."""
+        if callback not in self._frame_listeners:
+            self._frame_listeners.append(callback)
+
+    def remove_frame_listener(self, callback):
+        if callback in self._frame_listeners:
+            self._frame_listeners.remove(callback)
 
     def _recompute_averages(self):
         self.rawDataAve = np.flipud(np.mean(self.rawDataWin, axis=0))
@@ -63,6 +75,7 @@ class SensorDataBuffer:
         self.diffDataAve = np.zeros((self.n_row, self.n_col))
         self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
         self.frame_sequence = 0
+        self.frame_monotonic_sec = None
 
     def getWin(self, index):
         """Insert the current frame, preserving the legacy 1-based indexing."""
@@ -80,3 +93,12 @@ class SensorDataBuffer:
         if index >= self.windowSize:
             self._recompute_averages()
             self.frame_sequence += 1
+            self.frame_monotonic_sec = time.monotonic()
+            for callback in tuple(self._frame_listeners):
+                try:
+                    callback(self)
+                except Exception as exc:
+                    # A consumer must not break sensor acquisition. Fail visibly
+                    # and unsubscribe it rather than producing silent partial data.
+                    print(f"[SensorData] Frame listener stopped: {exc}")
+                    self.remove_frame_listener(callback)

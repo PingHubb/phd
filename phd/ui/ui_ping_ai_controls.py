@@ -23,6 +23,22 @@ class AiControlsMixin:
         ai_resource_path("models", "tactile_proximity")
     )
 
+    def _open_touch_tracking_workbench(self):
+        from phd.ui.touch_tracking_window import TouchTrackingWindow
+
+        window = getattr(self, "touch_tracking_window", None)
+        if window is None or getattr(window, "_closing", False):
+            window = TouchTrackingWindow(self)
+            self.touch_tracking_window = window
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _shutdown_touch_tracking_workbench(self):
+        window = getattr(self, "touch_tracking_window", None)
+        if window is not None:
+            window.shutdown()
+
     def _set_ai_frame(self, frame: str):
         self.ai_selected_frame = frame
         if hasattr(self, "ai_frame_input") and self.ai_frame_input is not None:

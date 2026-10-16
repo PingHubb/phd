@@ -4999,9 +4999,24 @@ class UI(
         training_layout = QVBoxLayout(training_page)
         training_layout.setSpacing(theme.SPACE_LG)
 
+        tracking_group, tracking_list = components.section(
+            "Continuous touch tracking",
+            "Camera-free guided collection, optional independent references, "
+            "model comparison and sensor-only preview without robot movement.",
+        )
+        self.touch_tracking_workbench_button = QPushButton(
+            "Open Touch Tracking workspace"
+        )
+        self.touch_tracking_workbench_button.clicked.connect(
+            self._open_touch_tracking_workbench
+        )
+        tracking_list.add(self.touch_tracking_workbench_button)
+        training_layout.addWidget(tracking_group)
+
         record_group, record_list = components.section(
-            "Record a dataset",
-            "Capture tactile trials for training the policy.",
+            "Existing robot-policy recording",
+            "Legacy imitation targets from controller/manual commands. "
+            "For continuous finger-position training, use Touch Tracking above.",
         )
 
         # One selection instead of four "Set ... Mode" buttons: these were

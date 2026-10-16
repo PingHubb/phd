@@ -18,6 +18,70 @@ ROBOT_DOG_SWIPE_COMMANDS = {
     "left": "kstr",
     "right": "khi",
 }
+ROBOT_DOG_REST_COMMAND = "d"
+
+
+def _connected_components(mask):
+    rows, columns = mask.shape
+    remaining = {
+        (int(row), int(column))
+        for row, column in np.argwhere(mask)
+    }
+    components_found = []
+    while remaining:
+        seed = remaining.pop()
+        stack = [seed]
+        component = [seed]
+        while stack:
+            row, column = stack.pop()
+            for delta_row in (-1, 0, 1):
+                for delta_column in (-1, 0, 1):
+                    if delta_row == 0 and delta_column == 0:
+                        continue
+                    neighbor = (
+                        row + delta_row,
+                        column + delta_column,
+                    )
+                    if (
+                        0 <= neighbor[0] < rows
+                        and 0 <= neighbor[1] < columns
+                        and neighbor in remaining
+                    ):
+                        remaining.remove(neighbor)
+                        stack.append(neighbor)
+                        component.append(neighbor)
+        components_found.append(component)
+    return components_found
+
+
+def _single_touch_center(values, touch_threshold):
+    touched = values < touch_threshold
+    components_found = _connected_components(touched)
+    if not components_found:
+        return None, 0
+    if len(components_found) != 1:
+        return None, len(components_found)
+
+    component = np.asarray(components_found[0], dtype=int)
+    rows = component[:, 0]
+    columns = component[:, 1]
+    weights = np.maximum(
+        touch_threshold - values[rows, columns],
+        0.001,
+    )
+    return (
+        float(np.average(rows, weights=weights)),
+        float(np.average(columns, weights=weights)),
+    ), 1
+
+
+def _normalized_offset(shape, start, center):
+    row_span = max(1.0, float(shape[0] - 1))
+    column_span = max(1.0, float(shape[1] - 1))
+    return (
+        (center[0] - start[0]) / row_span,
+        (center[1] - start[1]) / column_span,
+    )
 
 
 class SingleFingerSwipeDetector:
@@ -49,59 +113,6 @@ class SingleFingerSwipeDetector:
         self._emitted = False
         self._blocked_until_release = False
 
-    @staticmethod
-    def _connected_components(mask):
-        rows, columns = mask.shape
-        remaining = {
-            (int(row), int(column))
-            for row, column in np.argwhere(mask)
-        }
-        components_found = []
-        while remaining:
-            seed = remaining.pop()
-            stack = [seed]
-            component = [seed]
-            while stack:
-                row, column = stack.pop()
-                for delta_row in (-1, 0, 1):
-                    for delta_column in (-1, 0, 1):
-                        if delta_row == 0 and delta_column == 0:
-                            continue
-                        neighbor = (
-                            row + delta_row,
-                            column + delta_column,
-                        )
-                        if (
-                            0 <= neighbor[0] < rows
-                            and 0 <= neighbor[1] < columns
-                            and neighbor in remaining
-                        ):
-                            remaining.remove(neighbor)
-                            stack.append(neighbor)
-                            component.append(neighbor)
-            components_found.append(component)
-        return components_found
-
-    def _single_touch_center(self, values):
-        touched = values < self.touch_threshold
-        components_found = self._connected_components(touched)
-        if not components_found:
-            return None, 0
-        if len(components_found) != 1:
-            return None, len(components_found)
-
-        component = np.asarray(components_found[0], dtype=int)
-        rows = component[:, 0]
-        columns = component[:, 1]
-        weights = np.maximum(
-            self.touch_threshold - values[rows, columns],
-            0.001,
-        )
-        return (
-            float(np.average(rows, weights=weights)),
-            float(np.average(columns, weights=weights)),
-        ), 1
-
     def _release(self):
         self._start_center = None
         self._started_at = None
@@ -116,7 +127,10 @@ class SingleFingerSwipeDetector:
             self.reset()
             return None
         now = time.monotonic() if timestamp is None else float(timestamp)
-        center, cluster_count = self._single_touch_center(matrix)
+        center, cluster_count = _single_touch_center(
+            matrix,
+            self.touch_threshold,
+        )
 
         if cluster_count == 0:
             self._no_touch_count += 1
@@ -149,10 +163,11 @@ class SingleFingerSwipeDetector:
         if self._sample_count < self.minimum_frames:
             return None
 
-        row_span = max(1.0, float(matrix.shape[0] - 1))
-        column_span = max(1.0, float(matrix.shape[1] - 1))
-        delta_row = (center[0] - self._start_center[0]) / row_span
-        delta_column = (center[1] - self._start_center[1]) / column_span
+        delta_row, delta_column = _normalized_offset(
+            matrix.shape,
+            self._start_center,
+            center,
+        )
         vertical = abs(delta_row)
         horizontal = abs(delta_column)
 
@@ -173,6 +188,124 @@ class SingleFingerSwipeDetector:
         return direction
 
 
+class SingleFingerDoubleTapDetector:
+    """Recognize two short stationary taps inside one time window."""
+
+    def __init__(
+        self,
+        *,
+        touch_threshold=-3.0,
+        maximum_travel=0.22,
+        minimum_contact_frames=2,
+        maximum_contact_sec=0.40,
+        double_tap_window_sec=0.50,
+        release_frames=2,
+    ):
+        self.touch_threshold = float(touch_threshold)
+        self.maximum_travel = float(maximum_travel)
+        self.minimum_contact_frames = max(1, int(minimum_contact_frames))
+        self.maximum_contact_sec = max(0.05, float(maximum_contact_sec))
+        self.double_tap_window_sec = max(0.05, float(double_tap_window_sec))
+        self.release_frames = max(1, int(release_frames))
+        self.reset()
+
+    def reset(self):
+        self._start_center = None
+        self._started_at = None
+        self._last_touch_at = None
+        self._sample_count = 0
+        self._max_travel = 0.0
+        self._qualified = True
+        self._no_touch_count = 0
+        self._pending_tap_at = None
+
+    def _clear_contact(self):
+        self._start_center = None
+        self._started_at = None
+        self._last_touch_at = None
+        self._sample_count = 0
+        self._max_travel = 0.0
+        self._qualified = True
+
+    def _finish_contact(self):
+        started_at = self._started_at
+        last_touch_at = self._last_touch_at
+        sample_count = self._sample_count
+        qualified = bool(self._qualified and self._start_center is not None)
+        pending_tap_at = self._pending_tap_at
+        self._clear_contact()
+
+        is_tap = (
+            qualified
+            and started_at is not None
+            and last_touch_at is not None
+            and sample_count >= self.minimum_contact_frames
+            and (last_touch_at - started_at) <= self.maximum_contact_sec
+        )
+        if not is_tap:
+            if sample_count > 0:
+                self._pending_tap_at = None
+            return None
+        if (
+            pending_tap_at is not None
+            and (started_at - pending_tap_at) <= self.double_tap_window_sec
+        ):
+            self._pending_tap_at = None
+            return "double_tap"
+        self._pending_tap_at = last_touch_at
+        return None
+
+    def process(self, values, timestamp=None):
+        """Return ``double_tap`` when the second tap lifts inside the window."""
+        matrix = np.asarray(values, dtype=float)
+        if matrix.ndim != 2 or min(matrix.shape) < 2:
+            self.reset()
+            return None
+        now = time.monotonic() if timestamp is None else float(timestamp)
+        center, cluster_count = _single_touch_center(
+            matrix,
+            self.touch_threshold,
+        )
+
+        if cluster_count == 0:
+            self._no_touch_count += 1
+            if self._start_center is None:
+                return None
+            if self._no_touch_count >= self.release_frames:
+                return self._finish_contact()
+            return None
+
+        self._no_touch_count = 0
+        if cluster_count != 1 or center is None:
+            self._qualified = False
+            self._pending_tap_at = None
+            return None
+
+        if self._start_center is None:
+            self._start_center = center
+            self._started_at = now
+            self._last_touch_at = now
+            self._sample_count = 1
+            self._max_travel = 0.0
+            self._qualified = True
+            return None
+
+        self._sample_count += 1
+        self._last_touch_at = now
+        delta_row, delta_column = _normalized_offset(
+            matrix.shape,
+            self._start_center,
+            center,
+        )
+        travel = (delta_row * delta_row + delta_column * delta_column) ** 0.5
+        self._max_travel = max(self._max_travel, travel)
+        if self._max_travel > self.maximum_travel:
+            self._qualified = False
+        if now - self._started_at > self.maximum_contact_sec:
+            self._qualified = False
+        return None
+
+
 class RobotDogControlsMixin:
     """Build and operate the log-only Robot Dog gesture subtab."""
 
@@ -180,10 +313,11 @@ class RobotDogControlsMixin:
         self._robot_dog_gesture_enabled = False
         self._robot_dog_sensor_signal = None
         self._robot_dog_swipe_detector = SingleFingerSwipeDetector()
+        self._robot_dog_double_tap_detector = SingleFingerDoubleTapDetector()
 
         control_group, control_list = components.section(
             "Tactile gesture control",
-            "Recognize one-finger swipes from the connected tactile sensor.",
+            "Recognize one-finger swipes and a double tap from the connected tactile sensor.",
         )
         self.robot_dog_gesture_button = QPushButton("Enable Gesture Control")
         self.robot_dog_gesture_button.setCheckable(True)
@@ -194,7 +328,7 @@ class RobotDogControlsMixin:
         control_list.add_row(
             "Gesture input",
             self.robot_dog_gesture_button,
-            hint="Up: stand · Down: sit · Left: stretch · Right: greeting.",
+            hint="Up: stand · Down: sit · Left: stretch · Right: greeting · Double tap: rest.",
         )
 
         self.robot_dog_gesture_status = QLabel(
@@ -206,9 +340,9 @@ class RobotDogControlsMixin:
 
         event_group, event_list = components.section(
             "Detected gesture",
-            "Four directions are supported: up, down, left, and right.",
+            "Four swipe directions, plus a double tap for the rest pose.",
         )
-        self.robot_dog_last_gesture = QLabel("No swipe detected")
+        self.robot_dog_last_gesture = QLabel("No gesture detected")
         self.robot_dog_last_gesture.setWordWrap(True)
         event_list.add_row("Latest", self.robot_dog_last_gesture)
         layout.addWidget(event_group)
@@ -251,14 +385,16 @@ class RobotDogControlsMixin:
 
             self._robot_dog_sensor_signal = signal
             self._robot_dog_swipe_detector.reset()
+            self._robot_dog_double_tap_detector.reset()
             self._robot_dog_gesture_enabled = True
             self.robot_dog_gesture_button.setText("Disable Gesture Control")
             self.robot_dog_gesture_status.setText(
-                "On · single-finger swipe commands enabled"
+                "On · swipe and double-tap commands enabled"
             )
             self.log_display.append(
                 "[Robot Dog] Gesture control enabled: "
-                "Up→kup, Down→ksit, Left→kstr, Right→khi."
+                "Up→kup, Down→ksit, Left→kstr, Right→khi, "
+                "double tap→d."
             )
             return
 
@@ -274,9 +410,13 @@ class RobotDogControlsMixin:
         was_enabled = bool(getattr(self, "_robot_dog_gesture_enabled", False))
         self._robot_dog_sensor_signal = None
         self._robot_dog_gesture_enabled = False
-        detector = getattr(self, "_robot_dog_swipe_detector", None)
-        if detector is not None:
-            detector.reset()
+        for detector_name in (
+            "_robot_dog_swipe_detector",
+            "_robot_dog_double_tap_detector",
+        ):
+            detector = getattr(self, detector_name, None)
+            if detector is not None:
+                detector.reset()
         button = getattr(self, "robot_dog_gesture_button", None)
         if button is not None:
             button.blockSignals(True)
@@ -338,25 +478,37 @@ class RobotDogControlsMixin:
             matrix,
             timestamp=timestamp,
         )
-        if direction is None:
+        double_tap = self._robot_dog_double_tap_detector.process(
+            matrix,
+            timestamp=timestamp,
+        )
+        if direction is not None:
+            self._report_robot_dog_gesture(
+                f"Swipe {direction.upper()}",
+                ROBOT_DOG_SWIPE_COMMANDS[direction],
+            )
             return
+        if double_tap == "double_tap":
+            self._report_robot_dog_gesture(
+                "Double tap",
+                ROBOT_DOG_REST_COMMAND,
+            )
 
-        label = direction.upper()
-        command = ROBOT_DOG_SWIPE_COMMANDS[direction]
+    def _report_robot_dog_gesture(self, description, command):
         sent, error = self._send_robot_dog_command(command)
         if sent:
             self.robot_dog_last_gesture.setText(
-                f"Swipe {label} → {command}"
+                f"{description} → {command}"
             )
             self.log_display.append(
-                f"[Robot Dog] Swipe {label} detected → sent {command}."
+                f"[Robot Dog] {description} detected → sent {command}."
             )
             return
 
         self.robot_dog_last_gesture.setText(
-            f"Swipe {label} → send failed"
+            f"{description} → send failed"
         )
         self.log_display.append(
-            f"[Robot Dog] Swipe {label} detected, but {command} was not sent: "
+            f"[Robot Dog] {description} detected, but {command} was not sent: "
             f"{error}."
         )

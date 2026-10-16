@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -244,6 +245,19 @@ class _FrameGrabber(QThread):
         self._lock = threading.Lock()
         self._frame_pending = False
         self._failure_reported = False
+        self._color_snapshot = None
+
+    def _store_color_frame(self, rgb, timestamp=None):
+        """Reference capture is independent of depth view and display throttling."""
+        timestamp = time.monotonic() if timestamp is None else float(timestamp)
+        with self._lock:
+            self._color_snapshot = (timestamp, np.array(rgb, dtype=np.uint8, copy=True))
+
+    def color_snapshot(self, after=-float("inf")):
+        with self._lock:
+            if self._color_snapshot is None or self._color_snapshot[0] <= after:
+                return None
+            return self._color_snapshot[0], self._color_snapshot[1].copy()
 
     def stop(self) -> None:
         """Ask the grabber to release the camera and exit."""
@@ -306,6 +320,7 @@ class _CameraGrabber(_FrameGrabber):
             return
 
         while not self._stop:
+            self._store_color_frame(bgr_to_rgb(frame))
             self._emit_latest(qimage_from_rgb(bgr_to_rgb(frame)), None)
             if self._stop:
                 break
@@ -406,6 +421,7 @@ class _RealSenseGrabber(_FrameGrabber):
                 self._apply_options(rs, sensors)
                 try:
                     frames = pipeline.wait_for_frames(timeout_ms=2000)
+                    received_at = time.monotonic()
                 except Exception as exc:
                     if self._stop:
                         break
@@ -414,6 +430,12 @@ class _RealSenseGrabber(_FrameGrabber):
                     )
                     break
                 try:
+                    color_reference = frames.get_color_frame()
+                    if color_reference:
+                        self._store_color_frame(
+                            bgr_to_rgb(np.asanyarray(color_reference.get_data())),
+                            received_at,
+                        )
                     image = self._render_frame(
                         frames, align, point_cloud, depth_scale
                     )
@@ -648,6 +670,12 @@ class _RealSenseGrabber(_FrameGrabber):
 
 class CameraPreviewWindow(QWidget):
     """Live RealSense view. Closing the window releases the camera."""
+
+    def color_snapshot(self, after=-float("inf")):
+        grabber = self._grabber
+        if grabber is None or not grabber.isRunning():
+            return None
+        return grabber.color_snapshot(after)
 
     def __init__(self, parent=None):
         super().__init__(parent, Qt.Window)

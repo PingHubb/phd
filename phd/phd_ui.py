@@ -9,11 +9,13 @@ os.environ.setdefault("MPLCONFIGDIR", _DEFAULT_MPLCONFIGDIR)
 
 from PyQt5 import QtWidgets, QtGui  # noqa: E402
 from phd.ui import theme  # noqa: E402
+from phd.ui.combo_popup import install_full_choice_popups  # noqa: E402
 from phd.ui.ui_initial import MyMainWindow  # noqa: E402
 
 
 def main() -> int:
     print("Starting PingLab...")
+    install_full_choice_popups()
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
 
     # Family and size both come from the design tokens, so the application

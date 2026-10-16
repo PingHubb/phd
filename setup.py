@@ -24,6 +24,7 @@ setup(
             'check_ai_dfm_dataset = phd.script.check_ai_direct_finger_motion_dataset:main',
             'train_ai_dfm_model = phd.script.train_ai_direct_finger_motion:main',
             'train_tactile_proximity = phd.script.train_tactile_proximity:main',
+            'train_touch_tracking = phd.script.train_touch_tracking:main',
             'setup_goodix_usb_permissions = phd.script.setup_goodix_usb_permissions:main',
         ],
     },
