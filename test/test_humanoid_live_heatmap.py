@@ -284,6 +284,42 @@ def test_humanoid_sensor_annotation_includes_part_and_grid_shape():
     assert humanoid_sensor_grid_shape(port, assignments) == (9, 14)
 
 
+def test_testing_sensor_3_keeps_its_saved_20x20_name():
+    port = SimpleNamespace(
+        serial_number="48:F6:EE:21:88:44",
+        vid=0x303A,
+        pid=0x1001,
+    )
+    assignments = {
+        "usb:303a:1001:48:f6:ee:21:88:44": {
+            "part": "sensor:testing_20x20_3"
+        }
+    }
+
+    assert humanoid_sensor_annotation(port, assignments) == (
+        "Testing Sensor 3 (20x20)"
+    )
+    assert humanoid_sensor_grid_shape(port, assignments) == (20, 20)
+
+
+def test_robot_dog_back_sensor_keeps_its_saved_name():
+    port = SimpleNamespace(
+        serial_number="5AA9026909",
+        vid=0x1A86,
+        pid=0x55D3,
+    )
+    assignments = {
+        "usb:1a86:55d3:5aa9026909": {
+            "part": "sensor:robot_dog_back"
+        }
+    }
+
+    assert humanoid_sensor_annotation(port, assignments) == (
+        "Robot Dog Back Sensor (8x8)"
+    )
+    assert humanoid_sensor_grid_shape(port, assignments) == (8, 8)
+
+
 def test_end_effector_sensor_profile_includes_extra_packet_column():
     port = SimpleNamespace(
         serial_number="F4:12:FA:68:EC:20",

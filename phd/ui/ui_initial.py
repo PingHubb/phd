@@ -5,9 +5,9 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QTimer, QSize, QEvent, QSettings
+from PyQt5.QtCore import Qt, QTimer, QSize, QEvent, QSettings, QSignalBlocker
 from PyQt5.QtWidgets import (
-    QWidget, QAction, QSplitter, QVBoxLayout, QHBoxLayout, QLabel,
+    QWidget, QAction, QActionGroup, QSplitter, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QToolBar, QStatusBar, QComboBox,
     QFrame, QMessageBox, QStyle, QDialog, QDialogButtonBox, QListWidget, QListWidgetItem,
     QGridLayout, QToolButton, QSizePolicy, QMenu, QDoubleSpinBox, QFormLayout, QSpinBox,
@@ -17,20 +17,24 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QIcon, QColor, QPainter, QPen, QPainterPath, QPixmap, QFont
 import numpy as np
 from pyvistaqt import QtInteractor, MainWindow
-from phd.dependence.paths import icon_path, resource_path, stylesheet_path
+from phd.dependence.paths import experiment_path, icon_path, stylesheet_path
 from phd.ui import components, icons, theme
 from phd.ui.ui_ping import UI
 from phd.ui import experiment_tasks
-from phd.ui.calibration_graph_analysis import (
-    CalibrationGraphAnalysisDialog,
-    load_calibration_recording,
-)
+from phd.ui.experiment_run_view import ExperimentRunView, ended_run_message
+from phd.ui.calibration_protocol_panel import build_protocol_panel
+from phd.ui.calibration_readiness_panel import CalibrationReadinessPanel
+from phd.ui.calibration_graph_viewer import launch_graph_analysis
 from phd.ui.calibration_result_dialog import (
     CalibrationResultDialog,
     CalibrationTaxelMap,
     FullTaxelCalibrationResultDialog,
 )
 from phd.ui.taxel_position_navigation import MappedTaxelMoveTask, prepare_taxel_map
+from phd.ui.taxel_map_catalog import TaxelMapCatalog
+from phd.ui.taxel_map_revision import (
+    read_revision_source, revision_motion_error, revision_setup, save_setup_revision,
+)
 from phd.ui.camera_preview_window import CameraPreviewWindow
 from phd.ui.plotter_video_recorder import PlotterVideoRecorder
 from phd.ui.heatmap_signal_recording import (
@@ -486,10 +490,13 @@ class MyMainWindow(MainWindow):
         self._sensor_capture_result_dialog = None
         self._calibration_result_dialog = None
         self._full_taxel_calibration_result_dialog = None
-        self._calibration_graph_analysis_dialog = None
         self._taxel_navigation_result = None
         self._taxel_mapping_anchor_updated_after_load = False
         self._taxel_navigation_source_path = None
+        self._taxel_map_catalog = TaxelMapCatalog(experiment_path("taxel_position_maps"))
+        self._auto_taxel_map_context = None
+        self._auto_taxel_map_selection = None
+        self._auto_taxel_map_next_check = 0.0
         self._sidebar_active_task = None  # experiment_tasks.ExperimentTask, set while running
         self._sigraph_heatmap_recorder = None
         self._sigraph_heatmap_signal_recorder = None
@@ -503,7 +510,7 @@ class MyMainWindow(MainWindow):
         self._sigraph_heatmap_playback_restore_state = None
 
         # --- Initialize Window Properties ---
-        self.setWindowTitle("PingLab")
+        self.setWindowTitle("PingLab · Tactile Research Workspace")
         self.setMinimumSize(960, 540)
         self.resize(1650, 900)
         self.setWindowIcon(self.resources.get_icon('logo0.png'))
@@ -521,6 +528,12 @@ class MyMainWindow(MainWindow):
         self._keyboard_vel_timer = QTimer(self)
         self._keyboard_vel_timer.setInterval(50)
         self._keyboard_vel_timer.timeout.connect(self._keyboard_vel_timer_tick)
+        self._keyboard_tool_position_enabled = False
+        self._keyboard_pos_active_tokens: set[str] = set()
+        self._keyboard_pos_timer = QTimer(self)
+        self._keyboard_pos_timer.setInterval(250)
+        self._keyboard_pos_timer.timeout.connect(self._keyboard_pos_timer_tick)
+        self._keyboard_pos_step_m = 0.005
 
         # --- Build the User Interface ---
         self._setup_actions()
@@ -569,6 +582,17 @@ class MyMainWindow(MainWindow):
             "W/S = ±Y, A/D = ±X, O/P = ±Z, Q/E = ±Rz, R/T = ±Rx, Y/U = ±Ry.\n"
             "Hold or press multiple keys to combine (e.g. W+D = +Y and +X). "
             "Release a key to remove that component. Space stops all."
+        )
+        self.action_keyboard_tool_position = QAction(
+            icons.icon('position'),
+            'Keyboard Tool Position',
+            self,
+        )
+        self.action_keyboard_tool_position.setCheckable(True)
+        self.action_keyboard_tool_position.setToolTip(
+            "Keyboard base-frame tool position. Orientation stays as it is now.\n"
+            "W/S = ±Y, A/D = ±X, O/P = ±Z. Each held key steps 5 mm along a straight line.\n"
+            "Set Joint Preset 1 first if the probe should stay perpendicular to the table."
         )
 
         self.action_direct_finger_motion_params = QAction(
@@ -649,6 +673,15 @@ class MyMainWindow(MainWindow):
         self.action_presentation_mode.setToolTip(
             'Increase control and row sizes for projected demonstrations or touch use'
         )
+        from phd.ui import motion
+        self.action_reduce_motion = QAction('Reduce Motion', self)
+        self.action_reduce_motion.setCheckable(True)
+        self.action_reduce_motion.setChecked(motion.preferences().reduced)
+        self.action_reduce_motion.setToolTip(
+            'Make navigation and expandable sections immediate; remember this preference'
+        )
+        self.action_reduce_motion.toggled.connect(motion.preferences().set_reduced)
+        motion.preferences().changed.connect(self.action_reduce_motion.setChecked)
 
         self.action_exit = QAction(icons.icon('power', color=theme.DANGER), 'Exit', self)
         self.action_exit.setToolTip('Quit PingLab (Ctrl+Q)')
@@ -663,6 +696,24 @@ class MyMainWindow(MainWindow):
 
         view_menu = menu.addMenu('View')
         view_menu.addAction(self.action_presentation_mode)
+        view_menu.addAction(self.action_reduce_motion)
+        layout_menu = view_menu.addMenu('Workspace Layout')
+        self.workspace_layout_menu = layout_menu
+        self.workspace_layout_actions = {}
+        self.workspace_layout_action_group = QActionGroup(self)
+        self.workspace_layout_action_group.setExclusive(True)
+        for mode, label in (
+            ("auto", "Auto · follow task"),
+            ("split", "Split view"),
+            ("controls", "Focus controls"),
+            ("sensor", "Focus sensor"),
+        ):
+            action = layout_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(mode == "auto")
+            self.workspace_layout_action_group.addAction(action)
+            action.triggered.connect(lambda _checked=False, mode=mode: self._set_workspace_layout(mode))
+            self.workspace_layout_actions[mode] = action
 
         window_menu = menu.addMenu('Window')
         window_menu.addAction(self.action_window_experiments)
@@ -678,6 +729,7 @@ class MyMainWindow(MainWindow):
         function_menu.addAction(self.action_ps5_controller_test)
         function_menu.addAction(self.action_sensor_controller_test)
         function_menu.addAction(self.action_keyboard_tool_velocity)
+        function_menu.addAction(self.action_keyboard_tool_position)
         parameter_menu = function_menu.addMenu('Parameter Settings')
         parameter_menu.addAction(self.action_direct_finger_motion_params)
         parameter_menu.addAction(self.action_proximity_control_params)
@@ -695,13 +747,26 @@ class MyMainWindow(MainWindow):
         toolbar.setMovable(False)
         toolbar.setFloatable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonIconOnly)
-        toolbar.addAction(self.action_ping_mode)
+        self._toolbar_destinations = []
+        brand = QLabel("PingLab")
+        brand.setObjectName("appBrand")
+        toolbar.addWidget(brand)
+        toolbar.addSeparator()
+        # Frequent destinations have labels; advanced utilities remain in Menu.
+        # Reuse the same actions so enablement, shortcuts and slots stay intact.
+        for action in (
+            self.action_toggle_controls, self.action_sensor_signal,
+            self.action_camera_preview,
+        ):
+            button = QToolButton()
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+            toolbar.addWidget(button)
+            self._toolbar_destinations.append(button)
         toolbar.addSeparator()
         toolbar.addAction(self.action_log)
-        toolbar.addAction(self.action_sensor_signal)
-        toolbar.addAction(self.action_ps5_controller_test)
-        toolbar.addAction(self.action_sensor_controller_test)
         toolbar.addAction(self.action_keyboard_tool_velocity)
+        toolbar.addAction(self.action_keyboard_tool_position)
         self.toolbar_parameter_button = QToolButton()
         self.toolbar_parameter_button.setDefaultAction(self.action_parameter_settings)
         self.toolbar_parameter_button.setPopupMode(QToolButton.InstantPopup)
@@ -712,10 +777,6 @@ class MyMainWindow(MainWindow):
         parameter_popup_menu.addAction(self.action_sensor_params)
         self.toolbar_parameter_button.setMenu(parameter_popup_menu)
         toolbar.addWidget(self.toolbar_parameter_button)
-        toolbar.addAction(self.action_toggle_controls)
-        toolbar.addAction(self.action_camera_preview)
-        toolbar.addSeparator()
-        toolbar.addAction(self.action_exit)
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         # Without this the spacer picks up the default window background and
@@ -838,7 +899,30 @@ class MyMainWindow(MainWindow):
         )
         self.toolbar_update_sensor_button.clicked.connect(self.action_update_sensor.trigger)
         toolbar.addWidget(self.toolbar_update_sensor_button)
+        # Keep the software stop at the leading edge so toolbar overflow on a
+        # small display never hides it. Calibration keeps its disconnect neighbour.
+        stop_widget_action = next(
+            action for action in toolbar.actions()
+            if toolbar.widgetForAction(action) is self.toolbar_stop_all_motion_button
+        )
+        toolbar.insertAction(toolbar.actions()[1], stop_widget_action)
         self.addToolBar(toolbar)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Do not let frequent calibration or the software stop disappear into
+        # Qt's toolbar overflow when the window is used on a laptop.
+        compact = self.width() < 1280
+        for button in getattr(self, "_toolbar_destinations", ()):
+            button.setToolButtonStyle(
+                Qt.ToolButtonIconOnly if compact else Qt.ToolButtonTextBesideIcon
+            )
+        disconnect = getattr(self, "toolbar_disconnect_sensor_button", None)
+        calibrate = getattr(self, "toolbar_update_sensor_button", None)
+        if disconnect is not None:
+            disconnect.setText("Disconnect" if compact else "Disconnect Sensor")
+        if calibrate is not None:
+            calibrate.setText("Calibrate" if compact else "Calibrate Sensor")
 
     def _setup_main_layout(self):
         """Constructs the central widget and the main horizontal layout."""
@@ -847,8 +931,9 @@ class MyMainWindow(MainWindow):
         self.setCentralWidget(central_widget)
 
         main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(4, 4, 4, 4)
-        main_layout.setSpacing(4)
+        self.workspace_layout = main_layout
+        main_layout.setContentsMargins(10, 10, 10, 8)
+        main_layout.setSpacing(10)
 
         self.h_splitter = QSplitter(Qt.Horizontal)
         self.h_splitter.setHandleWidth(6)
@@ -871,10 +956,13 @@ class MyMainWindow(MainWindow):
 
         self.h_splitter.addWidget(self.view_container)
 
-        main_layout.addWidget(self.h_splitter)
+        main_layout.addWidget(self.h_splitter, 1)
 
         # --- Status Bar ---
         self._setup_status_bar()
+        self.experiment_monitor_timer = QTimer(self)
+        self.experiment_monitor_timer.setInterval(250)
+        self.experiment_monitor_timer.timeout.connect(self._refresh_run_monitor)
 
     def _create_sidebar(self) -> QFrame:
         """Creates the sidebar widget and all its contents."""
@@ -888,6 +976,13 @@ class MyMainWindow(MainWindow):
         layout = QVBoxLayout(sidebar)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
+
+        header = components.WorkspaceHeader(
+            "Experiments", "Choose a task, review its settings, then run when the rig is ready.",
+            eyebrow="PINGLAB / EXPERIMENTS",
+        )
+        header.set_compact(True)
+        layout.addWidget(header)
 
         self.experiment_controls_splitter = QSplitter(Qt.Horizontal)
         self.experiment_controls_splitter.setChildrenCollapsible(False)
@@ -938,6 +1033,19 @@ class MyMainWindow(MainWindow):
         if first_task_item is not None:
             self.sidebar_task_list.setCurrentItem(first_task_item)
         task_layout.addWidget(self.sidebar_task_list, stretch=1)
+        # Outside the task tree/parameter groups so mapping can lock its setup
+        # while saved-file analysis remains available. Never changes selection.
+        self.graph_analysis_button = QPushButton("Open Graph Analysis…")
+        self.graph_analysis_button.setToolTip(
+            "Open saved graphs in an independent offline viewer. Available during experiments; "
+            "does not stop the active task or connect to devices."
+        )
+        self.graph_analysis_button.clicked.connect(lambda: self._open_calibration_graph_analysis())
+        task_layout.addWidget(self.graph_analysis_button)
+        self.graph_analysis_status = QLabel("Saved recordings · independent offline viewer")
+        self.graph_analysis_status.setWordWrap(True)
+        self.graph_analysis_status.setStyleSheet(f"color: {theme.TEXT_MUTED};")
+        task_layout.addWidget(self.graph_analysis_status)
 
         detail_column = QWidget()
         detail_column.setMinimumWidth(520)
@@ -945,18 +1053,31 @@ class MyMainWindow(MainWindow):
         detail_layout.setContentsMargins(0, 0, 0, 0)
         detail_layout.setSpacing(8)
 
+        self.experiment_view_tabs = components.segmented(QTabWidget())
+        setup_page = QWidget()
+        setup_layout = QVBoxLayout(setup_page)
+        setup_layout.setContentsMargins(0, 8, 0, 0)
+        setup_layout.setSpacing(8)
+        self.experiment_view_tabs.addTab(setup_page, "Setup")
+        self.experiment_run_view = ExperimentRunView()
+        self.experiment_view_tabs.addTab(components.scroll_page(self.experiment_run_view), "Run")
+        detail_layout.addWidget(self.experiment_view_tabs, stretch=1)
+
         self.sidebar_task_info = QLabel()
         self.sidebar_task_info.setWordWrap(True)
+        self.sidebar_task_info.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
         self.sidebar_task_info.setStyleSheet(
             f"color: {theme.TEXT_MUTED}; background-color: {theme.SURFACE_RAISED}; "
             f"border: 1px solid {theme.BORDER_SUBTLE}; padding: 8px; border-radius: 6px;"
         )
-        detail_layout.addWidget(self.sidebar_task_info)
+        self.sidebar_task_help = components.CollapsibleGroup("About this task")
+        self.sidebar_task_help.add(self.sidebar_task_info)
+        setup_layout.addWidget(self.sidebar_task_help)
         self._update_sidebar_task_info()
 
         # Each task may expose a custom widget under this container; only the
         # widget that matches the currently-selected task is shown.
-        self._build_sidebar_task_param_widgets(detail_layout)
+        self._build_sidebar_task_param_widgets(setup_layout)
         self._update_sidebar_task_param_visibility()
 
         # Container for task execution and recording buttons
@@ -965,7 +1086,6 @@ class MyMainWindow(MainWindow):
         btn_layout.setContentsMargins(0, 0, 0, 0)
 
         run_layout = QHBoxLayout()
-        run_layout.addStretch()
         self.sidebar_btn_start = QPushButton("Start")
         self.sidebar_btn_start.setObjectName("btnStart")
         run_layout.addWidget(self.sidebar_btn_start)
@@ -973,10 +1093,19 @@ class MyMainWindow(MainWindow):
         self.sigraph_scanning_reverse_button.setObjectName("btnReverse")
         self.sigraph_scanning_reverse_button.setVisible(False)
         run_layout.addWidget(self.sigraph_scanning_reverse_button)
-        self.sidebar_btn_stop = QPushButton("Stop")
+        self.sidebar_btn_stop = QPushButton("Stop Experiment")
         self.sidebar_btn_stop.setObjectName("btnStop")
+        self.sidebar_btn_stop.setToolTip("Stop the active experiment using its existing stop procedure")
         run_layout.addWidget(self.sidebar_btn_stop)
-        run_layout.addStretch()
+        run_layout.addStretch(1)
+        run_layout.addWidget(components.divider(Qt.Vertical))
+        run_layout.addSpacing(8)
+        self.experiment_stop_all_button = QToolButton()
+        self.experiment_stop_all_button.setDefaultAction(self.action_stop_all_motion)
+        self.experiment_stop_all_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.experiment_stop_all_button.setStyleSheet(self.toolbar_stop_all_motion_button.styleSheet())
+        self.experiment_stop_all_button.setIcon(icons.icon('stop', color=theme.TEXT_ON_ACCENT))
+        run_layout.addWidget(self.experiment_stop_all_button)
         btn_layout.addLayout(run_layout)
 
         record_layout = QHBoxLayout()
@@ -996,17 +1125,18 @@ class MyMainWindow(MainWindow):
         record_layout.addStretch()
         btn_layout.addLayout(record_layout)
         detail_layout.addWidget(btn_container)
-        for index in range(detail_layout.count()):
-            item = detail_layout.itemAt(index)
+        for index in range(setup_layout.count()):
+            item = setup_layout.itemAt(index)
             widget = None if item is None else item.widget()
             if widget is None or widget in {
                 self.sidebar_task_info,
+                self.sidebar_task_help,
                 btn_container,
             }:
-                detail_layout.setStretch(index, 0)
+                setup_layout.setStretch(index, 0)
                 continue
             widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-            detail_layout.setStretch(index, 1)
+            setup_layout.setStretch(index, 1)
         self._update_sidebar_task_action_labels()
 
         self.experiment_controls_splitter.addWidget(task_column)
@@ -1149,6 +1279,10 @@ class MyMainWindow(MainWindow):
         """Record whether a valid sensor scene exists for recalibration."""
         self._sensor_scene_ready = bool(ready)
         self._refresh_sensor_update_control()
+        ui = getattr(self, "ui_ros", None)
+        update_presentation = getattr(ui, "set_scene_presentation", None)
+        if callable(update_presentation):
+            update_presentation(self._sensor_scene_ready)
 
     def set_sensor_update_enabled(self, enabled: bool = True) -> None:
         """Gate recalibration while preserving the scene-ready requirement."""
@@ -1183,7 +1317,7 @@ class MyMainWindow(MainWindow):
     # Ordered by precedence: the first running helper wins.
     _MODE_INDICATORS = (
         ("ai_direct_finger_motion_execution_class", "AI DFM (exec)"),
-        ("ai_direct_finger_motion_class", "AI DFM (record)"),
+        ("ai_direct_finger_motion_class", "Gesture recording"),
         ("direct_finger_motion_class", "Rule-based DFM"),
         ("proximity_control_class", "Proximity"),
         ("console_control_class", "Console"),
@@ -1358,6 +1492,8 @@ class MyMainWindow(MainWindow):
             model_label = getattr(ui, "ai_direct_execution_model_status", None)
         elif active_mode.startswith("AI Proximity"):
             model_label = getattr(ui, "ai_proximity_model_status", None)
+        elif active_mode == "Gesture recognition":
+            model_label = getattr(getattr(ui, "gesture_recognition_panel", None), "model_label", None)
         else:
             model_label = None
         model_text = model_label.text().strip() if model_label is not None else "Not active"
@@ -1401,6 +1537,9 @@ class MyMainWindow(MainWindow):
                 continue
             if getattr(helper, "is_running", False) is True:
                 return label
+        gesture_panel = getattr(getattr(self, "ui_ros", None), "gesture_recognition_panel", None)
+        if getattr(gesture_panel, "active", False) is True:
+            return "Gesture recognition"
         return "Idle"
 
     def _connect_signals_to_slots(self):
@@ -1430,6 +1569,7 @@ class MyMainWindow(MainWindow):
         self.action_ps5_controller_test.triggered.connect(self.open_ps5_controller_test_window)
         self.action_sensor_controller_test.triggered.connect(self.open_sensor_controller_test_window)
         self.action_keyboard_tool_velocity.toggled.connect(self._on_keyboard_tool_velocity_toggled)
+        self.action_keyboard_tool_position.toggled.connect(self._on_keyboard_tool_position_toggled)
         self.action_direct_finger_motion_params.triggered.connect(self.open_direct_finger_motion_params_window)
         self.action_proximity_control_params.triggered.connect(self.open_proximity_control_params_window)
         self.action_console_control_params.triggered.connect(self.open_console_control_params_window)
@@ -1793,10 +1933,48 @@ class MyMainWindow(MainWindow):
         self.view_placeholder.deleteLater()
         self.ui_ros = UI(Qt.Horizontal)
         self.view_container.layout().addWidget(self.ui_ros)
+        # Device context belongs to the whole app, not just the controls panel.
+        self.ui_ros.layout_func.removeWidget(self.ui_ros.session_strip)
+        self.workspace_layout.insertWidget(0, self.ui_ros.session_strip)
+        self.workspace_navigation = QFrame()
+        self.workspace_navigation.setObjectName("workspaceNavigation")
+        navigation_layout = QHBoxLayout(self.workspace_navigation)
+        navigation_layout.setContentsMargins(4, 0, 8, 0)
+        navigation_layout.setSpacing(8)
+        self.workspace_navigation_bar = self.ui_ros.tab_widget.create_external_navigation()
+        navigation_layout.addWidget(self.workspace_navigation_bar)
+        navigation_layout.addStretch(1)
+        self.workspace_layout_button = QToolButton()
+        self.workspace_layout_button.setPopupMode(QToolButton.InstantPopup)
+        self.workspace_layout_button.setMenu(self.workspace_layout_menu)
+        self.workspace_layout_button.setToolTip("Choose a workspace layout; Auto follows the selected task")
+        navigation_layout.addWidget(self.workspace_layout_button)
+        self.workspace_layout.insertWidget(1, self.workspace_navigation)
+        # The selected workspace and section already name the page. Keep the
+        # old header object for context updates, without a duplicate title row.
+        self.ui_ros.workspace_header.hide()
         self.ui_ros.reLayout()  # Call the UI's own layout adjustment
+        self.ui_ros.workspace_layout_changed.connect(self._sync_workspace_layout_menu)
+        for mode, action in self.workspace_layout_actions.items():
+            if action.isChecked():
+                self.ui_ros.set_workspace_layout_mode(mode)
+                break
 
         self._start_fps_counter()
-        self.info_process.setText("PING Mode Activated")
+        self.info_process.setText("Workspace ready · connect a device or open saved data")
+        self._refresh_status_indicators()
+
+    def _set_workspace_layout(self, mode):
+        if self.ui_ros is not None:
+            self.ui_ros.set_workspace_layout_mode(mode)
+
+    def _sync_workspace_layout_menu(self, mode):
+        action = self.workspace_layout_actions.get(mode)
+        if action is not None:
+            action.setChecked(True)
+            button = getattr(self, "workspace_layout_button", None)
+            if button is not None:
+                button.setText("Layout: " + {"auto": "Auto", "split": "Split", "controls": "Controls", "sensor": "Sensor"}[mode])
 
     def _start_fps_counter(self):
         """Finds the 3D renderer and sets up a timer to track and display FPS."""
@@ -1852,6 +2030,9 @@ class MyMainWindow(MainWindow):
 
     def _refresh_experiment_status(self) -> None:
         """Keep a compact stop affordance visible when the popup is hidden."""
+        refresh_monitor = getattr(self, "_refresh_run_monitor", None)
+        if callable(refresh_monitor):
+            refresh_monitor()
         indicator = getattr(self, "status_experiment", None)
         stop_button = getattr(self, "status_experiment_stop_button", None)
         travel_label = getattr(self, "status_calibration_travel", None)
@@ -1878,6 +2059,35 @@ class MyMainWindow(MainWindow):
                 in {"calibration", "full_taxel_calibration"}
             )
         self._refresh_taxel_navigation_controls()
+
+    def _refresh_run_monitor(self):
+        """Mirror cached telemetry, independent of the experiment's control timer."""
+        view = getattr(self, "experiment_run_view", None)
+        if view is None:
+            return
+        try:
+            if view.refresh(self):
+                self.experiment_view_tabs.setCurrentIndex(1)
+        except Exception as exc:
+            # Cosmetic failures must never break experiment/stop dispatch.
+            self._report_run_monitor_error(exc)
+            return
+        timer = getattr(self, "experiment_monitor_timer", None)
+        if timer is not None:
+            if self._sidebar_active_task is None:
+                timer.stop()
+            elif not timer.isActive():
+                timer.start()
+
+    def _report_run_monitor_error(self, error):
+        timer = getattr(self, "experiment_monitor_timer", None)
+        if timer is not None:
+            timer.stop()
+        print(f"Experiment monitor unavailable: {error}")
+        view = getattr(self, "experiment_run_view", None)
+        state = getattr(view, "state", None)
+        if state is not None:
+            state.set_state("warning", "Monitor unavailable · use Setup and Application Log")
 
     def _current_sidebar_task_item(self):
         tree = getattr(self, "sidebar_task_list", None)
@@ -1941,10 +2151,27 @@ class MyMainWindow(MainWindow):
             label.setText("Select a task from the list.")
             return
         description = self._sidebar_item_value(item, Qt.UserRole + 1) or ""
+        if self._sidebar_item_value(item, Qt.UserRole) == "taxel_position_mapping":
+            task = self._taxel_mapping_task()
+            if task is not None:
+                description = (
+                    f"Remember a clear pose above Taxel {task.anchor_taxel} for the "
+                    f"{task.sensor_rows}x{task.sensor_columns} sensor. The task learns "
+                    "the proximity height, locates and verifies each target's response "
+                    "centre, then saves the robot positions."
+                )
         label.setText(f"Task: {item.text(0)}\n\n{description}")
+        help_group = getattr(self, "sidebar_task_help", None)
+        if help_group is not None:
+            help_group.toggle.setText(f"About {item.text(0)}")
 
     def _on_sidebar_task_changed(self, _current=None, _previous=None):
+        if self._sidebar_active_task is None and hasattr(self, "experiment_view_tabs"):
+            self.experiment_view_tabs.setCurrentIndex(0)
         self._update_sidebar_task_info()
+        help_group = getattr(self, "sidebar_task_help", None)
+        if help_group is not None:
+            help_group.toggle.setChecked(self._current_sidebar_control_id() == "graph_analysis")
         self._update_sidebar_task_param_visibility()
         self._update_sidebar_task_action_labels()
         self._refresh_calibration_controls()
@@ -1965,7 +2192,8 @@ class MyMainWindow(MainWindow):
         # available without any connected device.
         start_button.setEnabled(
             task is not None
-            and getattr(self, "_sidebar_active_task", None) is None
+            and (getattr(self, "_sidebar_active_task", None) is None
+                 or getattr(task, "id", "") == "graph_analysis")
         )
         reverse_button = getattr(self, "sigraph_scanning_reverse_button", None)
         if reverse_button is not None:
@@ -2133,8 +2361,9 @@ class MyMainWindow(MainWindow):
         self.sigraph_scanning_replay_button.clicked.connect(
             self._choose_sigraph_heatmap_recording_for_playback
         )
-        self._task_param_widgets[task.id] = panel
-        parent_layout.addWidget(panel)
+        scanning_scroll = UI._scrollable(panel)
+        self._task_param_widgets[task.id] = scanning_scroll
+        parent_layout.addWidget(scanning_scroll)
         self._refresh_sigraph_scanning_points()
 
         calibration_task = experiment_tasks.get_task("calibration")
@@ -2162,9 +2391,8 @@ class MyMainWindow(MainWindow):
         self.calibration_taxel_map.taxelSelected.connect(
             self._select_single_calibration_taxel
         )
-        calibration_layout.addWidget(
-            self.calibration_taxel_map, alignment=Qt.AlignHCenter
-        )
+        self.calibration_taxel_selector = components.CollapsibleGroup("Choose a target on the taxel map")
+        self.calibration_taxel_selector.body.addWidget(self.calibration_taxel_map, alignment=Qt.AlignHCenter)
         self.calibration_load_map_button = QPushButton(
             "Load Taxel Position Map…"
         )
@@ -2177,8 +2405,16 @@ class MyMainWindow(MainWindow):
             self._load_single_calibration_map
         )
         calibration_layout.addWidget(self.calibration_load_map_button)
+        self.calibration_map_info = QLabel(
+            "Connect a sensor to automatically load its newest position map."
+        )
+        self.calibration_map_info.setWordWrap(True)
+        calibration_layout.addWidget(self.calibration_map_info)
+        self.calibration_map_folder_label = self._make_map_folder_label()
+        calibration_layout.addWidget(self.calibration_map_folder_label)
+        calibration_layout.addWidget(self.calibration_taxel_selector)
 
-        calibration_form = QFormLayout()
+        calibration_form = components.SettingsForm()
         self.calibration_taxel_spin = QSpinBox()
         self.calibration_taxel_spin.setRange(0, 79)
         self.calibration_taxel_spin.setValue(int(calibration_task.taxel_index))
@@ -2242,15 +2478,13 @@ class MyMainWindow(MainWindow):
         )
 
         self.calibration_max_travel_spin = QDoubleSpinBox()
-        self.calibration_max_travel_spin.setRange(0.0, 200.0)
+        self.calibration_max_travel_spin.setRange(0.1, 100.0)
         self.calibration_max_travel_spin.setDecimals(1)
         self.calibration_max_travel_spin.setSingleStep(0.5)
         self.calibration_max_travel_spin.setSuffix(" mm")
-        self.calibration_max_travel_spin.setSpecialValueText("No limit")
         self.calibration_max_travel_spin.setToolTip(
-            "Maximum downward travel for one contact trial. Set to No limit "
-            "to disable the distance guard; force freshness, contact threshold, "
-            "and Stop remain active."
+            "Required finite downward travel limit. Choose a limit appropriate "
+            "to the measured clearance; do not rely on force alone."
         )
         self.calibration_max_travel_spin.setValue(
             float(calibration_task.max_travel_m) * 1000.0
@@ -2258,14 +2492,12 @@ class MyMainWindow(MainWindow):
         calibration_form.addRow("Maximum travel", self.calibration_max_travel_spin)
 
         self.calibration_timeout_spin = QDoubleSpinBox()
-        self.calibration_timeout_spin.setRange(0.0, 1800.0)
+        self.calibration_timeout_spin.setRange(10.0, 7200.0)
         self.calibration_timeout_spin.setDecimals(1)
         self.calibration_timeout_spin.setSingleStep(10.0)
         self.calibration_timeout_spin.setSuffix(" s")
-        self.calibration_timeout_spin.setSpecialValueText("No limit")
         self.calibration_timeout_spin.setToolTip(
-            "Maximum time for one contact trial. Set to No limit to disable "
-            "the timer; force freshness, maximum travel, and Stop remain active."
+            "Wall-clock limit for the whole trial, including holds, return, recovery and communication pauses."
         )
         self.calibration_timeout_spin.setValue(float(calibration_task.timeout_sec))
         calibration_form.addRow("Timeout", self.calibration_timeout_spin)
@@ -2279,17 +2511,25 @@ class MyMainWindow(MainWindow):
         )
         calibration_form.addRow("Repetitions", self.calibration_repeat_spin)
         calibration_layout.addLayout(calibration_form)
+        self.calibration_protocol_panel = build_protocol_panel(
+            calibration_task, self.calibration_force_threshold_spin, self.calibration_repeat_spin,
+            self.calibration_speed_spin, selector_layout=calibration_layout,
+        )
+        self.calibration_protocol_selector = self.calibration_protocol_panel.protocol_selector
+        calibration_layout.addWidget(self.calibration_protocol_panel)
 
         calibration_note = QLabel(
             "Select one mapped taxel. Run moves to that taxel's saved start "
             "pose, measures the DYLY baseline, and moves in base -Z until the "
-            "gram threshold is reached. It holds for 1 s, returns in base +Z "
-            "at the same speed, and completes the trial only at that start "
-            "height. The tactile sensor recalibrates between repetitions."
+            "gram threshold is reached. It holds for the configured time, "
+            "returns in base +Z at the trial speed, observes unloaded recovery, "
+            "and completes the trial at that start height. Baseline updates are optional."
         )
         calibration_note.setWordWrap(True)
         calibration_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
-        calibration_layout.addWidget(calibration_note)
+        self.calibration_sequence_help = components.CollapsibleGroup("What happens during each trial?")
+        self.calibration_sequence_help.add(calibration_note)
+        calibration_layout.addWidget(self.calibration_sequence_help)
 
         self.calibration_progress_label = QLabel("Ready")
         self.calibration_progress_label.setWordWrap(True)
@@ -2350,9 +2590,15 @@ class MyMainWindow(MainWindow):
         self.calibration_repeat_spin.valueChanged.connect(
             lambda _value: self._refresh_calibration_progress()
         )
-        self._calibration_single_tab_index = self.calibration_mode_tabs.addTab(
-            single_page, "Single taxel"
+        self.calibration_readiness_panel = CalibrationReadinessPanel(
+            calibration_task, self.calibration_max_travel_spin, self.calibration_timeout_spin,
+            self.calibration_protocol_panel,
+            [self.calibration_force_threshold_spin, self.calibration_speed_spin,
+             self.calibration_repeat_spin, self.calibration_taxel_spin],
+            host=self,
         )
+        calibration_layout.insertWidget(2, self.calibration_readiness_panel)
+        single_scroll = UI._scrollable(single_page)
         self._refresh_calibration_controls()
         self._refresh_calibration_progress()
 
@@ -2360,6 +2606,9 @@ class MyMainWindow(MainWindow):
             "full_taxel_calibration"
         )
         if full_calibration_task is None:
+            self._calibration_single_tab_index = self.calibration_mode_tabs.addTab(
+                single_scroll, "Single taxel"
+            )
             return
         full_panel = QFrame()
         full_panel.setFrameShape(QFrame.StyledPanel)
@@ -2368,51 +2617,70 @@ class MyMainWindow(MainWindow):
         full_layout.setSpacing(8)
 
         self.full_taxel_initial_position_label = QLabel(
-            "Initial position: not remembered"
+            "Home: load a position map to use its safe anchor"
         )
         self.full_taxel_initial_position_label.setWordWrap(True)
         full_layout.addWidget(self.full_taxel_initial_position_label)
-        self.full_taxel_remember_position_button = QPushButton(
-            "Remember Initial Position"
-        )
-        self.full_taxel_remember_position_button.setToolTip(
-            "Save the robot's current joint and TCP pose as the start and "
-            "return position for Full Taxel Calibration. This pose is kept "
-            "separate from Single taxel calibration, and each sensor keeps "
-            "its own pose."
-        )
-        self.full_taxel_remember_position_button.clicked.connect(
-            self._remember_full_taxel_initial_position
-        )
-        full_layout.addWidget(self.full_taxel_remember_position_button)
-
         self.full_taxel_calibration_map_info = QLabel(
             "Position map: not loaded"
         )
         self.full_taxel_calibration_map_info.setWordWrap(True)
         full_layout.addWidget(self.full_taxel_calibration_map_info)
+        self.full_taxel_calibration_map_folder_label = self._make_map_folder_label()
+        full_layout.addWidget(self.full_taxel_calibration_map_folder_label)
         self.full_taxel_calibration_map = CalibrationTaxelMap(
             rows=8, columns=10
         )
         self.full_taxel_calibration_map.set_taxels([])
         self.full_taxel_calibration_map.set_interaction_enabled(False)
-        full_layout.addWidget(
+        self.full_taxel_map_disclosure = components.CollapsibleGroup("Mapped taxels · availability and progress")
+        self.full_taxel_map_disclosure.body.addWidget(
             self.full_taxel_calibration_map,
             alignment=Qt.AlignHCenter,
         )
+        full_layout.addWidget(self.full_taxel_map_disclosure)
         self.full_taxel_calibration_load_map_button = QPushButton(
-            "Load Taxel Position Map…"
+            "Load Taxel Position Map for New Calibration…"
         )
         self.full_taxel_calibration_load_map_button.setToolTip(
-            "Load the taxel_position_map.json created by Taxel Position Mapping. "
-            "Loading a map does not move the robot."
+            "Start a new Full Taxel Calibration from a taxel_position_map.json "
+            "made by Taxel Position Mapping. This is not a saved calibration result. "
+            "Loading does not move the robot. To continue a stopped run, use Resume."
         )
         self.full_taxel_calibration_load_map_button.clicked.connect(
             self._load_full_taxel_calibration_map
         )
         full_layout.addWidget(self.full_taxel_calibration_load_map_button)
+        self.full_taxel_calibration_resume_button = QPushButton("Resume Full Taxel Calibration…")
+        self.full_taxel_calibration_resume_button.setToolTip(
+            "Load full_taxel_summary.json from a stopped experiment. Review first; loading does not move the robot."
+        )
+        self.full_taxel_calibration_resume_button.clicked.connect(self._load_full_taxel_calibration_resume)
+        full_layout.addWidget(self.full_taxel_calibration_resume_button)
+        self.full_taxel_calibration_resume_info = QLabel()
+        self.full_taxel_calibration_resume_info.setWordWrap(True)
+        self.full_taxel_calibration_resume_info.setTextFormat(Qt.PlainText)
+        self.full_taxel_calibration_resume_info.setMinimumWidth(0)
+        self.full_taxel_calibration_resume_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.full_taxel_calibration_resume_info.setVisible(False)
+        full_layout.addWidget(self.full_taxel_calibration_resume_info)
+        self.full_taxel_calibration_resume_confirm = QCheckBox(
+            "Sensor and probe setup unchanged;\nunloaded probe and routing path checked"
+        )
+        self.full_taxel_calibration_resume_confirm.setVisible(False)
+        self.full_taxel_calibration_resume_confirm.toggled.connect(
+            lambda checked: setattr(full_calibration_task, "resume_setup_confirmed", bool(checked))
+        )
+        self.full_taxel_calibration_resume_confirm.toggled.connect(
+            lambda _: self._refresh_full_taxel_calibration_controls()
+        )
+        full_layout.addWidget(self.full_taxel_calibration_resume_confirm)
+        self.full_taxel_calibration_resume_clear = QPushButton("Clear resume · set up a new run")
+        self.full_taxel_calibration_resume_clear.setVisible(False)
+        self.full_taxel_calibration_resume_clear.clicked.connect(self._clear_full_taxel_calibration_resume)
+        full_layout.addWidget(self.full_taxel_calibration_resume_clear)
 
-        signal_form = QFormLayout()
+        signal_form = components.SettingsForm()
         self.full_taxel_calibration_signal_combo = QComboBox()
         self.full_taxel_calibration_signal_combo.addItem(
             "Sensor signal change", "diff_ave"
@@ -2437,9 +2705,9 @@ class MyMainWindow(MainWindow):
         signal_form.addRow(
             "Plotted signal", self.full_taxel_calibration_signal_combo
         )
-        full_layout.insertLayout(0, signal_form)
+        full_layout.addLayout(signal_form)
 
-        full_form = QFormLayout()
+        full_form = components.SettingsForm()
 
         self.full_taxel_calibration_speed_spin = QDoubleSpinBox()
         self.full_taxel_calibration_speed_spin.setRange(0.01, 2.0)
@@ -2486,7 +2754,7 @@ class MyMainWindow(MainWindow):
         )
 
         self.full_taxel_calibration_route_guard_spin = QDoubleSpinBox()
-        self.full_taxel_calibration_route_guard_spin.setRange(1.0, 2000.0)
+        self.full_taxel_calibration_route_guard_spin.setRange(1.0, 100.0)
         self.full_taxel_calibration_route_guard_spin.setDecimals(1)
         self.full_taxel_calibration_route_guard_spin.setSingleStep(1.0)
         self.full_taxel_calibration_route_guard_spin.setSuffix(" g")
@@ -2502,13 +2770,10 @@ class MyMainWindow(MainWindow):
         )
 
         self.full_taxel_calibration_max_travel_spin = QDoubleSpinBox()
-        self.full_taxel_calibration_max_travel_spin.setRange(0.0, 200.0)
+        self.full_taxel_calibration_max_travel_spin.setRange(0.1, 100.0)
         self.full_taxel_calibration_max_travel_spin.setDecimals(1)
         self.full_taxel_calibration_max_travel_spin.setSingleStep(0.5)
         self.full_taxel_calibration_max_travel_spin.setSuffix(" mm")
-        self.full_taxel_calibration_max_travel_spin.setSpecialValueText(
-            "No limit"
-        )
         self.full_taxel_calibration_max_travel_spin.setValue(
             float(full_calibration_task.max_travel_m) * 1000.0
         )
@@ -2517,13 +2782,10 @@ class MyMainWindow(MainWindow):
         )
 
         self.full_taxel_calibration_timeout_spin = QDoubleSpinBox()
-        self.full_taxel_calibration_timeout_spin.setRange(0.0, 1800.0)
+        self.full_taxel_calibration_timeout_spin.setRange(10.0, 7200.0)
         self.full_taxel_calibration_timeout_spin.setDecimals(1)
         self.full_taxel_calibration_timeout_spin.setSingleStep(10.0)
         self.full_taxel_calibration_timeout_spin.setSuffix(" s")
-        self.full_taxel_calibration_timeout_spin.setSpecialValueText(
-            "No limit"
-        )
         self.full_taxel_calibration_timeout_spin.setValue(
             float(full_calibration_task.timeout_sec)
         )
@@ -2545,18 +2807,33 @@ class MyMainWindow(MainWindow):
             self.full_taxel_calibration_repeat_spin,
         )
         full_layout.addLayout(full_form)
+        # The proximity profile runs from the Single taxel tab only.
+        self.full_taxel_calibration_protocol_panel = build_protocol_panel(
+            full_calibration_task, self.full_taxel_calibration_force_threshold_spin,
+            self.full_taxel_calibration_repeat_spin, self.full_taxel_calibration_speed_spin,
+            allow_profile=False, selector_layout=full_layout,
+        )
+        self.full_taxel_calibration_protocol_selector = (
+            self.full_taxel_calibration_protocol_panel.protocol_selector
+        )
+        full_layout.addWidget(self.full_taxel_calibration_protocol_panel)
 
         full_note = QLabel(
+            "The loaded map's safe anchor is the home for the start and end of the run; "
+            "no separate initial position is needed. "
             "Each full scan visits every mapped taxel once: route at the saved "
             "clearance height, descend to its non-contact start pose, measure "
             "force baseline, approach in base -Z, return in base +Z, and save "
-            "only that taxel's signal. The sensor recalibrates at clearance "
-            "before the next taxel. The next full scan starts after the whole "
+            "all taxel signals (the graph starts on the pressed taxel). Optional "
+            "sensor recalibration happens at clearance before the next taxel. "
+            "The next full scan starts after the whole "
             "set has been visited."
         )
         full_note.setWordWrap(True)
         full_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
-        full_layout.addWidget(full_note)
+        full_help = components.CollapsibleGroup("What happens during a full scan?")
+        full_help.add(full_note)
+        full_layout.addWidget(full_help)
 
         self.full_taxel_calibration_progress_label = QLabel("Ready")
         self.full_taxel_calibration_progress_label.setWordWrap(True)
@@ -2627,15 +2904,24 @@ class MyMainWindow(MainWindow):
         self.full_taxel_calibration_repeat_spin.valueChanged.connect(
             lambda _value: self._refresh_full_taxel_calibration_controls()
         )
+        self.full_taxel_calibration_readiness_panel = CalibrationReadinessPanel(
+            full_calibration_task, self.full_taxel_calibration_max_travel_spin,
+            self.full_taxel_calibration_timeout_spin, self.full_taxel_calibration_protocol_panel,
+            [self.full_taxel_calibration_force_threshold_spin,
+             self.full_taxel_calibration_speed_spin, self.full_taxel_calibration_repeat_spin],
+            host=self,
+        )
+        full_layout.insertWidget(2, self.full_taxel_calibration_readiness_panel)
 
-        full_scroll = QScrollArea()
-        full_scroll.setFrameShape(QFrame.NoFrame)
-        full_scroll.setWidgetResizable(True)
+        full_scroll = UI._scrollable(full_panel)
         full_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        full_scroll.setWidget(full_panel)
         self._calibration_full_taxel_tab_index = (
             self.calibration_mode_tabs.addTab(full_scroll, "Full taxel")
         )
+        self._calibration_single_tab_index = self.calibration_mode_tabs.addTab(
+            single_scroll, "Single taxel"
+        )
+        self.calibration_mode_tabs.setCurrentIndex(self._calibration_full_taxel_tab_index)
         self.calibration_mode_tabs.currentChanged.connect(
             self._on_calibration_mode_changed
         )
@@ -2651,7 +2937,12 @@ class MyMainWindow(MainWindow):
             return
         mapping_panel = QFrame()
         mapping_panel.setFrameShape(QFrame.StyledPanel)
-        mapping_layout = QVBoxLayout(mapping_panel)
+        mapping_outer = QVBoxLayout(mapping_panel)
+        mapping_outer.setContentsMargins(0, 0, 0, 0)
+        self.taxel_mapping_sections = QTabWidget()
+        mapping_outer.addWidget(self.taxel_mapping_sections, 1)
+        mapping_navigation = QWidget()
+        mapping_layout = QVBoxLayout(mapping_navigation)
         mapping_layout.setContentsMargins(8, 8, 8, 8)
         mapping_layout.setSpacing(8)
 
@@ -2661,6 +2952,8 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_map_info = QLabel("No position map yet. Run mapping or load a saved map.")
         self.taxel_mapping_map_info.setWordWrap(True)
         mapping_layout.addWidget(self.taxel_mapping_map_info)
+        self.taxel_mapping_map_folder_label = self._make_map_folder_label()
+        mapping_layout.addWidget(self.taxel_mapping_map_folder_label)
         self.taxel_mapping_map = CalibrationTaxelMap(rows=8, columns=10)
         self.taxel_mapping_map.set_taxels([])
         self.taxel_mapping_map.taxelSelected.connect(self._move_above_mapped_taxel)
@@ -2668,11 +2961,21 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_load_map_button = QPushButton("Load Saved Map…")
         self.taxel_mapping_load_map_button.clicked.connect(self._load_taxel_position_map)
         mapping_layout.addWidget(self.taxel_mapping_load_map_button)
+        compare_maps = QPushButton("Compare Repeated Maps…")
+        compare_maps.setToolTip("Offline position spread across independently repeated maps. Do not compare relocated sensors as repeatability.")
+        from phd.ui.mapping_repeatability_dialog import open_mapping_repeatability
+        compare_maps.clicked.connect(lambda: open_mapping_repeatability(self))
+        mapping_layout.addWidget(compare_maps)
+        self.taxel_mapping_reference_button = QPushButton("Validate Against Independent XY References…")
+        self.taxel_mapping_reference_button.setToolTip("Offline measured centre error. CSV: taxel_index,x_mm,y_mm in the SAME robot-base frame. No fast-versus-dense comparison is required.")
+        from phd.ui.mapping_reference_dialog import open_mapping_reference
+        self.taxel_mapping_reference_button.clicked.connect(lambda: open_mapping_reference(self))
+        mapping_layout.addWidget(self.taxel_mapping_reference_button)
         self.taxel_mapping_resume_button = QPushButton("Resume Loaded Map")
         self.taxel_mapping_resume_button.setEnabled(False)
         self.taxel_mapping_resume_button.setToolTip(
             "Load an incomplete taxel_position_map.json first. Resume keeps "
-            "its measured taxels and verifies Taxel 35 before moving on."
+            "its measured taxels and verifies the saved anchor before moving on."
         )
         self.taxel_mapping_resume_button.clicked.connect(
             self._resume_loaded_taxel_map
@@ -2683,16 +2986,18 @@ class MyMainWindow(MainWindow):
         )
         self.taxel_mapping_relocate_button.setEnabled(False)
         self.taxel_mapping_relocate_button.setToolTip(
-            "Load a completed map, move the sensor, position the robot safely "
-            "and approximately above its centre taxel, remember the new anchor, "
-            "then use this button. A new map is saved; the original is kept."
+            "Load a completed or partial map, position the robot safely and "
+            "approximately above its centre taxel, remember the new anchor, "
+            "then use this button. A new map is saved; the original is kept. "
+            "A partial map continues mapping its remaining taxels afterwards."
         )
         self.taxel_mapping_relocate_button.clicked.connect(
             self._relocate_loaded_taxel_map
         )
         mapping_layout.addWidget(self.taxel_mapping_relocate_button)
         self.taxel_mapping_move_status_label = QLabel(
-            "Moves use the saved clearance Z height. Grey cells are unmapped. "
+            "Click to move directly to the selected taxel's saved safe pose, without visiting the anchor. "
+            "If below clearance, lift first; correct tool orientation if needed. Grey cells are unmapped. "
             "Use saved maps only with the same sensor placement, robot base and tool."
         )
         self.taxel_mapping_move_status_label.setWordWrap(True)
@@ -2700,21 +3005,42 @@ class MyMainWindow(MainWindow):
         mapping_layout.addWidget(self.taxel_mapping_move_status_label)
 
         self.taxel_mapping_anchor_label = QLabel(
-            "Taxel 35 anchor: not remembered"
+            "Mapping anchor: not remembered"
         )
         self.taxel_mapping_anchor_label.setWordWrap(True)
         mapping_layout.addWidget(self.taxel_mapping_anchor_label)
         self.taxel_mapping_anchor_button = QPushButton(
-            "Remember Current Pose Above Taxel 35"
+            "Remember Current Anchor Pose"
         )
         self.taxel_mapping_anchor_button.setToolTip(
-            "Save the current TCP pose above Taxel 35. Its height is the safe "
+            "Save the current TCP pose above the sensor's anchor taxel. Its height is the safe "
             "travel height for the whole run and may be well above the skin."
         )
         mapping_layout.addWidget(self.taxel_mapping_anchor_button)
+        self.taxel_mapping_scan_height_label = QLabel(
+            "Fixed scan height: not set (proximity-threshold descent)"
+        )
+        self.taxel_mapping_scan_height_label.setWordWrap(True)
+        mapping_layout.addWidget(self.taxel_mapping_scan_height_label)
+        self.taxel_mapping_scan_height_button = QPushButton(
+            "Remember Current Height as Scan Plane"
+        )
+        self.taxel_mapping_scan_height_button.setToolTip(
+            "Move the robot to the height to scan at (close to, not touching, the skin) "
+            "and press this after remembering the safe anchor. Confirm to save. With a map "
+            "loaded, this creates a new setup revision and preserves the original measurements. "
+            "A changed height requires relocation verification or fresh mapping before reuse."
+        )
+        mapping_layout.addWidget(self.taxel_mapping_scan_height_button)
+        self.taxel_mapping_scan_height_clear_button = QPushButton("Clear Scan Plane")
+        mapping_layout.addWidget(self.taxel_mapping_scan_height_clear_button)
 
-        mapping_form = QFormLayout()
+        mapping_form = components.SettingsForm()
+        motion_form = components.SettingsForm()
+        search_form = components.SettingsForm()
         self.taxel_mapping_detection_combo = QComboBox()
+        self.taxel_mapping_detection_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.taxel_mapping_detection_combo.setMinimumContentsLength(20)
         self.taxel_mapping_detection_combo.addItem(
             "Robust downward signal change (recommended)", "robust_shift"
         )
@@ -2840,7 +3166,7 @@ class MyMainWindow(MainWindow):
             "Vertical distance between stationary sampling levels. A smaller "
             "step gives a more precise onset position but takes longer."
         )
-        mapping_form.addRow(
+        motion_form.addRow(
             "Probe depth step", self.taxel_mapping_probe_step_spin
         )
 
@@ -2855,15 +3181,31 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_scan_strength_spin.setToolTip(
             "After remembering the first confirmed proximity height, descend "
             "until the downward signal change reaches this multiple of the "
-            "learned onset threshold. The stronger level is used for XY scans."
+            f"learned onset threshold (default {mapping_task.DEFAULT_CENTRE_SCAN_SIGNAL_MULTIPLIER:g}×). Only a verified stronger "
+            "level is used for XY scans; otherwise mapping fails at the depth limit. "
+            "No measurable force alone does not certify an air gap."
         )
         mapping_form.addRow(
             "Centre-scan signal strength",
             self.taxel_mapping_scan_strength_spin,
         )
 
+        def show_detection_fields(*_args):
+            # Hide irrelevant knobs, but preserve their values for switching
+            # back or loading an older map. Never change enablement/safety.
+            mode = self.taxel_mapping_detection_combo.currentData()
+            for field, applicable_mode in (
+                (self.taxel_mapping_signal_threshold_spin, "fixed"),
+                (self.taxel_mapping_adaptive_percent_spin, "adaptive_range"),
+            ):
+                field.setVisible(mode == applicable_mode)
+                mapping_form.labelForField(field).setVisible(mode == applicable_mode)
+
+        self.taxel_mapping_detection_combo.currentIndexChanged.connect(show_detection_fields)
+        show_detection_fields()
+
         self.taxel_mapping_scan_extra_descent_spin = QDoubleSpinBox()
-        self.taxel_mapping_scan_extra_descent_spin.setRange(0.5, 20.0)
+        self.taxel_mapping_scan_extra_descent_spin.setRange(0.5, mapping_task.MAX_NONCONTACT_EXTRA_DESCENT_M*1000.)
         self.taxel_mapping_scan_extra_descent_spin.setDecimals(1)
         self.taxel_mapping_scan_extra_descent_spin.setSingleStep(0.5)
         self.taxel_mapping_scan_extra_descent_spin.setSuffix(" mm")
@@ -2871,14 +3213,27 @@ class MyMainWindow(MainWindow):
             float(mapping_task.centre_scan_max_extra_descent_m) * 1000.0
         )
         self.taxel_mapping_scan_extra_descent_spin.setToolTip(
-            "Safety limit after proximity onset. If the requested signal "
-            "strength is not reached within this distance, use the strongest "
-            "safe sampled level instead of descending farther."
+            f"Hard software limit after proximity onset (maximum {mapping_task.MAX_NONCONTACT_EXTRA_DESCENT_M * 1000.:g} mm). "
+            "Stops descending once the requested stronger signal is reached; "
+            "it does not always travel the full allowance. "
+            "An earlier onset-independent boundary from saved/local response "
+            "heights also applies, even if proximity detection is missed. "
+            "If the stronger signal is not reached, return to the anchor/retry "
+            "rather than scan weakly or descend farther. A 5 g force change "
+            "stops all motion as possible contact; it is not proof of clearance."
         )
-        mapping_form.addRow(
+        motion_form.addRow(
             "Maximum descent after onset",
             self.taxel_mapping_scan_extra_descent_spin,
         )
+        self.taxel_mapping_noncontact_note = QLabel(
+            "Non-contact intent: a 5 g force change stops motion as possible contact. "
+            "A 20 mm allowance can extend into contact; the stronger signal must "
+            "fit within the depth limit. Independently "
+            "check the air gap; the software cannot certify no contact."
+        )
+        self.taxel_mapping_noncontact_note.setWordWrap(True)
+        motion_form.addRow("Non-contact policy", self.taxel_mapping_noncontact_note)
 
         self.taxel_mapping_reference_speed_spin = QDoubleSpinBox()
         self.taxel_mapping_reference_speed_spin.setRange(
@@ -2892,9 +3247,9 @@ class MyMainWindow(MainWindow):
         )
         self.taxel_mapping_reference_speed_spin.setToolTip(
             "Speed of the single long probe from the anchor that learns the "
-            "sensor height at Taxel 35. Higher speeds increase stopping distance."
+            "sensor height at the anchor taxel. Higher speeds increase stopping distance."
         )
-        mapping_form.addRow(
+        motion_form.addRow(
             "First probe speed", self.taxel_mapping_reference_speed_spin
         )
 
@@ -2913,7 +3268,7 @@ class MyMainWindow(MainWindow):
             "shorter than the anchor-to-skin distance; the force stop is the "
             "backup if it is not."
         )
-        mapping_form.addRow(
+        motion_form.addRow(
             "First probe max descent", self.taxel_mapping_reference_descent_spin
         )
 
@@ -2927,9 +3282,9 @@ class MyMainWindow(MainWindow):
         )
         self.taxel_mapping_start_margin_spin.setToolTip(
             "Every later probe starts this far above the height where the "
-            "first probe detected Taxel 35."
+            "first probe detected the anchor taxel."
         )
-        mapping_form.addRow(
+        motion_form.addRow(
             "Probe start above learned height",
             self.taxel_mapping_start_margin_spin,
         )
@@ -2946,9 +3301,11 @@ class MyMainWindow(MainWindow):
         )
         self.taxel_mapping_probe_speed_spin.setToolTip(
             "Vertical speed between stationary sampling levels. The task "
-            "stops at every level before reading the sensor."
+            "stops at every level before reading the sensor. Near-sensor "
+            "working probes use the lower of this and confirmation speed "
+            "from the start, including after a lost detection candidate."
         )
-        mapping_form.addRow("Probe speed", self.taxel_mapping_probe_speed_spin)
+        motion_form.addRow("Probe speed", self.taxel_mapping_probe_speed_spin)
 
         self.taxel_mapping_confirmation_speed_spin = QDoubleSpinBox()
         self.taxel_mapping_confirmation_speed_spin.setRange(
@@ -2961,10 +3318,11 @@ class MyMainWindow(MainWindow):
             float(mapping_task.probe_confirmation_speed_m_s) * 1000.0
         )
         self.taxel_mapping_confirmation_speed_spin.setToolTip(
-            "Slower speed used to move to the next sampling level after the "
-            "first candidate proximity response."
+            "Near-sensor working probes use the lower of this and probe speed "
+            "from the start. The first height-discovery probe also latches "
+            "this slower speed after its first candidate proximity response."
         )
-        mapping_form.addRow(
+        motion_form.addRow(
             "Confirmation speed",
             self.taxel_mapping_confirmation_speed_spin,
         )
@@ -2984,10 +3342,48 @@ class MyMainWindow(MainWindow):
             "Use large values only when the path is clear and the live force "
             "safety guard is available."
         )
-        mapping_form.addRow("Probe max descent", self.taxel_mapping_descent_spin)
+        motion_form.addRow("Probe max descent", self.taxel_mapping_descent_spin)
+
+        self.taxel_mapping_auto_reruns_spin = QSpinBox()
+        self.taxel_mapping_auto_reruns_spin.setRange(0, mapping_task.MAX_AUTO_RERUNS)
+        self.taxel_mapping_auto_reruns_spin.setSpecialValueText("Off — manual recovery")
+        self.taxel_mapping_auto_reruns_spin.setValue(mapping_task.max_auto_reruns)
+        self.taxel_mapping_auto_reruns_spin.setAccessibleName("Maximum automatic mapping reruns")
+        self.taxel_mapping_auto_reruns_spin.setToolTip(
+            "Explicit opt-in: extra two-attempt rounds for an ordinary failed taxel "
+            "after returning to the confirmed-clear anchor and recalibrating. "
+            "Suggested initial limit: 3. The budget is cumulative for the saved map. "
+            "Force/contact, lost feedback, calibration faults, relocation and "
+            "initial height-search failures never automatically restart. "
+            "Loading a map does not enable this option. Stop cancels pending reruns. "
+            "This does not certify unattended robot operation."
+        )
+        self.taxel_mapping_auto_reruns_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "max_auto_reruns", int(value))
+        )
+        motion_form.addRow("Automatic recovery reruns", self.taxel_mapping_auto_reruns_spin)
+        self.taxel_mapping_rerun_delay_spin = QSpinBox()
+        self.taxel_mapping_rerun_delay_spin.setRange(10, 600)
+        self.taxel_mapping_rerun_delay_spin.setSuffix(" s")
+        self.taxel_mapping_rerun_delay_spin.setValue(int(mapping_task.auto_rerun_delay_sec))
+        self.taxel_mapping_rerun_delay_spin.setAccessibleName("Automatic mapping rerun cooldown")
+        self.taxel_mapping_rerun_delay_spin.setToolTip(
+            "Wait stationary at the clearance anchor with all safety guards active, "
+            "then check recovery and update calibration again before rerunning. "
+            "Only used when automatic recovery reruns are enabled."
+        )
+        self.taxel_mapping_rerun_delay_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "auto_rerun_delay_sec", float(value))
+        )
+        self.taxel_mapping_rerun_delay_spin.setEnabled(mapping_task.max_auto_reruns > 0)
+        self.taxel_mapping_auto_reruns_spin.valueChanged.connect(
+            lambda value: self.taxel_mapping_rerun_delay_spin.setEnabled(
+                int(value) > 0 and not mapping_task._active)
+        )
+        motion_form.addRow("Rerun cooldown", self.taxel_mapping_rerun_delay_spin)
 
         self.taxel_mapping_force_guard_spin = QDoubleSpinBox()
-        self.taxel_mapping_force_guard_spin.setRange(1.0, 2000.0)
+        self.taxel_mapping_force_guard_spin.setRange(1.0, 100.0)
         self.taxel_mapping_force_guard_spin.setDecimals(1)
         self.taxel_mapping_force_guard_spin.setSingleStep(10.0)
         self.taxel_mapping_force_guard_spin.setSuffix(" g")
@@ -2998,7 +3394,8 @@ class MyMainWindow(MainWindow):
             "Stop the complete task if force changes this much from the "
             "safe-height baseline."
         )
-        mapping_form.addRow("Unexpected-force stop", self.taxel_mapping_force_guard_spin)
+        motion_form.insertRow(0, "Unexpected-force stop", self.taxel_mapping_force_guard_spin)
+        self.taxel_mapping_force_guard_spin.setAccessibleName("Unexpected-force stop")
 
         self.taxel_mapping_coarse_radius_spin = QDoubleSpinBox()
         self.taxel_mapping_coarse_radius_spin.setRange(1.0, 30.0)
@@ -3008,7 +3405,7 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_coarse_radius_spin.setValue(
             float(mapping_task.coarse_radius_m) * 1000.0
         )
-        mapping_form.addRow("Neighbour-search radius", self.taxel_mapping_coarse_radius_spin)
+        search_form.addRow("Neighbour-search radius", self.taxel_mapping_coarse_radius_spin)
 
         self.taxel_mapping_coarse_step_spin = QDoubleSpinBox()
         self.taxel_mapping_coarse_step_spin.setRange(0.1, 5.0)
@@ -3018,7 +3415,32 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_coarse_step_spin.setValue(
             float(mapping_task.coarse_step_m) * 1000.0
         )
-        mapping_form.addRow("Neighbour-search step", self.taxel_mapping_coarse_step_spin)
+        self.taxel_mapping_coarse_step_spin.setToolTip(
+            "Dense fallback resolution. Large searches first try twice this "
+            "step, then automatically use this full grid if the reference "
+            "peaks, lattice or anchor-centre verification are unclear."
+        )
+        search_form.addRow("Neighbour-search step", self.taxel_mapping_coarse_step_spin)
+        self.taxel_mapping_xy_frames_spin = QSpinBox()
+        self.taxel_mapping_xy_frames_spin.setRange(3, 200)
+        self.taxel_mapping_xy_frames_spin.setValue(mapping_task.scan_frame_count)
+        self.taxel_mapping_xy_frames_spin.setToolTip(
+            "Unique stationary readings per XY point, combined by median. "
+            "Default 9 for faster search; use 20 or more for a noisier sensor. "
+            "Dense neighbour-search fallback uses at least 20. This does not "
+            "shorten the 20-frame proximity or final-verification windows."
+        )
+        self.taxel_mapping_xy_frames_spin.valueChanged.connect(
+            lambda value: setattr(mapping_task, "scan_frame_count", int(value))
+        )
+        search_form.addRow("Frames per XY point", self.taxel_mapping_xy_frames_spin)
+        self.taxel_mapping_reverse_scan_check = QCheckBox("Reverse XY scan order")
+        self.taxel_mapping_reverse_scan_check.setToolTip("Reverse scan-point order for a new independent repeatability run.")
+        self.taxel_mapping_reverse_scan_check.setChecked(mapping_task.reverse_scan_order)
+        self.taxel_mapping_reverse_scan_check.toggled.connect(
+            lambda value: setattr(mapping_task, "reverse_scan_order", bool(value))
+        )
+        search_form.addRow("Direction check", self.taxel_mapping_reverse_scan_check)
 
         self.taxel_mapping_local_radius_spin = QDoubleSpinBox()
         self.taxel_mapping_local_radius_spin.setRange(0.5, 10.0)
@@ -3032,7 +3454,7 @@ class MyMainWindow(MainWindow):
             "Half-length of the row and column line scans through each taxel. "
             "It is capped at 0.6 of the measured taxel pitch."
         )
-        mapping_form.addRow("Local scan half-width", self.taxel_mapping_local_radius_spin)
+        search_form.addRow("Local scan half-width", self.taxel_mapping_local_radius_spin)
 
         self.taxel_mapping_local_step_spin = QDoubleSpinBox()
         self.taxel_mapping_local_step_spin.setRange(0.1, 2.0)
@@ -3042,7 +3464,7 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_local_step_spin.setValue(
             float(mapping_task.local_step_m) * 1000.0
         )
-        mapping_form.addRow("Local scan step", self.taxel_mapping_local_step_spin)
+        search_form.addRow("Local scan step", self.taxel_mapping_local_step_spin)
 
         self.taxel_mapping_line_speed_spin = QSpinBox()
         self.taxel_mapping_line_speed_spin.setRange(1, 100)
@@ -3052,9 +3474,11 @@ class MyMainWindow(MainWindow):
         )
         self.taxel_mapping_line_speed_spin.setToolTip(
             "Speed of every straight-line tool move. The robot driver only "
-            "accepts whole mm/s."
+            "accepts whole mm/s. The robot controller's project-speed override "
+            "also applies: 20 mm/s at 5% is approximately 1 mm/s. The task "
+            "does not increase or bypass that override."
         )
-        mapping_form.addRow("Tool line speed", self.taxel_mapping_line_speed_spin)
+        motion_form.addRow("Tool line speed", self.taxel_mapping_line_speed_spin)
 
         self.taxel_mapping_xy_limit_spin = QDoubleSpinBox()
         self.taxel_mapping_xy_limit_spin.setRange(10.0, 200.0)
@@ -3066,10 +3490,38 @@ class MyMainWindow(MainWindow):
         )
         self.taxel_mapping_xy_limit_spin.setToolTip(
             "Reject any fitted taxel position farther than this XY distance "
-            "from the remembered Taxel 35 anchor."
+            "from the remembered anchor taxel."
         )
-        mapping_form.addRow("Maximum XY offset", self.taxel_mapping_xy_limit_spin)
-        mapping_layout.addLayout(mapping_form)
+        motion_form.insertRow(1, "Maximum XY offset", self.taxel_mapping_xy_limit_spin)
+        self.taxel_mapping_xy_limit_spin.setAccessibleName("Maximum XY offset")
+
+        # Keep the map available throughout a run; settings have their own
+        # labelled pages instead of living below an eighty-cell map.
+        top_widgets = (
+            self.taxel_mapping_anchor_label,
+            self.taxel_mapping_anchor_button,
+            self.taxel_mapping_scan_height_label,
+            self.taxel_mapping_scan_height_button,
+            self.taxel_mapping_scan_height_clear_button,
+        )
+        for widget in top_widgets:
+            mapping_layout.removeWidget(widget)
+        for position, widget in enumerate(top_widgets):
+            mapping_layout.insertWidget(position, widget)
+        mapping_layout.insertWidget(len(top_widgets), components.divider())
+        self.taxel_mapping_sections.addTab(UI._scrollable(mapping_navigation), "Map / anchor")
+        for title, description, form in (
+            ("Motion / safety", "Review force and travel limits before running. Speeds apply to the labelled moves only.", motion_form),
+            ("Signal detection", "Baseline sampling and the downward signal change used to confirm proximity.", mapping_form),
+            ("XY search", "Neighbour discovery and the local line scans used to locate each taxel centre.", search_form),
+        ):
+            section = QWidget()
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(8, 8, 8, 8)
+            section_layout.addWidget(components.SectionHeader(title, description))
+            section_layout.addLayout(form)
+            section_layout.addStretch()
+            self.taxel_mapping_sections.addTab(UI._scrollable(section), title)
 
         self.taxel_mapping_note = QLabel(
             "The default robust detector learns 100 safe-anchor frames, then "
@@ -3080,27 +3532,41 @@ class MyMainWindow(MainWindow):
             "reaches the configured centre-scan strength (2× by default), giving "
             "the XY scan a clearer peak. The "
             "first probe from the anchor "
-            "learns the sensor height at Taxel 35. "
+            "learns the sensor height at the anchor taxel. "
             "After that, every taxel is approached at the anchor height, "
-            "probed from just above the learned height, centred with row and "
+            "probed slowly against a far-field baseline from just above the learned height, centred with row and "
             "column line scans, and verified using a 20-frame centre sample. "
-            "All moves are straight lines. A missing taxel "
-            "returns to Taxel 35 and retries once; a second failure returns "
-            "to Taxel 35 and stops. The force transmitter connects automatically "
+            "After each verified taxel or recoverable failure, it lifts first, "
+            "returns to the remembered clearance anchor, checks signal recovery, "
+            "updates the full calibration and collects a fresh baseline. "
+            "The anchor must be independently confirmed outside proximity range. "
+            "A missing taxel retries once after this cycle; a second failure "
+            "completes the cycle then stops. Force/contact or feedback faults "
+            "stop immediately without automatic movement or calibration. "
+            "All moves are straight lines. The force transmitter connects automatically "
             "and robot motion waits for a fresh safety reading."
         )
         self.taxel_mapping_note.setWordWrap(True)
         self.taxel_mapping_note.setStyleSheet(f"color: {theme.TEXT_MUTED};")
-        mapping_layout.addWidget(self.taxel_mapping_note)
+        mapping_help = components.CollapsibleGroup("How mapping works")
+        mapping_help.add(self.taxel_mapping_note)
+        mapping_layout.addWidget(mapping_help)
+        mapping_layout.addStretch()
         self.taxel_mapping_progress_label = QLabel("Ready | 0/80 located")
         self.taxel_mapping_progress_label.setWordWrap(True)
         self.taxel_mapping_progress_label.setStyleSheet(
             f"color: {theme.TEXT_MUTED}; font-weight: 600;"
         )
-        mapping_layout.addWidget(self.taxel_mapping_progress_label)
+        mapping_outer.addWidget(self.taxel_mapping_progress_label)
 
         self.taxel_mapping_anchor_button.clicked.connect(
             self._remember_taxel_mapping_anchor
+        )
+        self.taxel_mapping_scan_height_button.clicked.connect(
+            self._remember_taxel_mapping_scan_height
+        )
+        self.taxel_mapping_scan_height_clear_button.clicked.connect(
+            self._clear_taxel_mapping_scan_height
         )
         self.taxel_mapping_detection_combo.currentIndexChanged.connect(
             lambda _index: setattr(
@@ -3199,15 +3665,48 @@ class MyMainWindow(MainWindow):
         self.taxel_mapping_xy_limit_spin.valueChanged.connect(
             lambda value: setattr(mapping_task, "max_xy_offset_m", float(value) / 1000.0)
         )
-        mapping_scroll = QScrollArea()
-        mapping_scroll.setFrameShape(QFrame.NoFrame)
-        mapping_scroll.setWidgetResizable(True)
-        mapping_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        mapping_scroll.setWidget(mapping_panel)
-        self._task_param_widgets[mapping_task.id] = mapping_scroll
-        parent_layout.addWidget(mapping_scroll)
+        mapping_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._task_param_widgets[mapping_task.id] = mapping_panel
+        parent_layout.addWidget(mapping_panel)
         self._refresh_taxel_mapping_controls()
         self._refresh_taxel_mapping_progress()
+
+    @staticmethod
+    def _make_map_folder_label():
+        label = components.muted(components.ElidedLabel("Map folder: no map loaded"))
+        label.setTextFormat(Qt.PlainText)
+        label.setAccessibleName("Loaded map folder")
+        label.setFocusPolicy(Qt.StrongFocus)
+        label.setContextMenuPolicy(Qt.ActionsContextMenu)
+        for title, prop in (("Copy folder path", "mapFolder"), ("Copy map file path", "mapFile")):
+            action = QAction(title, label)
+            action.setEnabled(False)
+            action.triggered.connect(
+                lambda checked=False, prop=prop: QApplication.clipboard().setText(label.property(prop) or "")
+            )
+            label.addAction(action)
+        return label
+
+    def _update_map_folder_label(self, name, result, source_path=None):
+        label = getattr(self, name, None)
+        if label is None:
+            return
+        source = str(source_path or (result or {}).get("json_path") or "") if result is not None else ""
+        path = os.path.abspath(os.path.expanduser(source)) if source else ""
+        folder = os.path.dirname(path) if path else ""
+        label.setProperty("mapFolder", folder)
+        label.setProperty("mapFile", path)
+        label.setText(
+            f"Map folder: {os.path.basename(folder) or folder}" if folder else
+            ("Map folder: current result has no saved path" if result is not None else "Map folder: no map loaded")
+        )
+        label.setToolTip(
+            f"Folder: {folder}\nMap file: {path}\nRight-click to copy either full path."
+            if path else label.text()
+        )
+        label.setAccessibleDescription(label.toolTip())
+        for action in label.actions():
+            action.setEnabled(bool(path))
 
     def _streaming_sensor_shape(self) -> tuple[int, int]:
         sensor = getattr(getattr(self, "ui_ros", None), "sensor_functions", None)
@@ -3226,10 +3725,21 @@ class MyMainWindow(MainWindow):
         """Keep both taxel maps on the grid size of the live sensor stream."""
         if getattr(self, "_sidebar_active_task", None) is not None:
             return
+        self._auto_load_connected_sensor_map()
         rows, columns = self._streaming_sensor_shape()
         if rows <= 0 or columns <= 0:
             return
         mapping_grid = getattr(self, "taxel_mapping_map", None)
+        if mapping_grid is not None:
+            task = self._taxel_mapping_task()
+            if task is not None and (
+                (task.sensor_rows, task.sensor_columns) != (rows, columns)
+                or getattr(self, "_taxel_mapping_controls_shape", None) != (rows, columns)
+            ):
+                # A sensor can connect after this page was opened. Update the
+                # anchor, help and settings with the grid, without requiring
+                # the user to select the experiment again.
+                self._refresh_taxel_mapping_controls()
         if mapping_grid is not None and (mapping_grid.rows, mapping_grid.columns) != (
             rows,
             columns,
@@ -3243,10 +3753,98 @@ class MyMainWindow(MainWindow):
         ) != (rows, columns):
             self._refresh_calibration_controls()
 
+    def _clear_loaded_sensor_maps(self):
+        """Discard old navigation/selected poses in memory, never saved files."""
+        self._taxel_navigation_result = None
+        self._taxel_navigation_source_path = None
+        self._taxel_mapping_anchor_updated_after_load = False
+        self._update_map_folder_label("taxel_mapping_map_folder_label", None)
+        for task in (self._calibration_task(), self._full_taxel_calibration_task()):
+            if task is not None:
+                task.position_map = None
+                task.position_map_path = ""
+                if (task.initial_position or {}).get("source") in {
+                    "taxel_position_map", "taxel_position_map_anchor",
+                }:
+                    task.initial_position = None
+                if task.id == "full_taxel_calibration":
+                    task._home_position = None
+        for name in ("taxel_mapping_map", "calibration_taxel_map", "full_taxel_calibration_map"):
+            grid = getattr(self, name, None)
+            if grid is not None:
+                grid.set_taxels([])
+        self._refresh_calibration_controls()
+        self._refresh_full_taxel_calibration_controls()
+        self._refresh_taxel_mapping_controls()
+        self._refresh_taxel_navigation_controls()
+
+    def _auto_load_connected_sensor_map(self):
+        if getattr(self, "_taxel_setup_confirmation_open", False):
+            return
+        if self._sidebar_active_task is not None:
+            return
+        if getattr(self._full_taxel_calibration_task(), "resume_plan", None) is not None:
+            return  # The staged run owns its original map, never the newest map.
+        shape = self._streaming_sensor_shape()
+        if shape == (0, 0):
+            # Leave an offline map available for inspection. Reconnecting
+            # triggers a fresh lookup, including after a USB port renumbering.
+            self._auto_taxel_map_context = None
+            return
+        key, label, _rows, _columns = experiment_tasks.connected_calibration_sensor(self)
+        context = (key, *shape)
+        changed = context != self._auto_taxel_map_context
+        now = time.monotonic()
+        if not changed and now < self._auto_taxel_map_next_check:
+            return
+        self._auto_taxel_map_context = context
+        self._auto_taxel_map_next_check = now + 5.0
+        entry = self._taxel_map_catalog.latest(key, shape)
+        selection = (str(entry.path), entry.fingerprint) if entry is not None else None
+        if not changed and selection == self._auto_taxel_map_selection:
+            # In particular, preserve a manually loaded older map while the
+            # newest saved map is unchanged.
+            return
+        self._auto_taxel_map_selection = selection
+        self._clear_loaded_sensor_maps()
+        if entry is None:
+            if not key or key.startswith("layout:"):
+                message = "Automatic map loading needs an identified sensor; assign its sensor profile first."
+            else:
+                message = f"No saved position map matches {label} ({shape[0]}x{shape[1]}). Run mapping or load a map manually."
+            self.taxel_mapping_map_info.setText(message)
+            self.full_taxel_calibration_map_info.setText(message)
+            self.calibration_map_info.setText(message)
+            self._append_sidebar_control_message(message)
+            return
+        self._show_taxel_position_map(entry.result, source_path=str(entry.path))
+        count = len(entry.result["positions"])
+        stamp = entry.result.get("saved_at") or "save time unavailable"
+        message = f"Auto-loaded latest map for {label}: {count} measured taxels · saved {stamp}"
+        if revision_motion_error(entry.result):
+            message = f"Auto-loaded setup revision for {label} · verification required\n{revision_motion_error(entry.result)}"
+        self.taxel_mapping_map_info.setText(message)
+        self.taxel_mapping_map_info.setToolTip(str(entry.path))
+        if revision_motion_error(entry.result):
+            self.calibration_map_info.setText(revision_motion_error(entry.result))
+            self.full_taxel_calibration_map_info.setText(revision_motion_error(entry.result))
+        elif self._calibration_task().position_map is None:
+            detail = "This map has no usable calibration start positions yet. Continue mapping first."
+            self.calibration_map_info.setText(message + "\n" + detail)
+            self.full_taxel_calibration_map_info.setText(detail)
+        else:
+            self.calibration_map_info.setText(message + "\nSelect a taxel to set the calibration start.")
+        self.calibration_map_info.setToolTip(str(entry.path))
+        self._append_sidebar_control_message(message + f"\n{entry.path}")
+
     def _paint_loaded_taxel_navigation_map(self) -> None:
         prepared = getattr(self, "_taxel_navigation_result", None)
         grid = getattr(self, "taxel_mapping_map", None)
         info = getattr(self, "taxel_mapping_map_info", None)
+        self._update_map_folder_label(
+            "taxel_mapping_map_folder_label", prepared,
+            getattr(self, "_taxel_navigation_source_path", None),
+        )
         if prepared is None or grid is None:
             return
         settings = prepared.get("settings") or {}
@@ -3295,7 +3893,8 @@ class MyMainWindow(MainWindow):
                 for value in record["safe_approach_position_m"]
             )
             grid.buttons[index].setToolTip(
-                f"Click to move above Taxel {index}\n"
+                ("Retained measurement — verify the new setup before moving\n"
+                 if revision_motion_error(prepared) else f"Click to move above Taxel {index}\n") +
                 f"Saved clearance TCP: ({xyz}) mm"
             )
         if info is None:
@@ -3306,6 +3905,8 @@ class MyMainWindow(MainWindow):
             or "Current mapping result"
         )
         state = "Completed map" if prepared.get("completed") else "Partial map"
+        if revision_motion_error(prepared):
+            state = "Setup revision — verification required (original measurements retained)"
         target_total = file_rows * file_columns - len(skipped)
         mapped_target = sum(
             int(record["taxel_index"]) not in skipped for record in records
@@ -3326,6 +3927,15 @@ class MyMainWindow(MainWindow):
         self._taxel_navigation_source_path = str(
             source_path or prepared.get("json_path") or ""
         ) or None
+        proposed = revision_setup(prepared)
+        mapping_task = self._taxel_mapping_task()
+        if proposed is not None and mapping_task is not None:
+            key, _label, _rows, _columns = experiment_tasks.connected_calibration_sensor(self)
+            if key == prepared.get("sensor_identity"):
+                mapping_task.use_connected_sensor(self)
+                mapping_task.apply_remembered_setup(proposed)
+                self._taxel_mapping_anchor_updated_after_load = True
+                self._refresh_taxel_mapping_controls()
         settings = prepared.get("settings") or {}
         try:
             file_rows = int(settings["sensor_rows"])
@@ -3348,34 +3958,65 @@ class MyMainWindow(MainWindow):
             grid.set_grid_shape(rows, columns)
         self._paint_loaded_taxel_navigation_map()
         self._refresh_taxel_navigation_status(
+            revision_motion_error(prepared) or
             "Click a numbered cell to move above that taxel at the saved clearance height. "
+            "No return to the anchor: lift vertically or correct tool orientation first only if needed. "
             "The sensor placement, robot base and tool must match this map."
         )
         self._refresh_taxel_navigation_controls()
         # The same validated map is immediately available to Full Taxel
         # Calibration. Loading remains a read-only action; no motion starts.
-        try:
-            self._show_full_taxel_calibration_map(
-                prepared,
-                source_path=source_path,
-            )
-        except ValueError:
-            # Older navigation-only maps can still be used to move above a
-            # taxel even when they do not contain the probe-start height that
-            # Full Taxel Calibration requires.
-            pass
+        if revision_motion_error(prepared):
+            # Keep the blocker in task state as well as the UI: stale selected
+            # start poses must not survive loading an unverified setup.
+            for task in (self._calibration_task(), self._full_taxel_calibration_task()):
+                if task is None or getattr(task, "resume_plan", None) is not None:
+                    continue  # A staged run always owns its original snapshot.
+                task.position_map = copy.deepcopy(prepared)
+                task.position_map["positions"] = []
+                task.position_map_path = self._taxel_navigation_source_path or ""
+                task.initial_position = None
+                if task.id == "full_taxel_calibration":
+                    task._home_position = None
+                    grid = getattr(self, "full_taxel_calibration_map", None)
+                    if grid is not None:
+                        grid.set_taxels([])
+            self._refresh_calibration_controls()
+            self._refresh_full_taxel_calibration_controls()
+            self.calibration_map_info.setText(revision_motion_error(prepared))
+            if getattr(self._full_taxel_calibration_task(), "resume_plan", None) is None:
+                self.full_taxel_calibration_map_info.setText(revision_motion_error(prepared))
+        else:
+            try:
+                if getattr(self._full_taxel_calibration_task(), "resume_plan", None) is None:
+                    self._show_full_taxel_calibration_map(prepared, source_path=source_path)
+                self._show_single_calibration_map(prepared, source_path=source_path)
+            except ValueError:
+                # Navigation-only maps may not contain a calibration start.
+                pass
         scroll = self._task_param_widgets.get("taxel_position_mapping")
         if isinstance(scroll, QScrollArea):
             scroll.verticalScrollBar().setValue(0)
+
+    def _choose_experiment_file(self, title, directory, file_filter):
+        """Open a file dialog over Experiment Controls and keep it in front afterwards."""
+        window = getattr(self, "experiments_window", None)
+        over_controls = window is not None and window.isVisible()
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            window if over_controls else self, title, directory, file_filter,
+        )
+        if over_controls:
+            window.raise_()
+            window.activateWindow()
+        return path
 
     def _load_taxel_position_map(self):
         if self._sidebar_active_task is not None:
             self._append_sidebar_control_message("Stop the current experiment before loading a position map.")
             return
-        path, _filter = QFileDialog.getOpenFileName(
-            self,
+        path = self._choose_experiment_file(
             "Load taxel position map",
-            resource_path("taxel_position_maps"),
+            experiment_path("taxel_position_maps"),
             "Taxel position map (taxel_position_map.json);;JSON files (*.json)",
         )
         if not path:
@@ -3430,15 +4071,16 @@ class MyMainWindow(MainWindow):
     def _refresh_taxel_navigation_controls(self):
         active = getattr(self, "_sidebar_active_task", None)
         busy = active is not None
+        unverified = bool(revision_motion_error(getattr(self, "_taxel_navigation_result", None)))
         grid = getattr(self, "taxel_mapping_map", None)
         if grid is not None:
             interaction_setter = getattr(
                 grid, "set_interaction_enabled", None
             )
             if callable(interaction_setter):
-                interaction_setter(not busy)
+                interaction_setter(not busy and not unverified)
             else:
-                grid.setEnabled(not busy)
+                grid.setEnabled(not busy and not unverified)
         loader = getattr(self, "taxel_mapping_load_map_button", None)
         if loader is not None:
             loader.setEnabled(not busy)
@@ -3475,9 +4117,11 @@ class MyMainWindow(MainWindow):
                 if valid and anchor_ready
                 else "Relocation unavailable: " + str(message)
             )
-        keyboard = getattr(self, "action_keyboard_tool_velocity", None)
-        if keyboard is not None:
-            keyboard.setEnabled(getattr(active, "id", None) != "mapped_taxel_move")
+        keyboard_allowed = getattr(active, "id", None) != "mapped_taxel_move"
+        for name in ("action_keyboard_tool_velocity", "action_keyboard_tool_position"):
+            keyboard = getattr(self, name, None)
+            if keyboard is not None:
+                keyboard.setEnabled(keyboard_allowed)
 
     def _resume_loaded_taxel_map(self):
         if self._sidebar_active_task is not None:
@@ -3485,9 +4129,9 @@ class MyMainWindow(MainWindow):
                 "Stop the current experiment before resuming a position map."
             )
             return
-        if self._keyboard_tool_velocity_enabled:
+        if self._keyboard_tool_velocity_enabled or self._keyboard_tool_position_enabled:
             self._append_sidebar_control_message(
-                "Turn off keyboard tool velocity before resuming taxel mapping."
+                "Turn off keyboard robot control before resuming taxel mapping."
             )
             return
         task = self._taxel_mapping_task()
@@ -3519,9 +4163,9 @@ class MyMainWindow(MainWindow):
                 "Stop the current experiment before relocating a position map."
             )
             return
-        if self._keyboard_tool_velocity_enabled:
+        if self._keyboard_tool_velocity_enabled or self._keyboard_tool_position_enabled:
             self._append_sidebar_control_message(
-                "Turn off keyboard tool velocity before relocating the map."
+                "Turn off keyboard robot control before relocating the map."
             )
             return
         task = self._taxel_mapping_task()
@@ -3557,8 +4201,8 @@ class MyMainWindow(MainWindow):
         if self._sidebar_active_task is not None:
             self._append_sidebar_control_message("Stop the current experiment before selecting another taxel.")
             return
-        if self._keyboard_tool_velocity_enabled:
-            self._append_sidebar_control_message("Turn off keyboard tool velocity before selecting a mapped taxel.")
+        if self._keyboard_tool_velocity_enabled or self._keyboard_tool_position_enabled:
+            self._append_sidebar_control_message("Turn off keyboard robot control before selecting a mapped taxel.")
             return
         mapping_task = self._taxel_mapping_task()
         try:
@@ -3593,11 +4237,24 @@ class MyMainWindow(MainWindow):
     def _calibration_task(self):
         return experiment_tasks.get_task("calibration")
 
+    def _refresh_calibration_planned_limits(self, task):
+        name = ("full_taxel_calibration_readiness_panel" if task.id == "full_taxel_calibration"
+                else "calibration_readiness_panel")
+        panel = getattr(self, name, None)
+        if panel is not None:
+            panel.sync_limits()
+            # Run already chose its limits; rendering must not replan them.
+            panel.refresh(apply_auto=False)
+
     def _refresh_calibration_controls(self):
         task = self._calibration_task()
         label = getattr(self, "calibration_initial_position_label", None)
         if task is None:
             return
+        self._update_map_folder_label(
+            "calibration_map_folder_label", getattr(task, "position_map", None),
+            getattr(task, "position_map_path", ""),
+        )
         if hasattr(task, "use_connected_sensor"):
             task.use_connected_sensor(self)
         sensor_label = str(
@@ -3670,6 +4327,9 @@ class MyMainWindow(MainWindow):
                 and tool_position is not None
                 and not bool(getattr(task, "_test_active", False))
             )
+        readiness = getattr(self, "calibration_readiness_panel", None)
+        if readiness is not None:
+            readiness.refresh()
 
     def _refresh_calibration_progress(
         self, current=None, total=None, phase=None, detail=""
@@ -3715,6 +4375,9 @@ class MyMainWindow(MainWindow):
             "calibration_max_travel_spin",
             "calibration_timeout_spin",
             "calibration_repeat_spin",
+            "calibration_protocol_selector",
+            "calibration_protocol_panel",
+            "calibration_readiness_panel",
             "calibration_load_map_button",
             "calibration_mode_tabs",
         ):
@@ -3729,6 +4392,9 @@ class MyMainWindow(MainWindow):
             grid.set_interaction_enabled(not running)
         if not running:
             self._refresh_calibration_controls()
+            force = getattr(self, "calibration_force_threshold_spin", None)
+            if force is not None:
+                force.setEnabled(getattr(self._calibration_task(), "protocol", "") != "force_sweep")
 
     def _refresh_calibration_live_force(
         self,
@@ -3788,10 +4454,9 @@ class MyMainWindow(MainWindow):
                 "Stop the current experiment before loading a position map."
             )
             return
-        path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
+        path = self._choose_experiment_file(
             "Load map for single-taxel calibration",
-            resource_path("taxel_position_maps"),
+            experiment_path("taxel_position_maps"),
             "Taxel position map (taxel_position_map.json);;JSON files (*.json)",
         )
         if not path:
@@ -3799,24 +4464,33 @@ class MyMainWindow(MainWindow):
         try:
             with open(path, "r", encoding="utf-8") as stream:
                 result = json.load(stream)
-            prepared = experiment_tasks.FullTaxelCalibrationTask.prepare_position_map(
-                result
-            )
+            self._show_single_calibration_map(result, source_path=path)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             self._append_sidebar_control_message(
                 f"Could not load the calibration taxel map: {exc}"
             )
             return
+        self._append_sidebar_control_message(
+            f"Single-taxel calibration map loaded: {path}"
+        )
+        selector = getattr(self, "calibration_taxel_selector", None)
+        if selector is not None:
+            selector.toggle.setChecked(True)
+
+    def _show_single_calibration_map(self, result, source_path=None):
+        prepared = experiment_tasks.FullTaxelCalibrationTask.prepare_position_map(result)
         task = self._calibration_task()
         if task is None:
             return
         task.position_map = prepared
+        task.position_map_path = str(source_path or prepared.get("json_path") or "")
         if (task.initial_position or {}).get("source") == "taxel_position_map":
             task.initial_position = None
         self._refresh_calibration_controls()
-        self._append_sidebar_control_message(
-            f"Single-taxel calibration map loaded: {path}"
+        self.calibration_map_info.setText(
+            f"Position map loaded · {len(prepared['positions'])} measured taxels. Select a taxel below."
         )
+        self.calibration_map_info.setToolTip(task.position_map_path)
 
     def _select_single_calibration_taxel(self, index):
         task = self._calibration_task()
@@ -3851,12 +4525,6 @@ class MyMainWindow(MainWindow):
             f"TCP {[round(float(value) * 1000.0, 2) for value in start]} mm."
         )
         self._move_above_mapped_taxel(int(index), prepared)
-
-    def _remember_full_taxel_initial_position(self):
-        task = self._full_taxel_calibration_task()
-        if task is None or self._current_sidebar_control_id() != task.id:
-            return
-        task.capture_initial_position(self)
 
     def _full_taxel_calibration_task(self):
         return experiment_tasks.get_task("full_taxel_calibration")
@@ -3926,16 +4594,87 @@ class MyMainWindow(MainWindow):
         self._refresh_full_taxel_calibration_progress()
         return True
 
+    def _sync_full_taxel_resume_settings(self):
+        task = self._full_taxel_calibration_task()
+        for name, value in (
+            ("speed", task.approach_speed_m_s * 1000.),
+            ("route_speed", task.line_speed_m_s * 1000.),
+            ("force_threshold", task.contact_threshold_g),
+            ("route_guard", task.route_force_guard_g),
+            ("max_travel", task.max_travel_m * 1000.),
+            ("timeout", task.timeout_sec), ("repeat", task.repeat_count),
+        ):
+            widget = getattr(self, f"full_taxel_calibration_{name}_spin")
+            blocker = QSignalBlocker(widget)
+            widget.setValue(value)
+            del blocker
+        combo = self.full_taxel_calibration_signal_combo
+        blocker = QSignalBlocker(combo)
+        combo.setCurrentIndex(combo.findData(task.signal_field))
+        del blocker
+        self.full_taxel_calibration_protocol_panel.sync_from_task()
+        readiness = self.full_taxel_calibration_readiness_panel
+        blocker = QSignalBlocker(readiness.auto_plan)
+        readiness.auto_plan.setChecked(task.loading_auto_plan)
+        del blocker
+        blocker = QSignalBlocker(readiness.extra)
+        readiness.extra.setValue(task.loading_extra_travel_mm)
+        del blocker
+
+    def _load_full_taxel_calibration_resume(self):
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message("Stop the current experiment and wait for saving before loading Resume.")
+            return
+        path = self._choose_experiment_file(
+            "Resume Full Taxel Calibration · select the stopped run summary",
+            experiment_path("calibration_recordings"),
+            "Full Taxel Calibration summary (full_taxel_summary.json);;JSON files (*.json)",
+        )
+        if not path:
+            return
+        task = self._full_taxel_calibration_task()
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            loaded, message = task.load_resume(path)
+        finally:
+            QApplication.restoreOverrideCursor()
+        self._append_sidebar_control_message(message)
+        if not loaded:
+            QMessageBox.warning(self, "Cannot resume calibration", message)
+            return
+        self._sync_full_taxel_resume_settings()
+        self.full_taxel_calibration_resume_info.setText("Resume ready · settings locked\n" + message + "\n" + str(task.resume_plan["folder"]))
+        self.full_taxel_calibration_resume_confirm.setText(
+            "Setup unchanged; unloaded routing / sliding paths checked;\nI will supervise"
+            if task.protocol == "sliding" else
+            "Sensor and probe setup unchanged;\nunloaded probe and routing path checked"
+        )
+        self.full_taxel_calibration_resume_confirm.setChecked(False)
+        self.full_taxel_calibration_map.set_grid_shape(task.sensor_rows, task.sensor_columns)
+        self._set_full_taxel_calibration_controls_running(False)
+        self._refresh_full_taxel_calibration_progress(detail="Saved run loaded; review and confirm setup before Resume")
+        self._update_sidebar_task_action_labels()
+        self._refresh_full_taxel_calibration_controls()
+
+    def _clear_full_taxel_calibration_resume(self):
+        if self._sidebar_active_task is not None:
+            return
+        self._full_taxel_calibration_task().clear_resume()
+        self._sync_full_taxel_resume_settings()
+        self._set_full_taxel_calibration_controls_running(False)
+        self._update_sidebar_task_action_labels()
+        self._refresh_full_taxel_calibration_controls()
+        self._refresh_full_taxel_calibration_progress(detail="New run setup; saved recordings unchanged")
+
     def _load_full_taxel_calibration_map(self):
         if self._sidebar_active_task is not None:
             self._append_sidebar_control_message(
                 "Stop the current experiment before loading a position map."
             )
             return
-        path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            "Load map for Full Taxel Calibration",
-            resource_path("taxel_position_maps"),
+        path = self._choose_experiment_file(
+            "Load Taxel Position Map for New Calibration",
+            experiment_path("taxel_position_maps"),
             "Taxel position map (taxel_position_map.json);;JSON files (*.json)",
         )
         if not path:
@@ -3949,11 +4688,11 @@ class MyMainWindow(MainWindow):
             )
         except (OSError, ValueError, TypeError, KeyError) as exc:
             self._append_sidebar_control_message(
-                f"Could not load the full-taxel calibration map: {exc}"
+                f"Could not load the taxel position map: {exc}"
             )
             return
         self._append_sidebar_control_message(
-            f"Full Taxel Calibration map loaded: {path}"
+            f"Taxel position map loaded for a new Full Taxel Calibration: {path}"
         )
 
     def _refresh_full_taxel_calibration_controls(self):
@@ -3961,10 +4700,16 @@ class MyMainWindow(MainWindow):
         if task is None:
             return
         result = getattr(task, "position_map", None)
+        self._update_map_folder_label(
+            "full_taxel_calibration_map_folder_label", result,
+            getattr(task, "position_map_path", ""),
+        )
         records = list((result or {}).get("positions") or [])
         label = getattr(self, "full_taxel_calibration_map_info", None)
         if label is not None and result is None:
             label.setText("Position map: not loaded")
+        elif label is not None and revision_motion_error(result):
+            label.setText(revision_motion_error(result))
         elif label is not None and not bool(getattr(task, "_test_active", False)):
             state = "Completed map" if result.get("completed") else "Partial map"
             map_settings = result.get("settings") or {}
@@ -3982,31 +4727,28 @@ class MyMainWindow(MainWindow):
             )
         if not bool(getattr(task, "_test_active", False)):
             task.use_connected_sensor(self)
+        # initial_position follows the current taxel while running; home stays
+        # at the map anchor captured at the beginning of this run.
+        pose = task._home_position if task._test_active else task.initial_position
         home = task._finite_values(
-            (getattr(task, "initial_position", None) or {}).get("tool_position_m"),
+            (pose or {}).get("tool_position_m"),
             3,
         )
         home_label = getattr(self, "full_taxel_initial_position_label", None)
         sensor_label = str(getattr(task, "active_sensor_label", "") or "this sensor")
         if home_label is not None:
-            pose = getattr(task, "initial_position", None)
             if home is None or pose is None:
                 home_label.setText(
-                    f"Initial position for {sensor_label}: not remembered"
+                    f"Home for {sensor_label}: load a matching position map to use its safe anchor"
                 )
+                home_label.setToolTip("")
             else:
-                joints_deg = np.degrees(
-                    np.asarray(pose.get("joints_rad", []), dtype=float)
-                )
                 tcp = np.asarray(home, dtype=float) * 1000.0
                 home_label.setText(
-                    f"Initial position for {sensor_label} remembered\n"
-                    f"J: {[round(value, 2) for value in joints_deg]} deg\n"
+                    f"Home for {sensor_label}: map safe anchor (Taxel {pose['taxel_index']})\n"
                     f"TCP: ({tcp[0]:.2f}, {tcp[1]:.2f}, {tcp[2]:.2f}) mm"
                 )
-        remember_button = getattr(self, "full_taxel_remember_position_button", None)
-        if remember_button is not None:
-            remember_button.setEnabled(not bool(getattr(task, "_test_active", False)))
+                home_label.setToolTip(str(pose.get("source_path") or ""))
         start_button = getattr(self, "sidebar_btn_start", None)
         if (
             start_button is not None
@@ -4017,7 +4759,12 @@ class MyMainWindow(MainWindow):
                 and bool(records)
                 and home is not None
                 and not bool(getattr(task, "_test_active", False))
+                and getattr(self, "_sidebar_active_task", None) is None
+                and (getattr(task, "resume_plan", None) is None or task.resume_setup_confirmed)
             )
+        readiness = getattr(self, "full_taxel_calibration_readiness_panel", None)
+        if readiness is not None:
+            readiness.refresh()
 
     def _refresh_full_taxel_calibration_progress(
         self,
@@ -4105,8 +4852,9 @@ class MyMainWindow(MainWindow):
 
     def _set_full_taxel_calibration_controls_running(self, running):
         running = bool(running)
+        task = self._full_taxel_calibration_task()
+        pending = getattr(task, "resume_plan", None) is not None
         for name in (
-            "full_taxel_remember_position_button",
             "full_taxel_calibration_load_map_button",
             "full_taxel_calibration_signal_combo",
             "full_taxel_calibration_speed_spin",
@@ -4116,15 +4864,31 @@ class MyMainWindow(MainWindow):
             "full_taxel_calibration_max_travel_spin",
             "full_taxel_calibration_timeout_spin",
             "full_taxel_calibration_repeat_spin",
+            "full_taxel_calibration_protocol_selector",
+            "full_taxel_calibration_protocol_panel",
+            "full_taxel_calibration_readiness_panel",
             "calibration_mode_tabs",
         ):
             widget = getattr(self, name, None)
             if widget is not None:
+                widget.setEnabled(not running and (not pending or name == "calibration_mode_tabs"))
+        for name in ("resume_info", "resume_confirm", "resume_clear"):
+            widget = getattr(self, f"full_taxel_calibration_{name}", None)
+            if widget is not None:
+                widget.setVisible(pending)
                 widget.setEnabled(not running)
+        resume_button = getattr(self, "full_taxel_calibration_resume_button", None)
+        if resume_button is not None:
+            resume_button.setEnabled(not running)
         start_button = getattr(self, "sidebar_btn_start", None)
         if start_button is not None:
             start_button.setEnabled(not running)
         if not running:
+            self._refresh_full_taxel_calibration_controls()
+            force = getattr(self, "full_taxel_calibration_force_threshold_spin", None)
+            if force is not None:
+                force.setEnabled(not pending and getattr(task, "protocol", "") != "force_sweep")
+            self._update_sidebar_task_action_labels()
             self._refresh_full_taxel_calibration_controls()
 
     def _refresh_full_taxel_calibration_live_force(
@@ -4171,9 +4935,12 @@ class MyMainWindow(MainWindow):
             "taxel_mapping_probe_speed_spin": task.probe_speed_m_s * 1000.0,
             "taxel_mapping_confirmation_speed_spin": task.probe_confirmation_speed_m_s * 1000.0,
             "taxel_mapping_descent_spin": task.max_probe_descent_m * 1000.0,
+            "taxel_mapping_auto_reruns_spin": task.max_auto_reruns,
+            "taxel_mapping_rerun_delay_spin": int(task.auto_rerun_delay_sec),
             "taxel_mapping_force_guard_spin": task.force_guard_g,
             "taxel_mapping_coarse_radius_spin": task.coarse_radius_m * 1000.0,
             "taxel_mapping_coarse_step_spin": task.coarse_step_m * 1000.0,
+            "taxel_mapping_xy_frames_spin": task.scan_frame_count,
             "taxel_mapping_local_radius_spin": task.local_radius_m * 1000.0,
             "taxel_mapping_local_step_spin": task.local_step_m * 1000.0,
             "taxel_mapping_line_speed_spin": round(task.line_speed_m_s * 1000.0),
@@ -4183,6 +4950,9 @@ class MyMainWindow(MainWindow):
             widget = getattr(self, name, None)
             if widget is not None:
                 widget.setValue(value)
+        reverse = getattr(self, "taxel_mapping_reverse_scan_check", None)
+        if reverse is not None:
+            reverse.setChecked(task.reverse_scan_order)
         detection_combo = getattr(
             self, "taxel_mapping_detection_combo", None
         )
@@ -4197,10 +4967,14 @@ class MyMainWindow(MainWindow):
         task = self._taxel_mapping_task()
         if task is None:
             return
+        previous_shape = getattr(self, "_taxel_mapping_controls_shape", None)
         if hasattr(task, "use_connected_sensor") and not bool(
             getattr(task, "_active", False)
         ):
             task.use_connected_sensor(self)
+        if (task.sensor_rows, task.sensor_columns) != previous_shape:
+            self._sync_taxel_mapping_settings()
+            self._taxel_mapping_controls_shape = (task.sensor_rows, task.sensor_columns)
         anchor_taxel = int(getattr(task, "anchor_taxel", 35))
         grid_name = f"{int(task.sensor_rows)}x{int(task.sensor_columns)}"
         sensor_label = str(getattr(task, "active_sensor_label", "") or grid_name)
@@ -4224,10 +4998,30 @@ class MyMainWindow(MainWindow):
                     label.setText(
                         f"Taxel {anchor_taxel} anchor for {sensor_label}: saved pose is invalid"
                     )
+        scan_label = getattr(self, "taxel_mapping_scan_height_label", None)
+        if scan_label is not None:
+            scan_z = getattr(task, "fixed_scan_z_m", None)
+            if scan_z is None:
+                scan_label.setText("Fixed scan height for this anchor: not remembered")
+            else:
+                below = ""
+                if anchor is not None:
+                    anchor_z = float(np.asarray(anchor.get("tool_position_m", [np.nan] * 3), dtype=float)[2])
+                    if np.isfinite(anchor_z):
+                        below = f", {(anchor_z - float(scan_z)) * 1000.0:.1f} mm below this anchor"
+                scan_label.setText(
+                    f"Fixed scan height for this anchor: Z {float(scan_z) * 1000.0:.2f} mm{below}."
+                )
         anchor_button = getattr(self, "taxel_mapping_anchor_button", None)
         if anchor_button is not None:
             anchor_button.setText(
                 f"Remember Current Pose Above Taxel {anchor_taxel}"
+            )
+            anchor_button.setToolTip(
+                f"Save the current TCP pose above Taxel {anchor_taxel} on the "
+                f"{grid_name} sensor after confirmation. With a map loaded, create and load "
+                "a new setup revision; keep the original measurements unchanged. "
+                "Changed geometry requires relocation verification or fresh mapping."
             )
         note = getattr(self, "taxel_mapping_note", None)
         if note is not None:
@@ -4239,15 +5033,22 @@ class MyMainWindow(MainWindow):
                 "After that, every taxel is approached at the anchor height, "
                 "probed from just above the learned height, centred with row and "
                 "column line scans, and verified from a 20-frame sample at its "
-                "centre. All moves are straight lines. A missing taxel "
-                f"returns to Taxel {anchor_taxel} and retries once; a second failure "
-                f"returns to Taxel {anchor_taxel} and stops. A live force transmitter "
-                "is mandatory."
+                "centre. After each verified taxel or recoverable failure it returns "
+                f"to the confirmed-clear Taxel {anchor_taxel} anchor, checks recovery "
+                "and updates full calibration. A missing taxel retries once. If "
+                "automatic recovery reruns are enabled, exhausted ordinary targets "
+                "wait at the anchor before another limited round; saved taxels are "
+                "kept. The rerun counter and reasons are saved. Stop cancels waiting. "
+                "Safety faults never automatically restart. All moves are straight "
+                "lines. A live force transmitter is mandatory."
             )
         progress = getattr(self, "taxel_mapping_progress_label", None)
         if progress is not None and not bool(getattr(task, "_active", False)):
-            total = int(task.sensor_rows) * int(task.sensor_columns)
+            total = len(task.mapping_target_indices())
             progress.setText(f"Ready | 0/{total} located")
+            if task.max_auto_reruns > 0 or task._auto_rerun_count > 0:
+                self._refresh_taxel_mapping_progress(
+                    mapped=task.mapped_target_count(), total=total, detail="Ready")
         grid = getattr(self, "taxel_mapping_map", None)
         if grid is not None and hasattr(grid, "set_grid_shape") and not bool(
             getattr(task, "_active", False)
@@ -4268,6 +5069,13 @@ class MyMainWindow(MainWindow):
             grid.set_grid_shape(rows, columns)
             if loaded is not None and (file_rows, file_columns) == (rows, columns):
                 self._paint_loaded_taxel_navigation_map()
+            elif loaded is None:
+                skipped = task.skipped_taxel_indices()
+                grid.set_taxels([], skipped=skipped)
+                for index in skipped:
+                    grid.buttons[index].setToolTip(
+                        f"Taxel {index}: skipped because it is on the outer border"
+                    )
         start_button = getattr(self, "sidebar_btn_start", None)
         if (
             start_button is not None
@@ -4281,6 +5089,10 @@ class MyMainWindow(MainWindow):
         anchor_button = getattr(self, "taxel_mapping_anchor_button", None)
         if anchor_button is not None:
             anchor_button.setEnabled(not running)
+        for name in ("taxel_mapping_scan_height_button", "taxel_mapping_scan_height_clear_button"):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(not running)
         start_button = getattr(self, "sidebar_btn_start", None)
         if (
             start_button is not None
@@ -4288,6 +5100,8 @@ class MyMainWindow(MainWindow):
         ):
             start_button.setEnabled(anchor is not None and not running)
         self._refresh_taxel_navigation_controls()
+        if self._current_sidebar_control_id() == task.id:
+            self._update_sidebar_task_info()
 
     def _refresh_taxel_mapping_progress(
         self,
@@ -4298,6 +5112,8 @@ class MyMainWindow(MainWindow):
         current_taxel=None,
         attempt=0,
         max_attempts=2,
+        auto_reruns=None,
+        max_auto_reruns=None,
     ):
         task = self._taxel_mapping_task()
         label = getattr(self, "taxel_mapping_progress_label", None)
@@ -4313,6 +5129,7 @@ class MyMainWindow(MainWindow):
             "sensor_calibrating": "Updating full sensor calibration",
             "collecting": "Checking sensor stability / collecting frames",
             "probing": "Searching in base -Z",
+            "auto_rerun_wait": "Waiting at clearance anchor before automatic rerun",
         }.get(phase, phase.replace("_", " ").title())
         status = str(detail or phase_text)
         context = []
@@ -4328,6 +5145,10 @@ class MyMainWindow(MainWindow):
             context.append(
                 f"attempt {min(attempt, max_attempts)}/{max_attempts}"
             )
+        reruns = int(task._auto_rerun_count if auto_reruns is None else auto_reruns)
+        rerun_limit = int(task.max_auto_reruns if max_auto_reruns is None else max_auto_reruns)
+        if rerun_limit > 0 or reruns > 0:
+            context.append(f"Auto reruns {reruns}/{rerun_limit}" if rerun_limit > 0 else f"Auto reruns {reruns} · off")
         context_text = f" | {' | '.join(context)}" if context else ""
         label.setText(
             f"{mapped}/{max(1, total)} located{context_text} | {status}"
@@ -4338,6 +5159,8 @@ class MyMainWindow(MainWindow):
         for name in (
             "sidebar_task_list",
             "taxel_mapping_anchor_button",
+            "taxel_mapping_scan_height_button",
+            "taxel_mapping_scan_height_clear_button",
             "taxel_mapping_detection_combo",
             "taxel_mapping_signal_threshold_spin",
             "taxel_mapping_adaptive_percent_spin",
@@ -4354,9 +5177,13 @@ class MyMainWindow(MainWindow):
             "taxel_mapping_probe_speed_spin",
             "taxel_mapping_confirmation_speed_spin",
             "taxel_mapping_descent_spin",
+            "taxel_mapping_auto_reruns_spin",
+            "taxel_mapping_rerun_delay_spin",
             "taxel_mapping_force_guard_spin",
             "taxel_mapping_coarse_radius_spin",
             "taxel_mapping_coarse_step_spin",
+            "taxel_mapping_xy_frames_spin",
+            "taxel_mapping_reverse_scan_check",
             "taxel_mapping_local_radius_spin",
             "taxel_mapping_local_step_spin",
             "taxel_mapping_line_speed_spin",
@@ -4371,6 +5198,9 @@ class MyMainWindow(MainWindow):
         start_button = getattr(self, "sidebar_btn_start", None)
         if start_button is not None:
             start_button.setEnabled(not running)
+        delay = getattr(self, "taxel_mapping_rerun_delay_spin", None)
+        if delay is not None:
+            delay.setEnabled(not running and self._taxel_mapping_task().max_auto_reruns > 0)
         if not running:
             self._refresh_taxel_mapping_controls()
         else:
@@ -4387,22 +5217,147 @@ class MyMainWindow(MainWindow):
             self._refresh_taxel_navigation_controls()
 
     def _remember_taxel_mapping_anchor(self):
+        self._remember_taxel_mapping_setup("anchor")
+
+    def _remember_taxel_mapping_scan_height(self):
+        self._remember_taxel_mapping_setup("scan_height")
+
+    def _remember_taxel_mapping_setup(self, kind):
         task = self._taxel_mapping_task()
         if task is None or self._current_sidebar_control_id() != task.id:
             return
-        saved = task.capture_anchor_pose(self)
-        if saved:
+        if getattr(self, "_taxel_setup_confirmation_open", False):
+            return
+        if self._sidebar_active_task is not None:
+            self._append_sidebar_control_message("Stop the current experiment before changing the mapping setup.")
+            return
+        if getattr(self._full_taxel_calibration_task(), "resume_plan", None) is not None:
+            self._append_sidebar_control_message(
+                "Clear the staged Full Taxel Calibration resume before editing a map setup. "
+                "That run must keep its original map."
+            )
+            return
+        if self._keyboard_tool_velocity_enabled or self._keyboard_tool_position_enabled:
+            self._append_sidebar_control_message("Turn off keyboard robot control before remembering the setup.")
+            return
+        source_path = self._taxel_navigation_source_path
+        result = self._taxel_navigation_result
+        try:
+            digest = None
+            if result is not None:
+                if not source_path:
+                    raise ValueError("Load a saved map file before creating its revision.")
+                result, digest = read_revision_source(source_path)
+                prepare_taxel_map(result)
+            setup, captured = task.preview_remembered_setup(self, kind, result)
+            anchor = setup["anchor_pose"]
+            old = revision_setup(result) or {}
+            old_anchor = old.get("anchor_pose") or (result or {}).get("anchor_pose") or task.anchor_pose
+            if old:
+                old_z = old.get("fixed_scan_z_m")
+            elif result is not None:
+                mm = result["settings"].get("fixed_scan_z_mm")
+                old_z = None if mm is None else float(mm) / 1000.
+            else:
+                old_z = task.fixed_scan_z_m
+            def xyz(value):
+                return "not set" if value is None else ", ".join(f"{x * 1000.:.2f}" for x in value["tool_position_m"]) + " mm"
+            def plane(value):
+                return "automatic proximity search" if value is None else f"Z {value * 1000.:.2f} mm"
+            detail = (
+                f"Sensor: {setup['sensor_label']}\n"
+                f"Safe anchor (Taxel {anchor['taxel_index']}): {xyz(old_anchor)} → {xyz(anchor)}\n"
+                f"Scan plane: {plane(old_z)} → {plane(setup['fixed_scan_z_m'])}\n"
+            )
+            if kind == "anchor":
+                old_q = [round(x, 6) for x in old_anchor["tool_quaternion_wxyz"]] if old_anchor else "not set"
+                detail += f"Tool quaternion (w,x,y,z): {old_q} → {[round(x, 6) for x in anchor['tool_quaternion_wxyz']]}\n"
+                detail += "A changed anchor clears the old scan plane; remember it again if needed.\n"
+            else:
+                detail += "Only TCP height is captured; scanning keeps the remembered anchor orientation.\n"
+            detail += (
+                f"Loaded map: {source_path}\nA new revision will be created and loaded. "
+                "Original measurements and calibration recordings will not be changed. "
+                "Changed geometry must be verified using Relocate loaded map or a fresh mapping."
+                if result is not None else
+                "No map is loaded. This saves the setup for the next mapping run; no measured positions are changed."
+            )
+            window = getattr(self, "experiments_window", None)
+            parent = window if window is not None and window.isVisible() else self
+            self._taxel_setup_confirmation_open = True
+            try:
+                approved = components.confirm(
+                    parent, "Save mapping setup?",
+                    "Remember this safe anchor?" if kind == "anchor" else "Remember this scan plane?",
+                    detail=detail, confirm_text="Create and load revision" if result is not None else "Save setup",
+                    destructive=False,
+                )
+            finally:
+                self._taxel_setup_confirmation_open = False
+            if not approved:
+                return
+            # Modal dialogs run an event loop. Check identity, feedback and
+            # motion state again before accepting the captured (displayed) pose.
+            check, current = task.preview_remembered_setup(self, kind, result)
+            if (check["sensor_identity"] != setup["sensor_identity"]
+                    or self._taxel_navigation_source_path != source_path
+                    or not np.allclose(current["tool_position_m"], captured["tool_position_m"], atol=.0005, rtol=0)
+                    or MappedTaxelMoveTask._orientation_error(current["tool_quaternion_wxyz"], captured["tool_quaternion_wxyz"]) > np.radians(.1)):
+                raise ValueError("The sensor, map or robot pose changed during confirmation. Please try again.")
+            if result is not None:
+                revision, path = save_setup_revision(source_path, setup, digest, directory=task.output_directory)
+                self._show_taxel_position_map(revision, source_path=str(path))
+                self._append_sidebar_control_message(
+                    f"Created and loaded map setup revision:\n{path}\n"
+                    + (revision_motion_error(revision) or "Setup geometry is unchanged; original measurements are retained.")
+                )
+            else:
+                task.apply_remembered_setup(setup, persist=True)
+                self._append_sidebar_control_message("Mapping setup saved. No robot motion was commanded.")
             self._taxel_mapping_anchor_updated_after_load = True
+            self._refresh_taxel_mapping_controls()
             self._refresh_taxel_navigation_controls()
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            self._append_sidebar_control_message(f"Could not remember mapping setup: {exc}")
+
+    def _clear_taxel_mapping_scan_height(self):
+        task = self._taxel_mapping_task()
+        if task is None or self._current_sidebar_control_id() != task.id:
+            return
+        task.clear_scan_height(self)
+
+    def _show_result_dialog(self, attribute, dialog):
+        """Show ``dialog`` and free it (and its recorded samples) once closed."""
+        previous = getattr(self, attribute, None)
+        if previous is not None:
+            try:
+                previous.close()
+            except RuntimeError:
+                pass
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(
+            lambda _object=None: setattr(self, attribute, None)
+            if getattr(self, attribute, None) is dialog else None
+        )
+        setattr(self, attribute, dialog)
+        dialog.show()
 
     def _show_calibration_result(self, result):
-        dialog = getattr(self, "_calibration_result_dialog", None)
+        self._show_result_dialog(
+            "_calibration_result_dialog",
+            CalibrationResultDialog(result, parent=self),
+        )
+
+    def _export_calibration_trial_graph(self, result, path):
+        return CalibrationResultDialog._export_trial_graph(result, path)
+
+    def _show_proximity_profile_result(self, result):
+        from phd.ui.proximity_profile_dialog import ProximityProfileResultDialog
+        dialog = getattr(self, "_proximity_profile_result_dialog", None)
         if dialog is not None and dialog.isVisible():
             dialog.close()
-        self._calibration_result_dialog = CalibrationResultDialog(
-            result, parent=self
-        )
-        self._calibration_result_dialog.show()
+        self._proximity_profile_result_dialog = ProximityProfileResultDialog(result, parent=self)
+        self._proximity_profile_result_dialog.show()
 
     def _show_full_taxel_calibration_result(self, result):
         dialog = getattr(
@@ -4415,51 +5370,31 @@ class MyMainWindow(MainWindow):
         )
         self._full_taxel_calibration_result_dialog.show()
 
+    def _open_sensor_characterisation(self):
+        from phd.ui.sensor_characterisation_window import SensorCharacterisationWindow
+        existing = getattr(self, "_sensor_characterisation_window", None)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._sensor_characterisation_window = SensorCharacterisationWindow(self)
+        self._sensor_characterisation_window.show()
+
     def _open_calibration_graph_analysis(self):
-        """Select saved calibration data and open its offline analysis."""
-        start_directory = resource_path("calibration_recordings")
-        selected_path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
-            "Select calibration recording or graph",
-            start_directory,
-            "Calibration data or graph (*.csv *.json *.png)",
-        )
-        if not selected_path:
-            return
+        """Launch analysis without sharing a GUI/control thread or task state."""
+        status = getattr(self, "graph_analysis_status", None)
         try:
-            loaded = load_calibration_recording(selected_path)
-        except (OSError, ValueError, TypeError) as exc:
-            QMessageBox.warning(
-                self,
-                "Graph Analysis",
-                f"The calibration recording could not be loaded.\n\n{exc}",
-            )
-            self._append_sidebar_control_message(
-                f"Graph Analysis could not load {selected_path}: {exc}"
-            )
-            return
-
-        dialog = getattr(self, "_calibration_graph_analysis_dialog", None)
-        if dialog is not None:
-            dialog.close()
-        dialog = CalibrationGraphAnalysisDialog(loaded, parent=self)
-        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        dialog.destroyed.connect(
-            lambda _object=None, dialog=dialog: self._graph_analysis_closed(
-                dialog
-            )
-        )
-        self._calibration_graph_analysis_dialog = dialog
-        dialog.show()
-        dialog.raise_()
-        dialog.activateWindow()
-        self._append_sidebar_control_message(
-            f"Graph Analysis loaded {len(loaded['datasets'])} trial(s)."
-        )
-
-    def _graph_analysis_closed(self, dialog):
-        if self._calibration_graph_analysis_dialog is dialog:
-            self._calibration_graph_analysis_dialog = None
+            if not launch_graph_analysis(experiment_path("calibration_recordings")):
+                raise RuntimeError("The offline viewer process could not be started.")
+        except Exception as exc:
+            # Do not replace the live experiment's latest status or hide its
+            # Stop action behind an application-modal error dialog.
+            if status is not None:
+                status.setText(f"Graph Analysis could not open: {exc}")
+            return False
+        if status is not None:
+            status.setText("Saved recordings · independent offline viewer")
+        return True
 
     def _sigraph_scanning_task(self):
         return experiment_tasks.get_task("sigraph2026_scanning")
@@ -4782,7 +5717,7 @@ class MyMainWindow(MainWindow):
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        output_directory = resource_path("sigraph2026_scanning_recordings")
+        output_directory = experiment_path("sigraph2026_scanning_recordings")
         direction = "reverse" if reverse else "forward"
         recording_stem = f"sigraph2026_{direction}_heatmap_{timestamp}"
         output_path = os.path.join(output_directory, f"{recording_stem}.mp4")
@@ -4860,9 +5795,8 @@ class MyMainWindow(MainWindow):
             )
 
     def _choose_sigraph_heatmap_recording_for_playback(self):
-        start_directory = resource_path("sigraph2026_scanning_recordings")
-        file_path, _selected_filter = QFileDialog.getOpenFileName(
-            self,
+        start_directory = experiment_path("sigraph2026_scanning_recordings")
+        file_path = self._choose_experiment_file(
             "Replay 3D Heatmap Recording",
             start_directory,
             "Tactile Heatmap Recordings (*_sensor.npz *.npz)",
@@ -5237,6 +6171,18 @@ class MyMainWindow(MainWindow):
             return False
 
     def _start_sidebar_control(self):
+        if getattr(self, "_taxel_setup_confirmation_open", False):
+            return
+        # This independent recorder/analysis window must not cancel a live robot
+        # experiment merely because the operator opens it. Its Record button
+        # separately refuses acquisition while another controller is active.
+        action_id = self._current_sidebar_control_id()
+        if action_id in {"sensor_characterisation", "graph_analysis"}:
+            try:
+                experiment_tasks.get_task(action_id).on_start(self)
+            except Exception as exc:
+                self._append_sidebar_control_message(f"Cannot open {action_id.replace('_', ' ')}: {exc}")
+            return
         if self._sidebar_control_timer is None:
             self._sidebar_control_timer = QTimer(self)
             self._sidebar_control_timer.timeout.connect(self._run_sidebar_control_action)
@@ -5295,6 +6241,15 @@ class MyMainWindow(MainWindow):
         if self._sidebar_control_timer is not None:
             self._sidebar_control_timer.stop()
         task = self._sidebar_active_task
+        task_cleanup_message = ""
+        view = getattr(self, "experiment_run_view", None)
+        if view is not None and task is not None:
+            # Preserve the last measured position before on_stop resets it.
+            try:
+                view.refresh(self)
+                view.finish(self, message=message)
+            except Exception as exc:
+                self._report_run_monitor_error(exc)
         self._sidebar_active_task = None
         self._sidebar_active_control_id = None
         self.info_process.setText(message)
@@ -5307,6 +6262,7 @@ class MyMainWindow(MainWindow):
                 self._append_sidebar_control_message(
                     f"Task '{getattr(task, 'label', task.id)}' stop error: {exc}"
                 )
+            task_cleanup_message = self.info_process.text()
             self._disconnect_force_meter_after_task(task)
         self._stop_sigraph_heatmap_recording(
             announce=True, elapsed_s=recording_elapsed_s
@@ -5314,6 +6270,19 @@ class MyMainWindow(MainWindow):
         self._stop_sigraph_heatmap_playback(announce=True)
 
         self._refresh_taxel_mapping_controls()
+        if task is not None:
+            # on_stop/force cleanup may replace the cause with "files saved".
+            # Keep both the cause and any final save/cleanup error visible.
+            final_message = ended_run_message(task, message, task_cleanup_message)
+            cleanup_message = self.info_process.text()
+            if cleanup_message and cleanup_message not in final_message:
+                final_message += f"\n{cleanup_message}"
+            self.info_process.setText(final_message)
+        if view is not None:
+            try:
+                view.update_end_details(self)
+            except Exception as exc:
+                self._report_run_monitor_error(exc)
 
     # --- Keyboard tool-frame velocity (WASD + O/P + Q/E + R/T + Y/U) ------
 
@@ -5496,6 +6465,8 @@ class MyMainWindow(MainWindow):
                 self.action_keyboard_tool_velocity.setChecked(False)
                 self.action_keyboard_tool_velocity.blockSignals(False)
                 return
+            if self._keyboard_tool_position_enabled:
+                self.action_keyboard_tool_position.setChecked(False)
             app = QApplication.instance()
             if app is not None:
                 app.installEventFilter(self)
@@ -5512,20 +6483,150 @@ class MyMainWindow(MainWindow):
         self._keyboard_tool_velocity_enabled = False
         self._keyboard_vel_active_tokens = set()
         self._keyboard_vel_timer.stop()
-        app = QApplication.instance()
-        if app is not None:
-            try:
-                app.removeEventFilter(self)
-            except Exception:
-                pass
         self._keyboard_vel_full_stop()
         if hasattr(self, "action_keyboard_tool_velocity"):
             self.action_keyboard_tool_velocity.blockSignals(True)
             self.action_keyboard_tool_velocity.setChecked(False)
             self.action_keyboard_tool_velocity.blockSignals(False)
+        self._keyboard_release_event_filter_if_idle()
         self.info_process.setText("Keyboard tool velocity: OFF")
 
+    def _keyboard_release_event_filter_if_idle(self):
+        if self._keyboard_tool_velocity_enabled or self._keyboard_tool_position_enabled:
+            return
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            app.removeEventFilter(self)
+        except Exception:
+            pass
+
+    def _keyboard_pos_key_token(self, key: int) -> Optional[str]:
+        return {
+            Qt.Key_W: "w",
+            Qt.Key_S: "s",
+            Qt.Key_A: "a",
+            Qt.Key_D: "d",
+            Qt.Key_O: "o",
+            Qt.Key_P: "p",
+        }.get(key)
+
+    def _keyboard_pos_delta(self):
+        step = float(self._keyboard_pos_step_m)
+        dx = dy = dz = 0.0
+        tokens = self._keyboard_pos_active_tokens
+        if "d" in tokens:
+            dx += step
+        if "a" in tokens:
+            dx -= step
+        if "w" in tokens:
+            dy += step
+        if "s" in tokens:
+            dy -= step
+        if "o" in tokens:
+            dz += step
+        if "p" in tokens:
+            dz -= step
+        return dx, dy, dz
+
+    def _keyboard_pos_timer_tick(self):
+        """Step the current tool position in the base frame; keep its orientation."""
+        if not self._keyboard_tool_position_enabled or not self._keyboard_pos_active_tokens:
+            return
+        api = getattr(self.ui_ros, "robot_api", None) if self.ui_ros is not None else None
+        if api is None or not hasattr(api, "get_current_tool_position"):
+            return
+        try:
+            pose = api.get_current_tool_position()
+        except Exception:
+            return
+        if not pose or pose[0] is None or pose[1] is None:
+            return
+        position, quaternion = pose
+        dx, dy, dz = self._keyboard_pos_delta()
+        target = [float(position[0]) + dx, float(position[1]) + dy, float(position[2]) + dz]
+        try:
+            # motion_type 4 is a Cartesian line in m/s. Type 2 is a joint PTP
+            # whose velocity is rad/s, so 0.02 there never completes a step.
+            sent = bool(api.send_positions_tool_position(
+                target, tuple(quaternion), velocity=0.05, acc_time=0.2,
+                blend_percentage=0, fine_goal=True, motion_type=4,
+            ))
+        except Exception as exc:
+            self.info_process.setText(f"Keyboard tool position: command failed ({exc})")
+            return
+        if not sent:
+            self.info_process.setText("Keyboard tool position: robot did not accept the move")
+
+    def _keyboard_pos_apply_active_tokens(self):
+        if not self._keyboard_pos_active_tokens:
+            self._keyboard_pos_update_status_text()
+            return
+        self._keyboard_pos_timer_tick()
+        self._keyboard_pos_update_status_text()
+
+    def _keyboard_pos_update_status_text(self):
+        labels = {"w": "+Y", "s": "−Y", "a": "−X", "d": "+X", "o": "+Z", "p": "−Z"}
+        tokens = self._keyboard_pos_active_tokens
+        if not tokens:
+            self.info_process.setText("Keyboard tool position: holding orientation")
+            return
+        parts = [labels.get(token, token) for token in sorted(tokens)]
+        self.info_process.setText(f"Keyboard tool position: {' + '.join(parts)} (5 mm)")
+
+    def _on_keyboard_tool_position_toggled(self, checked: bool):
+        if checked:
+            if not self.ping_mode_entered or self.ui_ros is None:
+                QMessageBox.information(
+                    self,
+                    "Keyboard Tool Position",
+                    "Please wait for Ping Mode to finish loading, then try again.",
+                )
+                self._set_action_checked(self.action_keyboard_tool_position, False)
+                return
+            api = getattr(self.ui_ros, "robot_api", None)
+            if api is None or not hasattr(api, "send_positions_tool_position"):
+                QMessageBox.warning(
+                    self,
+                    "Keyboard Tool Position",
+                    "Tool position control is not available.",
+                )
+                self._set_action_checked(self.action_keyboard_tool_position, False)
+                return
+            if self._keyboard_tool_velocity_enabled:
+                self.action_keyboard_tool_velocity.setChecked(False)
+            app = QApplication.instance()
+            if app is not None:
+                app.installEventFilter(self)
+            self._keyboard_tool_position_enabled = True
+            self._keyboard_pos_active_tokens = set()
+            self._keyboard_pos_timer.start()
+            self.info_process.setText(
+                "Keyboard tool position: ON (W/S=±Y, A/D=±X, O/P=±Z, 5 mm, orientation held)"
+            )
+        else:
+            self._disable_keyboard_tool_position_internal()
+
+    def _disable_keyboard_tool_position_internal(self):
+        self._keyboard_tool_position_enabled = False
+        self._keyboard_pos_active_tokens = set()
+        self._keyboard_pos_timer.stop()
+        self._keyboard_release_event_filter_if_idle()
+        if hasattr(self, "action_keyboard_tool_position"):
+            self._set_action_checked(self.action_keyboard_tool_position, False)
+        self.info_process.setText("Keyboard tool position: OFF")
+
+    @staticmethod
+    def _set_action_checked(action, checked: bool):
+        action.blockSignals(True)
+        action.setChecked(checked)
+        action.blockSignals(False)
+
     def eventFilter(self, watched, event):
+        if getattr(self, "_keyboard_tool_position_enabled", False):
+            if self._keyboard_pos_event(event):
+                return True
         if self._keyboard_tool_velocity_enabled:
             et = event.type()
             if et == QEvent.ShortcutOverride:
@@ -5571,6 +6672,37 @@ class MyMainWindow(MainWindow):
                         return True
         return super().eventFilter(watched, event)
 
+    def _keyboard_pos_event(self, event) -> bool:
+        et = event.type()
+        if et == QEvent.ShortcutOverride:
+            if self._keyboard_velocity_should_capture():
+                key = event.key()
+                if key == Qt.Key_Space or self._keyboard_pos_key_token(key) is not None:
+                    event.accept()
+                    return True
+            return False
+        if et == QEvent.KeyPress and self._keyboard_velocity_should_capture():
+            key = event.key()
+            if key == Qt.Key_Space:
+                if not event.isAutoRepeat():
+                    self._keyboard_pos_active_tokens.clear()
+                    self.info_process.setText("Keyboard tool position: stopped (Space)")
+                return True
+            token = self._keyboard_pos_key_token(key)
+            if token is not None:
+                if not event.isAutoRepeat():
+                    self._keyboard_pos_active_tokens.add(token)
+                    self._keyboard_pos_apply_active_tokens()
+                return True
+        if et == QEvent.KeyRelease and self._keyboard_velocity_should_capture():
+            token = self._keyboard_pos_key_token(event.key())
+            if token is not None:
+                if not event.isAutoRepeat():
+                    self._keyboard_pos_active_tokens.discard(token)
+                    self._keyboard_pos_apply_active_tokens()
+                return True
+        return False
+
     def keyPressEvent(self, event):
         """Handles global key press events."""
         if not self.ping_mode_entered and event.key() == Qt.Key_1:
@@ -5585,6 +6717,11 @@ class MyMainWindow(MainWindow):
             and self.action_keyboard_tool_velocity.isChecked()
         ):
             self._disable_keyboard_tool_velocity_internal()
+        if self._keyboard_tool_position_enabled or (
+            hasattr(self, "action_keyboard_tool_position")
+            and self.action_keyboard_tool_position.isChecked()
+        ):
+            self._disable_keyboard_tool_position_internal()
         if self._fps_timer is not None:
             self._fps_timer.stop()
         iren = getattr(self, "_fps_render_interactor", None)
@@ -5600,6 +6737,9 @@ class MyMainWindow(MainWindow):
         )
 
         # Explicitly close any child windows to avoid orphaned processes
+        characterisation_window = getattr(self, "_sensor_characterisation_window", None)
+        if characterisation_window is not None:
+            characterisation_window.close()
         experiments_window = getattr(self, "experiments_window", None)
         if experiments_window is not None:
             experiments_window.remember_geometry()

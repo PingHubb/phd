@@ -2624,10 +2624,6 @@ class MyMeshLab():
         parent = getattr(self, "parent", None)
         if parent is not None and bool(getattr(parent, "_direct_finger_active", False)):
             return "Direct Finger Motion"
-        if parent is not None and bool(
-            getattr(parent, "_ai_direct_finger_robot_active", False)
-        ):
-            return "AI DFM recording with robot motion"
 
         main_window = None
         if parent is not None:
@@ -2635,10 +2631,11 @@ class MyMeshLab():
                 main_window = parent.window()
             except Exception:
                 main_window = None
-        if main_window is not None and bool(
-            getattr(main_window, "_keyboard_tool_velocity_enabled", False)
+        if main_window is not None and (
+            bool(getattr(main_window, "_keyboard_tool_velocity_enabled", False))
+            or bool(getattr(main_window, "_keyboard_tool_position_enabled", False))
         ):
-            return "keyboard tool velocity"
+            return "keyboard robot control"
 
         sensor = getattr(parent, "sensor_functions", None)
         helper_specs = (
@@ -2657,19 +2654,6 @@ class MyMeshLab():
                 continue
             if bool(getattr(helper, state_name, False)):
                 return label
-
-        ai_record = (
-            getattr(sensor, "ai_direct_finger_motion_class", None)
-            if sensor is not None
-            else None
-        )
-        if (
-            ai_record is not None
-            and not ai_record.__class__.__name__.startswith("_")
-            and bool(getattr(ai_record, "is_running", False))
-            and bool(getattr(ai_record, "send_robot_commands", False))
-        ):
-            return "AI DFM recording with robot motion"
 
         ai_execute = (
             getattr(sensor, "ai_direct_finger_motion_execution_class", None)

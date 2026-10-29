@@ -20,7 +20,7 @@ from PyQt5.QtCore import Qt, QProcess, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor, QDesktopServices, QImage, QPainter, QPen
 from PyQt5.QtCore import QUrl
 from PyQt5.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout,
     QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSlider,
     QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
@@ -33,7 +33,7 @@ from phd.dependence.touch_tracking_data import (
 from phd.dependence.touch_tracking_camera_free import (
     CameraFreePreview, NOISE_SECONDS, PROTOCOL_SCHEMA, SUPERVISION,
 )
-from phd.ui import components
+from phd.ui import components, theme
 from phd.ui.camera_preview_window import image_pixel_at
 
 
@@ -49,7 +49,7 @@ class ReferenceCanvas(QWidget):
 
     def paintEvent(self, _event):
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#172029"))
+        painter.fillRect(self.rect(), QColor(theme.VIEWPORT_BG))
         if self.image.isNull():
             painter.setPen(Qt.white)
             painter.drawText(self.rect(), Qt.AlignCenter, "Open a captured trial to annotate its camera frames")
@@ -86,10 +86,11 @@ class TrackingMap(QWidget):
 
     def paintEvent(self, _event):
         p = QPainter(self)
-        p.fillRect(self.rect(), QColor("#172029"))
+        p.setRenderHint(QPainter.Antialiasing)
+        p.fillRect(self.rect(), QColor(theme.VIEWPORT_BG))
         pad = 25
         w, h = self.width()-2*pad, self.height()-2*pad
-        p.setPen(QPen(QColor("#46545e"), 1))
+        p.setPen(QPen(QColor(theme.VIEWPORT_GRID), 1))
         rows, cols = self.shape
         for r in range(rows+1):
             y = pad + round(r*h/rows)
@@ -97,6 +98,9 @@ class TrackingMap(QWidget):
         for c in range(cols+1):
             x = pad + round(c*w/cols)
             p.drawLine(x, pad, x, pad+h)
+        if self.point is None:
+            p.setPen(QColor(theme.VIEWPORT_MUTED))
+            p.drawText(self.rect(), Qt.AlignCenter, "Waiting for a valid finger position")
         p.setPen(QPen(QColor("#36d296"), 2))
         for a, b in zip(self.trail, self.trail[1:]):
             p.drawLine(pad+round(a[0]*w), pad+round(a[1]*h), pad+round(b[0]*w), pad+round(b[1]*h))
@@ -145,9 +149,14 @@ class TouchTrackingWindow(QWidget):
         self._range_start = None
 
         layout = QVBoxLayout(self)
-        title = QLabel("Single-finger tracking · Camera-free collection / optional independent references · No robot commands")
-        title.setWordWrap(True)
-        layout.addWidget(title)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(12)
+        header = components.WorkspaceHeader(
+            "Touch tracking", "Collect clean trials, train a model and follow one finger. No robot commands.",
+            eyebrow="PINGLAB / LEARNING WORKSPACE",
+        )
+        header.set_compact(True)
+        layout.addWidget(header)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs, 1)
         self._build_record_page()
@@ -156,6 +165,7 @@ class TouchTrackingWindow(QWidget):
         self._build_preview_page()
         self._record_mode_changed()
         self.status = QLabel("Ready. Existing recordings and robot policies remain unchanged.")
+        self.status.setObjectName("workspaceStatus")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
         self.timer = QTimer(self)
@@ -175,7 +185,10 @@ class TouchTrackingWindow(QWidget):
     def _build_record_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        form = QFormLayout()
+        setup_page = QWidget()
+        setup_layout = QVBoxLayout(setup_page)
+        setup_layout.setContentsMargins(0, 0, 0, 0)
+        form = components.SettingsForm()
         self.record_mode = QComboBox()
         self.record_mode.addItem("Camera-free — guided sensor collection", "camera_free")
         self.record_mode.addItem("Independent reference — camera or measured CSV", "independent")
@@ -184,16 +197,18 @@ class TouchTrackingWindow(QWidget):
         self.participant = QLineEdit("p01")
         self.session = QLineEdit(datetime.now().strftime("%Y%m%d") + "_a")
         self.sensor_id = QLineEdit("sensor_01")
+        identity_form = components.SettingsForm()
         for label, field in (("Dataset folder", self.data_root), ("Participant ID", self.participant),
                              ("Session ID (same sitting = same ID)", self.session), ("Physical sensor ID", self.sensor_id)):
-            form.addRow(label, field)
+            (form if field is self.data_root else identity_form).addRow(label, field)
+        dimensions_form = components.SettingsForm()
         self.width_mm, self.height_mm = QDoubleSpinBox(), QDoubleSpinBox()
         for spin in (self.width_mm, self.height_mm):
             spin.setRange(0, 2000)
             spin.setSpecialValueText("Unknown — normalized units only")
             spin.setSuffix(" mm")
-        form.addRow("Sensor width (column direction)", self.width_mm)
-        form.addRow("Sensor height (row direction)", self.height_mm)
+        dimensions_form.addRow("Sensor width (column direction)", self.width_mm)
+        dimensions_form.addRow("Sensor height (row direction)", self.height_mm)
         self.duration = QSpinBox()
         self.duration.setRange(10, 600)
         self.duration.setValue(120)
@@ -202,24 +217,43 @@ class TouchTrackingWindow(QWidget):
         self.capture_camera = QCheckBox("Save reference camera frames (recommended)")
         self.capture_camera.setChecked(True)
         form.addRow(self.capture_camera)
-        layout.addLayout(form)
+        setup = components.CardGroup("Trial setup")
+        setup.add_layout(form)
+        setup_layout.addWidget(setup)
+        identity = components.CardGroup("Participant and session")
+        identity.add_layout(identity_form)
+        setup_layout.addWidget(identity)
+        self.sensor_dimensions = components.CollapsibleGroup("Sensor dimensions · optional")
+        self.sensor_dimensions.add_layout(dimensions_form)
+        setup_layout.addWidget(self.sensor_dimensions)
         hint = QLabel("Before recording: keep the sensor fixed, update calibration with no nearby hand, and identify its row/column directions.\n"
                       "Record slow/fast lines, curves, holds, reversals, lift-off and no-touch intervals. Do not recalibrate during a trial.\n"
                       "Camera labels are surface-contact positions, not an elevated fingernail marker. Use a flat sensor for four-corner calibration.")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        self.collection_help = components.CollapsibleGroup("Collection checklist")
+        self.collection_help.add(hint)
+        setup_layout.addWidget(self.collection_help)
+        setup_layout.addStretch()
+        self.record_setup_scroll = components.scroll_page(setup_page)
+        layout.addWidget(self.record_setup_scroll, 1)
         self.record_hint = hint
         self.camera_free_instructions = QLabel(
             "Camera-free: keep your hand AWAY for the first 6 seconds. Then select Touch/move and keep one finger touching. "
             "Select Uncertain while lifting/repositioning; select No touch once clear. Position targets are sensor estimates, not measured truth.")
         self.camera_free_instructions.setWordWrap(True)
+        self.camera_free_instructions.setObjectName("instructionNote")
         layout.addWidget(self.camera_free_instructions)
         self.protocol_confirm = QCheckBox("I will follow the hands-away start and mark touch/no-touch honestly (regular taxel grid).")
         layout.addWidget(self.protocol_confirm)
         state_buttons = QHBoxLayout()
         self.protocol_buttons = []
-        for text, state in (("No touch — hand away", "no_touch"), ("Touch / move — keep contact", "touch"), ("Uncertain / reposition", "unknown")):
+        for text, state, hint in (
+            ("No touch\nHand away", "no_touch", "Hand completely clear of the sensing area."),
+            ("Touch / move\nKeep contact", "touch", "One finger touching, including while holding still."),
+            ("Uncertain\nReposition", "unknown", "Use while approaching, lifting or repositioning your finger."),
+        ):
             button = self._button(text, lambda _checked=False, s=state: self._mark_protocol(s), state_buttons)
+            button.setToolTip(hint)
             button.setCheckable(True)
             button.setEnabled(False)
             self.protocol_buttons.append(button)
@@ -227,12 +261,13 @@ class TouchTrackingWindow(QWidget):
         buttons = QHBoxLayout()
         self.open_camera_button = self._button("Open existing camera preview", self._open_camera, buttons)
         self.record_button = self._button("Start trial — no robot", self._toggle_record, buttons)
+        components.apply_variant(self.record_button, "primary")
         self._button("Open dataset folder", lambda: self._open_folder(self.data_root.text()), buttons)
         layout.addLayout(buttons)
         self.record_status = QLabel("No trial running")
         self.record_status.setWordWrap(True)
         layout.addWidget(self.record_status)
-        layout.addStretch()
+        # State marking and stop/save stay visible while only setup scrolls.
         self.tabs.addTab(page, "1 · Record")
         self.record_mode.currentIndexChanged.connect(self._record_mode_changed)
 
@@ -252,7 +287,8 @@ class TouchTrackingWindow(QWidget):
             self.data_root.setText(ai_resource_path("data", namespace))
             self.train_root.setText(self.data_root.text())
             self.output_root.setText(ai_resource_path("models", namespace))
-            self.tabs.setTabText(1, "2 · References (skip for camera-free)" if camera_free else "2 · Reference labels")
+            self.tabs.setTabText(1, "2 · References (optional)" if camera_free else "2 · Reference labels")
+            self.tabs.setTabToolTip(1, "Skip this step for camera-free collection." if camera_free else "Review independent position measurements.")
             self.record_hint.setText(
                 "Keep the sensor fixed and calibrate with no nearby hand before recording. Record lines, curves, holds and reversals across the grid. "
                 + ("No camera or image annotation is needed. Use the state buttons below." if camera_free else
@@ -294,6 +330,8 @@ class TouchTrackingWindow(QWidget):
         self._button("Previous", lambda: self._step_frame(-1), nav)
         self._button("Next", lambda: self._step_frame(1), nav)
         self._button("No touch", lambda: self._label_contact(0), nav)
+        layout.addLayout(nav)
+        nav = QHBoxLayout()
         self._button("Unknown / occluded", lambda: self._label_contact(-1), nav)
         self._button("Suggest next position", self._suggest_next, nav)
         self._button("Accept visible suggestion", self._accept_candidate, nav)
@@ -314,16 +352,19 @@ class TouchTrackingWindow(QWidget):
         self.reference_verified = QCheckBox("I reviewed the contact points, no-touch labels, plane calibration and timing; uncertain frames remain unknown.")
         layout.addWidget(self.reference_verified)
         self._button("Save verified reference (keep previous versions)", self._save_annotations, layout)
-        self.tabs.addTab(page, "2 · Reference labels")
+        self.tabs.addTab(components.scroll_page(page), "2 · Reference labels")
 
     def _build_train_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        setup = QWidget()
+        setup_layout = QVBoxLayout(setup)
+        setup_layout.setContentsMargins(0, 0, 0, 0)
         hint = QLabel("Requires at least three independent sessions (or people), including movement and no touch.\n"
                       "Camera-free training skips image annotation: positions are generated from sensor signals. Its scores measure target agreement, NOT physical accuracy.")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
-        form = QFormLayout()
+        setup_layout.addWidget(hint)
+        form = components.SettingsForm()
         self.training_supervision = QComboBox()
         self.training_supervision.addItem("Camera-free — operator states + estimated positions", "camera_free")
         self.training_supervision.addItem("Independent measured references", "independent")
@@ -344,32 +385,47 @@ class TouchTrackingWindow(QWidget):
         self.epochs = QSpinBox()
         self.epochs.setRange(1, 500)
         self.epochs.setValue(60)
-        form.addRow("Maximum epochs (early stopping enabled)", self.epochs)
+        advanced_form = components.SettingsForm()
+        advanced_form.addRow("Maximum epochs (early stopping enabled)", self.epochs)
         self.history_frames = QSpinBox()
         self.history_frames.setRange(4, 100)
         self.history_frames.setValue(16)
-        form.addRow("History frames at 50 Hz", self.history_frames)
+        advanced_form.addRow("History frames at 50 Hz", self.history_frames)
         self.seed = QSpinBox()
         self.seed.setRange(0, 1000000)
         self.seed.setValue(42)
-        form.addRow("Reproducible split / training seed", self.seed)
-        layout.addLayout(form)
+        advanced_form.addRow("Reproducible split / training seed", self.seed)
+        setup_layout.addLayout(form)
+        self.training_advanced = components.CollapsibleGroup("Training parameters · epochs, history and seed")
+        self.training_advanced.add_layout(advanced_form)
+        setup_layout.addWidget(self.training_advanced)
+        setup_layout.addStretch()
+        self.train_setup_scroll = components.scroll_page(setup)
+        layout.addWidget(self.train_setup_scroll, 3)
         bar = QHBoxLayout()
         self.check_button = self._button("Check dataset", lambda: self._run_training(False), bar)
         self.train_button = self._button("Train + evaluate", lambda: self._run_training(True), bar)
+        components.apply_variant(self.train_button, "primary")
         self.cancel_button = self._button("Cancel job", self._cancel_job, bar)
+        components.apply_variant(self.cancel_button, "danger")
         self.cancel_button.setEnabled(False)
         self._button("Open results", lambda: self._open_folder(self._last_output or self.output_root.text()), bar)
         layout.addLayout(bar)
         self.training_log = QPlainTextEdit()
         self.training_log.setReadOnly(True)
         self.training_log.setMaximumBlockCount(3000)
-        layout.addWidget(self.training_log, 1)
+        self.training_log.setAccessibleName("Dataset check and training output")
+        self.training_log.setPlaceholderText("Dataset checks and training output will appear here.")
+        self.training_log.setMinimumHeight(90)
+        layout.addWidget(self.training_log, 2)
         self.tabs.addTab(page, "3 · Train and evaluate")
 
     def _build_preview_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+        layout.addWidget(components.SectionHeader(
+            "Follow your finger", "For a first check, use the camera-free tracker below. No trained model is needed.",
+        ))
         self.preview_backend = QComboBox()
         self.preview_backend.addItem("Camera-free robust tracker — no model/training needed", "direct")
         self.preview_backend.addItem("Trained neural model — select checkpoint below", "neural")
@@ -382,13 +438,14 @@ class TouchTrackingWindow(QWidget):
         bar = QHBoxLayout()
         self.choose_model_button = self._button("Select model", self._choose_model, bar)
         self.preview_button = self._button("Start sensor-only preview", self._toggle_preview, bar)
+        components.apply_variant(self.preview_button, "primary")
         layout.addLayout(bar)
         self.preview_map = TrackingMap()
         layout.addWidget(self.preview_map, 1)
         self.preview_status = QLabel("Direct tracking needs no trained model. Keep your hand away during startup; no robot commands are sent.")
         self.preview_status.setWordWrap(True)
         layout.addWidget(self.preview_status)
-        self.tabs.addTab(page, "4 · Live preview")
+        self.tabs.addTab(components.scroll_page(page), "4 · Live preview")
         self.preview_backend.currentIndexChanged.connect(self._preview_backend_changed)
         self._preview_backend_changed()
 
@@ -451,7 +508,7 @@ class TouchTrackingWindow(QWidget):
             return
         try:
             active_modes = (
-                "_direct_finger_active", "_ai_direct_finger_robot_active",
+                "_direct_finger_active",
                 "_ai_direct_finger_execution_active", "_console_control_active",
                 "_ai_proximity_robot_motion_active", "centering_active",
             )

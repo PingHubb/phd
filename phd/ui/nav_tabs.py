@@ -1,18 +1,18 @@
 """Top navigation bar for the main workspace switcher.
 
 The app's top-level areas (Sensor, Robots, AI, ...) sit in a single horizontal
-bar above the sub-tabs, so the control panel spends all of its width on
-controls rather than on a permanent navigation column.
+bar outside the adaptive split, so navigation never moves with the controls.
 
 Rather than replacing ``QTabWidget`` with a hand-rolled stack, this module only
-swaps in a custom ``QTabBar``. That matters: ``addTab``, ``setTabEnabled``,
+uses a custom ``QTabBar`` and synchronizes an external navigator with it.
+That matters: ``addTab``, ``setTabEnabled``,
 ``currentIndex``, ``currentChanged`` and -- critically -- the **tab index
 numbers** keep working exactly as before, so the index-dependent logic that
 drives the humanoid 3D viewport lifecycle is untouched.
 
 The custom bar exists because Qt cannot draw a recoloured icon beside a label
 in a tab; painting it here also lets the selected entry use a soft accent pill
-that reads as a level above the segmented sub-tabs below it.
+that reads as a level above the underlined sub-tabs below it.
 
 Usage::
 
@@ -22,13 +22,13 @@ Usage::
 
 from __future__ import annotations
 
-from PyQt5.QtCore import QRect, QSize, Qt
-from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter
+from PyQt5.QtCore import QRect, QRectF, QSize, Qt, QSignalBlocker, pyqtSignal
+from PyQt5.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PyQt5.QtWidgets import QStyle, QStyleOptionTab, QTabBar, QTabWidget
 
-from phd.ui import icons, theme
+from phd.ui import icons, motion, theme
 
-TAB_HEIGHT = 34
+TAB_HEIGHT = 40
 ICON_SIZE = 17
 
 # Horizontal insets used both for painting and for the width calculation:
@@ -57,6 +57,53 @@ class NavigationTabBar(QTabBar):
         self.setMouseTracking(True)
         self.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
         self.setCursor(Qt.PointingHandCursor)
+        self._indicator = QRectF()
+        self._indicator_target = QRectF()
+        self._indicator_motion = motion.animation(self, motion.NAV_MS, self._set_indicator)
+        self.currentChanged.connect(self.sync_indicator)
+        motion.preferences().changed.connect(self._snap_indicator)
+
+    def _selection_rect(self):
+        index = self.currentIndex()
+        if index < 0 or not self.isTabVisible(index):
+            return QRectF()
+        return QRectF(self.tabRect(index).adjusted(PAD_OUTER, 3, -PAD_OUTER, -3))
+
+    def _set_indicator(self, rect):
+        self._indicator = QRectF(rect)
+        self.update()
+
+    def _snap_indicator(self, *_args):
+        self._indicator_motion.stop()
+        self._indicator_target = self._selection_rect()
+        self._set_indicator(self._indicator_target)
+
+    def sync_indicator(self, *_args):
+        """Selection is already committed; this only retargets its paint."""
+        target = self._selection_rect()
+        if target == self._indicator_target:
+            return
+        self._indicator_motion.stop()
+        self._indicator_target = target
+        if (motion.preferences().reduced or not self.isVisible() or
+                not self._indicator.isValid() or not target.isValid()):
+            self._set_indicator(target)
+            return
+        self._indicator_motion.setStartValue(self._indicator)
+        self._indicator_motion.setEndValue(target)
+        self._indicator_motion.start()
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._snap_indicator()
+
+    def showEvent(self, event):  # noqa: N802
+        super().showEvent(event)
+        self._snap_indicator()
+
+    def hideEvent(self, event):  # noqa: N802
+        self._snap_indicator()
+        super().hideEvent(event)
 
     # -- geometry ---------------------------------------------------------
     def _tab_width(self, index: int) -> int:
@@ -115,44 +162,58 @@ class NavigationTabBar(QTabBar):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor(theme.WINDOW_BG))
+        painter.fillRect(self.rect(), QColor(theme.SURFACE))
+
+        # Label/visibility changes can alter tab geometry without a resize.
+        if self._selection_rect() != self._indicator_target:
+            self._snap_indicator()
+        if 0 <= self._hovered < self.count() and self.isTabEnabled(self._hovered):
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(theme.SURFACE_SUNKEN))
+            painter.drawRoundedRect(
+                self.tabRect(self._hovered).adjusted(PAD_OUTER, 3, -PAD_OUTER, -3),
+                theme.RADIUS_MD, theme.RADIUS_MD,
+            )
+        indicator_path = QPainterPath()
+        indicator_path.addRoundedRect(self._indicator, theme.RADIUS_MD, theme.RADIUS_MD)
+        painter.fillPath(indicator_path, QColor(theme.ACCENT))
 
         current = self.currentIndex()
         for index in range(self.count()):
             rect = self.tabRect(index)
-            if not rect.isValid():
+            if not rect.isValid() or not self.isTabVisible(index):
                 continue
 
             option = QStyleOptionTab()
             self.initStyleOption(option, index)
             enabled = bool(option.state & QStyle.State_Enabled)
             selected = index == current
-            hovered = index == self._hovered and enabled and not selected
-
-            self._paint_tab(painter, rect, index, enabled, selected, hovered)
+            self._paint_tab(painter, rect, index, enabled, selected, on_accent=False)
+            # White glyphs only where the moving pill actually covers them.
+            # This avoids unreadable white text at the destination mid-flight.
+            if self._indicator.intersects(QRectF(rect)):
+                painter.save()
+                painter.setClipPath(indicator_path)
+                self._paint_tab(painter, rect, index, enabled, selected, on_accent=True)
+                painter.restore()
         painter.end()
 
-    def _paint_tab(self, painter, rect, index, enabled, selected, hovered):
+    def _paint_tab(self, painter, rect, index, enabled, selected, on_accent):
         body = rect.adjusted(PAD_OUTER, 3, -PAD_OUTER, -3)
-
-        if selected:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(theme.ACCENT_SOFT))
-            painter.drawRoundedRect(body, theme.RADIUS_MD, theme.RADIUS_MD)
-        elif hovered:
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor(theme.SURFACE_SUNKEN))
-            painter.drawRoundedRect(body, theme.RADIUS_MD, theme.RADIUS_MD)
+        compact = self.width() < sum(self._tab_width(i) for i in range(self.count()))
+        inset = 6 if compact else PAD_INNER
 
         if not enabled:
             color = theme.TEXT_DISABLED
-        elif selected:
-            color = theme.ACCENT
+        elif on_accent:
+            color = theme.TEXT_ON_ACCENT
         else:
             color = theme.TEXT_SECONDARY
 
-        text_left = body.left() + PAD_INNER
-        glyph = str(self.tabData(index) or "")
+        # On a narrow panel, readable workspace names are more useful than
+        # retaining every icon and reducing each label to one character.
+        text_left = body.left() + inset
+        glyph = "" if compact else str(self.tabData(index) or "")
         if glyph:
             pixmap = icons.pixmap(
                 glyph,
@@ -161,7 +222,7 @@ class NavigationTabBar(QTabBar):
                 ratio=float(self.devicePixelRatioF() or 1.0),
             )
             icon_rect = QRect(
-                body.left() + PAD_INNER,
+                body.left() + inset,
                 body.top() + (body.height() - ICON_SIZE) // 2,
                 ICON_SIZE,
                 ICON_SIZE,
@@ -177,13 +238,98 @@ class NavigationTabBar(QTabBar):
         text_rect = QRect(
             text_left,
             body.top(),
-            max(0, body.right() - text_left - PAD_INNER + PAD_OUTER),
+            max(0, body.right() - text_left - inset + PAD_OUTER),
             body.height(),
         )
         label = painter.fontMetrics().elidedText(
             self.tabText(index), Qt.ElideRight, text_rect.width()
         )
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
+        if selected and self.hasFocus():
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor(theme.TEXT_ON_ACCENT if on_accent else theme.ACCENT), 1, Qt.DotLine))
+            painter.drawRoundedRect(body.adjusted(3, 3, -3, -3), 5, 5)
+
+
+class WorkspaceTabs(QTabWidget):
+    """Keep page ownership in QTabWidget, with a synchronized external navigator.
+
+    The native tab indices, signals and enablement API remain authoritative.
+    No page or renderer is moved when the external navigation is attached.
+    """
+
+    navigation_activated = pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.external_bar = None
+        self.currentChanged.connect(self._sync_navigation)
+
+    def create_external_navigation(self):
+        if self.external_bar is None:
+            self.external_bar = NavigationTabBar()
+            self.external_bar.currentChanged.connect(self._activate_navigation)
+            self.external_bar.tabBarClicked.connect(self._activate_navigation)
+        self._sync_navigation()
+        self.tabBar().hide()
+        return self.external_bar
+
+    def _activate_navigation(self, index):
+        if 0 <= index < self.count() and self.isTabEnabled(index):
+            self.setCurrentIndex(index)
+            self.navigation_activated.emit(index)
+
+    def _sync_navigation(self, *_args):
+        bar = self.external_bar
+        if bar is None:
+            return
+        blocker = QSignalBlocker(bar)
+        while bar.count() > self.count():
+            bar.removeTab(bar.count() - 1)
+        for index in range(self.count()):
+            if index >= bar.count():
+                bar.addTab(self.tabText(index))
+            # Runtime readiness checks call this repeatedly. Reassigning the
+            # same text invalidates QTabBar geometry and schedules needless
+            # paints during a workspace transition.
+            if bar.tabText(index) != self.tabText(index):
+                bar.setTabText(index, self.tabText(index))
+            if bar.tabData(index) != self.tabBar().tabData(index):
+                bar.setTabData(index, self.tabBar().tabData(index))
+            if bar.tabToolTip(index) != self.tabToolTip(index):
+                bar.setTabToolTip(index, self.tabToolTip(index))
+            if bar.isTabEnabled(index) != self.isTabEnabled(index):
+                bar.setTabEnabled(index, self.isTabEnabled(index))
+            if bar.isTabVisible(index) != self.isTabVisible(index):
+                bar.setTabVisible(index, self.isTabVisible(index))
+        if bar.currentIndex() != self.currentIndex():
+            bar.setCurrentIndex(self.currentIndex())
+        del blocker
+        bar.sync_indicator()
+
+    def tabInserted(self, index):  # noqa: N802
+        super().tabInserted(index)
+        self._sync_navigation()
+
+    def tabRemoved(self, index):  # noqa: N802
+        super().tabRemoved(index)
+        self._sync_navigation()
+
+    def setTabEnabled(self, index, enabled):  # noqa: N802
+        super().setTabEnabled(index, enabled)
+        self._sync_navigation()
+
+    def setTabVisible(self, index, visible):  # noqa: N802
+        super().setTabVisible(index, visible)
+        self._sync_navigation()
+
+    def setTabText(self, index, text):  # noqa: N802
+        super().setTabText(index, text)
+        self._sync_navigation()
+
+    def setTabToolTip(self, index, text):  # noqa: N802
+        super().setTabToolTip(index, text)
+        self._sync_navigation()
 
 
 def install(

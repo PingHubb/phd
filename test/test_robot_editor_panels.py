@@ -104,12 +104,12 @@ def test_reclicking_closes_without_opening_another():
     assert _open_count(harness) == 0
 
 
-def test_read_section_hides_only_while_an_editor_is_open():
+def test_read_task_remains_available_while_a_command_editor_is_open():
     harness = _Harness()
     assert harness.read_group_robot.isVisible() is True
 
     harness.toggle(harness.position_quaternion_widget)
-    assert harness.read_group_robot.isVisible() is False
+    assert harness.read_group_robot.isVisible() is True
 
     harness.toggle(harness.position_quaternion_widget)
     assert harness.read_group_robot.isVisible() is True
@@ -131,7 +131,7 @@ def test_exclusivity_holds_while_the_workspace_is_hidden():
     harness.toggle(harness.position_toolframe_widget)
 
     assert _open_count(harness) == 1, "a second editor opened on top of the first"
-    assert harness.read_group_robot.isVisible() is False
+    assert harness.read_group_robot.isVisible() is True
 
 
 def test_is_visible_to_parent_handles_a_missing_widget():

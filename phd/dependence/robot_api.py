@@ -117,6 +117,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
         self.current_positions = None
         self.current_tool_pose = None
         self.current_project_speed_percent = None
+        self.current_project_paused = None
         self.current_feedback_state_time = None
         self.client = None
         self.send_script_client = None
@@ -915,6 +916,7 @@ class RobotController(Node if ROS_AVAILABLE else object):
             return
         if math.isfinite(project_speed):
             self.current_project_speed_percent = project_speed
+            self.current_project_paused = getattr(msg, "project_pause", None)
             self.current_feedback_state_time = time.monotonic()
 
     def get_project_speed_percent(self):

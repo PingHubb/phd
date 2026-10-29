@@ -1,5 +1,6 @@
 import csv
 import json
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -14,12 +15,29 @@ from phd.ui.calibration_graph_analysis import (
 from phd.ui.calibration_result_dialog import CalibrationCurveWidget
 
 
+def test_contact_relative_chart_preserves_negative_precontact_travel():
+    chart = SimpleNamespace(
+        _range=CalibrationCurveWidget._range,
+        contact_referenced=True,
+        signal_field="diff_ave",
+        mode="signal_distance",
+        distance_label="TCP travel relative to detected contact (mm)",
+    )
+    points = [(-12.0, -1.0), (0.0, -20.0), (3.0, 70.0)]
+    low, high = CalibrationCurveWidget._relationship_x_range(chart, points, "travel_down_mm")
+    assert low < -12.0
+    assert high > 3.0
+    assert "Contact-relative" in CalibrationCurveWidget._relationship_spec(chart)[4]
+    chart.contact_referenced = False
+    assert CalibrationCurveWidget._relationship_x_range(chart, points, "travel_down_mm")[0] == 0
+
+
 def _synthetic_rows(signal_offset=0.0):
     rows = []
     elapsed = 0.0
     for index in range(20):
         distance = index * 0.1
-        signal = signal_offset if index < 4 else signal_offset - 10.0 * (
+        signal = signal_offset if index < 4 else signal_offset - 100.0 * (
             distance - 0.3
         )
         force = 0.0 if index < 10 else 100.0 * (distance - 0.9)
@@ -38,7 +56,7 @@ def _synthetic_rows(signal_offset=0.0):
         loading_signal = (
             signal_offset
             if distance < 0.4
-            else signal_offset - 10.0 * (distance - 0.3)
+            else signal_offset - 100.0 * (distance - 0.3)
         )
         loading_force = 0.0 if distance < 1.0 else 100.0 * (distance - 0.9)
         rows.append(
@@ -91,7 +109,7 @@ def test_professional_analysis_reports_events_models_and_hysteresis():
     ]["contact_onset"]["distance_mm"]
     assert analysis["events"]["proximity_window_mm"] > 0.0
     assert np.isclose(
-        analysis["models"]["signal_distance"]["slope"], -10.0
+        analysis["models"]["signal_distance"]["slope"], -100.0
     )
     assert analysis["models"]["force_distance"]["slope"] > 0.0
     assert analysis["models"]["force_signal"]["slope"] < 0.0

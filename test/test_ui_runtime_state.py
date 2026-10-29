@@ -262,7 +262,7 @@ def test_session_summary_colors_active_and_inactive_services():
     MyMainWindow._refresh_session_strip(
         window,
         ui,
-        "AI DFM (record)",
+        "Gesture recording",
         True,
         60.0,
     )

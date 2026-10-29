@@ -63,6 +63,20 @@
       "vid": 12346,
       "pid": 4097,
       "last_port": "ttyACM7"
+    },
+    "usb:303a:1001:48:f6:ee:21:88:44": {
+      "part": "sensor:testing_20x20_3",
+      "serial_number": "48:F6:EE:21:88:44",
+      "vid": 12346,
+      "pid": 4097,
+      "last_port": "ttyACM3"
+    },
+    "usb:1a86:55d3:5aa9026909": {
+      "part": "sensor:robot_dog_back",
+      "serial_number": "5AA9026909",
+      "vid": 6790,
+      "pid": 21971,
+      "last_port": "ttyACM4"
     }
   },
   "mappings": {

@@ -10,7 +10,7 @@ grey chrome, white working surfaces, dark readable text, hairline borders and
 one saturated accent. Colour carries meaning and nothing else:
 
 ===========  ==========================================================
-Blue         primary action / current selection
+Teal         primary action / current selection
 Green        active, running, connected, healthy
 Amber        warning, degraded, needs attention
 Red          stop, danger, disconnected, emergency
@@ -30,23 +30,23 @@ future palette change stays a one-file edit::
 # WINDOW_BG is the app chrome (menu bar, toolbar, status bar, gutters).
 # SURFACE is a working surface that content sits on. SURFACE_RAISED is used for
 # secondary fills that need to separate from SURFACE without a border.
-WINDOW_BG = "#F4F4F6"
+WINDOW_BG = "#EEF2F5"
 SURFACE = "#FFFFFF"
-SURFACE_RAISED = "#F0F0F3"
-SURFACE_SUNKEN = "#E9E9ED"
+SURFACE_RAISED = "#F3F6F8"
+SURFACE_SUNKEN = "#E5ECF0"
 INPUT_BG = "#FFFFFF"
 
-BORDER = "#D0D0D6"
-BORDER_SUBTLE = "#E3E3E8"
-BORDER_STRONG = "#B8B8C0"
+BORDER = "#C9D4DC"
+BORDER_SUBTLE = "#DEE6EB"
+BORDER_STRONG = "#99AEBB"
 
 # ---------------------------------------------------------------------------
 # Text
 # ---------------------------------------------------------------------------
-TEXT_PRIMARY = "#1C1C1E"
-TEXT_SECONDARY = "#48484A"
-TEXT_MUTED = "#6B6B70"
-TEXT_DISABLED = "#A8A8AE"
+TEXT_PRIMARY = "#192F3D"
+TEXT_SECONDARY = "#405867"
+TEXT_MUTED = "#536B7A"
+TEXT_DISABLED = "#8C9BA5"
 TEXT_ON_ACCENT = "#FFFFFF"
 
 # ---------------------------------------------------------------------------
@@ -54,21 +54,21 @@ TEXT_ON_ACCENT = "#FFFFFF"
 # ---------------------------------------------------------------------------
 # Every filled variant below is dark enough to carry white text at >= 4.5:1,
 # so a coloured button never becomes unreadable.
-ACCENT = "#0B6BD3"
-ACCENT_HOVER = "#1A7BE5"
-ACCENT_PRESSED = "#0A5AB0"
-ACCENT_SOFT = "#E8F1FC"
-ACCENT_BORDER = "#A8CBF2"
-INFO = "#0B6BD3"
+ACCENT = "#086B78"
+ACCENT_HOVER = "#087989"
+ACCENT_PRESSED = "#075563"
+ACCENT_SOFT = "#E5F3F4"
+ACCENT_BORDER = "#9FCED3"
+INFO = ACCENT
 
-SUCCESS = "#1B8A3F"
-SUCCESS_HOVER = "#22A34C"
+SUCCESS = "#18743B"
+SUCCESS_HOVER = "#1B8144"
 SUCCESS_PRESSED = "#166F33"
 SUCCESS_SOFT = "#E6F4EA"
 SUCCESS_BORDER = "#A6D9B5"
 
 WARNING = "#B45309"
-WARNING_HOVER = "#D2690F"
+WARNING_HOVER = "#A54A08"
 WARNING_SOFT = "#FDF3E3"
 WARNING_BORDER = "#EBCB96"
 
@@ -79,15 +79,18 @@ DANGER_SOFT = "#FDECEA"
 DANGER_BORDER = "#F0B4AC"
 
 # Neutral "idle / unknown" state fill for indicators.
-NEUTRAL_SOFT = "#EFEFF2"
-NEUTRAL_BORDER = "#D8D8DE"
+NEUTRAL_SOFT = "#EDF2F5"
+NEUTRAL_BORDER = "#D1DCE3"
 
 # 3D viewport background (VTK/PyVista). Deliberately dark even though the
 # chrome is light: the tactile heatmap encodes "no contact" as pure white
 # (see sensor_heatmap.heatmap_rgb), so a light canvas would hide every idle
 # taxel. Treated as a content canvas inside light chrome, the way pro media
 # tools do, rather than as another surface.
-VIEWPORT_BG = "#2B2B30"
+VIEWPORT_BG = "#142432"
+VIEWPORT_TEXT = "#E6EEF4"
+VIEWPORT_MUTED = "#A0B5C4"
+VIEWPORT_GRID = "#2A4051"
 
 # Secondary accents are reserved for the few places where two concurrent
 # non-status actions must remain distinguishable (for example forward and
@@ -99,12 +102,12 @@ TEAL = "#0F766E"
 TEAL_HOVER = "#0D9488"
 
 # Fine-grained neutral fills used by tables, scrollbars and inset surfaces.
-TEXT_FAINT = "#C7C7CC"
-VIEWPORT_EDGE = "#33333A"
-SURFACE_BRIGHT = "#FCFCFD"
-SURFACE_QUIET = "#F8F8FA"
-TABLE_ALTERNATE = "#FAFAFC"
-TABLE_GRID = "#EDEDF1"
+TEXT_FAINT = "#B8C6D0"
+VIEWPORT_EDGE = "#203645"
+SURFACE_BRIGHT = "#FCFDFE"
+SURFACE_QUIET = "#F6F8FA"
+TABLE_ALTERNATE = "#F5F8FA"
+TABLE_GRID = "#E5ECF0"
 
 # ---------------------------------------------------------------------------
 # Typography
@@ -121,7 +124,7 @@ FONT_FAMILY_MONO = (
 FONT_SIZE_SMALL = "9pt"
 FONT_SIZE_BASE = "10pt"
 FONT_SIZE_MEDIUM = "11pt"
-FONT_SIZE_TITLE = "13pt"
+FONT_SIZE_TITLE = "16pt"
 
 # The same base size as a number, plus the family stack in preference order,
 # for setting QApplication's font. Qt sizes some widgets (notably QTabBar) with
@@ -185,10 +188,10 @@ SPACE_LG = 16
 SPACE_XL = 24
 
 RADIUS_SM = 4
-RADIUS_MD = 6
-RADIUS_LG = 8
+RADIUS_MD = 8
+RADIUS_LG = 12
 
-CONTROL_HEIGHT = 28
+CONTROL_HEIGHT = 30
 CONTROL_HEIGHT_SM = 24
 CONTROL_HEIGHT_LG = 34
 
@@ -389,6 +392,9 @@ QSS_TOKENS = {
     "NEUTRAL_SOFT": NEUTRAL_SOFT,
     "NEUTRAL_BORDER": NEUTRAL_BORDER,
     "VIEWPORT_BG": VIEWPORT_BG,
+    "VIEWPORT_TEXT": VIEWPORT_TEXT,
+    "VIEWPORT_MUTED": VIEWPORT_MUTED,
+    "VIEWPORT_GRID": VIEWPORT_GRID,
     "PURPLE": PURPLE,
     "PURPLE_HOVER": PURPLE_HOVER,
     "TEAL": TEAL,

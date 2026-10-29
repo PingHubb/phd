@@ -1,5 +1,5 @@
 /*====================================================================
-    PingLab — Light instrument theme
+    PingLab — Slate / teal instrument workspace
     --------------------------------------------------------------
     Rendered from phd/ui/theme.py at startup. That module is the source
     of truth; named placeholders below must not be replaced by hand.
@@ -23,7 +23,7 @@
       Warning (amber)     @WARNING@  hover @WARNING_HOVER@  soft @WARNING_SOFT@
       Danger  (red)       @DANGER@  hover @DANGER_HOVER@  soft @DANGER_SOFT@
 
-    Colour is meaning: blue = primary action, green = running,
+    Colour is meaning: teal = primary action, green = running,
     amber = warning, red = stop/danger, grey = everything else.
 ====================================================================*/
 
@@ -46,6 +46,40 @@ QMainWindow {
 
 QLabel {
     background: transparent;
+}
+
+/* A persistent task index, visually separate from executable controls. */
+QWidget#taskIndex {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid @BORDER_SUBTLE@;
+}
+QPushButton#taskChoice {
+    background: transparent;
+    color: @TEXT_SECONDARY@;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    font-weight: 500;
+    padding: 3px 6px;
+    text-align: left;
+}
+QPushButton#taskChoice:hover {
+    background: @SURFACE@;
+    border-color: @BORDER@;
+}
+QPushButton#taskChoice:checked {
+    background: @ACCENT_SOFT@;
+    color: @ACCENT@;
+    border-color: @ACCENT_BORDER@;
+    font-weight: 600;
+}
+QPushButton#taskChoice:pressed {
+    background: @ACCENT_SOFT@;
+    border-color: @ACCENT@;
+}
+QPushButton#taskChoice:focus {
+    border: 1px solid @ACCENT@;
+    padding: 3px 6px;
 }
 
 QToolTip {
@@ -108,11 +142,11 @@ QMenu::indicator {
 }
 
 QToolBar {
-    background-color: @WINDOW_BG@;
+    background-color: @SURFACE@;
     border: none;
     border-bottom: 1px solid @BORDER_SUBTLE@;
-    padding: 4px 6px;
-    spacing: 2px;
+    padding: 8px 10px;
+    spacing: 4px;
 }
 QToolBar::separator {
     background: @BORDER_SUBTLE@;
@@ -141,6 +175,9 @@ QToolButton:pressed {
 }
 QToolButton:disabled {
     color: @TEXT_DISABLED@;
+}
+QToolButton:focus {
+    border-color: @ACCENT@;
 }
 QToolButton::menu-indicator {
     image: none;
@@ -174,9 +211,9 @@ QLabel#statusSeparator {
 
 /* Persistent operational context above the workspace navigation. */
 QFrame#sessionStrip {
-    background-color: @SURFACE_RAISED@;
+    background-color: @SURFACE@;
     border: 1px solid @BORDER_SUBTLE@;
-    border-radius: 6px;
+    border-radius: 8px;
 }
 QWidget#sessionField,
 QFrame#sessionStrip QLabel {
@@ -189,11 +226,115 @@ QLabel#sessionFieldTitle {
 }
 QLabel#sessionFieldValue {
     color: @TEXT_PRIMARY@;
-    font-size: @FONT_SIZE_SMALL@;
+    font-size: @FONT_SIZE_BASE@;
 }
 QFrame#sessionSeparator {
     background-color: @BORDER@;
     border: none;
+}
+
+/* Workspace hierarchy: one title, a clear local task, no floating notices. */
+QLabel#appBrand {
+    color: @TEXT_PRIMARY@;
+    font-size: @FONT_SIZE_MEDIUM@;
+    font-weight: 600;
+    padding: 0 12px 0 2px;
+}
+QWidget#controlWorkspace {
+    background-color: @SURFACE@;
+    border-radius: 10px;
+}
+QFrame#workspaceHeader {
+    background-color: @SURFACE@;
+    border: none;
+    border-bottom: 1px solid @BORDER_SUBTLE@;
+}
+QFrame#workspaceNavigation {
+    background: @SURFACE@;
+    border: 1px solid @BORDER_SUBTLE@;
+    border-radius: 8px;
+}
+QFrame#actionCard {
+    background: @SURFACE@;
+    border: 1px solid @BORDER_SUBTLE@;
+    border-radius: 10px;
+}
+QFrame#actionCard:hover {
+    border-color: @NEUTRAL_BORDER@;
+}
+QLabel#actionCardStep {
+    color: @ACCENT@;
+    font-size: @FONT_SIZE_SMALL@;
+    font-weight: 600;
+}
+QLabel#workspaceEyebrow {
+    color: @ACCENT@;
+    font-size: 8pt;
+    font-weight: 600;
+}
+QLabel#workspaceTitle {
+    color: @TEXT_PRIMARY@;
+    font-size: @FONT_SIZE_TITLE@;
+    font-weight: 600;
+}
+QLabel#workspaceSubtitle {
+    color: @TEXT_MUTED@;
+    font-size: @FONT_SIZE_SMALL@;
+}
+QWidget#viewportHeader {
+    background-color: @VIEWPORT_BG@;
+    border-bottom: 1px solid @VIEWPORT_GRID@;
+}
+QLabel#viewportTitle {
+    color: @VIEWPORT_TEXT@;
+    font-weight: 600;
+}
+QLabel#viewportState {
+    color: @VIEWPORT_MUTED@;
+    font-size: @FONT_SIZE_SMALL@;
+}
+QFrame#viewportWelcome {
+    background-color: @VIEWPORT_BG@;
+    border: none;
+}
+QFrame#viewportWelcome QWidget {
+    background: transparent;
+}
+QLabel#viewportWelcomeTitle {
+    color: @VIEWPORT_TEXT@;
+    font-size: 20pt;
+    font-weight: 600;
+}
+QLabel#viewportWelcomeNote {
+    color: @VIEWPORT_MUTED@;
+    font-size: @FONT_SIZE_BASE@;
+}
+QPushButton#welcomeAction {
+    color: @VIEWPORT_TEXT@;
+    background-color: @VIEWPORT_EDGE@;
+    border: 1px solid @VIEWPORT_GRID@;
+    padding: 7px 14px;
+}
+QPushButton#welcomeAction:hover,
+QPushButton#welcomeAction:focus {
+    border-color: @VIEWPORT_MUTED@;
+    background-color: @VIEWPORT_GRID@;
+}
+QPushButton#welcomeAction:pressed {
+    background-color: @ACCENT@;
+}
+QLabel#instructionNote {
+    background-color: @ACCENT_SOFT@;
+    color: @TEXT_SECONDARY@;
+    border: 1px solid @ACCENT_BORDER@;
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+QLabel#workspaceStatus {
+    background-color: @SURFACE_RAISED@;
+    color: @TEXT_SECONDARY@;
+    border-top: 1px solid @BORDER_SUBTLE@;
+    padding: 8px 12px;
 }
 
 /*====================================================================
@@ -348,7 +489,7 @@ QGroupBox#dangerZone::title {
     Three flavours:
       * default            -> underline tabs (top-level dialogs)
       * #navBar            -> top-level workspace switcher
-      * #segmentedTabs     -> iOS-style segmented control for sub-tools
+      * #segmentedTabs     -> quiet underlined navigation for sub-tools
 ====================================================================*/
 
 QTabWidget::pane {
@@ -404,19 +545,19 @@ QTabWidget#segmentedTabs::pane {
     background: transparent;
 }
 QTabBar#segmentedBar {
-    background-color: @SURFACE_SUNKEN@;
-    border-radius: 7px;
-    padding: 2px;
+    background-color: transparent;
+    padding: 0px;
 }
 /* Every state keeps the same font weight. Qt sizes a tab from the base rule
    only, so a heavier :selected font would overflow the rect it was given and
-   clip the label on both sides. Selection is shown by the pill instead. */
+   clip the label on both sides. Selection is shown by an underline instead. */
 QTabBar#segmentedBar::tab {
     background: transparent;
     color: @TEXT_SECONDARY@;
-    border: 1px solid transparent;
-    border-radius: 5px;
-    padding: 5px 18px;
+    border: none;
+    border-bottom: 2px solid transparent;
+    border-radius: 0px;
+    padding: 6px 14px;
     margin: 0 1px;
     min-height: 18px;
 }
@@ -424,9 +565,9 @@ QTabBar#segmentedBar::tab:hover {
     color: @TEXT_PRIMARY@;
 }
 QTabBar#segmentedBar::tab:selected {
-    background-color: @SURFACE@;
+    background-color: transparent;
     color: @ACCENT@;
-    border-color: @NEUTRAL_BORDER@;
+    border-bottom: 2px solid @ACCENT@;
 }
 QTabBar#segmentedBar::tab:disabled {
     color: @TEXT_DISABLED@;
@@ -746,7 +887,7 @@ QComboBox::down-arrow:disabled {
 QComboBox QAbstractItemView {
     background-color: @SURFACE@;
     border: 1px solid @BORDER@;
-    border-radius: 8px;
+    border-radius: 0;
     padding: 0;
     selection-background-color: @ACCENT@;
     selection-color: @SURFACE@;

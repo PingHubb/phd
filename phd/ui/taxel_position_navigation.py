@@ -6,8 +6,13 @@ import copy
 import time
 
 import numpy as np
+from phd.ui.taxel_map_revision import (
+    revision_motion_error, revision_setup, setup_changes_measurements, validate_setup_binding,
+)
 
-from phd.ui.experiment_tasks import CalibrationTask, TaxelPositionMappingTask
+from phd.ui.experiment_tasks import (
+    CalibrationTask, TaxelPositionMappingTask, position_map_sensor_error,
+)
 
 
 def prepare_taxel_map(result: dict) -> dict:
@@ -110,23 +115,35 @@ def prepare_taxel_map(result: dict) -> dict:
         item["safe_approach_position_m"] = safe.tolist()
         measured.append(item)
     normalized["positions"] = measured
+    if "setup_revision" in normalized:
+        try:
+            setup = validate_setup_binding(normalized, revision_setup(normalized))
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ValueError("The saved setup revision is invalid.") from exc
+        normalized["setup_revision"]["requested_setup"] = setup
+        if setup_changes_measurements(normalized, setup) and not revision_motion_error(normalized):
+            raise ValueError("Changed map setup is missing its verification-required flag.")
     return normalized
 
 
 class MappedTaxelMoveTask(TaxelPositionMappingTask):
     """A single monitored route to a saved clearance pose; never runs a probe.
 
-    Reuse the mapper's straight-line routing, feedback arrival checks and
-    sensor/force guards. This transient task uses the ordinary experiment
-    timer and Stop lifecycle, without modifying or saving the original map.
+    Go to the selected taxel without visiting the anchor XY. Lift vertically
+    first when below clearance, and restore orientation there if needed. This
+    transient task uses the ordinary experiment timer and Stop lifecycle.
     """
 
     id = "mapped_taxel_move"
     # This transient command finishes after every grid click. Keep the safety
     # stream available so another mapped taxel can be selected immediately.
     disconnect_force_meter_on_stop = False
+    ORIENTATION_TOLERANCE_RAD = np.radians(2.0)
+    ANGULAR_STATIONARY_TOLERANCE_RAD = np.radians(0.1)
 
     def __init__(self, result, taxel_index, *, line_speed_m_s, force_guard_g):
+        if isinstance(result, dict) and revision_motion_error(result):
+            raise ValueError(revision_motion_error(result))
         super().__init__(storage_path=None, output_directory=None)
         self.map_result = prepare_taxel_map(result)
         settings = self.map_result.get("settings") or {}
@@ -142,8 +159,23 @@ class MappedTaxelMoveTask(TaxelPositionMappingTask):
         self.line_speed_m_s = float(line_speed_m_s)
         self.force_guard_g = float(force_guard_g)
         self.max_xy_offset_m = float(self.map_result["settings"]["max_xy_offset_mm"]) / 1000.0
-        # Even a short lateral move begins after reaching clearance height.
-        self.route_xy_tolerance_m = 1e-9
+        self._navigation_queue = []
+        self._move_goal_quaternion = None
+        self._move_last_quaternion = None
+
+    @staticmethod
+    def _orientation_error(current, target):
+        current = np.asarray(current, dtype=float)
+        target = np.asarray(target, dtype=float)
+        if (current.shape != (4,) or target.shape != (4,)
+                or not np.all(np.isfinite(current)) or not np.all(np.isfinite(target))):
+            return float("inf")
+        norm = float(np.linalg.norm(current) * np.linalg.norm(target))
+        if norm < 1e-9:
+            return float("inf")
+        # q and -q describe the same physical orientation.
+        dot = abs(float(np.dot(current, target))) / norm
+        return float(2.0 * np.arccos(np.clip(dot, 0.0, 1.0)))
 
     def _progress(self, host, detail="") -> None:
         callback = getattr(host, "_refresh_taxel_navigation_status", None)
@@ -159,6 +191,9 @@ class MappedTaxelMoveTask(TaxelPositionMappingTask):
         active = getattr(host, "_sidebar_active_task", None)
         if active is not None and active is not self:
             return reject("Stop the current experiment before selecting a mapped taxel.")
+        mismatch = position_map_sensor_error(host, self.map_result)
+        if mismatch:
+            return reject(mismatch)
         if not np.isfinite(self.line_speed_m_s) or not 0.001 <= self.line_speed_m_s <= 0.1:
             return reject("Set the tool line speed between 1 and 100 mm/s.")
         if not np.isfinite(self.force_guard_g) or not 1.0 <= self.force_guard_g <= 2000.0:
@@ -167,24 +202,33 @@ class MappedTaxelMoveTask(TaxelPositionMappingTask):
         pose = self._read_tool_pose(api)
         if pose is None or not callable(getattr(api, "send_positions_tool_position", None)):
             return reject("Robot TCP feedback and position control are required to move above a taxel.")
-        origin = np.asarray(self.anchor_pose["tool_position_m"], dtype=float)
-        if np.linalg.norm(pose[0][:2] - origin[:2]) > self.max_xy_offset_m:
-            return reject("Move the robot into the recorded sensor workspace before using the taxel map.")
-        current_q = pose[1]
-        q_norm = float(np.linalg.norm(current_q))
-        target_q = np.asarray(self.anchor_pose["tool_quaternion_wxyz"], dtype=float)
-        if q_norm < 1e-9 or abs(float(np.dot(current_q / q_norm, target_q))) < np.cos(np.radians(2.5)):
-            return reject("Restore the tool orientation used during mapping before selecting a taxel.")
+        if not np.isfinite(self._orientation_error(pose[1], pose[1])):
+            return reject("Valid robot tool-orientation feedback is required before moving.")
+        now = time.monotonic()
+        try:
+            feedback_age = now - float(api.current_feedback_state_time)
+        except (AttributeError, TypeError, ValueError):
+            feedback_age = float("inf")
+        if not -0.1 <= feedback_age <= 1.0:
+            return reject("Live robot feedback is required before moving to a mapped taxel.")
+        if getattr(api, "current_project_paused", None) is True:
+            return reject(
+                "Taxel move did not start: the robot project is paused. "
+                "Check the robot controller and clear the pause only when safe, then click the taxel again."
+            )
         frame = self._read_sensor_frame(host)
         if frame is None:
             return reject(
                 f"Connect the {self.sensor_rows}x{self.sensor_columns} tactile sensor "
                 "before moving to a mapped taxel."
             )
-        now = time.monotonic()
         force = self._fresh_force(host, now)
         if force is None:
-            return reject("Connect the force transmitter and wait for live data before moving to a mapped taxel.")
+            # Starts the reader and re-enters on_start once fresh data arrives;
+            # the robot does not move before then.
+            return self._begin_force_meter_connection(host)
+        if abs(float(force[0])) / self.NEWTONS_PER_GRAM >= CalibrationTask.EMERGENCY_FORCE_G:
+            return reject("Taxel move did not start: raw force reached the 900 g software limit.")
         self._force_baseline_n = float(force[0])
         self._last_sensor_sequence = frame[0]
         self._last_sensor_advance_at = now
@@ -195,26 +239,97 @@ class MappedTaxelMoveTask(TaxelPositionMappingTask):
         if callable(setter):
             setter(True)
         self._progress(host, f"Taxel {self._current_taxel}: checking live readings before moving")
+        host._append_sidebar_control_message(
+            f"Taxel {self._current_taxel}: moving to its saved safe pose without returning to the anchor. "
+            "A vertical lift or tool-orientation correction will be made first only if needed."
+        )
         return True
 
     def on_tick(self, host) -> None:
+        if self._active and getattr(self._robot_api(host), "current_project_paused", None) is True:
+            self._request_stop(
+                host, "robot_project_paused",
+                "Taxel move stopped: the robot project is paused. "
+                "Remaining waypoints were cancelled; check the controller before trying again.",
+            )
+            return
         super().on_tick(host)
         if not self._active or self._phase != "navigation_preflight":
             return
         frame = self._read_sensor_frame(host)
         if frame is None or frame[0] == self._preflight_sequence:
             return
-        self._route_to(
-            host,
-            self.target_position[:2],
-            self.target_position[2],
-            "navigation_arrived",
-            f"Moving above Taxel {self._current_taxel} via the saved clearance height",
-        )
+        pose = self._read_tool_pose(self._robot_api(host))
+        if pose is None:
+            self._request_stop(host, "robot_feedback_lost", "Taxel move stopped: robot TCP feedback was lost.")
+            return
+        self._begin_selected_taxel_route(host, pose)
+
+    def _begin_selected_taxel_route(self, host, pose):
+        position = np.array(pose[0], dtype=float, copy=True)
+        current_q = np.asarray(pose[1], dtype=float)
+        current_q = current_q / np.linalg.norm(current_q)
+        target = np.asarray(self.target_position, dtype=float)
+        target_q = np.asarray(self.anchor_pose["tool_quaternion_wxyz"], dtype=float)
+        queue = []
+        # Never take a diagonal shortcut from the probing/contact depth, even
+        # when the starting height is within the normal arrival tolerance.
+        if position[2] < target[2] - 1e-6:
+            position[2] = target[2]
+            queue.append((position.copy(), current_q.copy(), "Lifting vertically to clearance before moving to the selected taxel"))
+        if self._orientation_error(current_q, target_q) > self.ORIENTATION_TOLERANCE_RAD:
+            queue.append((position.copy(), target_q.copy(), "Restoring the saved tool orientation at clearance height"))
+        # Both endpoints are now at/above saved clearance. No anchor waypoint
+        # and no descent to the taxel's lower non-contact scanning position.
+        queue.append((target.copy(), target_q.copy(), f"Moving directly to the saved safe pose above Taxel {self._current_taxel}"))
+        self._navigation_queue = queue
+        self._advance_navigation_route(host)
+
+    def _advance_navigation_route(self, host):
+        if not self._navigation_queue:
+            self._request_stop(host, "route_lost", "Taxel move stopped: the selected-taxel route was lost.")
+            return
+        position, quaternion, detail = self._navigation_queue.pop(0)
+        action = "navigation_waypoint" if self._navigation_queue else "navigation_arrived"
+        self._command_move(host, position, action, detail, quaternion=quaternion)
+
+    def _command_move(self, host, position, action, detail, *, quaternion=None):
+        target_q = self.anchor_pose["tool_quaternion_wxyz"] if quaternion is None else quaternion
+        self._move_goal_quaternion = np.asarray(target_q, dtype=float).copy()
+        self._move_last_quaternion = None
+        return super()._command_move(host, position, action, detail, quaternion=target_q)
+
+    def _tick_move(self, host, now):
+        pose = self._read_tool_pose(self._robot_api(host))
+        if pose is None:
+            self._request_stop(host, "robot_feedback_lost", "Taxel move stopped: robot TCP feedback was lost.")
+            return
+        current_q = pose[1]
+        angular_error = self._orientation_error(current_q, self._move_goal_quaternion)
+        if not np.isfinite(angular_error):
+            self._request_stop(
+                host, "robot_feedback_lost",
+                "Taxel move stopped: tool-orientation feedback became invalid.",
+            )
+            return
+        still_rotating = self._move_last_quaternion is None or self._orientation_error(
+            current_q, self._move_last_quaternion
+        ) > self.ANGULAR_STATIONARY_TOLERANCE_RAD
+        self._move_last_quaternion = current_q.copy()
+        if angular_error > self.ORIENTATION_TOLERANCE_RAD or still_rotating:
+            self._move_arrived_at = None
+            if (self._move_started_at is not None
+                    and now - self._move_started_at > self._move_timeout_current_sec):
+                self._request_stop(
+                    host, "orientation_timeout",
+                    "Taxel move stopped: the tool did not reach and settle at its commanded orientation.",
+                )
+            return
+        super()._tick_move(host, now)
 
     def _dispatch_move_action(self, host, action: str) -> None:
-        if action == "route_waypoint":
-            self._advance_route(host)
+        if action == "navigation_waypoint":
+            self._advance_navigation_route(host)
         elif action == "navigation_arrived":
             self._completed = True
             host._stop_sidebar_control(
@@ -227,6 +342,7 @@ class MappedTaxelMoveTask(TaxelPositionMappingTask):
         self._active = False
         self._phase = "idle"
         self._route_queue = []
+        self._navigation_queue = []
         setter = getattr(host, "_set_taxel_mapping_controls_running", None)
         if callable(setter):
             setter(False)

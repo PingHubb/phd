@@ -106,7 +106,7 @@ class TrialRecorder:
             self.error = "Recording writer overloaded. Trial stopped; partial data retained."
             return False
 
-    def sensor_frame(self, timestamp, sequence, raw, baseline, valid_taxels=None):
+    def sensor_frame(self, timestamp, sequence, raw, baseline, valid_taxels=None, *, filtered_signed=None):
         if self.error or self._closed:
             return False
         if sequence == self._last_sequence:
@@ -132,7 +132,11 @@ class TrialRecorder:
             self.error = "Calibration or disabled-taxel mask changed; start a new trial."
             return False
         self._baseline, self._mask = baseline, mask
-        if self._submit(("sensor", (float(timestamp - self.started), int(sequence), raw, baseline, mask))):
+        filtered = np.full(self.shape, np.nan, np.float32) if filtered_signed is None else np.array(filtered_signed, dtype=np.float32, copy=True)
+        if filtered.shape != self.shape or (filtered_signed is not None and not np.isfinite(filtered).all()):
+            self.error = "Filtered sensor array is invalid."
+            return False
+        if self._submit(("sensor", (float(timestamp - self.started), int(sequence), raw, baseline, mask, filtered))):
             self._last_time, self._last_sequence = timestamp, sequence
             self.sensor_count += 1
             return True
@@ -163,12 +167,13 @@ class TrialRecorder:
             nonlocal rows, chunk_index
             if not rows:
                 return
-            t, seq, raw, base, mask = zip(*rows)
+            t, seq, raw, base, mask, filtered = zip(*rows)
             final = self.path / "sensor" / f"{chunk_index:06d}.npz"
             tmp = final.with_suffix(".tmp")
             with tmp.open("wb") as handle:
                 np.savez_compressed(handle, t=np.array(t), sequence=np.array(seq, np.int64),
-                                    raw=np.stack(raw), baseline=np.stack(base), valid_taxels=np.stack(mask))
+                                    raw=np.stack(raw), baseline=np.stack(base), valid_taxels=np.stack(mask),
+                                    filtered_signed=np.stack(filtered))
             tmp.replace(final)
             rows = []
             chunk_index += 1
@@ -232,9 +237,12 @@ def load_trial(path):
     for file in sorted((path / "sensor").glob("*.npz")):
         with np.load(file, allow_pickle=False) as data:
             parts.append({key: np.array(data[key]) for key in ("t", "sequence", "raw", "baseline", "valid_taxels")})
+            if "filtered_signed" in data:
+                parts[-1]["filtered_signed"] = np.array(data["filtered_signed"])
     if not parts:
         raise ValueError(f"{path.name}: no completed sensor chunks.")
-    arrays = {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
+    keys = set.intersection(*(set(part) for part in parts))
+    arrays = {key: np.concatenate([part[key] for part in parts]) for key in keys}
     n = len(arrays["t"])
     shape = tuple(meta["sensor_shape"])
     if n < 2 or arrays["t"].shape != (n,) or arrays["sequence"].shape != (n,):
@@ -245,6 +253,8 @@ def load_trial(path):
         raise ValueError(f"{path.name}: duplicate or reset sensor sequence.")
     if any(arrays[k].shape != (n, *shape) for k in ("raw", "baseline", "valid_taxels")):
         raise ValueError(f"{path.name}: sensor array shape mismatch.")
+    if "filtered_signed" in arrays and arrays["filtered_signed"].shape != (n, *shape):
+        raise ValueError(f"{path.name}: filtered sensor array shape mismatch.")
     return meta, arrays
 
 

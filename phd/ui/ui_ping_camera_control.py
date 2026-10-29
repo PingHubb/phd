@@ -209,8 +209,16 @@ class CameraControlMixin:
 
         self._is_shutting_down = True
         self._shutdown_optional_call(
+            "_shutdown_gesture_recognition",
+            "Sensor-only gesture recognition",
+        )
+        self._shutdown_optional_call(
             "_shutdown_touch_tracking_workbench",
             "Touch Tracking workspace",
+        )
+        self._shutdown_optional_call(
+            "_shutdown_intention_workbench",
+            "Intention Learning workspace",
         )
         self.manual_watchdog_timer.stop()
         runtime_timer = getattr(self, "_runtime_availability_timer", None)

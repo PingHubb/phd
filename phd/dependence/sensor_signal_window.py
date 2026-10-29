@@ -1042,6 +1042,9 @@ class SensorSignalWindow(QWidget):
         layout = QVBoxLayout(self)
 
         source_row = QWidget()
+        layout.addWidget(components.SectionHeader(
+            "Sensor signals", "Inspect the live taxel map and select a cell to track its signal.",
+        ))
         source_layout = QHBoxLayout(source_row)
         source_layout.setContentsMargins(0, 0, 0, theme.SPACE_SM)
         source_layout.setSpacing(theme.SPACE_SM)

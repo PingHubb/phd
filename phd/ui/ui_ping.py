@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QDoubleSpinBox,
     QLineEdit,
     QListWidget,
@@ -245,15 +246,12 @@ class _NoOpToggle:
     def set_dry_run_predictions_only(self, *args, **kwargs):
         return None
 
-    def set_teaching_override(self, *args, **kwargs):
-        return None
-
 
 class DisabledSensorFunctions:
     DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH = ai_resource_path(
         "models",
-        "ai_direct_finger_motion",
-        "latest_cnn_gru_model_10x10.pt",
+        "touch_policy",
+        "six_gestures_single_touch_10x10.pt",
     )
     DEFAULT_SENSOR_AVERAGE_WINDOW_SIZE = 3
     DEFAULT_VISUALIZATION_TARGET_HZ = 60.0
@@ -474,6 +472,9 @@ class LogConsoleWindow(QDialog):
         )
         layout.setSpacing(theme.SPACE_SM)
 
+        layout.addWidget(components.SectionHeader(
+            "Application log", "Search, inspect and export messages from this session.",
+        ))
         toolbar = QHBoxLayout()
         toolbar.setContentsMargins(0, 0, 0, 0)
         toolbar.setSpacing(theme.SPACE_XS)
@@ -699,10 +700,9 @@ class RobotPositionWidget(QWidget):
 
         self.angle_group_box, angle_list = components.section(
             "Joint targets",
-            "Angles are in radians; use the step buttons for precise changes.",
+            "Fields open at the robot's current joint angles, in degrees. The step buttons change one joint by 10°.",
         )
 
-        step_rad = math.radians(10.0)
         for i in range(6):
             row_widget = QWidget()
             row_h = QHBoxLayout(row_widget)
@@ -711,15 +711,15 @@ class RobotPositionWidget(QWidget):
 
             label = QLabel(f"Joint {i + 1}")
             line_edit = QLineEdit()
-            line_edit.setText(f"{self.presets[1][i]:.4f}")
+            line_edit.setText(f"{math.degrees(self.presets[1][i]):.2f}")
             line_edit.setMinimumWidth(72)
 
             btn_minus = QPushButton("-10°")
             btn_plus = QPushButton("+10°")
             btn_minus.setFixedWidth(52)
             btn_plus.setFixedWidth(52)
-            btn_minus.clicked.connect(lambda checked, idx=i, dr=-step_rad: self._nudge_joint_rad(idx, dr))
-            btn_plus.clicked.connect(lambda checked, idx=i, dr=step_rad: self._nudge_joint_rad(idx, dr))
+            btn_minus.clicked.connect(lambda checked, idx=i: self._nudge_joint_deg(idx, -10.0))
+            btn_plus.clicked.connect(lambda checked, idx=i: self._nudge_joint_deg(idx, 10.0))
 
             row_h.addWidget(line_edit, 1)
             row_h.addWidget(btn_minus)
@@ -774,7 +774,7 @@ class RobotPositionWidget(QWidget):
         if preset_values:
             self.current_preset_number = int(preset_number)
             for i, value in enumerate(preset_values):
-                self.position_edits[i].setText(f"{value:.4f}")
+                self.position_edits[i].setText(f"{math.degrees(value):.2f}")
             self._update_load_current_angle_button_state()
 
     def _update_load_current_angle_button_state(self):
@@ -818,12 +818,12 @@ class RobotPositionWidget(QWidget):
 
         self.presets[preset_number] = current_positions
         for i, value in enumerate(current_positions):
-            self.position_edits[i].setText(f"{value:.4f}")
+            self.position_edits[i].setText(f"{math.degrees(value):.2f}")
         self._save_presets_to_disk()
 
         print(
             f"Loaded current robot joint angles into Preset {preset_number}: "
-            f"{[round(v, 4) for v in current_positions]}"
+            f"{[round(math.degrees(v), 2) for v in current_positions]} deg"
         )
 
     def _save_presets_to_disk(self):
@@ -862,20 +862,37 @@ class RobotPositionWidget(QWidget):
         except Exception as e:
             print(f"Failed to load robot position presets: {e}")
 
-    def _nudge_joint_rad(self, index: int, delta_rad: float):
+    def fill_from_current_joints(self):
+        """Show the live joint angles, in degrees, as the editable targets."""
+        api = self.robot_api
+        if api is None or not hasattr(api, "get_current_positions"):
+            return False
+        try:
+            current_positions = list(api.get_current_positions() or [])
+        except Exception as exc:
+            print(f"Failed to read current robot joint angles: {exc}")
+            return False
+        if len(current_positions) < 6:
+            return False
+        for index, value in enumerate(current_positions[:6]):
+            self.position_edits[index].setText(f"{math.degrees(float(value)):.2f}")
+        return True
+
+    def _nudge_joint_deg(self, index: int, delta_deg: float):
         edit = self.position_edits[index]
         try:
             v = float(edit.text())
         except ValueError:
             v = 0.0
-        edit.setText(f"{v + float(delta_rad):.4f}")
+        edit.setText(f"{v + float(delta_deg):.2f}")
 
     def send_positions(self):
         try:
-            positions = [float(edit.text()) for edit in self.position_edits]
+            degrees = [float(edit.text()) for edit in self.position_edits]
         except ValueError:
-            print("Invalid input! Please enter valid numbers.")
+            print("Invalid input! Please enter joint angles in degrees.")
             return
+        positions = [math.radians(value) for value in degrees]
 
         api = self.robot_api
         if api is None or not hasattr(api, 'send_positions_joint_angle'):
@@ -883,7 +900,7 @@ class RobotPositionWidget(QWidget):
             return
 
         try:
-            print("Sending positions:", positions)
+            print("Sending joint targets (deg):", [round(value, 2) for value in degrees])
             ok = api.send_positions_joint_angle(positions)
             if not ok:
                 print("Failed to queue joint positions: robot API returned False.")
@@ -1408,7 +1425,9 @@ class _WidthFittingScrollArea(QScrollArea):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._locking_content_height = False
-        self._lock_serial = 0
+        self._height_lock_timer = QTimer(self)
+        self._height_lock_timer.setSingleShot(True)
+        self._height_lock_timer.timeout.connect(self._lock_content_height)
         self._watched = set()
 
     def setWidget(self, widget):  # noqa: N802 - Qt override
@@ -1440,8 +1459,8 @@ class _WidthFittingScrollArea(QScrollArea):
             QtCore.QEvent.Show,
             QtCore.QEvent.Hide,
         ):
-            # Only the latest request is applied. Earlier ones still see the
-            # pre-collapse height.
+            # A tab can show dozens of descendants together. Coalesce them
+            # into one callback after the child layouts have settled.
             self._schedule_content_height_lock()
         return super().eventFilter(watched, event)
 
@@ -1450,14 +1469,8 @@ class _WidthFittingScrollArea(QScrollArea):
         self._lock_content_height()
 
     def _schedule_content_height_lock(self):
-        self._lock_serial += 1
-        serial = self._lock_serial
-        QTimer.singleShot(0, lambda serial=serial: self._apply_scheduled_content_height_lock(serial))
-
-    def _apply_scheduled_content_height_lock(self, serial):
-        if serial != self._lock_serial:
-            return
-        self._lock_content_height()
+        if not self._height_lock_timer.isActive():
+            self._height_lock_timer.start(0)
 
     def _lock_content_height(self):
         """Stop the page being squeezed shorter than its own content."""
@@ -1498,6 +1511,8 @@ class UI(
     UiInteractionsMixin,
     QSplitter,
 ):
+    workspace_layout_changed = QtCore.pyqtSignal(str)
+
     def __init__(self, orientation: QtCore.Qt.Orientation):
         super().__init__(orientation)
 
@@ -1527,6 +1542,8 @@ class UI(
         self._main_control_panel_last_width = theme.CONTROL_PANEL_WIDTH
         self._main_control_panel_state_syncing = False
         self._main_control_panel_user_sized = False
+        self._workspace_layout_mode = "auto"
+        self._workspace_layout_target = "split"
         self._log_unread_count = 0
 
         self.gripper_closed_flag = False
@@ -1880,6 +1897,9 @@ class UI(
             )
 
     def _set_main_control_panel_visible(self, visible):
+        if hasattr(self, "_workspace_layout_mode"):
+            self.set_workspace_layout_mode("split" if visible else "sensor")
+            return
         visible = bool(visible)
         sizes = self.sizes()
         total_width = max(
@@ -1922,6 +1942,62 @@ class UI(
             self._main_control_panel_last_width = panel_width
             # The user has chosen a width: stop auto-fitting on window resize.
             self._main_control_panel_user_sized = True
+        self._workspace_layout_mode = "split" if panel_width > 0 else "sensor"
+        self._workspace_layout_target = self._workspace_layout_mode
+        self.workspace_layout_changed.emit(self._workspace_layout_mode)
+        self._sync_main_control_panel_handle()
+
+    def set_workspace_layout_mode(self, mode):
+        """Change presentation only; never recreate a renderer or stop a stream."""
+        if mode not in {"auto", "split", "controls", "sensor"}:
+            raise ValueError(f"Unknown workspace layout: {mode}")
+        self._workspace_layout_mode = mode
+        self._apply_workspace_layout()
+        self.workspace_layout_changed.emit(mode)
+
+    def _automatic_workspace_layout(self):
+        index = self.tab_widget.currentIndex()
+        hand_tabs = getattr(self, "hand_sub_tabs", None)
+        if index == self.hand_tab_index and hand_tabs is not None and hand_tabs.currentIndex() == 1:
+            return "controls"
+        # AI and Tools keep the sensor view; full-width controls remain a manual choice.
+        return "split"
+
+    def _apply_workspace_layout(self, *_args):
+        if not hasattr(self, "splitter_2"):
+            return
+        mode = self._workspace_layout_mode
+        target = self._automatic_workspace_layout() if mode == "auto" else mode
+        previous = self._workspace_layout_target
+        if target == previous:
+            return
+        sizes = self.sizes()
+        if previous == "split" and len(sizes) > 1 and sizes[1] > 0:
+            self._main_control_panel_last_width = sizes[1]
+        self._workspace_layout_target = target
+        self._main_control_panel_collapsed = target == "sensor"
+        self._main_control_panel_state_syncing = True
+        updates_enabled = self.updatesEnabled()
+        self.setUpdatesEnabled(False)
+        try:
+            # Hiding a container retains the live view, selection and devices.
+            self.splitter_1.setVisible(target != "controls")
+            self.splitter_2.setVisible(True)
+            total = max(self.width(), 1)
+            if target == "controls":
+                self.setSizes([0, total])
+            elif target == "sensor":
+                self.setSizes([total, 0])
+            else:
+                available = max(total - self.handleWidth(), 2)
+                panel = min(self._main_control_panel_last_width, available - 1)
+                self.setSizes([max(available - panel, 1), panel])
+        finally:
+            self._main_control_panel_state_syncing = False
+            self.setUpdatesEnabled(updates_enabled)
+        # Restore the saved width directly. A full-width task index still has
+        # its expanded size hint here; fitting it again causes a second resize
+        # and a needlessly wide panel (plus extra VTK redraws).
         self._sync_main_control_panel_handle()
 
     def setup_layout(self):
@@ -1936,9 +2012,29 @@ class UI(
         self.widget_plotter_2 = PlotterWidget()
         layout_plotter_2 = QGridLayout(self.widget_plotter_2)
         layout_plotter_2.setContentsMargins(0, 0, 0, 0)
+        layout_plotter_2.setSpacing(0)
+        viewport_header = QWidget()
+        viewport_header.setObjectName("viewportHeader")
+        viewport_bar = QHBoxLayout(viewport_header)
+        viewport_bar.setContentsMargins(16, 12, 16, 12)
+        self.viewport_title = QLabel("Sensor surface")
+        self.viewport_title.setObjectName("viewportTitle")
+        self.viewport_state = QLabel("No scene loaded")
+        self.viewport_state.setObjectName("viewportState")
+        viewport_bar.addWidget(self.viewport_title)
+        viewport_bar.addStretch()
+        viewport_bar.addWidget(self.viewport_state)
+        layout_plotter_2.addWidget(viewport_header, 0, 0)
         self.plotter_2 = QtInteractor(self.widget_plotter_2)
         self.plotter_2.background_color = theme.VIEWPORT_BG
-        layout_plotter_2.addWidget(self.plotter_2.interactor)
+        layout_plotter_2.addWidget(self.plotter_2.interactor, 1, 0)
+        layout_plotter_2.setRowStretch(1, 1)
+        self.viewport_welcome = components.ViewportWelcome()
+        self.viewport_welcome.setup_requested.connect(self._show_sensor_workspace)
+        self.viewport_welcome.tracking_requested.connect(self._open_touch_tracking_workbench)
+        layout_plotter_2.addWidget(self.viewport_welcome, 1, 0)
+        self.viewport_welcome.raise_()
+        self._presentation_scene_ready = False
 
         self.log_display = QTextEdit()
         self.log_display.setObjectName("logDisplay")  # Set object name for QSS
@@ -1974,20 +2070,29 @@ class UI(
         # and shifted the whole panel down. setup_tab2 now mounts them inside
         # the Robots page, under the buttons that open them.
         self.widget_func = QWidget()
+        self.widget_func.setObjectName("controlWorkspace")
         self.layout_func = QVBoxLayout(self.widget_func)
+        self.layout_func.setContentsMargins(8, 8, 8, 8)
+        self.layout_func.setSpacing(8)
 
         # Always-visible operational context. This summarizes cached state
         # only; MyMainWindow refreshes it alongside the status bar.
         self.session_strip = components.SessionStrip(self.widget_func)
         self.layout_func.addWidget(self.session_strip)
+        self.workspace_header = components.WorkspaceHeader(
+            "Sensor acquisition", "Configure your source, then connect to start streaming.",
+            eyebrow="PINGLAB / WORKSPACES",
+        )
+        self.layout_func.addWidget(self.workspace_header)
 
-        self.tab_widget = QTabWidget()
+        self.tab_widget = nav_tabs.WorkspaceTabs()
         self.tab_widget.setUsesScrollButtons(False)
         # The navigation rail must be installed before any tab is added:
         # QTabWidget stores its tabs *in* the tab bar, so replacing the bar
         # afterwards would silently discard every page.
         nav_tabs.install(self.tab_widget)
         self.setup_tabs()
+        self.tab_widget.navigation_activated.connect(self._reveal_workspace_controls)
 
         self.layout_func.addWidget(self.tab_widget)
         self.splitter_2.addWidget(self.widget_func)
@@ -1998,6 +2103,25 @@ class UI(
             self._on_main_control_splitter_moved
         )
         self._sync_main_control_panel_handle()
+
+    def _reveal_workspace_controls(self, _index):
+        # A workspace choice must remain useful even in Focus sensor mode.
+        if self._workspace_layout_mode == "sensor":
+            self.set_workspace_layout_mode("auto")
+
+    def _show_sensor_workspace(self):
+        """Navigation only: selecting setup never connects a device."""
+        self._set_main_control_panel_visible(True)
+        self.tab_widget.setCurrentIndex(self.sensor_tab_index)
+        self.sensor_sub_tabs.setCurrentIndex(0)
+
+    def set_scene_presentation(self, ready: bool):
+        """Reflect cached scene state without polling or commanding hardware."""
+        self._presentation_scene_ready = bool(ready)
+        humanoid = bool(getattr(self, "_humanoid_viewport_active", False))
+        self.viewport_welcome.setVisible(not ready and not humanoid)
+        self.viewport_title.setText("Humanoid scene" if humanoid else "Sensor surface")
+        self.viewport_state.setText("Scene loaded" if ready or humanoid else "No scene loaded")
 
     def _ensure_secondary_plotter(self):
         """Create the hidden mesh-lab view the first time it is drawn into."""
@@ -2025,6 +2149,9 @@ class UI(
         out permanently.
         """
         super().resizeEvent(event)
+        heading = getattr(self, "workspace_header", None)
+        if heading is not None:
+            heading.set_compact(self.height() < 600)
         if self.width() <= 1 or self._main_control_panel_user_sized:
             return
         self._fit_main_control_panel()
@@ -2036,7 +2163,7 @@ class UI(
         is clipped; on a wide display that number stops growing and the
         viewport absorbs the rest.
         """
-        if self._main_control_panel_collapsed:
+        if self._main_control_panel_collapsed or getattr(self, "_workspace_layout_target", "split") != "split":
             return
         total = self.width()
         wanted = max(
@@ -2099,7 +2226,7 @@ class UI(
         robot_layout = QVBoxLayout(robot_page)
         self.setup_tab2(robot_layout)
         self.tm_robot_tab_index = self.robots_sub_tabs.addTab(
-            self._scrollable(robot_page), "TM Robot"
+            robot_page, "TM Robot"
         )
 
         robot_dog_page = QWidget()
@@ -2175,7 +2302,7 @@ class UI(
         tab5_layout = QVBoxLayout(tab5)
         self.setup_tab4(tab5_layout)
         self.tools_tab_index = self.tab_widget.addTab(
-            self._scrollable(tab5), "Tools"
+            tab5, "Tools"
         )
         self.tab_widget.currentChanged.connect(self._on_main_tab_changed)
 
@@ -2201,6 +2328,18 @@ class UI(
         QTimer.singleShot(0, self._ensure_humanoid_viewer)
 
     def _on_main_tab_changed(self, index):
+        contexts = {
+            self.sensor_tab_index: ("Sensor acquisition", "Configure your source, then connect to start streaming."),
+            self.robots_tab_index: ("Robot workspace", "Connection, motion and feedback for your robot platforms."),
+            self.control_tab_index: ("Tactile control", "Configure sensor-driven control and inspect its parameters."),
+            self.ai_tab_index: ("Learning & inference", "Run a model, collect new trials or explore touch tracking."),
+            self.hand_tab_index: ("Dexterous hand", "Tactile feedback, joint controls and saved hand poses."),
+            self.tools_tab_index: ("Lab instruments", "Force measurements, gripper controls and supporting tools."),
+        }
+        header = getattr(self, "workspace_header", None)
+        if header is not None:
+            header.set_context(*contexts.get(index, ("Workspace", "")))
+        self._apply_workspace_layout()
         if int(index) == int(getattr(self, "control_tab_index", -1)):
             QTimer.singleShot(0, self._ensure_control_workspace)
         if int(index) == int(getattr(self, "ai_tab_index", -1)):
@@ -2226,9 +2365,7 @@ class UI(
             self._control_host_layout.removeWidget(placeholder)
             placeholder.hide()
             placeholder.deleteLater()
-            self._control_host_layout.addWidget(
-                self._scrollable(self.control_page)
-            )
+            self._control_host_layout.addWidget(self.control_page)
             connect_control = getattr(self, "_connect_control_workspace", None)
             if callable(connect_control):
                 connect_control()
@@ -2273,6 +2410,7 @@ class UI(
             if getattr(self, "ai_sub_tabs", None) is not None:
                 components.segmented(self.ai_sub_tabs)
             self._ai_workspace_ready = True
+            self._apply_workspace_layout()
             if hasattr(self, "_fit_main_control_panel"):
                 self._fit_main_control_panel()
         finally:
@@ -2329,6 +2467,7 @@ class UI(
             )
             sensor.set_main_visualization_enabled(False, render=False)
         self._humanoid_viewport_active = True
+        self.set_scene_presentation(self._presentation_scene_ready)
         self.widget_plotter_2.setVisible(True)
 
     def _release_humanoid_viewport(self):
@@ -2347,6 +2486,7 @@ class UI(
             sensor.set_main_visualization_enabled(bool(previous), render=False)
         self._humanoid_previous_sensor_visibility = None
         self._humanoid_viewport_active = False
+        self.set_scene_presentation(self._presentation_scene_ready)
         try:
             self.plotter_2.render()
         except Exception:
@@ -2364,17 +2504,14 @@ class UI(
         self.sensor_sub_tabs.setUsesScrollButtons(False)
 
         # ─── Subtab "Setup" ───
-        # Two grouped inset lists (the macOS System Settings pattern): each
-        # section is one rounded surface with hairline rules between its rows,
-        # and its title sits outside and above. The page is a linear task --
-        # choose a sensor, connect it, then adjust how it draws -- so a border
-        # around every step added weight without adding meaning.
+        # Connection and display are separate tasks. Their tabs stay visible
+        # while the selected page scrolls.
         send_page = QWidget()
         send_page_layout = QVBoxLayout(send_page)
         send_page_layout.setSpacing(theme.SPACE_LG)
 
         send_group, send_list = components.section(
-            "Sensor",
+            "Source & connection",
             "Pick a sensor model and the port it is connected to.",
         )
         viz_group, viz_list = components.section(
@@ -2393,8 +2530,16 @@ class UI(
             "Geometry of the sensor being read, which sets how the 3D grid is "
             "laid out."
         )
-        components.fit_list_height(self.sensor_choice, max_rows=6)
-        send_list.add(self.sensor_choice)
+        # A geometry is one choice, not a browsing task. Keep the existing
+        # list model/API for device code while presenting a compact selector.
+        self.sensor_choice.hide()
+        self.sensor_geometry_combo = QComboBox()
+        self.sensor_geometry_combo.setModel(self.sensor_choice.model())
+        self.sensor_geometry_combo.setCurrentIndex(self.sensor_choice.currentRow())
+        self.sensor_geometry_combo.currentIndexChanged.connect(self.sensor_choice.setCurrentRow)
+        self.sensor_choice.currentRowChanged.connect(self.sensor_geometry_combo.setCurrentIndex)
+        self.sensor_geometry_combo.setToolTip(self.sensor_choice.toolTip())
+        send_list.add_row("Geometry", self.sensor_geometry_combo)
 
         self.sensor_source_mode_combo = QComboBox(self.widget_func)
         self.sensor_source_mode_combo.addItem("Single Sensor", "single")
@@ -2592,8 +2737,11 @@ class UI(
         viz_list.add(self.sensor_transparent_screenshot_button)
 
         send_page_layout.addWidget(send_group)
-        send_page_layout.addWidget(viz_group)
         send_page_layout.addStretch()
+        display_page = QWidget()
+        display_layout = QVBoxLayout(display_page)
+        display_layout.addWidget(viz_group)
+        display_layout.addStretch()
 
         # ─── Subtab "Diagnostics" ───
         read_page = QWidget()
@@ -2660,6 +2808,9 @@ class UI(
 
         self.sensor_setup_tab_index = self.sensor_sub_tabs.addTab(
             self._scrollable(send_page), "Setup"
+        )
+        self.sensor_display_tab_index = self.sensor_sub_tabs.addTab(
+            self._scrollable(display_page), "Display"
         )
         self.sensor_diagnostics_tab_index = self.sensor_sub_tabs.addTab(
             self._scrollable(read_page), "Diagnostics"
@@ -4361,7 +4512,7 @@ class UI(
         for label, hint, button in (
             (
                 "Joint angles",
-                "Move each of the six joints to an absolute angle.",
+                "Move each of the six joints to an absolute angle in degrees.",
                 self.send_position_PTP_J_button,
             ),
             (
@@ -4382,18 +4533,10 @@ class UI(
         ):
             send_list.add(components.SettingsRow(label, button, hint=hint))
 
-        self.robot_basic_controls_group = components.CollapsibleGroup(
-            "Basic controls",
-            expanded=True,
-        )
-        self.robot_basic_controls_group.add(self.read_group_robot)
-        self.robot_advanced_controls_group = components.CollapsibleGroup(
-            "Advanced commands"
-        )
-        self.robot_advanced_controls_group.add(send_group)
-
-        layout.addWidget(self.robot_basic_controls_group)
-        layout.addWidget(self.robot_advanced_controls_group)
+        commands_page = QWidget()
+        commands_layout = QVBoxLayout(commands_page)
+        commands_layout.setContentsMargins(0, 0, 0, 0)
+        commands_layout.addWidget(send_group)
 
         # Editors are mounted here, below the buttons that open them, and only
         # one is visible at a time (see _toggle_robot_editor). Inside the page
@@ -4405,10 +4548,17 @@ class UI(
             self.position_toolframe_widget,
             self.position_script_widget,
         ):
-            self.robot_advanced_controls_group.add(editor)
-
-        # Keep the groups at their natural height at the top of the page.
-        layout.addStretch(1)
+            commands_layout.addWidget(editor)
+        self.robot_sections = components.TaskSections(scroll_factory=self._scrollable)
+        self.robot_sections.add_section(
+            "Read state", "Read joint angles, tool pose or open the robot model.",
+            self.read_group_robot,
+        )
+        self.robot_sections.add_section(
+            "Move / send", "Choose a command and edit its target before sending.",
+            commands_page,
+        )
+        layout.addWidget(self.robot_sections)
 
     def _build_control_workspace(self):
         """Build the deterministic Control page. AI stays deferred."""
@@ -4520,12 +4670,15 @@ class UI(
         self._build_direct_finger_motion_settings_dialog()
         self._build_console_control_settings_dialog()
 
-        layout.setSpacing(theme.SPACE_LG)
-        layout.addWidget(rule_based_group)
-        layout.addWidget(console_group)
-        layout.addWidget(tool_path_group)
-        layout.addWidget(admittance_group)
-        layout.addStretch()
+        self.control_sections = components.TaskSections(scroll_factory=self._scrollable)
+        for title, description, group in (
+            ("Touch / proximity", "Follow finger contact or hover using deterministic control.", rule_based_group),
+            ("Controller input", "Choose gamepad or sensor input for the arm.", console_group),
+            ("Record tool path", "Record, load or clear travelled tool positions.", tool_path_group),
+            ("Pressure response", "Start or stop pressure-based admittance.", admittance_group),
+        ):
+            self.control_sections.add_section(title, description, group)
+        layout.addWidget(self.control_sections)
         self.control_page = page
 
     def setup_tab3(self, layout):
@@ -4536,7 +4689,10 @@ class UI(
         ai_model_page = QWidget()
         ai_model_layout = QVBoxLayout(ai_model_page)
 
-        self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Predict")
+        self.predict_threelevel_hierarchical_transformer_gesture_button = QPushButton("Start / Stop")
+        self.predict_threelevel_hierarchical_transformer_gesture_button.setToolTip(
+            "Run the older three-level Transformer using its separate checkpoint. Can command robot motion."
+        )
         self.btn_toggle_3lvl_latch = QPushButton("Latch off")
 
         self.proximity_settings_dialog = QDialog(self.widget_func)
@@ -4728,7 +4884,7 @@ class UI(
         )
         tactile_ai_advanced_group, tactile_ai_advanced_list = components.section(
             "Tactile policy setup",
-            "Checkpoint selection and gesture-recognition tools.",
+            "The selected checkpoint determines the architecture and available outputs.",
         )
         proximity_ai_group, proximity_ai_list = components.section(
             "Proximity",
@@ -4739,8 +4895,7 @@ class UI(
             "Detection tuning and checkpoint selection.",
         )
 
-        self.ai_direct_finger_motion_button = QPushButton("AI DFM Record (No Robot)")
-        self.ai_direct_finger_motion_robot_button = QPushButton("AI DFM Record + Robot")
+        self.ai_direct_finger_motion_button = QPushButton("Record")
         self.ai_direct_finger_motion_execution_button = QPushButton("AI Direct Finger Motion (Execute)")
         self.ai_proximity_detection_button = QPushButton("Detect")
         self.ai_proximity_detection_button.setCheckable(True)
@@ -4812,8 +4967,9 @@ class UI(
         )
 
         model_row = QWidget()
-        model_row_layout = QHBoxLayout(model_row)
+        model_row_layout = QVBoxLayout(model_row)
         model_row_layout.setContentsMargins(0, 0, 0, 0)
+        model_row_layout.setSpacing(6)
         self.ai_direct_execution_model_path_input = QLineEdit(model_row)
         self.ai_direct_execution_model_path_input.setPlaceholderText(
             DisabledSensorFunctions.DEFAULT_AI_DIRECT_EXECUTION_MODEL_PATH
@@ -4821,9 +4977,18 @@ class UI(
         default_ai_model_path = self._get_default_ai_execution_model_path()
         self.ai_direct_execution_model_path_input.setText(default_ai_model_path)
         self.ai_direct_execution_model_path_input.setVisible(False)
-        # A checkpoint filename can be long. Let the label give up width and
-        # elide rather than push the buttons beside it off the panel edge.
-        self.ai_direct_execution_model_status = components.ElidedLabel()
+        # Match the proximity checkpoint: keep the complete name readable and
+        # let it wrap instead of hiding the model behind an ellipsis.
+        self.ai_direct_execution_model_status = QLabel()
+        self.ai_direct_execution_model_status.setWordWrap(True)
+        self.ai_direct_execution_model_status.setMinimumWidth(0)
+        model_label_policy = self.ai_direct_execution_model_status.sizePolicy()
+        model_label_policy.setHorizontalPolicy(QSizePolicy.Ignored)
+        self.ai_direct_execution_model_status.setSizePolicy(model_label_policy)
+        self.ai_direct_execution_model_status.setTextFormat(Qt.PlainText)
+        self.ai_direct_execution_model_status.setTextInteractionFlags(
+            Qt.TextSelectableByMouse | Qt.TextSelectableByKeyboard
+        )
         self.ai_direct_execution_select_model_button = QPushButton(
             "Select Model"
         )
@@ -4831,28 +4996,22 @@ class UI(
             "Choose the PyTorch checkpoint used the next time AI Direct "
             "Finger Motion execution starts."
         )
-        self.ai_direct_execution_use_default_button = QPushButton(
-            "Use Default"
-        )
-        self.ai_direct_execution_use_default_button.setToolTip(
-            "Restore the current latest_cnn_gru_model_10x10.pt checkpoint."
-        )
         self.ai_direct_execution_model_status.setStyleSheet(
             theme.type_style("caption")
         )
         model_row_layout.addWidget(
             self.ai_direct_execution_model_status,
-            1,
         )
-        model_row_layout.addWidget(
-            self.ai_direct_execution_select_model_button
-        )
-        model_row_layout.addWidget(
-            self.ai_direct_execution_use_default_button
-        )
+        from phd.ui.touch_policy_model_details import TouchPolicyModelDetails
+        self.ai_direct_execution_model_details = TouchPolicyModelDetails(model_row)
+        model_row_layout.addWidget(self.ai_direct_execution_model_details)
+        model_buttons = QHBoxLayout()
+        model_buttons.setContentsMargins(0, 0, 0, 0)
+        model_buttons.addWidget(self.ai_direct_execution_select_model_button)
+        model_buttons.addStretch()
+        model_row_layout.addLayout(model_buttons)
         self._set_ai_direct_execution_model_path(
             default_ai_model_path,
-            is_default=True,
         )
 
         execute_safety_row = QWidget()
@@ -4860,17 +5019,21 @@ class UI(
         execute_safety_layout.setContentsMargins(0, 0, 0, 0)
         execute_safety_layout.setSpacing(8)
         self.ai_direct_execution_dry_run_checkbox = QCheckBox("Dry run")
-        self.ai_direct_execution_dry_run_checkbox.setChecked(False)
+        self.ai_direct_execution_dry_run_checkbox.setChecked(True)
         self.ai_direct_execution_dry_run_checkbox.setToolTip(
             "When checked, AI predicts live velocity but does not send robot motion commands."
         )
         self.ai_direct_execution_prediction_status = QLabel("Prediction: idle")
+        self.ai_direct_execution_prediction_status.setWordWrap(True)
+        prediction_size_policy = self.ai_direct_execution_prediction_status.sizePolicy()
+        prediction_size_policy.setHorizontalPolicy(QSizePolicy.Ignored)
+        self.ai_direct_execution_prediction_status.setSizePolicy(prediction_size_policy)
         self.ai_direct_execution_prediction_status.setStyleSheet(
             theme.type_style("caption")
         )
         execute_safety_layout.addWidget(self.ai_direct_execution_dry_run_checkbox)
         execute_safety_layout.addStretch()
-        execute_safety_layout.addWidget(self.ai_direct_execution_prediction_status)
+        execute_safety_layout.addWidget(self.ai_direct_execution_prediction_status, 1)
 
         execute_action_row = QWidget()
         execute_action_layout = QHBoxLayout(execute_action_row)
@@ -4891,8 +5054,8 @@ class UI(
         self.ai_direct_execution_velocity_scale_spin.setValue(1.00)
         self.ai_direct_execution_velocity_scale_spin.setSuffix("x")
         self.ai_direct_execution_velocity_scale_spin.setToolTip(
-            "Multiply the AI-predicted velocity. The execution safety limit "
-            "still caps the total XYZ linear-speed magnitude at 0.30 m/s."
+            "1× commands 50 mm/s along the recognised gesture axis. "
+            "There is no maximum speed cap."
         )
         execute_action_layout.addWidget(
             self.ai_direct_execution_velocity_scale_spin
@@ -4955,16 +5118,20 @@ class UI(
         execute_row = components.SettingsRow(
             "Direct finger motion",
             execute_action_row,
-            hint="Safety cap: 0.30 m/s total linear speed",
+            hint="Outputs and motion limits come from the selected checkpoint. Preview in Dry run first.",
         )
         tactile_ai_list.add(execute_row)
-        tactile_ai_advanced_list.add(
-            components.SettingsRow("Checkpoint", model_row)
-        )
+        tactile_ai_advanced_list.add_stacked("Checkpoint", model_row)
         tactile_ai_list.add(execute_safety_row)
-        tactile_ai_advanced_list.add(
-            components.SettingsRow("Gesture recognition", threelevel_row)
+        from phd.ui.gesture_feedback import TouchPolicyGestureFeedback
+        self.ai_touch_gesture_feedback = TouchPolicyGestureFeedback()
+        tactile_ai_list.add(self.ai_touch_gesture_feedback)
+        legacy_ai_group, legacy_ai_list = components.section(
+            "Legacy three-level Transformer",
+            "Separate older controller: predicts finger, gesture and quality using its own checkpoint. "
+            "It does not use the model selected in Touch Policy. Can command robot motion.",
         )
+        legacy_ai_list.add(components.SettingsRow("Legacy controller", threelevel_row))
 
         # ── Proximity section ───────────────────────────────────────────
         proximity_ai_list.add(
@@ -4978,77 +5145,106 @@ class UI(
             components.SettingsRow("State", self.ai_proximity_detection_status)
         )
 
-        self.ai_basic_controls_group = components.CollapsibleGroup(
-            "Basic controls",
-            expanded=True,
-        )
-        self.ai_basic_controls_group.add(tactile_ai_group)
-        self.ai_basic_controls_group.add(proximity_ai_group)
         self.ai_advanced_controls_group = components.CollapsibleGroup(
-            "Advanced setup"
+            "Policy setup · checkpoint & frame"
         )
         self.ai_advanced_controls_group.add(frame_group)
         self.ai_advanced_controls_group.add(tactile_ai_advanced_group)
-        self.ai_advanced_controls_group.add(proximity_ai_advanced_group)
-        ai_model_layout.addWidget(self.ai_basic_controls_group)
-        ai_model_layout.addWidget(self.ai_advanced_controls_group)
-        ai_model_layout.addStretch()
+        self.ai_proximity_setup_group = components.CollapsibleGroup(
+            "Proximity setup · model & sensitivity"
+        )
+        self.ai_proximity_setup_group.add(proximity_ai_advanced_group)
+        self.ai_run_sections = components.TaskSections(scroll_factory=self._scrollable)
+        from phd.ui.gesture_recognition_panel import GestureRecognitionPanel
+
+        self.gesture_recognition_panel = GestureRecognitionPanel(
+            lambda: getattr(self, "sensor_functions", None)
+        )
+        self.ai_gesture_section_index = self.ai_run_sections.add_section(
+            "Gesture recognition", "Recognise a completed touch gesture. No robot commands.",
+            self.gesture_recognition_panel,
+        )
+        self.ai_run_sections.add_section(
+            "Touch policy", "Execute a learned robot policy; safety controls remain with execution.",
+            tactile_ai_group, self.ai_advanced_controls_group,
+        )
+        self.ai_run_sections.add_section(
+            "Proximity", "Detect approach or arm retreat; tune its model separately.",
+            proximity_ai_group, self.ai_proximity_setup_group,
+        )
+        self.ai_legacy_section_index = self.ai_run_sections.add_section(
+            "Legacy controller", "Older Transformer with its own model. Can command the robot.",
+            legacy_ai_group,
+        )
+        ai_model_layout.addWidget(self.ai_run_sections)
 
         # ─── Subtab "Data" ───
         training_page = QWidget()
         training_layout = QVBoxLayout(training_page)
         training_layout.setSpacing(theme.SPACE_LG)
 
-        tracking_group, tracking_list = components.section(
+        tracking_group = QWidget()
+        tracking_layout = QVBoxLayout(tracking_group)
+        tracking_layout.setContentsMargins(0, 0, 0, 0)
+        tracking_layout.setSpacing(theme.SPACE_MD)
+        tracking_layout.addWidget(components.SectionHeader(
             "Continuous touch tracking",
-            "Camera-free guided collection, optional independent references, "
-            "model comparison and sensor-only preview without robot movement.",
-        )
-        self.touch_tracking_workbench_button = QPushButton(
-            "Open Touch Tracking workspace"
-        )
+            "Collect data, compare models, then preview with your sensor. No robot movement.",
+        ))
+        self.touch_tracking_actions = components.ActionCards()
+        self.touch_tracking_workbench_button = QPushButton("Collect touch data")
+        components.apply_variant(self.touch_tracking_workbench_button, "primary")
         self.touch_tracking_workbench_button.clicked.connect(
-            self._open_touch_tracking_workbench
+            lambda: self._open_touch_tracking_page(0)
         )
-        tracking_list.add(self.touch_tracking_workbench_button)
-        training_layout.addWidget(tracking_group)
+        self.touch_tracking_actions.add_card("01 / COLLECT", "Build your dataset", "Record guided, camera-free touch trials. Optional reference measurements remain available.", self.touch_tracking_workbench_button)
+        self.touch_tracking_train_button = QPushButton("Train / compare models")
+        self.touch_tracking_train_button.clicked.connect(lambda: self._open_touch_tracking_page(2))
+        self.touch_tracking_actions.add_card("02 / TRAIN", "Compare your models", "Choose recordings, configure training and compare the resulting models.", self.touch_tracking_train_button)
+        self.touch_tracking_preview_button = QPushButton("Sensor-only preview")
+        self.touch_tracking_preview_button.clicked.connect(lambda: self._open_touch_tracking_page(3))
+        self.touch_tracking_actions.add_card("03 / PREVIEW", "Try live tracking", "Inspect the model's output using sensor data, without controlling a robot.", self.touch_tracking_preview_button)
+        tracking_layout.addWidget(self.touch_tracking_actions)
+
+        intention_group = QWidget()
+        intention_layout = QVBoxLayout(intention_group)
+        intention_layout.setContentsMargins(0, 0, 0, 0)
+        intention_layout.setSpacing(theme.SPACE_MD)
+        intention_layout.addWidget(components.SectionHeader(
+            "Intention learning · A / B / C",
+            "A separate, camera-free research task: infer a person's declared surface goal. No robot commands or CIC labels.",
+        ))
+        self.intention_actions = components.ActionCards()
+        for index, title, subtitle, description, button_text in (
+            (0, "01 / COLLECT", "Declare the intended goal", "Record full tactile frames with independent human declarations and target-layout context.", "Collect intention data"),
+            (1, "02 / EVALUATE", "Test across people", "Compare touch + context, touch-only and context-only models on held-out groups.", "Train intention models"),
+            (2, "03 / PREVIEW", "Inspect goal predictions", "Watch A/B/C probabilities and withheld predictions without robot movement.", "Preview intentions"),
+        ):
+            button = QPushButton(button_text)
+            button.clicked.connect(lambda checked=False, page=index: self._open_intention_page(page))
+            self.intention_actions.add_card(title, subtitle, description, button)
+        intention_layout.addWidget(self.intention_actions)
 
         record_group, record_list = components.section(
-            "Existing robot-policy recording",
-            "Legacy imitation targets from controller/manual commands. "
-            "For continuous finger-position training, use Touch Tracking above.",
+            "Touch gesture trials",
+            "Saves the tactile frames of each trial. No robot commands are sent.",
+        )
+        environment_group, environment_list = components.section(
+            "Proximity background recording",
+            "Collect the empty environment for proximity-model training. No robot commands are sent.",
         )
 
-        # One selection instead of four "Set ... Mode" buttons: these were
-        # mutually exclusive settings of a single value, so a button each gave
-        # no way to see which one was in force.
-        trigger_mode_row = QWidget()
-        trigger_mode_layout = QHBoxLayout(trigger_mode_row)
-        trigger_mode_layout.setContentsMargins(0, 0, 0, 0)
-        trigger_mode_layout.setSpacing(6)
         self.record_trigger_mode_combo = QComboBox()
         for label, mode, hint in (
             (
-                "Manual start/stop",
-                "no_trigger",
-                "Record only while you hold the Record button.",
-            ),
-            (
-                "Auto trials, recalibrate each",
-                "no_trigger_auto",
-                "Record repeated trials automatically, recalibrating the "
-                "sensor between each one.",
-            ),
-            (
-                "Auto trials, keep calibration",
-                "no_trigger_no_updatecal_auto",
-                "Record repeated trials automatically without recalibrating "
-                "between them, so a slow drift is preserved in the data.",
-            ),
-            (
                 "Start on touch",
                 "trigger",
-                "Begin each trial automatically when contact is detected.",
+                "Touch begins a trial; release saves it and waits for the next touch.",
+            ),
+            (
+                "Manual start/stop",
+                "no_trigger",
+                "Press Record to start; press it again to stop and save one trial.",
             ),
         ):
             self.record_trigger_mode_combo.addItem(label, mode)
@@ -5056,41 +5252,30 @@ class UI(
             self.record_trigger_mode_combo.setItemData(
                 index, hint, Qt.ToolTipRole
             )
-        self.record_trigger_mode_combo.setCurrentIndex(0)
-        trigger_mode_layout.addWidget(self.record_trigger_mode_combo, 1)
-        record_list.add(components.SettingsRow("Mode", trigger_mode_row))
+        record_list.add(components.SettingsRow("Mode", self.record_trigger_mode_combo))
 
         self.ai_dfm_session_input = QLineEdit()
         self.ai_dfm_session_input.setPlaceholderText(
             "Auto: ai_dfm_10x10_v1"
         )
         self.ai_dfm_session_input.setToolTip(
-            "Optional custom dataset session. Leave blank to group trials "
-            "automatically by sensor size."
+            "Folder for these trials. Training uses the folder name as the "
+            "gesture label. Leave blank to group trials by sensor size."
         )
         record_list.add(
             components.SettingsRow(
                 "Session",
                 self.ai_dfm_session_input,
-                hint="Leave blank to group trials by sensor size.",
+                hint="Name it after the gesture, for example 10x10_up.",
             )
         )
 
-        ai_dfm_record_row = QWidget()
-        ai_dfm_record_row_layout = QHBoxLayout(ai_dfm_record_row)
-        ai_dfm_record_row_layout.setContentsMargins(0, 0, 0, 0)
-        ai_dfm_record_row_layout.setSpacing(6)
-        self.ai_direct_finger_motion_button.setText("Without robot")
-        self.ai_direct_finger_motion_robot_button.setText("With robot")
         self.ai_direct_finger_motion_button.setMinimumWidth(0)
-        self.ai_direct_finger_motion_robot_button.setMinimumWidth(0)
-        ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_button, 1)
-        ai_dfm_record_row_layout.addWidget(self.ai_direct_finger_motion_robot_button, 1)
         record_list.add(
             components.SettingsRow(
-                "Record trial",
-                ai_dfm_record_row,
-                hint="Space starts and stops recording on this page.",
+                "Record",
+                self.ai_direct_finger_motion_button,
+                hint="Space starts and stops; Esc stops.",
             )
         )
 
@@ -5109,137 +5294,47 @@ class UI(
         self.ai_proximity_environment_record_status.setStyleSheet(
             theme.type_style("caption")
         )
-        record_list.add(
+        environment_list.add(
             components.SettingsRow(
                 "Proximity background",
                 self.ai_proximity_environment_record_button,
                 hint="Ten one-minute trials of the empty environment.",
             )
         )
-        record_list.add(
+        environment_list.add(
             components.SettingsRow(
                 "State", self.ai_proximity_environment_record_status
             )
         )
 
-        # Legacy path kept but demoted behind a disclosure: it writes the old
-        # gesture-number dataset that only the original Record button reads.
-        legacy_group = components.CollapsibleGroup("Legacy gesture recording")
-        legacy_list = components.InsetList()
-        self.gesture_number_input = QLineEdit()
-        self.gesture_number_input.setToolTip(
-            "Label used only by the legacy Record button."
+        self.ai_data_sections = components.TaskSections(scroll_factory=self._scrollable)
+        self.ai_robot_recording_section_index = self.ai_data_sections.add_section(
+            "Gesture recording", "Record touch gestures for the touch policy. The session name is the label.",
+            record_group,
         )
-        self.record_gesture_button = QPushButton("Record")
-        legacy_list.add(
-            components.SettingsRow("Gesture label", self.gesture_number_input)
+        self.ai_data_sections.add_section(
+            "Touch tracking", "Collect, train and preview continuous finger tracking without robot motion.",
+            tracking_group,
         )
-        legacy_list.add(
-            components.SettingsRow("Capture", self.record_gesture_button)
+        self.ai_data_sections.add_section(
+            "Proximity background", "Record empty-environment trials for proximity training.",
+            environment_group,
         )
-        legacy_group.add(legacy_list)
-        record_group.layout().addWidget(legacy_group)
-
-        # ── Teaching label ─────────────────────────────────────────────
-        # Sixteen momentary buttons in one flat grid gave no clue that they
-        # fall into three kinds, so they are grouped and the axis pairs are
-        # laid out to read as pairs.
-        self.ai_teaching_label_group, teaching_list = components.section(
-            "Teaching label",
-            "Tag what the demonstration is doing while it records.",
+        self.ai_intention_section_index = self.ai_data_sections.add_section(
+            "Intention learning", "Collect declared A/B/C goals, evaluate across people and preview predictions.",
+            intention_group,
         )
-
-        self.ai_teaching_label_buttons = {}
-        self.ai_teaching_label_status = QLabel("Auto/DFM")
-        self.ai_teaching_label_status.setStyleSheet(theme.type_style("caption"))
-
-        # Each axis gets a stable row. This costs a little height, but is much
-        # easier to scan and hit during a projected or touch-led session than
-        # six equally weighted buttons in one line.
-        teaching_rows = [
-            (
-                "Behaviour",
-                [
-                    ("auto", "Auto/DFM"),
-                    ("stop", "Stop"),
-                    ("normal_swipe", "Swipe"),
-                    ("push", "Push"),
-                    ("pull", "Pull"),
-                ],
-            ),
-            (
-                "Translation X",
-                [
-                    ("x_pos", "X+"), ("x_neg", "X−"),
-                ],
-            ),
-            (
-                "Translation Y",
-                [
-                    ("y_pos", "Y+"), ("y_neg", "Y−"),
-                ],
-            ),
-            (
-                "Translation Z",
-                [
-                    ("z_pos", "Z+"), ("z_neg", "Z−"),
-                ],
-            ),
-            (
-                "Rotation RX",
-                [
-                    ("rx_pos", "RX+"), ("rx_neg", "RX−"),
-                ],
-            ),
-            (
-                "Rotation RY",
-                [
-                    ("ry_pos", "RY+"), ("ry_neg", "RY−"),
-                ],
-            ),
-            (
-                "Rotation RZ",
-                [
-                    ("rz_pos", "RZ+"), ("rz_neg", "RZ−"),
-                ],
-            ),
-        ]
-        for row_label, specs in teaching_rows:
-            row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
-            row_layout.setContentsMargins(0, 0, 0, 0)
-            row_layout.setSpacing(theme.SPACE_XS)
-            for label_key, label_text in specs:
-                button = QPushButton(label_text)
-                button.setCheckable(True)
-                button.setMinimumWidth(0)
-                self.ai_teaching_label_buttons[label_key] = button
-                row_layout.addWidget(button, 1)
-            teaching_list.add_stacked(row_label, row_widget)
-        teaching_list.add(
-            components.SettingsRow("Current", self.ai_teaching_label_status)
-        )
-
-        self.ai_data_basic_group = components.CollapsibleGroup(
-            "Basic recording",
-            expanded=True,
-        )
-        self.ai_data_basic_group.add(record_group)
-        self.ai_data_advanced_group = components.CollapsibleGroup(
-            "Advanced labels"
-        )
-        self.ai_data_advanced_group.add(self.ai_teaching_label_group)
-        training_layout.addWidget(self.ai_data_basic_group)
-        training_layout.addWidget(self.ai_data_advanced_group)
-        training_layout.addStretch()
+        training_layout.addWidget(self.ai_data_sections)
 
         self.ai_run_tab_index = self.ai_sub_tabs.addTab(
-            self._scrollable(ai_model_page), "Run"
+            ai_model_page, "Run"
         )
         self.ai_data_training_tab_index = self.ai_sub_tabs.addTab(
-            self._scrollable(training_page),
+            training_page,
             "Data",
         )
+        self.ai_sub_tabs.setCurrentIndex(self.ai_run_tab_index)
+        self.ai_sub_tabs.currentChanged.connect(self._apply_workspace_layout)
         layout.addWidget(self.ai_sub_tabs)
 
     def setup_tab4(self, layout):
@@ -5372,9 +5467,6 @@ class UI(
             components.SettingsRow("State", self.force_meter_status_label)
         )
 
-        layout.addWidget(force_meter_group)
-        layout.addWidget(graph_group)
-
         self._refresh_force_meter_ports()
 
         # --- Gripper Manual Control ---
@@ -5416,7 +5508,6 @@ class UI(
         btn_layout.addWidget(self.btn_grip_open)
         btn_layout.addWidget(self.btn_grip_close)
         gripper_list.add(components.SettingsRow("Fully", btn_row))
-        layout.addWidget(gripper_group)
 
         # Connections
         self.gripper_slider.valueChanged.connect(self._update_slider_label)
@@ -5447,8 +5538,18 @@ class UI(
                 hint="Move the arm to keep the detected object centred.",
             )
         )
-        layout.addWidget(camera_group)
-        layout.addStretch()
+        self.tools_sections = components.TaskSections(scroll_factory=self._scrollable)
+        self.tools_sections.add_section(
+            "Force meter", "Connect, zero and inspect force readings over time.",
+            force_meter_group, graph_group,
+        )
+        self.tools_sections.add_section(
+            "Gripper", "Open, close or adjust the two-finger gripper.", gripper_group,
+        )
+        self.tools_sections.add_section(
+            "Camera control", "Object detection and optional robot auto-centering.", camera_group,
+        )
+        layout.addWidget(self.tools_sections)
 
     def setup_tab5(self, layout):
         self.hand_sub_tabs = QTabWidget()
@@ -5631,7 +5732,6 @@ class UI(
         motion_list.add(
             components.SettingsRow("Thumb rotation", thumb_row_widget)
         )
-        hand_motion_layout.addWidget(motion_group)
 
         # Per-finger sliders. Drag a slider to set the target angle; the
         # right-most "Send" button sends just that finger (others left
@@ -5755,7 +5855,6 @@ class UI(
 
         slider_list.add_stacked("Presets", preset_row_widget)
         slider_list.add(bottom_row_widget)
-        hand_motion_layout.addWidget(slider_group)
 
         pose_group, pose_list = components.section("Saved poses")
 
@@ -5814,17 +5913,27 @@ class UI(
             components.SettingsRow("Stored", self.hand_pose_status_label)
         )
 
-        hand_motion_layout.addWidget(pose_group)
         self._load_hand_pose_presets()
-        hand_motion_layout.addStretch()
+        self.hand_motion_sections = components.TaskSections(scroll_factory=self._scrollable)
+        self.hand_motion_sections.add_section(
+            "Whole hand", "Grip, thumb rotation, speed and force settings.", motion_group,
+        )
+        self.hand_motion_sections.add_section(
+            "Individual fingers", "Set six actuator angles or sync from the live hand.", slider_group,
+        )
+        self.hand_motion_sections.add_section(
+            "Saved poses", "Save slider values, load poses or explicitly load and send.", pose_group,
+        )
+        hand_motion_layout.addWidget(self.hand_motion_sections)
 
         self.hand_sub_tabs.addTab(
             self._scrollable(hand_monitor_page), "Tactile / Model"
         )
         self.hand_sub_tabs.addTab(
-            self._scrollable(hand_motion_page), "Motion Controls"
+            hand_motion_page, "Motion Controls"
         )
         layout.addWidget(self.hand_sub_tabs)
+        self.hand_sub_tabs.currentChanged.connect(self._apply_workspace_layout)
 
     def _set_button_active(self, btn: QPushButton, active: bool):
         """Green when active; when inactive, revert to the default theme."""

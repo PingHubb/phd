@@ -21,6 +21,8 @@ HUMANOID_PART_DISPLAY = {
     "sensor:testing_8x10": ("Testing Sensor", (8, 10)),
     "sensor:testing_5x5_1": ("Testing Sensor 1", (5, 5)),
     "sensor:testing_5x5_2": ("Testing Sensor 2", (5, 5)),
+    "sensor:testing_20x20_3": ("Testing Sensor 3", (20, 20)),
+    "sensor:robot_dog_back": ("Robot Dog Back Sensor", (8, 8)),
     "sensor:dexterous_hand": ("Dexterous Hand", (27, 22)),
     "signal:1:head_link": ("Head", (9, 14)),
     "signal:10:torso_link": ("Torso Part 10", (15, 16)),

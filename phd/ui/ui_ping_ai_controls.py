@@ -23,6 +23,16 @@ class AiControlsMixin:
         ai_resource_path("models", "tactile_proximity")
     )
 
+    def _stop_gesture_recognition(self):
+        panel = getattr(self, "gesture_recognition_panel", None)
+        if panel is not None:
+            panel.stop()
+
+    def _shutdown_gesture_recognition(self):
+        panel = getattr(self, "gesture_recognition_panel", None)
+        if panel is not None:
+            panel.shutdown()
+
     def _open_touch_tracking_workbench(self):
         from phd.ui.touch_tracking_window import TouchTrackingWindow
 
@@ -34,8 +44,30 @@ class AiControlsMixin:
         window.raise_()
         window.activateWindow()
 
+    def _open_touch_tracking_page(self, index):
+        """Open a named workbench page without starting capture or inference."""
+        self._open_touch_tracking_workbench()
+        self.touch_tracking_window.tabs.setCurrentIndex(index)
+
     def _shutdown_touch_tracking_workbench(self):
         window = getattr(self, "touch_tracking_window", None)
+        if window is not None:
+            window.shutdown()
+
+    def _open_intention_page(self, index=0):
+        from phd.ui.intention_window import IntentionWindow
+
+        window = getattr(self, "intention_window", None)
+        if window is None or getattr(window, "_closing", False):
+            window = IntentionWindow(self)
+            self.intention_window = window
+        window.tabs.setCurrentIndex(index)
+        window.show()
+        window.raise_()
+        window.activateWindow()
+
+    def _shutdown_intention_workbench(self):
+        window = getattr(self, "intention_window", None)
         if window is not None:
             window.shutdown()
 
@@ -61,7 +93,6 @@ class AiControlsMixin:
         self._console_control_sensor_active = False
         self._console_control_sensor_v2_active = False
         self._ai_direct_finger_active = False
-        self._ai_direct_finger_robot_active = False
         self._ai_direct_finger_execution_active = False
         self._ai_proximity_detection_active = False
         self._ai_proximity_detector = None
@@ -123,9 +154,6 @@ class AiControlsMixin:
         record_button = getattr(self, "ai_direct_finger_motion_button", None)
         if record_button is not None:
             self._set_button_active(record_button, False)
-        robot_record = getattr(self, "ai_direct_finger_motion_robot_button", None)
-        if robot_record is not None:
-            self._set_button_active(robot_record, False)
         execute_button = getattr(
             self, "ai_direct_finger_motion_execution_button", None
         )
@@ -166,11 +194,8 @@ class AiControlsMixin:
 
         if hasattr(self, "ai_direct_finger_motion_button"):
             self.ai_direct_finger_motion_button.setToolTip(
-                "Start/stop AI Direct Finger Motion recording without sending robot commands. Shortcut: Space. Stop: Esc."
-            )
-        if hasattr(self, "ai_direct_finger_motion_robot_button"):
-            self.ai_direct_finger_motion_robot_button.setToolTip(
-                "Start/stop AI Direct Finger Motion recording while sending the rule-based robot commands."
+                "Start/stop touch gesture recording. No robot commands are sent. "
+                "Shortcut: Space. Stop: Esc."
             )
         if hasattr(self, "ai_direct_finger_motion_execution_button"):
             self.ai_direct_finger_motion_execution_button.setToolTip(
@@ -1040,9 +1065,14 @@ class AiControlsMixin:
 
     def _is_data_training_subtab_active(self):
         return (
-            hasattr(self, "ai_sub_tabs")
+            hasattr(self, "tab_widget")
+            and self.tab_widget.currentIndex() == getattr(self, "ai_tab_index", -1)
+            and hasattr(self, "ai_sub_tabs")
             and self.ai_sub_tabs.currentIndex()
-            == int(getattr(self, "ai_data_training_tab_index", 2))
+            == int(getattr(self, "ai_data_training_tab_index", -1))
+            and hasattr(self, "ai_data_sections")
+            and self.ai_data_sections.currentIndex()
+            == getattr(self, "ai_robot_recording_section_index", -1)
         )
 
     def _shortcut_toggle_ai_direct_finger_motion(self):
@@ -1057,10 +1087,7 @@ class AiControlsMixin:
     def _shortcut_stop_ai_direct_finger_motion(self):
         if self._focus_on_text_input():
             return
-        if not (
-            getattr(self, "_ai_direct_finger_active", False)
-            or getattr(self, "_ai_direct_finger_robot_active", False)
-        ):
+        if not getattr(self, "_ai_direct_finger_active", False):
             return
         if not self.ai_direct_finger_motion_button.isEnabled():
             return

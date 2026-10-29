@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 
+from PyQt5.QtCore import QPoint
 from PyQt5.QtWidgets import QApplication, QComboBox
 
 from phd.dependence.paths import icon_path, stylesheet_path
@@ -53,6 +54,32 @@ def test_combo_popup_requests_every_current_choice():
     combo.hidePopup()
 
 
+def test_two_sensor_show_options_are_both_visible():
+    install_full_choice_popups()
+    combo = QComboBox()
+    combo.addItem("Single Sensor", "single")
+    combo.addItem("Multiple Ports", "multiple")
+    combo.resize(220, 32)
+    combo.move(80, 180)
+    combo.show()
+    combo.showPopup()
+    app.processEvents()
+
+    view = combo.view()
+    popup = view.window()
+    row_height = view.sizeHintForRow(0)
+    frame = max(0, popup.height() - view.viewport().height())
+    popup.resize(popup.width(), row_height + frame)
+    app.processEvents()
+
+    for row in range(combo.count()):
+        rect = view.visualRect(view.model().index(row, 0))
+        assert rect.isValid()
+        assert rect.top() >= 0
+        assert rect.bottom() <= view.viewport().height()
+    combo.hidePopup()
+
+
 def test_combo_popup_can_reach_the_last_choice():
     install_full_choice_popups()
     icon_dir = icon_path("generated")
@@ -73,8 +100,17 @@ def test_combo_popup_can_reach_the_last_choice():
 
     combo.showPopup()
     view = combo.view()
+    popup = view.window()
+    assert _scroll_arrows_are_hidden(popup)
+
+    scrollbar = view.verticalScrollBar()
+    scrollbar.setValue(min(scrollbar.maximum(), scrollbar.singleStep() or 1))
+    app.processEvents()
+    assert _scroll_arrows_are_hidden(popup)
+
     last = view.model().index(combo.count() - 1, 0)
     view.scrollTo(last)
+    app.processEvents()
     visible = view.visualRect(last)
     viewport_height = view.viewport().height()
 
@@ -82,4 +118,17 @@ def test_combo_popup_can_reach_the_last_choice():
     assert visible.height() == view.sizeHintForRow(0)
     assert visible.top() >= 0
     assert visible.bottom() <= viewport_height
+    assert _scroll_arrows_are_hidden(popup)
+    combo_rect = combo.rect()
+    combo_rect.moveTopLeft(combo.mapToGlobal(QPoint(0, 0)))
+    assert not popup.geometry().intersects(combo_rect)
     combo.hidePopup()
+
+
+def _scroll_arrows_are_hidden(popup) -> bool:
+    for child in popup.children():
+        if child.metaObject().className() != "QComboBoxPrivateScroller":
+            continue
+        if child.isVisible() and child.height() > 0:
+            return False
+    return True

@@ -1,0 +1,86 @@
+{
+  "version": 2,
+  "profiles": {
+    "sensor:testing_8x10": {
+      "saved_at": "",
+      "taxel_index": 35,
+      "tool_position_m": [
+        0.1,
+        0.2,
+        0.3
+      ],
+      "tool_quaternion_wxyz": [
+        1.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "sensor:testing_5x5_1": {
+      "saved_at": "2026-10-27T05:00:54.528255+00:00",
+      "taxel_index": 12,
+      "tool_position_m": [
+        -0.5254058227539062,
+        0.47324691772460936,
+        0.2786520690917969
+      ],
+      "tool_quaternion_wxyz": [
+        -0.002989601722301183,
+        -0.38376338157196044,
+        0.9234253941224898,
+        -0.001506896054911211
+      ],
+      "scan_plane_choice": {
+        "z_m": 0.22671026611328127,
+        "saved_at": "2026-10-27T10:10:50.896712+00:00",
+        "sensor_identity": "sensor:testing_5x5_1",
+        "sensor_rows": 5,
+        "sensor_columns": 5
+      }
+    },
+    "sensor:testing_5x5_2": {
+      "saved_at": "2026-10-26T10:18:36.771797+00:00",
+      "taxel_index": 12,
+      "tool_position_m": [
+        -0.6251297607421875,
+        0.37134036254882813,
+        0.2815228881835938
+      ],
+      "tool_quaternion_wxyz": [
+        0.008133155999940106,
+        -0.4790694622193333,
+        0.8777326441810823,
+        -0.0034216196815247736
+      ],
+      "scan_plane_choice": {
+        "z_m": 0.22722615051269532,
+        "saved_at": "2026-10-27T10:10:56.711521+00:00",
+        "sensor_identity": "sensor:testing_5x5_2",
+        "sensor_rows": 5,
+        "sensor_columns": 5
+      }
+    },
+    "sensor:testing_20x20_3": {
+      "saved_at": "2026-10-26T17:43:44.122651+00:00",
+      "taxel_index": 189,
+      "tool_position_m": [
+        -0.7487540893554687,
+        0.10014861297607422,
+        0.25916729736328126
+      ],
+      "tool_quaternion_wxyz": [
+        0.007873482072833175,
+        -0.4796744529691718,
+        0.877407485931469,
+        -0.0025555978152667
+      ],
+      "scan_plane_choice": {
+        "z_m": 0.22677432250976562,
+        "saved_at": "2026-10-26T17:44:50.551574+00:00",
+        "sensor_identity": "sensor:testing_20x20_3",
+        "sensor_rows": 20,
+        "sensor_columns": 20
+      }
+    }
+  }
+}

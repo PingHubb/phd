@@ -31,6 +31,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QButtonGroup,
     QFrame,
+    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -39,13 +40,14 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QStackedWidget,
+    QScrollArea,
     QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from phd.ui import icons, theme
+from phd.ui import icons, motion, theme
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +142,8 @@ def apply_variant(widget: QWidget, variant: str | None) -> QWidget:
         style.unpolish(widget)
         style.polish(widget)
     widget.update()
+    if isinstance(widget, (QPushButton, QToolButton)) and variant != "danger":
+        motion.add_hover(widget)
     return widget
 
 
@@ -213,6 +217,16 @@ def segmented(tabs: QTabWidget) -> QTabWidget:
     return tabs
 
 
+def scroll_page(page: QWidget) -> QScrollArea:
+    """Keep utility forms reachable on short laptop displays."""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    area.setWidget(page)
+    return area
+
+
 # ---------------------------------------------------------------------------
 # Headers and containers
 # ---------------------------------------------------------------------------
@@ -251,6 +265,108 @@ class SectionHeader(QWidget):
         """Place ``widget`` at the trailing edge of the header."""
         self._layout.addWidget(widget, 0, Qt.AlignRight | Qt.AlignVCenter)
         return widget
+
+
+class WorkspaceHeader(QFrame):
+    """A consistent, compressible heading for a workspace or utility window."""
+
+    def __init__(self, title: str, subtitle: str = "", *, eyebrow: str = "WORKSPACE", parent=None):
+        super().__init__(parent)
+        self._compact = False
+        self.setObjectName("workspaceHeader")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(theme.SPACE_LG, theme.SPACE_MD, theme.SPACE_LG, theme.SPACE_MD)
+        layout.setSpacing(theme.SPACE_XS)
+        self.eyebrow = QLabel(eyebrow)
+        self.eyebrow.setObjectName("workspaceEyebrow")
+        self.title_label = QLabel(title)
+        self.title_label.setObjectName("workspaceTitle")
+        self.title_label.setWordWrap(True)
+        self.subtitle_label = QLabel(subtitle)
+        self.subtitle_label.setObjectName("workspaceSubtitle")
+        self.subtitle_label.setWordWrap(True)
+        layout.addWidget(self.eyebrow)
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.subtitle_label)
+        self.subtitle_label.setVisible(bool(subtitle))
+
+    def set_context(self, title: str, subtitle: str) -> None:
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+        self.subtitle_label.setVisible(bool(subtitle) and not self._compact)
+
+    def set_compact(self, compact: bool) -> None:
+        """Recover content space on short screens without changing navigation."""
+        if self._compact == bool(compact):
+            return
+        self._compact = bool(compact)
+        self.eyebrow.setVisible(not self._compact)
+        self.subtitle_label.setVisible(bool(self.subtitle_label.text()) and not self._compact)
+        margin = theme.SPACE_XS if self._compact else theme.SPACE_MD
+        self.layout().setContentsMargins(theme.SPACE_LG, margin, theme.SPACE_LG, margin)
+
+
+class ViewportWelcome(QFrame):
+    """An honest idle scene. Its shortcuts only open UI, never hardware."""
+
+    setup_requested = pyqtSignal()
+    tracking_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("viewportWelcome")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(theme.SPACE_LG)
+        layout.addStretch(2)
+        glyph = self.welcome_glyph = QLabel()
+        glyph.setPixmap(icons.pixmap("sensor", color=theme.VIEWPORT_MUTED, size=56))
+        glyph.setAlignment(Qt.AlignCenter)
+        layout.addWidget(glyph)
+        title = self.welcome_title = QLabel("Your sensor workspace")
+        title.setObjectName("viewportWelcomeTitle")
+        title.setAlignment(Qt.AlignCenter)
+        title.setWordWrap(True)
+        layout.addWidget(title)
+        note = self.welcome_note = QLabel("Connect a sensor to see its live surface here.\nYou can also explore saved data without hardware.")
+        note.setObjectName("viewportWelcomeNote")
+        note.setAlignment(Qt.AlignCenter)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        actions = self.welcome_actions = QHBoxLayout()
+        actions.setSpacing(theme.SPACE_SM)
+        actions.addStretch()
+        self.setup_button = QPushButton("Sensor setup")
+        self.setup_button.setObjectName("welcomeAction")
+        self.setup_button.clicked.connect(self.setup_requested)
+        self.tracking_button = QPushButton("Touch tracking")
+        self.tracking_button.setObjectName("welcomeAction")
+        self.tracking_button.clicked.connect(self.tracking_requested)
+        actions.addWidget(self.setup_button)
+        actions.addWidget(self.tracking_button)
+        actions.addStretch()
+        layout.addLayout(actions)
+        layout.addStretch(2)
+        footer = self.welcome_footer = QLabel("ACQUIRE  /  EXPLORE  /  EXPERIMENT")
+        footer.setObjectName("viewportWelcomeNote")
+        footer.setAlignment(Qt.AlignCenter)
+        layout.addWidget(footer)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        compact = self.height() < 360 or self.width() < 420
+        self.welcome_glyph.setVisible(not compact)
+        self.welcome_footer.setVisible(not compact)
+        self.welcome_title.setText("Sensor workspace" if compact else "Your sensor workspace")
+        self.welcome_title.setStyleSheet("font-size: 14pt;" if compact else "")
+        self.layout().setContentsMargins(12 if compact else 28, 16 if compact else 24,
+                                        12 if compact else 28, 16 if compact else 24)
+        self.layout().setSpacing(theme.SPACE_SM if compact else theme.SPACE_LG)
+        self.welcome_actions.setDirection(
+            QHBoxLayout.TopToBottom if self.width() < 340 else QHBoxLayout.LeftToRight
+        )
 
 
 class CardGroup(QGroupBox):
@@ -581,14 +697,13 @@ def section(title: str, subtitle: str = "") -> tuple[QWidget, InsetList]:
 class CollapsibleGroup(QWidget):
     """Disclosure container for advanced parameters.
 
-    All sections start open so each tab exposes its complete set of controls.
-    The disclosure arrow still lets an operator collapse sections they do not
-    need during a session.
+    Advanced sections start closed; their labelled disclosure stays visible.
+    Callers can explicitly expand a section that is part of the main task.
     """
 
     toggled = pyqtSignal(bool)
 
-    def __init__(self, title: str, parent=None, *, expanded: bool = True):
+    def __init__(self, title: str, parent=None, *, expanded: bool = False):
         super().__init__(parent)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -596,6 +711,7 @@ class CollapsibleGroup(QWidget):
 
         self.toggle = QToolButton()
         self.toggle.setText(title)
+        self.toggle.setAccessibleName(title)
         self.toggle.setCheckable(True)
         self.toggle.setChecked(expanded)
         self.toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -603,24 +719,28 @@ class CollapsibleGroup(QWidget):
         self.toggle.setCursor(Qt.PointingHandCursor)
         self.toggle.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.toggle.setStyleSheet(
-            "QToolButton { border: none; background: transparent;"
+            "QToolButton { border: 1px solid transparent; background: transparent;"
             f" color: {theme.TEXT_SECONDARY}; font-weight: 600;"
-            f" font-size: {theme.FONT_SIZE_SMALL}; padding: 3px 2px; text-align: left; }}"
+            f" font-size: {theme.FONT_SIZE_SMALL}; padding: 2px 1px; text-align: left; }}"
             f"QToolButton:hover {{ color: {theme.TEXT_PRIMARY}; }}"
+            f"QToolButton:focus {{ border-color: {theme.ACCENT}; }}"
+            f"QToolButton:pressed {{ background: {theme.ACCENT_SOFT}; }}"
         )
         layout.addWidget(self.toggle)
 
-        self.content = QWidget()
+        self.content = motion.DisclosureBody()
         self.body = QVBoxLayout(self.content)
         self.body.setContentsMargins(theme.SPACE_SM, 0, 0, theme.SPACE_XS)
         self.body.setSpacing(theme.SPACE_SM)
         self.content.setVisible(expanded)
         layout.addWidget(self.content)
 
+        self._motion = motion.DisclosureMotion(self)
+        motion.add_hover(self.toggle)
         self.toggle.toggled.connect(self._on_toggled)
 
     def _on_toggled(self, checked: bool) -> None:
-        self.content.setVisible(checked)
+        self._motion.set_expanded(checked)
         self.toggle.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
         self.toggled.emit(checked)
 
@@ -631,6 +751,185 @@ class CollapsibleGroup(QWidget):
     def add_layout(self, layout):
         self.body.addLayout(layout)
         return layout
+
+
+class ActionCards(QWidget):
+    """Responsive, bounded cards wrapping existing action buttons unchanged."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cards = []
+        self._columns = 1
+        self.grid = QGridLayout(self)
+        self.grid.setContentsMargins(0, 0, 0, 0)
+        self.grid.setSpacing(theme.SPACE_MD)
+
+    def add_card(self, step, title, description, button):
+        card = QFrame()
+        card.setObjectName("actionCard")
+        column = QVBoxLayout(card)
+        column.setContentsMargins(12, 12, 12, 12)
+        column.setSpacing(8)
+        for text, name in ((step, "actionCardStep"), (title, "sectionTitle"), (description, "sectionBody")):
+            label = QLabel(text)
+            label.setObjectName(name)
+            label.setWordWrap(True)
+            label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+            column.addWidget(label)
+        column.addStretch(1)
+        button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        button.setMinimumHeight(34)
+        button.setCursor(Qt.PointingHandCursor)
+        motion.add_hover(button)
+        column.addWidget(button)
+        self.cards.append(card)
+        self.grid.addWidget(card, len(self.cards) - 1, 0)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        columns = max(1, min(len(self.cards), self.width() // 280))
+        if columns == self._columns:
+            return
+        for card in self.cards:
+            self.grid.removeWidget(card)
+        for column in range(max(columns, self._columns)):
+            self.grid.setColumnStretch(column, 1 if column < columns else 0)
+        self._columns = columns
+        for index, card in enumerate(self.cards):
+            self.grid.addWidget(card, index // columns, index % columns)
+
+
+class TaskSections(QWidget):
+    """Keep a small task index visible and show only its selected controls.
+
+    Navigation only: pages are never rebuilt and no action button is invoked
+    when changing sections. Each page retains its values and scroll position.
+    """
+
+    currentChanged = pyqtSignal(int)
+
+    def __init__(self, parent=None, *, scroll_factory=scroll_page):
+        super().__init__(parent)
+        self._scroll_factory = scroll_factory
+        self.buttons = []
+        self.pages = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(theme.SPACE_SM)
+        self.index = QWidget()
+        self.index.setObjectName("taskIndex")
+        self.index.setAttribute(Qt.WA_StyledBackground, True)
+        self.index.setMaximumWidth(1040)
+        self.index.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.index_layout = QGridLayout(self.index)
+        self.index_layout.setContentsMargins(0, 0, 0, 4)
+        self.index_layout.setSpacing(4)
+        self._index_columns = 2
+        self.group = QButtonGroup(self)
+        self.group.setExclusive(True)
+        self.stack = QStackedWidget()
+        index_row = QHBoxLayout()
+        index_row.setContentsMargins(0, 0, 0, 0)
+        index_row.setSpacing(0)
+        index_row.addStretch(1)
+        index_row.addWidget(self.index, 1000)
+        index_row.addStretch(1)
+        layout.addLayout(index_row)
+        layout.addWidget(self.stack, 1)
+
+    def add_section(self, title, description, *widgets):
+        index = len(self.buttons)
+        button = QPushButton(title)
+        button.setObjectName("taskChoice")
+        button.setCheckable(True)
+        button.setMinimumHeight(32)
+        button.setMinimumWidth(0)
+        button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        button.setToolTip(description)
+        button.setAccessibleDescription(description)
+        button.setCursor(Qt.PointingHandCursor)
+        motion.add_hover(button)
+        self.group.addButton(button, index)
+        button.clicked.connect(lambda _checked=False, i=index: self.setCurrentIndex(i))
+        self.index_layout.addWidget(button, index // 2, index % 2)
+        self.index_layout.setColumnStretch(0, 1)
+        self.index_layout.setColumnStretch(1, 1)
+        self.buttons.append(button)
+
+        page = QWidget()
+        page.setMaximumWidth(1040)
+        column = QVBoxLayout(page)
+        column.setContentsMargins(2, 4, 2, 4)
+        column.setSpacing(theme.SPACE_LG)
+        for widget in widgets:
+            column.addWidget(widget)
+        column.addStretch(1)
+        area = self._scroll_factory(page)
+        area.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        area._page_reveal = motion.PageReveal(area)
+        self.pages.append(area)
+        self.stack.addWidget(area)
+        if index == 0:
+            button.setChecked(True)
+        return index
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        available = min(self.width(), 1040)
+        # Never fix the width here: that also fixes its minimum. After a
+        # full-width page, the stale minimum forces the splitter to expand
+        # through several layouts when returning to Robots/Sensor.
+        columns = max(1, min(len(self.buttons), available // 200))
+        if columns == self._index_columns:
+            return
+        for button in self.buttons:
+            self.index_layout.removeWidget(button)
+        for column in range(max(columns, self._index_columns)):
+            self.index_layout.setColumnStretch(column, 1 if column < columns else 0)
+        self._index_columns = columns
+        for index, button in enumerate(self.buttons):
+            self.index_layout.addWidget(button, index // columns, index % columns)
+
+    def currentIndex(self):  # noqa: N802 - Qt-style interface
+        return self.stack.currentIndex()
+
+    def setCurrentIndex(self, index):  # noqa: N802 - Qt-style interface
+        if not 0 <= index < len(self.buttons):
+            return
+        changed = index != self.currentIndex()
+        self.buttons[index].setChecked(True)
+        self.stack.setCurrentIndex(index)
+        if changed:
+            self.currentChanged.emit(index)
+
+
+class SettingsForm(QFormLayout):
+    """Compact native form with wrapping labels and accessible field names.
+
+    This only changes presentation; values, ranges and signals remain owned
+    by the feature that supplies each field.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setHorizontalSpacing(theme.SPACE_MD)
+        self.setVerticalSpacing(theme.SPACE_SM)
+        self.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        self.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+
+    def addRow(self, *args):  # noqa: N802 - Qt API
+        if len(args) == 2 and isinstance(args[0], str) and isinstance(args[1], QWidget):
+            text, field = args
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setMinimumWidth(180)
+            label.setBuddy(field)
+            if not field.accessibleName():
+                field.setAccessibleName(text)
+            super().addRow(label, field)
+        else:
+            super().addRow(*args)
 
 
 class ParameterGrid(QWidget):
@@ -767,6 +1066,7 @@ class SessionStrip(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("sessionStrip")
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setAttribute(Qt.WA_StyledBackground, True)
         layout = QHBoxLayout(self)
         layout.setContentsMargins(

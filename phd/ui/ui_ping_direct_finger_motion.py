@@ -29,7 +29,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 from pyvistaqt import QtInteractor
-from phd.dependence.paths import resource_path, robot_resource_path  # pyright: ignore[reportMissingImports]
+from phd.dependence.paths import ai_resource_path, resource_path, robot_resource_path  # pyright: ignore[reportMissingImports]
 from phd.ui import components, theme
 
 try:
@@ -1107,7 +1107,23 @@ class DirectFingerMotionMixin:
         if label is None:
             return
         helper = self._get_ai_direct_finger_motion_execution_helper()
+        self._refresh_ai_direct_execution_model_status(helper)
+        if helper is not None and hasattr(helper, "is_running"):
+            running = bool(helper.is_running)
+            if running != bool(getattr(self, "_ai_direct_finger_execution_active", False)):
+                self._ai_direct_finger_execution_active = running
+                button = getattr(self, "ai_direct_finger_motion_execution_button", None)
+                if button is not None:
+                    self._set_button_active(button, running)
         prediction = getattr(helper, "last_prediction", None) if helper is not None else None
+        feedback_panel = getattr(self, "ai_touch_gesture_feedback", None)
+        if feedback_panel is not None:
+            selected = getattr(self, "ai_direct_execution_model_path_input", None)
+            selected_path = selected.text().strip() if selected is not None else ""
+            loaded_path = str(getattr(helper, "loaded_model_checkpoint_path", "") or "")
+            mismatch = (not bool(getattr(helper, "is_running", False)) and selected_path and loaded_path
+                        and os.path.realpath(selected_path) != os.path.realpath(loaded_path))
+            feedback_panel.update_from_helper(None if mismatch else helper)
         if not prediction:
             active = bool(getattr(self, "_ai_direct_finger_execution_active", False))
             label.setText("Prediction: waiting" if active else "Prediction: idle")
@@ -1118,7 +1134,11 @@ class DirectFingerMotionMixin:
         mode_text = self._ai_direct_prediction_direction_text(mode, velocity)
         conf = float(prediction.get("mode_conf", 0.0))
         run_text = "dry" if prediction.get("dry_run", True) else "live"
-        label.setText(f"Prediction: {mode_text} {conf:.2f} | [{velocity_text}] | {run_text}")
+        gesture = prediction.get("gesture")
+        gesture_text = f"{gesture} · " if gesture and gesture not in ("stop", mode) else ""
+        reason = str(prediction.get("reason") or "")
+        suffix = f" | {reason}" if reason else ""
+        label.setText(f"Prediction: {gesture_text}{mode_text} {conf:.2f} | [{velocity_text}] | {run_text}{suffix}")
 
     def _on_ai_direct_execution_velocity_scale_changed(self, value):
         helper = self._get_ai_direct_finger_motion_execution_helper()
@@ -4891,52 +4911,9 @@ class DirectFingerMotionMixin:
 
         self._update_anchor_button_label()
 
-    def _teaching_label_display_text(self, label):
-        button = getattr(self, "ai_teaching_label_buttons", {}).get(label)
-        if button is not None:
-            try:
-                return button.text()
-            except Exception:
-                pass
-        return "Auto/DFM" if label == "auto" else str(label)
-
-    def _update_ai_teaching_label_ui(self):
-        active_label = getattr(self, "_ai_teaching_label", "auto")
-        for label, button in getattr(self, "ai_teaching_label_buttons", {}).items():
-            is_active = label == active_label
-            try:
-                button.setChecked(is_active)
-            except Exception:
-                pass
-            if hasattr(self, "_set_button_active"):
-                self._set_button_active(button, is_active)
-
-        status = getattr(self, "ai_teaching_label_status", None)
-        if status is not None:
-            status.setText(f"Teaching: {self._teaching_label_display_text(active_label)}")
-
-    def _set_ai_teaching_label(self, label="auto"):
-        label = str(label or "auto").strip().lower()
-        if label in {"dfm", "auto_dfm", "auto/dfm", "none"}:
-            label = "auto"
-        self._ai_teaching_label = label
-        helper = self._get_ai_direct_finger_motion_helper()
-        if helper is not None and hasattr(helper, "set_teaching_override"):
-            try:
-                self._ai_teaching_label = helper.set_teaching_override(label)
-            except Exception as exc:
-                print(f"[UI] Failed to set AI teaching label '{label}': {exc}")
-        self._update_ai_teaching_label_ui()
-
-    def _set_ai_direct_finger_record_buttons(self, no_robot_active=False, robot_active=False):
-        self._ai_direct_finger_active = bool(no_robot_active)
-        self._ai_direct_finger_robot_active = bool(robot_active)
+    def _set_ai_direct_finger_record_buttons(self, active=False):
+        self._ai_direct_finger_active = bool(active)
         self._set_button_active(self.ai_direct_finger_motion_button, self._ai_direct_finger_active)
-        if hasattr(self, "ai_direct_finger_motion_robot_button"):
-            self._set_button_active(
-                self.ai_direct_finger_motion_robot_button,
-                self._ai_direct_finger_robot_active,
-            )
 
     def _automatic_ai_dfm_session_tag(self):
         rows_spin = getattr(self, "grid_rows_spin", None)
@@ -4962,37 +4939,25 @@ class DirectFingerMotionMixin:
                 f"Auto: {self._automatic_ai_dfm_session_tag()}"
             )
 
-    def _on_toggle_ai_direct_finger_motion(self, send_robot_commands=False):
-        was_no_robot_active = bool(getattr(self, "_ai_direct_finger_active", False))
-        was_robot_active = bool(getattr(self, "_ai_direct_finger_robot_active", False))
-        was_running = was_no_robot_active or was_robot_active
-
-        if was_running:
-            self._set_ai_direct_finger_record_buttons(False, False)
-        else:
-            self._set_ai_direct_finger_record_buttons(
-                no_robot_active=not bool(send_robot_commands),
-                robot_active=bool(send_robot_commands),
-            )
-
+    def _on_toggle_ai_direct_finger_motion(self):
+        was_running = bool(getattr(self, "_ai_direct_finger_active", False))
+        self._set_ai_direct_finger_record_buttons(not was_running)
         session_tag = self._current_ai_dfm_session_tag()
 
         try:
             helper = self._get_ai_direct_finger_motion_helper()
             if helper is None:
                 raise AttributeError("ai_direct_finger_motion_class is not available")
-            if hasattr(helper, "set_teaching_override"):
-                self._ai_teaching_label = helper.set_teaching_override(
-                    getattr(self, "_ai_teaching_label", "auto")
-                )
-                self._update_ai_teaching_label_ui()
+            # Read the selection when arming, including after a sensor rebuild.
+            mode_combo = getattr(self, "record_trigger_mode_combo", None)
+            start_on_touch = mode_combo is not None and mode_combo.currentData() == "trigger"
             helper.toggle_ai_direct_finger_motion(
                 session_tag=session_tag,
-                send_robot_commands=bool(send_robot_commands),
+                start_on_touch=start_on_touch,
             )
         except Exception as exc:
-            print(f"[UI] AI direct finger motion toggle failed: {exc}")
-            self._set_ai_direct_finger_record_buttons(was_no_robot_active, was_robot_active)
+            print(f"[UI] Gesture recording toggle failed: {exc}")
+            self._set_ai_direct_finger_record_buttons(was_running)
 
     def _set_ai_proximity_environment_status(self, text, state="idle"):
         label = getattr(
@@ -5033,10 +4998,7 @@ class DirectFingerMotionMixin:
             button.blockSignals(False)
             self._set_button_active(button, active)
 
-        control_names = (
-            "ai_direct_finger_motion_button",
-            "ai_direct_finger_motion_robot_button",
-        )
+        control_names = ("ai_direct_finger_motion_button",)
         if active:
             self._ai_environment_previous_control_states = {
                 name: bool(getattr(self, name).isEnabled())
@@ -5307,10 +5269,7 @@ class DirectFingerMotionMixin:
             )
             return
         try:
-            helper.toggle_ai_direct_finger_motion(
-                session_tag=session_tag,
-                send_robot_commands=False,
-            )
+            helper.toggle_ai_direct_finger_motion(session_tag=session_tag)
         except Exception as exc:
             self._fail_ai_proximity_environment_recording(
                 f"Could not start trial {trial_number}: {exc}"
@@ -5576,34 +5535,110 @@ class DirectFingerMotionMixin:
     def _set_ai_direct_execution_model_path(
         self,
         model_path,
-        *,
-        is_default=False,
     ):
+        helper = getattr(self, "_ai_direct_execution_display_helper", None)
+        if bool(getattr(self, "_ai_direct_finger_execution_active", False)) or bool(getattr(helper, "is_running", False)):
+            return
         path = os.path.abspath(os.path.expanduser(str(model_path).strip()))
         if hasattr(self, "ai_direct_execution_model_path_input"):
             self.ai_direct_execution_model_path_input.setText(path)
+        dry_run = getattr(self, "ai_direct_execution_dry_run_checkbox", None)
+        if dry_run is not None:
+            dry_run.setChecked(True)
+        scale = getattr(self, "ai_direct_execution_velocity_scale_spin", None)
+        if scale is not None:
+            # Selection must not instantiate the execution helper via the
+            # speed-change callback, even when no sensor is connected.
+            blocked = scale.blockSignals(True)
+            try:
+                scale.setValue(1.00)
+            finally:
+                scale.blockSignals(blocked)
+        feedback_panel = getattr(self, "ai_touch_gesture_feedback", None)
+        if feedback_panel is not None:
+            feedback_panel.clear()
+        # A display refresh must not instantiate the lazy execution helper.
+        self._refresh_ai_direct_execution_model_status(
+            getattr(self, "_ai_direct_execution_display_helper", None)
+        )
 
+    def _refresh_ai_direct_execution_model_status(self, helper=None):
+        """Show the selected checkpoint, or the actual loaded one while running."""
+        self._ai_direct_execution_display_helper = helper
+        path_input = getattr(self, "ai_direct_execution_model_path_input", None)
+        selected_path = path_input.text().strip() if path_input is not None else ""
+        running = bool(getattr(helper, "is_running", False)) if helper is not None else False
+        loaded_path = str(getattr(helper, "loaded_model_checkpoint_path", "") or "") if helper is not None else ""
+        path = (loaded_path or str(getattr(helper, "model_checkpoint_path", "") or "")) if running else selected_path
+        prefix = "Running" if running else "Selected"
+        model_type = ""
+        loaded_matches = helper is not None and loaded_path and path and (
+            os.path.realpath(loaded_path) == os.path.realpath(path)
+        ) and bool(getattr(helper, "model_loaded", False))
+        bundle = None
+        kind = None
+        if loaded_matches and running:
+            kind = str(getattr(helper, "model_kind", ""))
+            model_type = {
+                "cnn_gru": "CNN–GRU",
+                "cnn_tcn_gesture": "Touch gesture policy",
+                "legacy_transformer": "CNN–Transformer",
+            }.get(kind, "")
+            bundle = getattr(helper, "_touch_gesture_bundle", {}) if kind == "cnn_tcn_gesture" else {}
+            if bundle.get("members") and bundle.get("class_names"):
+                architectures = sorted({m["config"]["architecture"] for m in bundle["members"]})
+                names = {"cnn_gru": "CNN–GRU", "cnn_tcn": "CNN–TCN"}
+                model_type = " + ".join(names.get(a, a) for a in architectures)
+                model_type += f" · {len(bundle['class_names'])} gestures"
+                if len(bundle["members"]) > 1:
+                    model_type += f" · ensemble ({len(bundle['members'])})"
+            if bundle.get("preprocess", {}).get("prediction_unit") == "recent_touch_window":
+                window_ms = round(bundle["preprocess"].get("window_duration_sec", 0.2) * 1000)
+                model_type += f" · continuous {window_ms} ms"
+        details = getattr(self, "ai_direct_execution_model_details", None)
+        if details is not None:
+            # Only active execution overrides on-disk preview. A stopped
+            # model may be reselected after its checkpoint has been updated.
+            details.set_source(path, loaded_bundle=bundle if running else None,
+                               loaded_kind=kind if running else None)
         label = getattr(self, "ai_direct_execution_model_status", None)
         if label is not None:
-            prefix = "Default" if is_default else "Selected"
-            label.setToolTip(path)
-            label.setText(f"{prefix}: {os.path.basename(path)}")
-            if os.path.isfile(path):
+            name = os.path.basename(path) if path else "no checkpoint selected"
+            text = f"Model: {prefix}: {name}"
+            if model_type:
+                text += f" | {model_type}"
+            tooltip = path
+            if running:
+                tooltip = "Currently running checkpoint:\n" + path
+                if selected_path and os.path.realpath(selected_path) != os.path.realpath(path):
+                    tooltip += "\n\nSelected for the next run:\n" + selected_path
+            exists = bool(path) and os.path.isfile(path)
+            if not running and path and not exists:
+                text += "\nCheckpoint file not found"
+            display_state = (id(label), text, tooltip, running, exists)
+            if display_state != getattr(self, "_ai_direct_execution_model_display_state", None):
+                label.setText(text)
+                label.setToolTip(tooltip)
+                label.setAccessibleName("Touch policy checkpoint")
+                label.setAccessibleDescription(text + "\n" + tooltip)
                 label.setStyleSheet(
                     f"color: {theme.SUCCESS_HOVER}; font-weight: 600;"
+                    if running or exists else f"color: {theme.DANGER_HOVER};"
                 )
-            else:
-                label.setStyleSheet(f"color: {theme.DANGER_HOVER};")
+                self._ai_direct_execution_model_display_state = display_state
 
-        default_button = getattr(
-            self,
-            "ai_direct_execution_use_default_button",
-            None,
-        )
-        if default_button is not None:
-            default_button.setEnabled(not is_default)
+        select_button = getattr(self, "ai_direct_execution_select_model_button", None)
+        if select_button is not None:
+            select_button.setEnabled(not running)
+
+        dry_run_checkbox = getattr(self, "ai_direct_execution_dry_run_checkbox", None)
+        if dry_run_checkbox is not None:
+            dry_run_checkbox.setEnabled(not running)
 
     def _on_select_ai_direct_execution_model(self):
+        helper = getattr(self, "_ai_direct_execution_display_helper", None)
+        if bool(getattr(self, "_ai_direct_finger_execution_active", False)) or bool(getattr(helper, "is_running", False)):
+            return
         default_path = self._get_default_ai_execution_model_path()
         current_path = default_path
         if hasattr(self, "ai_direct_execution_model_path_input"):
@@ -5618,7 +5653,7 @@ class DirectFingerMotionMixin:
         )
         dialog = QFileDialog(
             self,
-            "Select AI Direct Finger Motion Model",
+            "Select Touch Policy Model",
             start_directory,
             "PyTorch Models (*.pt *.pth);;All Files (*)",
         )
@@ -5631,9 +5666,3 @@ class DirectFingerMotionMixin:
         if not selected:
             return
         self._set_ai_direct_execution_model_path(selected[0])
-
-    def _on_use_default_ai_direct_execution_model(self):
-        self._set_ai_direct_execution_model_path(
-            self._get_default_ai_execution_model_path(),
-            is_default=True,
-        )

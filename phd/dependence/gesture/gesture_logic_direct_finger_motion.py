@@ -7,6 +7,7 @@ import time
 import numpy as np
 from PyQt5.QtCore import QTimer
 from phd.dependence.paths import ai_resource_path, resource_path
+from phd.dependence.gesture.touch_gesture_execution import TouchGestureExecutionMixin
 
 from phd.dependence.sensor_layout import (
     column_major_coords,
@@ -1049,225 +1050,43 @@ class DirectFingerMotion:
 
 
 class AI_DirectFingerMotion(DirectFingerMotion):
+    """Record touch-gesture trials: tactile frames only, never robot commands.
+
+    The inherited rule-based controller is not run while recording. A trial's
+    label is its session folder name.
+    """
+
+    DATASET_VERSION = 4
     RECORD_TARGET_HZ = 60.0
     RECORD_TIMER_INTERVAL_MS = 16
-    TARGET_SEQ_LEN = 16
-    TEACHING_AUTO_LABEL = "auto"
-    TEACHING_LABELS = (
-        "auto",
-        "stop",
-        "normal_swipe",
-        "push",
-        "pull",
-        "x_pos",
-        "x_neg",
-        "y_pos",
-        "y_neg",
-        "z_pos",
-        "z_neg",
-        "rx_pos",
-        "rx_neg",
-        "ry_pos",
-        "ry_neg",
-        "rz_pos",
-        "rz_neg",
-    )
+    # Same contact threshold as the touch-gesture trainers' preprocessing.
+    TOUCH_THRESHOLD_PERCENT = -3.0
+    TOUCH_RELEASE_FRAMES = 3
+    TOUCH_RELEASE_SEC = 0.12
+    MIN_TOUCH_FRAMES = 2
+    SENSOR_CHANNELS = ("rawData", "diffData", "diffPerData", "diffDataAve", "diffPerDataAve")
 
     def __init__(self, ros_splitter_instance, my_sensor_instance):
         super().__init__(ros_splitter_instance, my_sensor_instance)
+        self.robot_command_output_enabled = False
 
-        self.dataset_root = os.path.join(self.AI_DATA_DIR, "ai_direct_finger_motion")
+        self.dataset_root = os.path.join(self.AI_DATA_DIR, "tactile_recordings")
         self.min_frames_to_save = 5
         self.session_tag = "default"
         self.trial_number = None
         self.episode_started_at = None
         self.episode_started_perf_at = None
         self._last_episode_perf_timestamp = None
-        self.teaching_override_label = self.TEACHING_AUTO_LABEL
-        self.send_robot_commands = False
+        self.start_on_touch = False
+        self._touch_trial_active = False
+        self._trial_touch_frames = 0
+        self._release_frames = 0
+        self._release_started_at = None
         self.current_episode = self._create_empty_episode()
 
     def _create_empty_episode(self):
-        return {
-            "timestamps": [],
-            "elapsed_sec": [],
-            "dt_sec": [],
-            "sensor_frame_sequence": [],
-            "rawData": [],
-            "diffData": [],
-            "diffPerData": [],
-            "diffDataAve": [],
-            "diffPerDataAve": [],
-            "touch_mask": [],
-            "touch_present": [],
-            "finger_count_est": [],
-            "cluster_count": [],
-            "center": [],
-            "delta": [],
-            "delta_norm": [],
-            "speed": [],
-            "peak_value": [],
-            "mean_active_value": [],
-            "mode": [],
-            "teacher_velocity_pre_flip": [],
-            "teacher_velocity_sent": [],
-            "teacher_velocity_target": [],
-            "intended_velocity_target": [],
-            "intended_mode": [],
-            "teaching_label": [],
-            "teaching_source": [],
-            "manual_override_active": [],
-            "robot_tool_pose": [],
-            "robot_joint_positions": [],
-            "robot_feedback_valid": [],
-            "control_frame_idx": [],
-            "two_peak_state": [],
-            "selected_frame": [],
-        }
-
-    @staticmethod
-    def _safe_sequence(value, length):
-        if value is None:
-            return [float("nan")] * int(length)
-        try:
-            seq = list(value)
-        except Exception:
-            return [float("nan")] * int(length)
-
-        out = []
-        for idx in range(int(length)):
-            try:
-                out.append(float(seq[idx]))
-            except Exception:
-                out.append(float("nan"))
-        return out
-
-    def _safe_tool_pose(self):
-        robot_api = getattr(self.ros_splitter, "robot_api", None)
-        if robot_api is None or not hasattr(robot_api, "get_current_tool_position"):
-            return [float("nan")] * 7
-        try:
-            pos, quat = robot_api.get_current_tool_position()
-            return self._safe_sequence(pos, 3) + self._safe_sequence(quat, 4)
-        except Exception:
-            return [float("nan")] * 7
-
-    def _safe_joint_positions(self):
-        robot_api = getattr(self.ros_splitter, "robot_api", None)
-        if robot_api is None or not hasattr(robot_api, "get_current_positions"):
-            return [float("nan")] * 6
-        try:
-            return self._safe_sequence(robot_api.get_current_positions(), 6)
-        except Exception:
-            return [float("nan")] * 6
-
-    @staticmethod
-    def _selected_frame_index(frame_name):
-        frame_name = str(frame_name or "").lower()
-        if frame_name in {"tool", "tcp", "joint6", "j6"}:
-            return 6.0
-        if frame_name in {"base", "world", "joint1", "j1"}:
-            return 1.0
-        match = re.fullmatch(r"(?:joint|j)([1-6])", frame_name)
-        if match:
-            return float(match.group(1))
-        return 0.0
-
-    def _two_peak_state_vector(self):
-        state = self.current_two_peak_state
-        if state is None:
-            return [float("nan")] * 9
-        return [
-            float(state.get("left_col", np.nan)),
-            float(state.get("left_row", np.nan)),
-            float(state.get("right_col", np.nan)),
-            float(state.get("right_row", np.nan)),
-            float(state.get("left_force", np.nan)),
-            float(state.get("right_force", np.nan)),
-            float(state.get("span", np.nan)),
-            float(state.get("mid_col", np.nan)),
-            float(state.get("mid_row", np.nan)),
-        ]
-
-    def set_teaching_override(self, label=None):
-        label = str(label or self.TEACHING_AUTO_LABEL).strip().lower()
-        if label in {"dfm", "auto_dfm", "auto/dfm", "none"}:
-            label = self.TEACHING_AUTO_LABEL
-        if label not in self.TEACHING_LABELS:
-            label = self.TEACHING_AUTO_LABEL
-        self.teaching_override_label = label
-        return self.teaching_override_label
-
-    def get_teaching_override_label(self):
-        return str(getattr(self, "teaching_override_label", self.TEACHING_AUTO_LABEL))
-
-    def _manual_teaching_velocity_target(self, label):
-        label = str(label or self.TEACHING_AUTO_LABEL)
-        linear_speed = float(
-            max(
-                abs(float(getattr(self, "robot_speed", 0.0))),
-                abs(float(getattr(self, "push_speed", 0.0))),
-                abs(float(getattr(self, "pull_speed", 0.0))),
-            )
-        )
-        push_speed = abs(float(getattr(self, "push_speed", linear_speed)))
-        pull_speed = abs(float(getattr(self, "pull_speed", linear_speed)))
-        rotation_speed = abs(float(getattr(self, "rotation_speed", 0.0)))
-
-        velocity = [0.0] * 6
-        if label == "stop":
-            return velocity
-        if label == "push":
-            velocity[1] = -push_speed * self._push_pressure_speed_ratio()
-            return velocity
-        if label == "pull":
-            velocity[1] = pull_speed * self._two_finger_pressure_speed_ratio()
-            return velocity
-
-        axis_map = {
-            "x_pos": (0, 1.0, linear_speed),
-            "x_neg": (0, -1.0, linear_speed),
-            "y_pos": (1, 1.0, linear_speed),
-            "y_neg": (1, -1.0, linear_speed),
-            "z_pos": (2, 1.0, linear_speed),
-            "z_neg": (2, -1.0, linear_speed),
-            "rx_pos": (3, 1.0, rotation_speed),
-            "rx_neg": (3, -1.0, rotation_speed),
-            "ry_pos": (4, 1.0, rotation_speed),
-            "ry_neg": (4, -1.0, rotation_speed),
-            "rz_pos": (5, 1.0, rotation_speed),
-            "rz_neg": (5, -1.0, rotation_speed),
-        }
-        spec = axis_map.get(label)
-        if spec is None:
-            return None
-        axis, sign, speed = spec
-        velocity[axis] = float(sign * speed)
-        return velocity
-
-    def _normal_swipe_teaching_target(self, feature):
-        if feature is None or not bool(feature.get("touch_present", 0.0)):
-            return self._zero_velocity(), "stop"
-
-        delta_col = float(feature.get("delta_col_norm", 0.0))
-        delta_row = float(feature.get("delta_row_norm", 0.0))
-        pre_flip_velocity = self._centroid_delta_to_robot_velocity(delta_col, delta_row)
-        if not any(abs(value) > 1e-12 for value in pre_flip_velocity):
-            return self._zero_velocity(), "stop"
-        return self._sent_velocity_from_pre_flip(pre_flip_velocity), "single_finger_swipe"
-
-    def _intended_teaching_target(self, dfm_target, dfm_mode, feature=None):
-        label = self.get_teaching_override_label()
-        if label == self.TEACHING_AUTO_LABEL:
-            return list(dfm_target), str(dfm_mode), label, "dfm", 0
-        if label == "normal_swipe":
-            velocity, mode = self._normal_swipe_teaching_target(feature)
-            return list(velocity), mode, label, "manual", 1
-
-        velocity = self._manual_teaching_velocity_target(label)
-        if velocity is None:
-            return list(dfm_target), str(dfm_mode), self.TEACHING_AUTO_LABEL, "dfm", 0
-        return list(velocity), str(label), label, "manual", 1
+        keys = ("timestamps", "elapsed_sec", "dt_sec", "sensor_frame_sequence", "touch_present")
+        return {key: [] for key in keys + self.SENSOR_CHANNELS}
 
     def sanitize_session_tag(self, session_tag):
         session_tag = (session_tag or "default").strip()
@@ -1288,35 +1107,49 @@ class AI_DirectFingerMotion(DirectFingerMotion):
                     existing.append(int(match.group(1)))
         return max(existing, default=0) + 1
 
-    def toggle_ai_direct_finger_motion(self, session_tag=None, send_robot_commands=False):
+    def _clear_recording_episode(self):
+        self.current_episode = self._create_empty_episode()
+        self.trial_number = None
+        self.episode_started_at = None
+        self.episode_started_perf_at = None
+        self._last_episode_perf_timestamp = None
+        self._touch_trial_active = False
+        self._trial_touch_frames = 0
+        self._release_frames = 0
+        self._release_started_at = None
+
+    def _begin_recording_episode(self, timestamp, perf_timestamp):
+        self.trial_number = self._get_next_trial_number()
+        self.episode_started_at = float(timestamp)
+        self.episode_started_perf_at = float(perf_timestamp)
+        self._last_episode_perf_timestamp = None
+
+    def toggle_ai_direct_finger_motion(self, session_tag=None, start_on_touch=False):
         self.is_running = not self.is_running
 
         if self.is_running:
             self.session_tag = self.sanitize_session_tag(session_tag)
-            self.send_robot_commands = bool(send_robot_commands)
-            self.robot_command_output_enabled = bool(send_robot_commands)
-            self.trial_number = self._get_next_trial_number()
-            self.episode_started_at = time.time()
-            self.episode_started_perf_at = time.perf_counter()
-            self._last_episode_perf_timestamp = None
-            self.current_episode = self._create_empty_episode()
+            self.start_on_touch = bool(start_on_touch)
+            self._clear_recording_episode()
+            if not self.start_on_touch:
+                self._begin_recording_episode(time.time(), time.perf_counter())
             self._reset_state()
             self.control_timer.start(int(self.RECORD_TIMER_INTERVAL_MS))
-            record_mode = "with_robot" if self.send_robot_commands else "no_robot"
             print(
-                f"AI direct finger motion STARTED ({record_mode}) | session='{self.session_tag}' | "
+                f"Touch gesture recording STARTED | session='{self.session_tag}' | "
                 f"trial={self.trial_number} | target={self.RECORD_TARGET_HZ:.0f} Hz"
             )
+            if self.start_on_touch:
+                print("Touch recording ARMED: touch to start; lift to save; repeats until stopped.")
         else:
             self.control_timer.stop()
-            self._stop_robot_motion(stop_mode=True)
-            self._save_episode()
-            self.robot_command_output_enabled = True
-            self.send_robot_commands = False
+            if self.current_episode["timestamps"]:
+                self._save_episode(reason="manual_stop")
+            self._clear_recording_episode()
             self._reset_state()
             self.episode_started_perf_at = None
             self._last_episode_perf_timestamp = None
-            print("AI direct finger motion STOPPED")
+            print("Touch gesture recording STOPPED")
 
     def run_step(self):
         if not self.is_running:
@@ -1330,30 +1163,50 @@ class AI_DirectFingerMotion(DirectFingerMotion):
         if sensor_frame_sequence is not None:
             if sensor_frame_sequence == self._last_processed_sensor_frame:
                 timeout = max(0.0, float(getattr(self, "sensor_frame_timeout_sec", 0.2)))
-                if (
-                    timeout > 0.0
-                    and self.last_robot_velocity_cmd != self._zero_velocity()
-                    and (perf_timestamp - self._last_sensor_frame_seen_at) >= timeout
-                ):
-                    self._apply_stop_output()
+                if timeout > 0.0 and (perf_timestamp - self._last_sensor_frame_seen_at) >= timeout:
+                    # A stream interruption is not evidence that the finger lifted.
+                    self._release_frames = 0
+                    self._release_started_at = None
                 return
             self._last_processed_sensor_frame = sensor_frame_sequence
             self._last_sensor_frame_seen_at = perf_timestamp
 
-        prev_row = self.last_touch_center_row
-        prev_col = self.last_touch_center_col
         timestamp = time.time()
         sensor_snapshot = self._snapshot_sensor_frame()
+        values = sensor_snapshot["diffPerDataAve"]
+        touching = bool(np.any(values < self.TOUCH_THRESHOLD_PERCENT))
 
-        self.print_single_touch_map_with_motion(threshold=self.motion_threshold)
-        self._append_teacher_frame(
-            timestamp,
-            perf_timestamp,
-            sensor_frame_sequence,
-            sensor_snapshot,
-            prev_row,
-            prev_col,
-        )
+        if self.start_on_touch:
+            if not np.isfinite(values).all():
+                self._release_frames = 0
+                self._release_started_at = None
+                return
+            if not self._touch_trial_active:
+                if not touching:
+                    return  # Armed: do not record the idle time between touches.
+                self._begin_recording_episode(timestamp, perf_timestamp)
+                self._touch_trial_active = True
+                print(f"Touch detected: started Trial {self.trial_number}.")
+            if touching:
+                self._trial_touch_frames += 1
+                self._release_frames = 0
+                self._release_started_at = None
+            else:
+                self._release_frames += 1
+                if self._release_started_at is None:
+                    self._release_started_at = perf_timestamp
+
+        self._append_frame(timestamp, perf_timestamp, sensor_frame_sequence, sensor_snapshot, touching)
+        if (
+            self.start_on_touch
+            and self._release_frames >= self.TOUCH_RELEASE_FRAMES
+            and self._release_started_at is not None
+            and perf_timestamp - self._release_started_at >= self.TOUCH_RELEASE_SEC
+        ):
+            self._save_episode(reason="touch_released")
+            # Keep the fresh-frame gate intact: the last release frame must not
+            # be processed twice. The next touch creates a new numbered trial.
+            print("Touch recording ARMED: waiting for the next touch.")
 
     def _snapshot_sensor_frame(self):
         data = self.my_sensor._data
@@ -1365,19 +1218,8 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             "diffPerDataAve": column_major_matrix_view(data.diffPerDataAve, dtype=np.float32, copy=True),
         }
 
-    def _append_teacher_frame(
-        self,
-        timestamp,
-        perf_timestamp,
-        sensor_frame_sequence,
-        sensor_snapshot,
-        prev_row,
-        prev_col,
-    ):
+    def _append_frame(self, timestamp, perf_timestamp, sensor_frame_sequence, sensor_snapshot, touching):
         episode = self.current_episode
-        values = sensor_snapshot["diffPerDataAve"]
-        feature = self._compute_touch_motion_features(values, prev_row, prev_col)
-
         if self.episode_started_perf_at is None:
             self.episode_started_perf_at = float(perf_timestamp)
         elapsed_sec = float(perf_timestamp - self.episode_started_perf_at)
@@ -1387,69 +1229,23 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             dt_sec = float(perf_timestamp - self._last_episode_perf_timestamp)
         self._last_episode_perf_timestamp = float(perf_timestamp)
 
-        teacher_pre_flip = self._safe_sequence(self.last_teacher_velocity_pre_flip, 6)
-        teacher_sent = self._safe_sequence(self.last_robot_velocity_cmd or self._zero_velocity(), 6)
-        (
-            intended_velocity,
-            intended_mode,
-            teaching_label,
-            teaching_source,
-            manual_override_active,
-        ) = self._intended_teaching_target(teacher_sent, self.current_motion_mode, feature)
-        tool_pose = self._safe_tool_pose()
-        joint_positions = self._safe_joint_positions()
-        robot_feedback_valid = int(
-            any(np.isfinite(tool_pose)) or any(np.isfinite(joint_positions))
-        )
-        selected_frame = feature["selected_frame"]
-
         episode["timestamps"].append(float(timestamp))
         episode["elapsed_sec"].append(np.float32(elapsed_sec))
         episode["dt_sec"].append(np.float32(dt_sec))
         episode["sensor_frame_sequence"].append(
             np.int64(-1 if sensor_frame_sequence is None else int(sensor_frame_sequence))
         )
+        episode["touch_present"].append(np.uint8(touching))
         for key, value in sensor_snapshot.items():
             episode[key].append(value)
-        episode["touch_mask"].append(feature["touch_mask"].astype(np.uint8))
-        episode["touch_present"].append(np.uint8(feature["touch_present"] > 0.0))
-        episode["finger_count_est"].append(np.int16(feature["finger_count_est"]))
-        episode["cluster_count"].append(np.int16(feature["cluster_count"]))
-        episode["center"].append(
-            np.array(
-                [
-                    np.nan if feature["current_row"] is None else float(feature["current_row"]),
-                    np.nan if feature["current_col"] is None else float(feature["current_col"]),
-                ],
-                dtype=np.float32,
-            )
-        )
-        episode["delta"].append(np.array([feature["delta_row"], feature["delta_col"]], dtype=np.float32))
-        episode["delta_norm"].append(np.array([feature["delta_row_norm"], feature["delta_col_norm"]], dtype=np.float32))
-        episode["speed"].append(np.float32(feature["speed"]))
-        episode["peak_value"].append(np.float32(feature["peak_value"]))
-        episode["mean_active_value"].append(np.float32(feature["mean_active_value"]))
-        episode["mode"].append(str(self.current_motion_mode))
-        episode["teacher_velocity_pre_flip"].append(np.asarray(teacher_pre_flip, dtype=np.float32))
-        episode["teacher_velocity_sent"].append(np.asarray(teacher_sent, dtype=np.float32))
-        episode["teacher_velocity_target"].append(np.asarray(teacher_sent, dtype=np.float32))
-        episode["intended_velocity_target"].append(np.asarray(intended_velocity, dtype=np.float32))
-        episode["intended_mode"].append(str(intended_mode))
-        episode["teaching_label"].append(str(teaching_label))
-        episode["teaching_source"].append(str(teaching_source))
-        episode["manual_override_active"].append(np.uint8(manual_override_active))
-        episode["robot_tool_pose"].append(np.asarray(tool_pose, dtype=np.float32))
-        episode["robot_joint_positions"].append(np.asarray(joint_positions, dtype=np.float32))
-        episode["robot_feedback_valid"].append(np.uint8(robot_feedback_valid))
-        episode["control_frame_idx"].append(np.float32(self._selected_frame_index(selected_frame)))
-        episode["two_peak_state"].append(np.asarray(self._two_peak_state_vector(), dtype=np.float32))
-        episode["selected_frame"].append(selected_frame)
 
-    def _save_episode(self):
+    def _save_episode(self, reason="manual_stop"):
         frame_count = len(self.current_episode["timestamps"])
-        if frame_count < self.min_frames_to_save:
-            print(f"AI direct finger motion: only {frame_count} frame(s), skip save.")
-            self.current_episode = self._create_empty_episode()
+        if frame_count < self.min_frames_to_save or (
+            self.start_on_touch and self._trial_touch_frames < self.MIN_TOUCH_FRAMES
+        ):
+            print(f"Touch gesture recording: trial too short ({frame_count} frames), skip save.")
+            self._clear_recording_episode()
             return
 
         session_dir = self._session_dir()
@@ -1459,8 +1255,8 @@ class AI_DirectFingerMotion(DirectFingerMotion):
         filename = os.path.join(session_dir, f"trial_{int(self.trial_number):04d}_{started_stamp}.npz")
 
         metadata = {
-            "dataset_version": 3,
-            "dataset_role": "ai_direct_finger_motion_stage2_teaching_recording",
+            "dataset_version": self.DATASET_VERSION,
+            "dataset_role": "touch_gesture_recording",
             "session_tag": self.session_tag,
             "trial_number": int(self.trial_number or 0),
             "frame_count": int(frame_count),
@@ -1471,37 +1267,17 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             "sensor_model": str(getattr(self.my_sensor, "current_model_name", "")),
             "sensor_reorder_mode": str(getattr(self.my_sensor, "current_reorder_mode", "")),
             "sensor_average_window_size": int(getattr(self.my_sensor, "sensor_average_window_size", 0) or 0),
-            "motion_threshold": float(self.motion_threshold),
-            "teacher": "direct_finger_motion_v1_rule_based",
+            # Historic key name: loaders read it to transpose the frame arrays.
             "teacher_layout": "column_major_matrix_view",
-            "record_mode": "with_robot" if bool(getattr(self, "send_robot_commands", False)) else "no_robot",
-            "send_robot_commands": bool(getattr(self, "send_robot_commands", False)),
+            "robot_commands_sent": False,
+            "record_trigger_mode": "trigger" if self.start_on_touch else "no_trigger",
+            "completion_reason": str(reason),
+            "touch_threshold_percent": float(self.TOUCH_THRESHOLD_PERCENT),
+            "touch_release_frames": int(self.TOUCH_RELEASE_FRAMES),
+            "touch_release_sec": float(self.TOUCH_RELEASE_SEC),
             "record_target_hz": float(self.RECORD_TARGET_HZ),
             "record_timer_interval_ms": int(self.RECORD_TIMER_INTERVAL_MS),
-            "target_sequence_length": int(self.TARGET_SEQ_LEN),
-            "target_window_sec_estimate": float(self.TARGET_SEQ_LEN / self.RECORD_TARGET_HZ),
             "fresh_sensor_frame_gated": True,
-            "model_input_intent": "recent tactile sequence + robot state",
-            "model_output_intent": "6d velocity [vx, vy, vz, rx, ry, rz] in selected EE frame",
-            "training_target_key": "intended_velocity_target",
-            "dfm_training_target_key": "teacher_velocity_target",
-            "intended_training_target_key": "intended_velocity_target",
-            "teaching_labels": list(self.TEACHING_LABELS),
-            "teaching_auto_label": self.TEACHING_AUTO_LABEL,
-            "two_peak_state_layout": [
-                "left_col",
-                "left_row",
-                "right_col",
-                "right_row",
-                "left_force",
-                "right_force",
-                "span",
-                "mid_col",
-                "mid_row",
-            ],
-            "robot_tool_pose_layout": ["x", "y", "z", "qw", "qx", "qy", "qz"],
-            "robot_joint_positions_layout": ["j1", "j2", "j3", "j4", "j5", "j6"],
-            "dfm_settings": self.get_settings(),
         }
 
         episode = self.current_episode
@@ -1512,52 +1288,23 @@ class AI_DirectFingerMotion(DirectFingerMotion):
             elapsed_sec=np.asarray(episode["elapsed_sec"], dtype=np.float32),
             dt_sec=np.asarray(episode["dt_sec"], dtype=np.float32),
             sensor_frame_sequence=np.asarray(episode["sensor_frame_sequence"], dtype=np.int64),
-            rawData=np.stack(episode["rawData"], axis=0),
-            diffData=np.stack(episode["diffData"], axis=0),
-            diffPerData=np.stack(episode["diffPerData"], axis=0),
-            diffDataAve=np.stack(episode["diffDataAve"], axis=0),
-            diffPerDataAve=np.stack(episode["diffPerDataAve"], axis=0),
-            touch_mask=np.stack(episode["touch_mask"], axis=0),
             touch_present=np.asarray(episode["touch_present"], dtype=np.uint8),
-            finger_count_est=np.asarray(episode["finger_count_est"], dtype=np.int16),
-            cluster_count=np.asarray(episode["cluster_count"], dtype=np.int16),
-            center=np.stack(episode["center"], axis=0),
-            delta=np.stack(episode["delta"], axis=0),
-            delta_norm=np.stack(episode["delta_norm"], axis=0),
-            speed=np.asarray(episode["speed"], dtype=np.float32),
-            peak_value=np.asarray(episode["peak_value"], dtype=np.float32),
-            mean_active_value=np.asarray(episode["mean_active_value"], dtype=np.float32),
-            mode=np.asarray(episode["mode"], dtype="U32"),
-            teacher_velocity_pre_flip=np.stack(episode["teacher_velocity_pre_flip"], axis=0),
-            teacher_velocity_sent=np.stack(episode["teacher_velocity_sent"], axis=0),
-            teacher_velocity_target=np.stack(episode["teacher_velocity_target"], axis=0),
-            intended_velocity_target=np.stack(episode["intended_velocity_target"], axis=0),
-            intended_mode=np.asarray(episode["intended_mode"], dtype="U32"),
-            teaching_label=np.asarray(episode["teaching_label"], dtype="U32"),
-            teaching_source=np.asarray(episode["teaching_source"], dtype="U16"),
-            manual_override_active=np.asarray(episode["manual_override_active"], dtype=np.uint8),
-            robot_tool_pose=np.stack(episode["robot_tool_pose"], axis=0),
-            robot_joint_positions=np.stack(episode["robot_joint_positions"], axis=0),
-            robot_feedback_valid=np.asarray(episode["robot_feedback_valid"], dtype=np.uint8),
-            control_frame_idx=np.asarray(episode["control_frame_idx"], dtype=np.float32),
-            two_peak_state=np.stack(episode["two_peak_state"], axis=0),
-            selected_frame=np.asarray(episode["selected_frame"], dtype="U32"),
+            **{key: np.stack(episode[key], axis=0) for key in self.SENSOR_CHANNELS},
         )
 
-        print(f"AI direct finger motion episode saved: {filename}")
-        self.current_episode = self._create_empty_episode()
-        self.episode_started_at = None
-        self.trial_number = None
+        print(f"Touch gesture trial saved: {filename}")
+        self._clear_recording_episode()
+        return filename
 
 
-class AI_DirectFingerMotion_execution(DirectFingerMotion):
+class AI_DirectFingerMotion_execution(TouchGestureExecutionMixin, DirectFingerMotion):
     MODE_TO_INDEX = {"stop": 0, "move": 1, "push": 2, "pull": 3}
     INDEX_TO_MODE = {v: k for k, v in MODE_TO_INDEX.items()}
     SAFE_MAX_LINEAR_SPEED_MPS = 0.30
     DEFAULT_MODEL_CHECKPOINT = os.path.join(
         DirectFingerMotion.AI_MODELS_DIR,
-        "ai_direct_finger_motion",
-        "latest_cnn_gru_model_10x10.pt",
+        "touch_policy",
+        "six_gestures_single_touch_10x10.pt",
     )
 
     def __init__(self, ros_splitter_instance, my_sensor_instance):
@@ -1629,6 +1376,10 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         return self._torch
 
     def set_dry_run_predictions_only(self, enabled=True):
+        # A running live policy must stop through the live zero-command path.
+        # Switching to dry-run just before Stop would otherwise skip that stop.
+        if self.is_running:
+            return self.dry_run_predictions_only
         self.dry_run_predictions_only = bool(enabled)
         return self.dry_run_predictions_only
 
@@ -1643,6 +1394,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         return self.velocity_scale
 
     def _reset_execution_buffers(self):
+        self._detach_touch_gesture_stream()
         self.frame_buffer = []
         self.aux_buffer = []
         self._prev_diff_for_frame_diff = None
@@ -1685,8 +1437,23 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         self._reset_state()
         self._reset_execution_buffers()
         self._reset_execution_runtime_state()
+        if self.model_kind == "cnn_tcn_gesture":
+            try:
+                self._start_touch_gesture_stream()
+            except Exception as exc:
+                self.is_running = False
+                self._detach_touch_gesture_stream()
+                self.last_prediction = {"mode": "stop", "mode_conf": 1.0, "finger_idx": 0,
+                                        "velocity_sent": [0.0] * 6, "dry_run": self.dry_run_predictions_only,
+                                        "gesture": "stop", "reason": str(exc)}
+                print(f"[Touch Policy] Cannot start: {exc}")
+                return False
         if not self.dry_run_predictions_only:
-            self._ensure_robot_velocity_mode()
+            if self.model_kind == "cnn_tcn_gesture" and not self.is_running:
+                return False
+            if not self._ensure_robot_velocity_mode() and self.model_kind == "cnn_tcn_gesture":
+                self._touch_robot_command_failed()
+                return False
         self.control_timer.start(self.prediction_interval_ms)
         mode_text = "DRY RUN" if self.dry_run_predictions_only else "ROBOT MOTION ENABLED"
         print(
@@ -1710,6 +1477,7 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         else:
             self.control_timer.stop()
             self._cancel_pending_inference()
+            self._detach_touch_gesture_stream()
         self._shutdown_inference_executor(wait=wait)
 
     def _shutdown_inference_executor(self, wait=True):
@@ -1746,13 +1514,18 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             config = checkpoint.get("config", {})
             model_class = str(checkpoint.get("model_class", ""))
             model_family = str(config.get("model_family", ""))
-            if model_class == "TactileCNNGRUPolicy" or model_family == "tactile_cnn_gru_policy":
+            if checkpoint.get("format") == "pinglab_touch_gesture_policy_v1":
+                self._load_touch_gesture_checkpoint(checkpoint)
+            elif model_class == "TactileCNNGRUPolicy" or model_family == "tactile_cnn_gru_policy":
                 self._load_cnn_gru_checkpoint(checkpoint, config)
             else:
                 self._load_legacy_transformer_checkpoint(checkpoint, config)
-            state = checkpoint.get("model_state", checkpoint)
-            self.model.load_state_dict(state)
+            if self.model_kind != "cnn_tcn_gesture":
+                state = checkpoint.get("model_state", checkpoint)
+                self.model.load_state_dict(state)
             self.model.eval()
+            if self.model_kind == "cnn_tcn_gesture":
+                self._warmup_touch_gesture_inference()
             self.model_loaded = True
             self.model_checkpoint_path = resolved_path
             self.loaded_model_checkpoint_path = resolved_path
@@ -1774,6 +1547,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         from phd.dependence.tactile_models import TactileCNNGRUPolicy
 
         self.model_kind = "cnn_gru"
+        self.max_linear_speed = self.SAFE_MAX_LINEAR_SPEED_MPS
+        self.model_conf_threshold = 0.55
+        self.min_motion_command_speed = 0.005
         self.seq_len = int(config.get("seq_len", 16))
         self.input_channels = list(config.get("channels", self.input_channels))
         self.aux_feature_names = list(config.get("aux_feature_names", self.aux_feature_names))
@@ -1819,6 +1595,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         from phd.dependence.tactile_models import _AI_DFM_CNNTactileTransformerAux
 
         self.model_kind = "legacy_transformer"
+        self.max_linear_speed = self.SAFE_MAX_LINEAR_SPEED_MPS
+        self.model_conf_threshold = 0.55
+        self.min_motion_command_speed = 0.005
         self.seq_len = int(config.get("seq_len", 20))
         self.input_channels = list(config.get("input_channels", config.get("channels", self.input_channels)))
         self.use_aux_features = bool(config.get("use_aux_features", True))
@@ -1852,6 +1631,9 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
 
     def run_step(self):
         if not self.is_running or not self.model_loaded:
+            return
+        if self.model_kind == "cnn_tcn_gesture":
+            self._run_touch_gesture_step()
             return
         if self.my_sensor.n_row < 2 or self.my_sensor.n_col < 2:
             return
@@ -2080,11 +1862,18 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             prediction = future.result()
         except Exception as exc:
             print(f"[AI-DFM] Background inference failed: {exc}")
+            if self.model_kind == "cnn_tcn_gesture":
+                self._touch_stream_fault(f"Gesture inference failed: {exc}")
             return
         # Discard the result if a stop/reset happened after submission —
         # otherwise a stale motion command could override the stop.
         if epoch != self._inference_epoch or prediction is None:
             return
+        if self.model_kind == "cnn_tcn_gesture":
+            stamp = prediction.get("source_monotonic_sec", 0.0)
+            if not 0 <= time.monotonic() - stamp <= 0.2:
+                self._touch_stream_fault("Gesture prediction expired; motion stopped")
+                return
         self._apply_prediction(prediction)
 
     def _discard_pending_predictions(self):
@@ -2105,19 +1894,44 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             self._pending_predicted_mode_frames = 0
             self._active_predicted_mode = "stop"
         else:
-            if mode == self._pending_predicted_mode:
+            # All four directions share mode=move, but a new direction must
+            # earn confirmation independently rather than inheriting motion.
+            confirmation_key = prediction.get("gesture", mode)
+            if confirmation_key == self._pending_predicted_mode:
                 self._pending_predicted_mode_frames += 1
             else:
-                self._pending_predicted_mode = mode
+                self._pending_predicted_mode = confirmation_key
                 self._pending_predicted_mode_frames = 1
             if (
-                mode != self._active_predicted_mode
+                confirmation_key != self._active_predicted_mode
                 and self._pending_predicted_mode_frames < int(self.move_confirmation_frames)
             ):
                 mode = "stop"
                 velocity_sent = np.zeros(6, dtype=np.float32)
             else:
-                self._active_predicted_mode = mode
+                self._active_predicted_mode = confirmation_key
+
+        latched = getattr(self, "_touch_latched_gesture", None)
+        prefix = getattr(self, "_touch_prefix", None)
+        if (mode == "stop" and latched and prediction.get("gesture") != "stop"
+                and prefix is not None and prefix.continuous and prefix.touching):
+            from phd.dependence.touch_gesture_policy import TOUCH_POLICY_UNIT_SPEED_MPS, gesture_velocity, gesture_control_mode
+
+            # A hold, an uncertain window, or the first frame of a new gesture
+            # must not cancel the direction already confirmed for this contact.
+            velocity_sent = self._clip_velocity6(gesture_velocity(
+                latched, TOUCH_POLICY_UNIT_SPEED_MPS, self.velocity_scale))
+            mode = gesture_control_mode(latched)
+            mode_conf = float(self._touch_latched_confidence)
+            prediction = dict(prediction)
+            prediction["gesture"] = latched
+            prediction["reason"] = "Holding last gesture"
+
+        if (mode != "stop" and prefix is not None and prefix.continuous and prefix.touching
+                and prediction.get("reason") != "Holding last gesture"
+                and prediction.get("gesture") not in (None, "stop", "uncertain")):
+            self._touch_latched_gesture = prediction["gesture"]
+            self._touch_latched_confidence = float(prediction["mode_conf"])
 
         velocity6_sent = [float(v) for v in velocity_sent[:6]]
         velocity6_pre_flip = [
@@ -2130,7 +1944,15 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
         ]
         self._set_teacher_output(mode, velocity6_pre_flip)
         if not self.dry_run_predictions_only:
-            self._send_robot_velocity_execution(velocity6_sent)
+            try:
+                sent = self._send_robot_velocity_execution(velocity6_sent)
+            except Exception:
+                if self.model_kind != "cnn_tcn_gesture":
+                    raise
+                sent = False
+            if not sent and self.model_kind == "cnn_tcn_gesture":
+                self._touch_robot_command_failed()
+                return
         self.last_prediction = {
             "mode": mode,
             "mode_conf": mode_conf,
@@ -2138,6 +1960,12 @@ class AI_DirectFingerMotion_execution(DirectFingerMotion):
             "velocity_sent": velocity6_sent,
             "dry_run": bool(self.dry_run_predictions_only),
         }
+        for key in ("gesture", "top_gesture", "gesture_margin", "gesture_probabilities", "reason"):
+            if key in prediction:
+                self.last_prediction[key] = prediction[key]
+        feedback = getattr(self, "touch_gesture_feedback", None)
+        if self.model_kind == "cnn_tcn_gesture" and feedback is not None:
+            feedback.observe(prediction, confirmed=mode != "stop")
         self.last_prediction_time = time.time()
         self._debug_print(
             f"[AI_EXEC{' DRY' if self.dry_run_predictions_only else ''}] "

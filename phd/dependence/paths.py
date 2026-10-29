@@ -58,6 +58,8 @@ ICON_DIR = RESOURCE_ROOT / "icon"
 STYLESHEET_DIR = RESOURCE_ROOT / "stylesheets"
 SENSOR_RESOURCE_DIR = RESOURCE_ROOT / "sensor"
 ROBOT_RESOURCE_DIR = RESOURCE_ROOT / "robot"
+# Experiment outputs (calibration, taxel maps, scanning, characterisation).
+EXPERIMENT_RESOURCE_DIR = RESOURCE_ROOT / "experiment"
 
 
 def resource_path(*parts: str) -> str:
@@ -84,6 +86,12 @@ def robot_resource_path(*parts: str) -> str:
     if not parts:
         return str(ROBOT_RESOURCE_DIR)
     return str(ROBOT_RESOURCE_DIR.joinpath(*parts))
+
+
+def experiment_path(*parts: str) -> str:
+    if not parts:
+        return str(EXPERIMENT_RESOURCE_DIR)
+    return str(EXPERIMENT_RESOURCE_DIR.joinpath(*parts))
 
 
 def sensor_resource_path(*parts: str) -> str:

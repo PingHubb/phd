@@ -282,14 +282,3 @@ class RobotSensorControlsMixin:
             self.sensor_functions.updateCal()
         else:
             self.log_display.append("Cannot calibrate: Sensor API is not ready.")
-
-    def start_record_gesture(self):
-        gesture_number = self.gesture_number_input.text().strip()
-        if not gesture_number:
-            self.log_display.append("Please enter a gesture number or name.")
-            return
-        helper = self._get_sensor_helper("record_gesture_class")
-        if helper is None:
-            self.log_display.append("Record gesture helper is not ready yet.")
-            return
-        helper.start_record_gesture(gesture_number)

@@ -22,11 +22,11 @@ def _qss():
     return QSS.read_text()
 
 
-def test_collapsible_groups_start_expanded():
+def test_advanced_disclosures_start_collapsed():
     default = inspect.signature(components.CollapsibleGroup).parameters[
         "expanded"
     ].default
-    assert default is True
+    assert default is False
 
 
 def test_list_item_padding_token_matches_the_stylesheet():

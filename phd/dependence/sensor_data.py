@@ -2,6 +2,7 @@
 
 import numpy as np
 import time
+from types import SimpleNamespace
 
 
 class SensorDataBuffer:
@@ -23,6 +24,7 @@ class SensorDataBuffer:
         self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
         self.frame_sequence = 0
         self.frame_monotonic_sec = None
+        self.completed_frame_snapshot = None
         self._frame_listeners = []
 
     def add_frame_listener(self, callback):
@@ -76,6 +78,7 @@ class SensorDataBuffer:
         self.diffPerDataAve = np.zeros((self.n_row, self.n_col))
         self.frame_sequence = 0
         self.frame_monotonic_sec = None
+        self.completed_frame_snapshot = None
 
     def getWin(self, index):
         """Insert the current frame, preserving the legacy 1-based indexing."""
@@ -94,6 +97,19 @@ class SensorDataBuffer:
             self._recompute_averages()
             self.frame_sequence += 1
             self.frame_monotonic_sec = time.monotonic()
+            # Publish one complete frame atomically. Experiment readers must
+            # not mix a new raw matrix with the previous average/calibration.
+            matrices = {}
+            for name in ("rawData", "calData", "diffData", "diffPerData",
+                         "rawDataAve", "diffDataAve", "diffPerDataAve"):
+                matrix = np.array(getattr(self, name), copy=True)
+                matrix.flags.writeable = False
+                matrices[name] = matrix
+            self.completed_frame_snapshot = SimpleNamespace(
+                frame_sequence=self.frame_sequence,
+                frame_monotonic_sec=self.frame_monotonic_sec,
+                **matrices,
+            )
             for callback in tuple(self._frame_listeners):
                 try:
                     callback(self)

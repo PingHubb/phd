@@ -28,6 +28,7 @@ from __future__ import annotations
 import copy
 import csv
 import json
+import math
 import os
 import time
 from datetime import datetime, timezone
@@ -36,15 +37,45 @@ from typing import List, Optional
 
 import numpy as np
 
-from phd.dependence.paths import resource_path
+from phd.dependence.calibration_recording_names import (
+    calibration_folder_name,
+    sensor_name_for_recording,
+)
+from phd.dependence.paths import experiment_path, resource_path
+from phd.ui.calibration_readiness import (
+    loading_plan, loading_plan_error, suggested_loading_plan, travel_error,
+)
 from phd.ui.calibration_analysis import (
     analyze_calibration_rows,
     taxel_signal_column,
+    contact_referenced_rows,
+    release_trial_rows,
+)
+from phd.ui.experiment_quality import downward_detector, finite_number
+from phd.ui.memory_guard import GIB, available_memory_bytes, process_rss_bytes
+from phd.ui import full_taxel_resume
+from phd.ui.taxel_map_revision import (
+    normalize_setup, revision_motion_error, revision_setup, same_pose, validate_setup_binding,
+)
+from phd.ui.proximity_profile import (
+    analyse_proximity_profile,
+    report_lines as proximity_report_lines,
+    save_profile_outputs,
+    surface_reference,
 )
 
 
 _DEFAULT_STORAGE_PATH = object()
 _LEGACY_CALIBRATION_SENSOR_KEY = "sensor:testing_8x10"
+
+
+def _mapping_json_default(value):
+    """Encode numeric NumPy values without hiding invalid/unknown objects."""
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
 def connected_calibration_sensor(host):
@@ -79,6 +110,21 @@ def connected_calibration_sensor(host):
     if not label:
         label = f"{rows}x{columns} sensor" if rows > 0 and columns > 0 else "this sensor"
     return key, label, rows, columns
+
+
+def position_map_sensor_error(host, result) -> str:
+    """Reject a known map from another sensor even before the UI refreshes."""
+    saved_key = str((result or {}).get("sensor_identity") or "")
+    if not saved_key or saved_key.startswith("layout:"):
+        # Existing unlabelled maps can still be loaded explicitly by the user.
+        return ""
+    key, label, _rows, _columns = connected_calibration_sensor(host)
+    if key != saved_key:
+        return (
+            f"The loaded map belongs to {saved_key}, but the connected sensor is {label} "
+            f"({key}). Load the map for the connected sensor before starting."
+        )
+    return ""
 
 
 class ExperimentTask:
@@ -211,9 +257,10 @@ class CalibrationGraphAnalysisTask(ExperimentTask):
     description = (
         "Select a saved calibration CSV, JSON, or exported graph to examine "
         "event distances, fitted equations, residuals, hysteresis, acquisition "
-        "quality, and repeat-trial consistency."
+        "quality, and repeat-trial consistency. Opens an independent offline "
+        "viewer; it can be used while a robot experiment continues."
     )
-    start_button_label = "Select Recording"
+    start_button_label = "Select Graph"
     tick_interval_ms = None
 
     def on_start(self, host) -> bool:
@@ -224,6 +271,28 @@ class CalibrationGraphAnalysisTask(ExperimentTask):
             )
             return False
         opener()
+        return False
+
+
+class SensorCharacterisationTask(ExperimentTask):
+    """Open native recording/independent-reference analysis without devices."""
+    id = "sensor_characterisation"
+    label = "Sensor Characterisation"
+    category = "TRO2026"
+    description = (
+        "Fixture-guided spatial fields, multi-touch, size/speed, mounting, noise "
+        "and latency audits. Records native sensor frames and independent "
+        "annotations; never sends robot commands. Offline analysis needs no devices."
+    )
+    start_button_label = "Open Workbench"
+    tick_interval_ms = None
+
+    def on_start(self, host):
+        opener = getattr(host, "_open_sensor_characterisation", None)
+        if callable(opener):
+            opener()
+        else:
+            host._append_sidebar_control_message("Sensor Characterisation workbench is unavailable.")
         return False
 
 
@@ -244,7 +313,16 @@ class CalibrationTask(ExperimentTask):
     tick_interval_ms = 50
     disconnect_force_meter_on_stop = True
     NEWTONS_PER_GRAM = 0.00980665
-    MAX_CONTACT_THRESHOLD_G = 2000.0
+    # Confirmed installed cell: 1 kg rated. Overload capacity is NOT its range.
+    RATED_FORCE_G = 1000.0
+    MAX_CONTACT_THRESHOLD_G = 800.0
+    EMERGENCY_FORCE_G = 900.0
+    # A trial holds all its frames in memory until saved; the kernel kills the
+    # whole UI (mid-press, unsaved) if RAM runs out, so stop first.
+    MEMORY_STOP_FREE_BYTES = 1 * GIB
+    MEMORY_START_FREE_BYTES = 2 * GIB
+    MEMORY_TRIAL_MARGIN = 1.5
+    MEMORY_CHECK_INTERVAL_SEC = 2.0
     SIGNAL_MATRIX_SOURCES = {
         "raw": ("rawData", False),
         "calibration": ("calData", False),
@@ -266,7 +344,7 @@ class CalibrationTask(ExperimentTask):
                 "config", "calibration_initial_position.json"
             )
         if output_directory is _DEFAULT_STORAGE_PATH:
-            output_directory = resource_path("calibration_recordings")
+            output_directory = experiment_path("calibration_recordings")
         self.storage_path = (
             Path(storage_path).expanduser() if storage_path is not None else None
         )
@@ -288,12 +366,107 @@ class CalibrationTask(ExperimentTask):
         # underlying diffDataAve value is signed: raw - calibration.
         self.signal_field = "diff_ave"
         self.approach_speed_m_s = 0.0001
+        # 0 disables it. Only used above a contact height already measured
+        # on the same taxel in this run, and never once force is detected.
+        self.far_field_speed_mm_s = 0.0
+        self.slow_zone_mm = 5.0
+        # "stepwise": TM line moves measured at rest; "velocity": legacy streaming.
+        self.motion_mode = "stepwise"
+        self.step_far_mm = 0.2
+        self.step_near_mm = 0.05
+        self.step_loading_mm = 0.02
+        self.step_dwell_sec = 0.5
+        self.sliding_step_mm = 0.05
+        self._reset_step_state()
+        self.velocity_rest_sec = 0.5
+        self._rest_last_position = None
+        self._rest_since = None
+        self._slide_resting = False
+        self._slide_rest_started_at = None
+        self._slide_target_m = 0.0
+        self._return_start_z = None
+        self._memory_checked_at: Optional[float] = None
+        self._trial_rss_start: Optional[int] = None
+        self._trial_memory_bytes = 0
+        self._contact_z_by_taxel: dict[int, float] = {}
+        self._expected_contact_z_m: Optional[float] = None
+        self._approach_zone = ""
+        self._slow_zone_entered = False
         self.contact_threshold_n = (
-            self.MAX_CONTACT_THRESHOLD_G * self.NEWTONS_PER_GRAM
+            500.0 * self.NEWTONS_PER_GRAM
         )
         self.contact_hold_sec = 1.0
-        self.max_travel_m = 0.0
-        self.timeout_sec = 0.0
+        self.max_travel_m = 0.03
+        self.timeout_sec = 600.0
+        self.loading_extra_travel_mm = 5.0  # Planning only; never extends motion by itself.
+        # The UI opts in explicitly. Programmatic callers retain manual limits.
+        self.loading_auto_plan = False
+        self._loading_plan = None
+        self.sensor_sample_stale_sec = 1.0
+        # Only at a completed, stationary trial boundary, never during motion.
+        self.post_save_feedback_timeout_sec = 10.0
+        self.post_save_feedback_stable_sec = 0.25
+        self._clear_post_save_wait()
+        self.sensor_baseline_frames = 100
+        self.sensor_baseline_duration_sec = 5.0
+        self.sensor_baseline_timeout_sec = 30.0
+        self.proximity_window_frames = 7
+        self.proximity_min_margin = 6.0
+        self.recalibrate_between_trials = True
+        self.recovery_observation_sec = 5.0
+        self.protocol = "standard"
+        self.sliding_distance_mm = 2.0
+        self.sliding_speed_mm_s = 0.1
+        self.sliding_direction = "x+"
+        self.sliding_path_confirmed = False
+        self._slide_origin = None
+        self._slide_returning = False
+        self.speed_schedule_mm_s = [0.05, 0.1, 0.2]
+        self.force_schedule_g = [5., 10., 20., 50., 100.]
+        # Proximity profile: the largest gap is the far-field reference. Levels
+        # are 2–3 mm apart over 10–40 mm, where the 3σ/5σ ranges lie.
+        self.profile_gaps_mm = [
+            100., 70., 50., 45., 40., 37., 34., 31., 28., 25., 22., 20., 18., 16., 14.,
+            12., 10., 8., 6., 5., 4., 3., 2.5, 2., 1.5, 1.2, 1., .8, .6, .4,
+        ]
+        self.profile_sweeps = 5
+        self.profile_order = "alternate"
+        self.profile_frames_per_level = 40
+        self.profile_settle_sec = 1.0
+        # Common-mode rejection removes most drift between references.
+        self.profile_reference_every = 6
+        self.profile_surface_probes = 3
+        self.profile_surface_stop_g = 3.0
+        self.profile_search_step_far_mm = 0.2
+        self.profile_search_step_near_mm = 0.05
+        self.profile_probe_step_mm = 0.01
+        self.profile_move_speed_mm_s = 10.0
+        self.profile_remeasure_surface = True
+        self._profile_project_speed_percent = None
+        # Above the force zero re-taken at rest near the surface (stepwise and profile).
+        self.light_contact_threshold_g = 0.5
+        self._reset_force_zero_state()
+        self._reset_profile_state()
+        self.specimen_id = ""
+        self.session_id = ""
+        self.mounting_id = ""
+        self.probe_geometry = "unspecified"
+        self.probe_material = "conductive"
+        self.probe_material_note = ""
+        self.probe_diameter_mm = 0.
+        self.contact_area_confirmed = False
+        self.force_reference_verified = False
+        self.experiment_notes = ""
+        self._trial_speed_m_s = self.approach_speed_m_s
+        self._baseline_rows = []
+        self._baseline_last_sequence = None
+        self._last_recorded_sequence = None
+        self._trial_wall_started_at = None
+        self._pause_events = []
+        self._recovery_started_at = None
+        self._pending_return_purpose = ""
+        self._force_sample_source_at = None
+        self._pose_sample_source_at = None
         self.repeat_count = 1
         self.return_velocity_rad_s = 0.20
         self.return_timeout_sec = 90.0
@@ -328,7 +501,13 @@ class CalibrationTask(ExperimentTask):
         self._last_force_sample_at: Optional[float] = None
         self._samples: list[dict] = []
         self._stop_reason = ""
+        self._stop_message = ""
+        self._stop_phase = ""
+        self._stopped_at = ""
+        self._stop_taxel_index = None
+        self._stop_pass_number = None
         self._trial_result_saved = False
+        self._trial_completed = False
         self._trial_number = 0
         self._batch_total = 1
         self._batch_id = ""
@@ -392,10 +571,19 @@ class CalibrationTask(ExperimentTask):
             token = token.replace("--", "-")
         return token.strip("-_") or "unknown"
 
+    def _recording_metadata(self) -> dict:
+        return {
+            "sensor_name": sensor_name_for_recording(
+                self.active_sensor_label, self.active_sensor_key_name,
+                (self.sensor_rows, self.sensor_columns),
+            ),
+            "sensor_identity": str(self.active_sensor_key_name or ""),
+            "protocol": str(self.protocol),
+        }
+
     def _experiment_folder_name(self, timestamp: str) -> str:
-        """Name one calibration folder from time and all seven settings."""
+        """Name one folder from its sensor, protocol, time and seven settings."""
         speed_mm_s = abs(float(self.approach_speed_m_s)) * 1000.0
-        threshold_g = float(self.contact_threshold_g)
         travel_mm = max(0.0, float(self.max_travel_m)) * 1000.0
         timeout_s = max(0.0, float(self.timeout_sec))
         travel_token = (
@@ -408,16 +596,43 @@ class CalibrationTask(ExperimentTask):
             if timeout_s > 0.0
             else "unlimited"
         )
-        return (
-            f"calibration_{self._folder_token(timestamp)}_"
+        settings = (
             f"taxel-{int(self.taxel_index)}_"
             f"signal-{self._folder_token(self.signal_field)}_"
             f"speed-{self._folder_number(speed_mm_s)}mmps_"
-            f"threshold-{self._folder_number(threshold_g)}g_"
+            f"threshold-{self._force_folder_token()}g_"
             f"travel-{travel_token}_"
             f"timeout-{timeout_token}_"
-            f"reps-{max(1, int(self.repeat_count))}"
+            f"reps-{max(1, int(self.repeat_count))}_"
+            f"{self._probe_material_folder_token()}"
         )
+        return calibration_folder_name(
+            "calibration", timestamp, settings,
+            sensor_name=self._recording_metadata()["sensor_name"], protocol=self.protocol,
+        )
+
+    def _probe_material_folder_token(self) -> str:
+        """Filename token for the probe category and any typed description."""
+        tokens = {
+            "conductive": "probe-conductive",
+            "insulative": "probe-insulative",
+            "human_like": "probe-human-like",
+        }
+        note = self._folder_token(self.probe_material_note)
+        note = "" if note == "unknown" else note[:40].rstrip("-_")
+        if self.probe_material == "other":
+            return f"probe-{note}" if note else "probe-other"
+        base = tokens.get(str(self.probe_material), "probe-unspecified")
+        return f"{base}-{note}" if note else base
+
+    def _force_folder_token(self):
+        if self.protocol != "force_sweep":
+            return self._folder_number(self.contact_threshold_g)
+        # Keep a component within filesystem limits; the complete schedule is
+        # always in the trial metadata, not the previously selected fixed target.
+        levels = "-".join(self._folder_number(v) for v in self.force_schedule_g[:6])
+        suffix = "-more" if len(self.force_schedule_g) > 6 else ""
+        return f"sweep-{levels}{suffix}"
 
     @staticmethod
     def _robot_api(host):
@@ -546,6 +761,8 @@ class CalibrationTask(ExperimentTask):
         self.initial_position = copy.deepcopy(
             self._position_profiles.get(key)
         )
+        if revision_motion_error(getattr(self, "position_map", None)):
+            self.initial_position = None
         return key
 
     def use_mapped_taxel(self, record: dict, *, rows: int, columns: int) -> None:
@@ -718,7 +935,7 @@ class CalibrationTask(ExperimentTask):
         if (
             reading is None
             or not self._force_meter_reader_running(self._ui_ros(host))
-            or now - float(reading[1]) > float(self.force_sample_stale_sec)
+            or not -0.1 <= now - float(reading[1]) <= float(self.force_sample_stale_sec)
         ):
             return None
         return reading
@@ -738,11 +955,22 @@ class CalibrationTask(ExperimentTask):
         ui_ros = self._ui_ros(host)
         sensor = getattr(ui_ros, "sensor_functions", None) if ui_ros else None
         data_obj = getattr(sensor, "_data", None) if sensor is not None else None
-        if sensor is None or data_obj is None:
+        if sensor is None or data_obj is None or not bool(getattr(sensor, "is_connected", False)):
+            return None
+        if hasattr(data_obj, "completed_frame_snapshot"):
+            data_obj = data_obj.completed_frame_snapshot
+            if data_obj is None:
+                return None
+        stamp = finite_number(getattr(data_obj, "frame_monotonic_sec", None))
+        age = None if stamp is None else time.monotonic() - stamp
+        if age is None or not 0.0 <= age <= self.sensor_sample_stale_sec:
             return None
         rows = int(getattr(sensor, "n_row", 0) or 0)
         columns = int(getattr(sensor, "n_col", 0) or 0)
         if rows != int(self.sensor_rows) or columns != int(self.sensor_columns):
+            return None
+        matrix = np.asarray(getattr(data_obj, "diffDataAve", []), dtype=float)
+        if matrix.shape != (rows, columns) or not np.all(np.isfinite(matrix)):
             return None
         return sensor, data_obj, rows, columns
 
@@ -763,6 +991,7 @@ class CalibrationTask(ExperimentTask):
         source_row = rows - 1 - display_row
         values = {
             "frame_sequence": int(getattr(data_obj, "frame_sequence", 0) or 0),
+            "sensor_monotonic_s": finite_number(getattr(data_obj, "frame_monotonic_sec", None)),
             "cell_index": index,
             "display_row": display_row,
             "column": column,
@@ -821,11 +1050,332 @@ class CalibrationTask(ExperimentTask):
                     taxel_index,
                 )
                 values[column_name] = value
+        # Retain raw, baseline and signed data for EVERY node, independent of
+        # the selected plot. Raw matrices use the source-row convention.
+        for field in ("raw", "calibration", "diff", "diff_ave", "diff_percent_ave"):
+            name, flipped = self.SIGNAL_MATRIX_SOURCES[field]
+            for taxel_index in range(rows * columns):
+                row = taxel_index % rows
+                values[taxel_signal_column(field, taxel_index)] = self._matrix_value(
+                    data_obj, name, row if flipped else rows - 1 - row, taxel_index // rows
+                )
         return values
+
+    def _validate_measurement_settings(self, host):
+        settings = (
+            self.contact_threshold_g, self.max_travel_m, self.timeout_sec,
+            self.approach_speed_m_s, self.contact_hold_sec, self.recovery_observation_sec,
+        )
+        if not all(finite_number(value) is not None for value in settings):
+            return self._fail_start(host, "Calibration settings must be finite.")
+        if self.protocol not in {"standard", "hold_recovery", "speed_sweep", "force_sweep", "drift", "sliding", "proximity", "proximity_profile"} or self.signal_field not in self.SIGNAL_MATRIX_SOURCES:
+            return self._fail_start(host, "Select a valid protocol and plotted signal.")
+        if not 0 < self.contact_threshold_g <= self.MAX_CONTACT_THRESHOLD_G:
+            return self._fail_start(host, "The installed 1 kg cell allows targets up to 800 g, not 2,000 g.")
+        if not 0 < self.max_travel_m <= 0.1 or not 0 < self.timeout_sec <= 7200:
+            return self._fail_start(host, "Set finite travel (up to 100 mm) and time (up to 7,200 s) limits.")
+        if not 0.00001 <= self.approach_speed_m_s <= 0.002:
+            return self._fail_start(host, "Approach speed must be 0.01–2 mm/s.")
+        far_field = finite_number(self.far_field_speed_mm_s)
+        slow_zone = finite_number(self.slow_zone_mm)
+        if far_field is None or not (far_field == 0 or 0.01 <= far_field <= 2.0):
+            return self._fail_start(host, "Far-field approach speed must be 0 (off) or 0.01–2 mm/s.")
+        if slow_zone is None or not 1.0 <= slow_zone <= 50.0:
+            return self._fail_start(host, "The slow zone above the previous contact must be 1–50 mm.")
+        if not 0 <= self.contact_hold_sec <= 300 or not 0 <= self.recovery_observation_sec <= 300:
+            return self._fail_start(host, "Hold/recovery duration must be 0–300 seconds.")
+        slowest = 0.001 if self.motion_mode == "stepwise" else 0.01
+        if self.protocol == "speed_sweep" and (
+            not self.speed_schedule_mm_s or
+            any(finite_number(v) is None or not slowest <= float(v) <= 2 for v in self.speed_schedule_mm_s)
+        ):
+            return self._fail_start(host, f"Speed schedule must contain values from {slowest:g} to 2 mm/s.")
+        if self.protocol == "force_sweep" and (
+            not self.force_reference_verified or not self.force_schedule_g
+            or any(finite_number(v) is None or not 0 < float(v) <= self.MAX_CONTACT_THRESHOLD_G for v in self.force_schedule_g)
+        ):
+            return self._fail_start(host, "Verify the force reference against known loads and enter force levels above 0 and up to 800 g. Reader resolution/noise may prevent reliable low-force measurements.")
+        if finite_number(self.probe_diameter_mm) is None or self.probe_diameter_mm < 0:
+            return self._fail_start(host, "Probe diameter must be finite and nonnegative (0 = unknown).")
+        if self.contact_area_confirmed and (self.probe_geometry != "flat_circular" or self.probe_diameter_mm <= 0 or not self.force_reference_verified):
+            return self._fail_start(host, "Nominal pressure needs a verified force reference and a known flat circular full-contact probe area.")
+        if self.protocol == "sliding" and (
+            not self.sliding_path_confirmed or self.contact_threshold_g > 200
+            or finite_number(self.sliding_distance_mm) is None
+            or not 0.1 <= self.sliding_distance_mm <= 5
+            or finite_number(self.sliding_speed_mm_s) is None
+            or not 0.01 <= self.sliding_speed_mm_s <= 0.5
+            or self.sliding_direction not in {"x+", "x-", "y+", "y-"}
+        ):
+            return self._fail_start(host, "Sliding needs a confirmed clear XY path, target ≤200 g, distance 0.1–5 mm and speed 0.01–0.5 mm/s. No shear-force protection is available.")
+        if self.protocol == "proximity" and self.contact_threshold_g > 10:
+            return self._fail_start(host, "Proximity approach requires a contact-stop target ≤10 g.")
+        if self.protocol == "proximity_profile":
+            return self._validate_profile_settings(host)
+        if self.motion_mode not in {"stepwise", "velocity"}:
+            return self._fail_start(host, "Select stepwise or velocity motion.")
+        if self.motion_mode == "stepwise":
+            for value, low, high, message in (
+                (self.step_far_mm, 0.05, 1.0, "Far approach step must be 0.05–1 mm."),
+                (self.step_near_mm, 0.01, 0.2, "Near approach step must be 0.01–0.2 mm."),
+                (self.step_loading_mm, 0.005, 0.1, "Loading step must be 0.005–0.1 mm."),
+                (self.step_dwell_sec, 0.3, 30.0, "Time at rest per step must be 0.3–30 s."),
+                (self.sliding_step_mm, 0.01, 1.0, "Sliding step must be 0.01–1 mm."),
+            ):
+                number = finite_number(value)
+                if number is None or not low <= number <= high:
+                    return self._fail_start(host, message)
+            if self.protocol == "speed_sweep":
+                fastest = float(self.step_loading_mm) / self.STEP_MIN_PERIOD_SEC
+                if any(float(v) > fastest for v in self.speed_schedule_mm_s):
+                    return self._fail_start(
+                        host,
+                        "Stepwise loading rate is step size ÷ step period. With "
+                        f"{self.step_loading_mm:.3f} mm steps the fastest reliable rate is about "
+                        f"{fastest:.3f} mm/s; lower the speeds or enlarge the loading step.",
+                    )
+        return True
+
+    def _profile_level_gaps(self) -> tuple[float, list[float]]:
+        """Far reference gap and the measured levels below it, far to near."""
+        gaps = sorted({round(float(value), 4) for value in self.profile_gaps_mm}, reverse=True)
+        return gaps[0], gaps[1:]
+
+    def _profile_speed_mm_s(self, project_speed_percent=None) -> tuple[float, float]:
+        """Effective line-move speed and the TM project speed override it assumes."""
+        percent = finite_number(project_speed_percent)
+        if percent is None or percent <= 0:
+            percent = finite_number(self._profile_project_speed_percent)
+        if percent is None or percent <= 0:
+            percent = self.PROFILE_ASSUMED_SPEED_PERCENT
+        percent = min(float(percent), 100.0)
+        return max(0.01, float(self.profile_move_speed_mm_s) * percent / 100.0), percent
+
+    def estimate_profile_duration_sec(self, project_speed_percent=None) -> float:
+        """Time from the surface to the end: probes, every planned window and the end check."""
+        speed, _percent = self._profile_speed_mm_s(project_speed_percent)
+        window = (
+            float(self.profile_settle_sec) + int(self.profile_frames_per_level) / self.PROFILE_FRAME_RATE_HZ
+            + self.PROFILE_WINDOW_OVERHEAD_SEC
+        )
+        probe = (
+            self.PROFILE_PROBE_START_M * 1000.0 / float(self.profile_probe_step_mm) * self.PROFILE_SEARCH_STEP_SEC
+            + 2.0 * self.PROFILE_MOVE_OVERHEAD_SEC
+        )
+        total, gap = int(self.profile_surface_probes) * probe, 0.0
+        for step in self._build_profile_plan():
+            total += self.PROFILE_MOVE_OVERHEAD_SEC + abs(float(step["gap_mm"]) - gap) / speed + window
+            gap = float(step["gap_mm"])
+        if self.profile_remeasure_surface:
+            total += self.PROFILE_MOVE_OVERHEAD_SEC + gap / speed + int(self.profile_surface_probes) * probe
+        return total
+
+    def estimate_profile_descent_sec(self) -> float:
+        """Upper bound of the stepped surface search within Maximum travel."""
+        travel_mm = max(0.0, float(self.max_travel_m) * 1000.0)
+        near_mm = min(travel_mm, self.PROFILE_NEAR_ZONE_MM)
+        steps = (
+            (travel_mm - near_mm) / float(self.profile_search_step_far_mm)
+            + near_mm / float(self.profile_search_step_near_mm)
+        )
+        return steps * self.PROFILE_SEARCH_STEP_SEC
+
+    def _validate_profile_settings(self, host) -> bool:
+        if self.id != "calibration":
+            return self._fail_start(host, "Run the proximity profile from the Single taxel tab.")
+        try:
+            gaps = [float(value) for value in self.profile_gaps_mm]
+        except (TypeError, ValueError):
+            gaps = []
+        if not gaps or any(not math.isfinite(g) or not 0.2 <= g <= 100.0 for g in gaps):
+            return self._fail_start(host, "Profile gaps must be 0.2–100 mm.")
+        if len(self._profile_level_gaps()[1]) < 3:
+            return self._fail_start(host, "Enter at least three gaps below the largest (far reference) gap.")
+        checks = (
+            (self.profile_sweeps, 1, 20, "Sweeps must be 1–20."),
+            (self.profile_frames_per_level, 10, 500, "Frames per level must be 10–500."),
+            (self.profile_settle_sec, 0, 10, "Settle time must be 0–10 s."),
+            (self.profile_reference_every, 1, 20, "Reference interval must be 1–20 levels."),
+            (self.profile_surface_probes, 1, 10, "Surface probes must be 1–10."),
+            (self.profile_surface_stop_g, 1, 20, "Surface light-contact stop must be 1–20 g."),
+            (self.profile_search_step_far_mm, 0.05, 1.0, "Far surface-search step must be 0.05–1 mm."),
+            (self.profile_search_step_near_mm, 0.01, 0.2, "Near surface-search step must be 0.01–0.2 mm."),
+            (self.profile_probe_step_mm, 0.005, 0.05, "Light-contact probe step must be 0.005–0.05 mm."),
+            (self.profile_move_speed_mm_s, 1, 20, "Profile move speed must be 1–20 mm/s."),
+        )
+        for value, low, high, message in checks:
+            number = finite_number(value)
+            if number is None or not low <= number <= high:
+                return self._fail_start(host, message)
+        if self.profile_order not in {"alternate", "descending", "random"}:
+            return self._fail_start(host, "Select a profile level order.")
+        reported = None
+        getter = getattr(self._robot_api(host), "get_project_speed_percent", None)
+        if callable(getter):
+            try:
+                reported = finite_number(getter())
+            except Exception:
+                reported = None
+        if reported is not None and reported > 0:
+            self._profile_project_speed_percent = float(reported)
+        percent = reported if reported is not None and reported > 0 else self.PROFILE_FALLBACK_SPEED_PERCENT
+        speed, percent = self._profile_speed_mm_s(percent)
+        profile = self.estimate_profile_duration_sec(percent)
+        descent = self.estimate_profile_descent_sec()
+        estimate = profile + descent + float(self.max_travel_m) * 1000.0 / speed + 60.0
+        if self.timeout_sec < estimate:
+            return self._fail_start(
+                host,
+                f"The proximity profile needs up to {estimate / 60.0:.0f} min at {percent:.0f}% TM project speed "
+                f"({profile / 60.0:.0f} min from the surface, up to {descent / 60.0:.0f} min of descent within "
+                f"Maximum travel); raise Timeout above {estimate:.0f} s (maximum 7,200 s), shorten Maximum "
+                "travel or use fewer levels/sweeps.",
+            )
+        return True
+
+    def _tick_sliding(self, host, now, position, force_g):
+        """Fixed-Z bounded out-and-back path, not force or shear control."""
+        api = self._robot_api(host)
+        position = np.asarray(position, dtype=float)
+        origin = self._slide_origin
+        axis = 0 if self.sliding_direction.startswith("x") else 1
+        sign = 1 if self.sliding_direction.endswith("+") else -1
+        displacement = sign * (position[axis] - origin[axis])
+        length = self.sliding_distance_mm / 1000
+        if (abs(position[2] - origin[2]) > 0.0005
+                or abs(position[1 - axis] - origin[1 - axis]) > 0.0005
+                or displacement < -0.0002 or displacement > length + 0.0002
+                or force_g > min(1.5 * self.contact_threshold_g, self.EMERGENCY_FORCE_G)
+                or force_g < max(1.0, 0.1 * self.contact_threshold_g)):
+            self._request_stop(host, "sliding_guard", "Sliding stopped: path deviation, lost contact or excessive normal force. Inspect manually.")
+            return
+        if self._stepwise():
+            self._tick_stepwise_sliding(host, now, position, force_g, axis, sign, length)
+            return
+        reached = displacement <= 0.00005 if self._slide_returning else displacement >= length - 0.00005
+        if reached or self._slide_resting:
+            if not self._slide_resting:
+                self._slide_resting = True
+                self._slide_rest_started_at = float(now)
+                self._reset_rest_tracking()
+            if not self._send_zero_velocity(host):
+                return
+            if not self._at_rest(now, position):
+                if now - float(self._slide_rest_started_at) > self.VELOCITY_REST_TIMEOUT_SEC:
+                    self._request_stop(host, "not_at_rest", "Sliding stopped: the TCP did not come to rest at a path end.")
+                return
+            self._slide_resting = False
+            self._stop_robot(api)  # Reverse only after a clean stop at rest.
+            if not self._slide_returning:
+                self._slide_returning = True
+                return
+            self._begin_return_to_initial(
+                host, now, purpose="complete" if self._trial_number >= self._batch_total else "next_trial"
+            )
+            return
+        velocity = [0.0, 0.0, 0.0]
+        velocity[axis] = sign * self.sliding_speed_mm_s / 1000 * (-1 if self._slide_returning else 1)
+        sender = getattr(api, "send_end_effector_velocity_in_frame", None)
+        if not callable(sender) or not sender(velocity, [0.0] * 3, frame="base", ensure_mode=True):
+            self._request_stop(host, "command_failed", "Sliding stopped: XY velocity command rejected.")
+
+    def _tick_stepwise_sliding(self, host, now, position, force_g, axis, sign, length) -> None:
+        """XY step-and-hold at fixed Z; rate = step size / step period."""
+        step_m = min(float(self.sliding_step_mm) / 1000.0, length)
+        if self._step_state:
+            period = step_m / (float(self.sliding_speed_mm_s) / 1000.0)
+            if self._tick_step(host, now, position, force_g, period_sec=period) is None:
+                return
+        if self._slide_returning and self._slide_target_m <= 1e-9:
+            self._step_state = ""
+            self._begin_return_to_initial(
+                host, now, purpose="complete" if self._trial_number >= self._batch_total else "next_trial"
+            )
+            return
+        if not self._slide_returning and self._slide_target_m >= length - 1e-9:
+            self._slide_returning = True
+        delta = -step_m if self._slide_returning else step_m
+        self._slide_target_m = min(length, max(0.0, self._slide_target_m + delta))
+        target = np.asarray(self._slide_origin, dtype=float).copy()
+        target[axis] += sign * self._slide_target_m
+        self._send_step_move(host, now, target, step_m, "sliding")
+
+    def _measurement_guard(self, host, now, *, sensor_required=True):
+        """Fail closed before issuing or continuing motion; never auto-retract on fault."""
+        if sensor_required and self._read_sensor_frame(host) is None:
+            self._request_stop(host, "sensor_stale", "Stopped: tactile data is disconnected, invalid or over 1 s old. Check the sensor before restarting.")
+            return False
+        api = self._robot_api(host)
+        stamp = finite_number(getattr(api, "current_feedback_state_time", None))
+        self._pose_sample_source_at = stamp
+        # Feedback can arrive just after the tick's `now` was captured.
+        if stamp is None or not -0.1 <= now - stamp <= 1.0:
+            self._request_stop(host, "robot_feedback_stale", "Stopped: robot position feedback is missing or stale.")
+            return False
+        force = self._fresh_force_reading(host, now)
+        self._force_sample_source_at = None if force is None else float(force[1])
+        if force is not None:
+            raw = abs(float(force[0]))
+            delta = abs(float(force[0]) - float(self._force_baseline_n or 0))
+            if max(raw, delta) >= self.EMERGENCY_FORCE_G * self.NEWTONS_PER_GRAM:
+                self._request_stop(host, "force_safety_limit", "Emergency force stop at 900 g (raw or baseline-relative). Inspect the setup; no automatic return.")
+                return False
+        if self._trial_wall_started_at is not None and now - self._trial_wall_started_at >= self.timeout_sec:
+            self._request_stop(host, "timeout", "Stopped: trial wall-clock time limit reached, including pauses.")
+            return False
+        if self._test_active and not self._memory_ok(host, now):
+            return False
+        return True
+
+    def _memory_ok(self, host, now) -> bool:
+        checked = self._memory_checked_at
+        if checked is not None and now - checked < self.MEMORY_CHECK_INTERVAL_SEC:
+            return True
+        self._memory_checked_at = float(now)
+        available = available_memory_bytes()
+        if available is None or available >= self.MEMORY_STOP_FREE_BYTES:
+            return True
+        self._request_stop(
+            host,
+            "low_memory",
+            f"Stopped: only {available / GIB:.1f} GB of RAM is free, so the computer would soon "
+            "kill the UI. The data recorded so far is saved. The robot stopped where it is "
+            "(no automatic retract): move the probe off the sensor if it is pressing, close "
+            "other programs, then restart.",
+        )
+        return False
+
+    def _memory_allows_trial(self, host) -> bool:
+        """Stop at the start pose when the next trial would not fit in RAM."""
+        available = available_memory_bytes()
+        needed = max(
+            float(self.MEMORY_START_FREE_BYTES),
+            self.MEMORY_TRIAL_MARGIN * float(self._trial_memory_bytes),
+        )
+        if available is None or available >= needed:
+            self._trial_rss_start = process_rss_bytes()
+            return True
+        self._request_stop(
+            host,
+            "low_memory",
+            f"Stopped before the next trial: {available / GIB:.1f} GB of RAM is free and about "
+            f"{needed / GIB:.1f} GB is needed. Saved trials are kept and the robot is at the "
+            "start height. Close other programs or restart the UI, then continue.",
+        )
+        return False
+
+    def _record_trial_memory(self) -> None:
+        start, now = self._trial_rss_start, process_rss_bytes()
+        if start is not None and now is not None:
+            self._trial_memory_bytes = max(self._trial_memory_bytes, now - start)
 
     def _recorded_taxel_indices(self) -> list[int]:
         """Taxel signal columns intentionally retained in one recording."""
         return list(range(self.sensor_rows * self.sensor_columns))
+
+    def _rows_for_storage(self, rows):
+        """Storage projection, after any full-grid analysis has completed."""
+        return rows
 
     @staticmethod
     def _send_base_z_velocity(api, velocity_m_s: float) -> bool:
@@ -858,6 +1408,344 @@ class CalibrationTask(ExperimentTask):
             return False
         return bool(api.send_request(command))
 
+    # TM ContinueVLine: an abrupt stop while moving makes the next velocity
+    # command start in the opposite direction. Normal-flow stops therefore
+    # stream zero velocity until the TCP is still and only then leave velocity
+    # mode; _stop_robot stays the immediate stop for faults and Stop.
+    VELOCITY_REST_TOLERANCE_M = 0.000003
+    VELOCITY_REST_TIMEOUT_SEC = 10.0
+    RETURN_REVERSAL_LIMIT_M = 0.0001
+    DESCENT_REVERSAL_LIMIT_M = 0.0005
+
+    # Stepwise motion: TM line moves, each checked at rest before measuring.
+    STEP_LINE_MOTION = 4
+    STEP_MOVE_SPEED_M_S = 0.005
+    STEP_RETRACT_SPEED_M_S = 0.01  # Existing clearance-return command, not the unloading rate.
+    STEP_SETTLE_SEC = 0.3
+    # TM5 line moves land within about ±0.02 mm; a still TCP this close to a
+    # tiny step's target is accepted after STEP_RELAXED_AFTER_SEC.
+    STEP_REPEATABILITY_M = 0.00003
+    STEP_RELAXED_AFTER_SEC = 1.0
+    STEP_FORCE_LAG_SEC = 0.25
+    STEP_MIN_PERIOD_SEC = 0.8
+    STEP_MOVE_TIMEOUT_SEC = 30.0
+    STEP_STATIONARY_TOLERANCE_M = 0.000003
+    STEP_RETURN_TOLERANCE_M = 0.0001
+    # The trial-start force zero shifts by ~1 g with cable drag and after
+    # earlier presses, so light contact is judged against a zero re-taken at
+    # rest near the surface: steady within the range for the window, waiting
+    # at most the maximum for recovery.
+    FORCE_ZERO_WINDOW_SEC = 2.0
+    FORCE_ZERO_MIN_SAMPLES = 3
+    FORCE_ZERO_STABLE_RANGE_G = 0.15
+    FORCE_ZERO_MAX_WAIT_SEC = 15.0
+    FORCE_ZERO_TRACK_STEPS = 5
+
+    def _reset_step_state(self) -> None:
+        self._step_state = ""
+        self._step_mode = ""
+        self._step_index = 0
+        self._step_size_m = 0.0
+        self._step_target = None
+        self._step_started_at = None
+        self._step_arrived_at = None
+        self._step_forces = []
+        self._step_raw_forces = []
+        self._step_force_at = None
+        self._step_last_position = None
+        self._step_still_since = None
+        self._step_signal_centre = None
+        self._step_slow_threshold = None
+        self._step_contact_threshold_g = 1.0
+        self._step_zeroed = False
+
+    def _reset_force_zero_state(self) -> None:
+        self._force_raw_g_now = None
+        self._zero_samples = []
+        self._zero_started_at = None
+        self._zero_last_stamp = None
+        self._zero_purpose = ""
+        self._force_zero_log = []
+        self._far_rest_raw_g = []
+
+    def _start_force_zero(self, now: float, purpose: str) -> None:
+        """Begin the stationary window that becomes the new light-contact zero."""
+        self._zero_samples = []
+        self._zero_started_at = float(now)
+        self._zero_last_stamp = self._force_sample_source_at
+        self._zero_purpose = str(purpose)
+
+    def _poll_force_zero(self, now: float) -> Optional[dict]:
+        """Set the force zero once the at-rest force is steady or the wait runs out."""
+        stamp = self._force_sample_source_at
+        if stamp is not None and stamp != self._zero_last_stamp and self._force_raw_g_now is not None:
+            self._zero_last_stamp = stamp
+            self._zero_samples.append((float(now), float(self._force_raw_g_now)))
+        waited = float(now) - float(self._zero_started_at)
+        if waited < self.FORCE_ZERO_WINDOW_SEC or len(self._zero_samples) < self.FORCE_ZERO_MIN_SAMPLES:
+            return None
+        window = [g for t, g in self._zero_samples if t >= float(now) - self.FORCE_ZERO_WINDOW_SEC]
+        if len(window) < self.FORCE_ZERO_MIN_SAMPLES:
+            window = [g for _t, g in self._zero_samples[-self.FORCE_ZERO_MIN_SAMPLES:]]
+        values = np.asarray(window, dtype=float)
+        spread = float(np.ptp(values))
+        stable = spread <= self.FORCE_ZERO_STABLE_RANGE_G
+        if not stable and waited < self.FORCE_ZERO_MAX_WAIT_SEC:
+            return None
+        sigma = float(1.4826 * np.median(np.abs(values - np.median(values))))
+        zero = {
+            "purpose": self._zero_purpose,
+            "zero_g": float(np.median(values)),
+            "previous_zero_g": float(self._force_baseline_n) / self.NEWTONS_PER_GRAM,
+            "range_g": spread,
+            "stable": stable,
+            "wait_s": waited,
+            "threshold_g": max(float(self.light_contact_threshold_g), 3.0 * sigma, 2.0 * spread),
+        }
+        self._force_baseline_n = zero["zero_g"] * self.NEWTONS_PER_GRAM
+        self._force_zero_log.append(zero)
+        return zero
+
+    def _force_zero_message(self, zero: dict) -> str:
+        text = (
+            f"Force zero {zero['zero_g']:+.2f} g for the {zero['purpose']} (was {zero['previous_zero_g']:+.2f} g; "
+            f"steady within {zero['range_g']:.2f} g after {zero['wait_s']:.1f} s); light contact at "
+            f"{zero['threshold_g']:.2f} g above it."
+        )
+        if not zero["stable"]:
+            text += (
+                f" The force never settled within {self.FORCE_ZERO_STABLE_RANGE_G:.2f} g, so the threshold "
+                "was raised; check the force-meter cable."
+            )
+        return text
+
+    def _track_far_force_zero(self, raw_g: Optional[float]) -> None:
+        """Follow slow drift at rest during the far approach (contact jumps within one step)."""
+        if raw_g is None:
+            return
+        self._far_rest_raw_g.append(float(raw_g))
+        recent = self._far_rest_raw_g[-self.FORCE_ZERO_TRACK_STEPS:]
+        if len(recent) >= self.FORCE_ZERO_MIN_SAMPLES:
+            self._force_baseline_n = float(np.median(recent)) * self.NEWTONS_PER_GRAM
+
+    def _step_tags(self) -> dict:
+        return {
+            "step_state": self._step_state,
+            "step_mode": self._step_mode,
+            "step_index": self._step_index if self._step_state else "",
+        }
+
+    def _stepwise(self) -> bool:
+        return self.motion_mode == "stepwise" and self.protocol != "proximity_profile"
+
+    def _send_step_move(self, host, now: float, position, size_m: float, mode: str, speed_m_s=None) -> bool:
+        """Command one TM line move; measurement waits until it is at rest."""
+        position = np.asarray(position, dtype=float).copy()
+        if mode in {"far", "near", "loading"} and self._start_tool_position is not None:
+            # Check the next command, not just feedback after the robot has
+            # already crossed the limit. Includes the optional far-field jump.
+            floor_z = float(self._start_tool_position[2]) - float(self.max_travel_m)
+            position[2] = max(float(position[2]), floor_z)
+        api = self._robot_api(host)
+        pose = self._read_tool_pose(api)
+        quaternion = self._finite_values((self.initial_position or {}).get("tool_quaternion_wxyz"), 4)
+        if quaternion is None and pose is not None:
+            quaternion = self._finite_values(pose[1], 4)
+        if api is None or not hasattr(api, "send_positions_tool_position") or quaternion is None:
+            self._request_stop(host, "robot_unavailable", "Stopped: TCP position control is unavailable for a step.")
+            return False
+        self._stop_robot(api)
+        try:
+            sent = bool(api.send_positions_tool_position(
+                [float(value) for value in position], list(quaternion),
+                velocity=float(speed_m_s or self.STEP_MOVE_SPEED_M_S), acc_time=0.2,
+                blend_percentage=0, fine_goal=True, motion_type=self.STEP_LINE_MOTION,
+            ))
+        except Exception:
+            sent = False
+        if not sent:
+            self._request_stop(host, "command_failed", "Stopped: the robot rejected a line-move step.")
+            return False
+        self._step_target = np.asarray(position, dtype=float)
+        self._step_size_m = float(size_m)
+        self._step_mode = mode
+        self._step_index += 1
+        self._step_state = "moving"
+        self._step_started_at = float(now)
+        self._step_last_position = None
+        self._step_still_since = None
+        return True
+
+    def _tick_step(self, host, now: float, position, force_g: float, *, period_sec: float = 0.0):
+        """Advance moving → settling → dwell; return the median force once done."""
+        position = np.asarray(position, dtype=float)[:3]
+        if self._step_state == "moving":
+            previous = self._step_last_position
+            self._step_last_position = position
+            if previous is None or float(np.max(np.abs(position - previous))) > self.STEP_STATIONARY_TOLERANCE_M:
+                self._step_still_since = float(now)
+            error = float(np.max(np.abs(position - self._step_target)))
+            close = error <= max(self.STEP_STATIONARY_TOLERANCE_M, 0.5 * self._step_size_m) or (
+                now - float(self._step_started_at) >= self.STEP_RELAXED_AFTER_SEC
+                and error <= self.STEP_REPEATABILITY_M
+            )
+            arrived = close and now - float(self._step_still_since) >= self.STEP_SETTLE_SEC
+            if arrived:
+                self._step_state = "settling"
+                self._step_arrived_at = float(now)
+            elif now - float(self._step_started_at) > self.STEP_MOVE_TIMEOUT_SEC:
+                self._request_stop(host, "step_move_timeout", "Stopped: a line-move step did not finish.")
+            return None
+        if self._step_state == "settling":
+            if now - float(self._step_arrived_at) >= self.STEP_FORCE_LAG_SEC:
+                self._step_state = "dwell"
+                self._step_forces = []
+                self._step_raw_forces = []
+                self._step_force_at = self._force_sample_source_at
+            return None
+        if self._step_state != "dwell":
+            return None
+        stamp = self._force_sample_source_at
+        if stamp is not None and stamp != self._step_force_at:
+            self._step_force_at = stamp
+            self._step_forces.append(float(force_g))
+            if self._force_raw_g_now is not None:
+                self._step_raw_forces.append(self._force_raw_g_now)
+        done = (
+            len(self._step_forces) >= 2
+            and now - float(self._step_arrived_at) >= float(self.step_dwell_sec)
+            and now - float(self._step_started_at) >= float(period_sec)
+        )
+        if not done:
+            if now - float(self._step_arrived_at) > float(self.step_dwell_sec) + float(period_sec) + 5.0:
+                self._request_stop(host, "step_no_force", "Stopped: no fresh force data while at rest.")
+            return None
+        return float(np.median(self._step_forces))
+
+    def _loading_period_sec(self) -> float:
+        """Step period that gives the nominal loading rate (0 when unattainable)."""
+        speed_m_s = abs(float(self._trial_speed_m_s))
+        if speed_m_s <= 0:
+            return 0.0
+        return float(self.step_loading_mm) / 1000.0 / speed_m_s
+
+    def _insulative_full_taxel_approach(self) -> bool:
+        """An insulative probe does not make a reliable proximity signal."""
+        return self.id == "full_taxel_calibration" and self.probe_material == "insulative"
+
+    def _begin_stepwise_approach(self, host, now: float) -> None:
+        signals = [finite_number(row[2].get(self.signal_field)) for row in self._baseline_rows]
+        signals = np.asarray([value for value in signals if value is not None], dtype=float)
+        centre = float(np.median(signals)) if signals.size else 0.0
+        sigma = float(1.4826 * np.median(np.abs(signals - centre))) if signals.size > 1 else 0.0
+        self._step_signal_centre = centre
+        self._step_slow_threshold = max(self.PROFILE_SLOW_SIGNAL_MIN, self.PROFILE_SLOW_SIGNAL_SIGMA * sigma)
+        forces = np.asarray(self._force_baseline_samples, dtype=float) / self.NEWTONS_PER_GRAM
+        noise_g = float(1.4826 * np.median(np.abs(forces - np.median(forces)))) if forces.size > 1 else 0.0
+        self._step_contact_threshold_g = max(float(self.light_contact_threshold_g), 3.0 * noise_g)
+        self._far_rest_raw_g = []
+        self._step_zeroed = False
+        start = np.asarray(self._start_tool_position, dtype=float)
+        self._step_index = 0
+        expected = self._expected_contact_z_m
+        jump_z = None if expected is None else expected + float(self.slow_zone_mm) / 1000.0
+        if float(self.far_field_speed_mm_s) > 0 and jump_z is not None and jump_z < start[2]:
+            self._approach_zone = "far_field"
+            host._append_sidebar_control_message(
+                f"Stepwise approach: one line move to {self.slow_zone_mm:.1f} mm above the previous "
+                "contact height, then near steps."
+            )
+            landing = "far" if self._insulative_full_taxel_approach() else "near"
+            self._send_step_move(host, now, [start[0], start[1], jump_z], 0.0, landing,
+                                 speed_m_s=float(self.far_field_speed_mm_s) / 1000.0)
+            return
+        self._step_mode = "far"
+        self._next_approach_step(host, now, np.asarray(self._start_tool_position, dtype=float))
+
+    def _next_approach_step(self, host, now: float, position, size_mm=None) -> None:
+        mode = self._step_mode or "far"
+        if size_mm is None:
+            size_mm = {"far": self.step_far_mm, "near": self.step_near_mm, "loading": self.step_loading_mm}[mode]
+        target = np.asarray(position, dtype=float).copy()
+        base = self._step_target if self._step_target is not None else target
+        floor_z = float(self._start_tool_position[2]) - float(self.max_travel_m)
+        if float(base[2]) <= floor_z + 1e-9:
+            self._request_stop(host, "max_travel", "Calibration stopped: the commanded downward travel limit was reached before the force target.")
+            return
+        target[:2] = np.asarray(self._start_tool_position, dtype=float)[:2]
+        target[2] = float(base[2]) - float(size_mm) / 1000.0
+        self._approach_zone = mode
+        self._send_step_move(host, now, target, float(size_mm) / 1000.0, mode)
+
+    def _tick_stepwise_approach(self, host, now: float, tool_position, force_g: float) -> None:
+        if self._step_state == "zeroing":
+            zero = self._poll_force_zero(now)
+            if zero is None:
+                return
+            self._step_contact_threshold_g = zero["threshold_g"]
+            self._step_zeroed = True
+            self._step_state = ""
+            host._append_sidebar_control_message(self._force_zero_message(zero))
+            self._next_approach_step(host, now, tool_position)
+            return
+        period = self._loading_period_sec() if self._step_mode == "loading" else 0.0
+        force = self._tick_step(host, now, tool_position, force_g, period_sec=period)
+        if force is None:
+            return
+        if self._step_mode in {"far", "near"} and force >= self._step_contact_threshold_g:
+            self._step_mode = "loading"
+            host._append_sidebar_control_message(
+                f"Light contact {force:.1f} g at Z {float(tool_position[2]) * 1000.0:.3f} mm; "
+                f"loading in {self.step_loading_mm:.3f} mm steps."
+            )
+        elif self._step_mode == "far":
+            self._track_far_force_zero(
+                float(np.median(self._step_raw_forces)) if self._step_raw_forces else None
+            )
+            values = [
+                finite_number(row.get(self.signal_field)) for row in self._samples[-7:]
+                if row.get("step_state") == "dwell"
+            ]
+            values = [value for value in values if value is not None]
+            if (
+                not self._insulative_full_taxel_approach()
+                and self._step_signal_centre is not None and values
+                and self._step_signal_centre - float(np.median(values)) >= self._step_slow_threshold
+            ):
+                self._step_mode = "near"
+                host._append_sidebar_control_message(
+                    f"Proximity signal is strong at Z {float(tool_position[2]) * 1000.0:.2f} mm; "
+                    f"continuing in {self.step_near_mm:.3f} mm steps."
+                )
+        if self._step_mode == "near" and not self._step_zeroed:
+            self._start_force_zero(now, "near approach")
+            self._step_state = "zeroing"
+            return
+        size_mm = None
+        if self._step_mode == "loading" and force >= 0.8 * self.contact_threshold_g:
+            size_mm = max(0.005, 0.5 * float(self.step_loading_mm))
+        self._next_approach_step(host, now, tool_position, size_mm)
+
+    def _send_zero_velocity(self, host) -> bool:
+        if self._send_base_z_velocity(self._robot_api(host), 0.0):
+            return True
+        self._request_stop(host, "command_failed", "Stopped: the robot rejected the zero-velocity command.")
+        return False
+
+    def _reset_rest_tracking(self) -> None:
+        self._rest_last_position = None
+        self._rest_since = None
+
+    def _at_rest(self, now: float, position) -> bool:
+        """True once the TCP has not moved for ``velocity_rest_sec``."""
+        position = np.asarray(position, dtype=float)[:3]
+        previous = self._rest_last_position
+        self._rest_last_position = position
+        if previous is None or float(np.max(np.abs(position - previous))) > self.VELOCITY_REST_TOLERANCE_M:
+            self._rest_since = float(now)
+            return False
+        return now - float(self._rest_since) >= float(self.velocity_rest_sec)
+
     @staticmethod
     def _stop_robot(api) -> None:
         if api is None:
@@ -889,6 +1777,14 @@ class CalibrationTask(ExperimentTask):
         return False
 
     def _validate_start_prerequisites(self, host) -> bool:
+        if not self._validate_measurement_settings(host):
+            return False
+        revision_error = revision_motion_error(getattr(self, "position_map", None))
+        if revision_error:
+            return self._fail_start(host, revision_error)
+        mismatch = position_map_sensor_error(host, getattr(self, "position_map", None))
+        if mismatch:
+            return self._fail_start(host, mismatch)
         self.use_connected_sensor(host)
         saved_joints = self._finite_values(
             (self.initial_position or {}).get("joints_rad"), 6
@@ -934,6 +1830,8 @@ class CalibrationTask(ExperimentTask):
                 "Wait for the active sensor calibration to finish before "
                 "starting the Calibration experiment.",
             )
+        if self.protocol == "standard" and (error := travel_error(self)):
+            return self._fail_start(host, error)
         return True
 
     @staticmethod
@@ -1047,10 +1945,31 @@ class CalibrationTask(ExperimentTask):
         )
 
     def _begin_trial(self, host, now: float, tool_position) -> None:
+        if not self._memory_allows_trial(host):
+            return
         self._phase = "force_baseline"
         self._started_at = float(now)
+        self._trial_wall_started_at = float(now)
+        self._baseline_rows = []
+        self._baseline_last_sequence = None
+        self._last_recorded_sequence = None
+        self._pause_events = []
+        self._recovery_started_at = None
+        repetition = int(getattr(self, "_pass_number", self._trial_number))
+        if self.protocol == "force_sweep":
+            self.contact_threshold_g = float(self.force_schedule_g[(max(1, repetition)-1) % len(self.force_schedule_g)])
+        self._trial_speed_m_s = (
+            float(self.speed_schedule_mm_s[(max(1, repetition) - 1) % len(self.speed_schedule_mm_s)]) / 1000
+            if self.protocol == "speed_sweep" else abs(float(self.approach_speed_m_s))
+        )
         self._approach_started_at = None
         self._start_tool_position = list(tool_position)
+        self._expected_contact_z_m = self._contact_z_by_taxel.get(int(self.taxel_index))
+        self._approach_zone = "measurement"
+        self._slow_zone_entered = False
+        self._reset_profile_state()
+        self._reset_step_state()
+        self._reset_force_zero_state()
         self._reset_travel_status(host, trial_started=True)
         self._force_baseline_samples = []
         self._force_baseline_n = None
@@ -1058,6 +1977,7 @@ class CalibrationTask(ExperimentTask):
         self._samples = []
         self._stop_reason = ""
         self._trial_result_saved = False
+        self._trial_completed = False
         self._return_started_at = None
         self._return_arrived_at = None
         self._return_best_remaining_m = None
@@ -1093,8 +2013,13 @@ class CalibrationTask(ExperimentTask):
                 "force meter in the Tools tab.",
             )
 
+        self._trial_wall_started_at = None
+        if not self._measurement_guard(host, now):
+            return False
         self._test_active = True
         self._force_connection_started_at = None
+        self._contact_z_by_taxel = {}
+        self._trial_memory_bytes = 0
         self._batch_total = max(1, int(self.repeat_count))
         self._trial_number = 1
         self._batch_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -1130,7 +2055,11 @@ class CalibrationTask(ExperimentTask):
     def _append_sample(self, now, force_raw_n, taxel, tool_position) -> None:
         if self._started_at is None or self._force_baseline_n is None:
             return
-        elapsed = max(0.0, float(now) - float(self._started_at))
+        sequence = (taxel.get("sensor_monotonic_s"), taxel.get("frame_sequence"))
+        if sequence == self._last_recorded_sequence:
+            return
+        self._last_recorded_sequence = sequence
+        elapsed = max(0.0, float(now) - float(self._trial_wall_started_at or self._started_at))
         force_sample_fresh = force_raw_n is not None
         force_raw_n = float(force_raw_n) if force_sample_fresh else None
         force_delta = (
@@ -1155,7 +2084,15 @@ class CalibrationTask(ExperimentTask):
         current_z = float(tool_position[2])
         sample = {
             "elapsed_s": elapsed,
+            "active_elapsed_s": max(0.0, elapsed - self._force_pause_total_sec),
+            "acquisition_monotonic_s": float(now),
+            "force_monotonic_s": self._force_sample_source_at,
+            "robot_monotonic_s": self._pose_sample_source_at,
+            "sensor_age_s": max(0.0, now - float(taxel["sensor_monotonic_s"])),
+            "force_age_s": None if self._force_sample_source_at is None else max(0.0, now - self._force_sample_source_at),
+            "robot_age_s": None if self._pose_sample_source_at is None else max(0.0, now - self._pose_sample_source_at),
             "phase": self._phase,
+            "approach_zone": self._approach_zone if self._phase == "approaching" else "",
             "force_sample_fresh": force_sample_fresh,
             "force_raw_n": force_raw_n,
             "force_baseline_n": float(self._force_baseline_n),
@@ -1170,15 +2107,40 @@ class CalibrationTask(ExperimentTask):
                 abs(force_delta_g) if force_delta_g is not None else None
             ),
             "tool_z_m": current_z,
+            "tool_x_m": float(tool_position[0]),
+            "tool_y_m": float(tool_position[1]),
             "travel_down_mm": max(0.0, start_z - current_z) * 1000.0,
-            **taxel,
+            **self._profile_trimmed_taxel(taxel),
         }
+        if self.protocol == "proximity_profile":
+            sample.update(self._profile_tags())
+        elif self.motion_mode == "stepwise":
+            sample.update(self._step_tags())
         self._samples.append(sample)
 
     def _request_stop(self, host, reason: str, message: str) -> None:
         self._stop_reason = str(reason)
+        self._stop_message = str(message)
+        self._stop_phase = self._phase
         self._stop_robot(self._robot_api(host))
         host._stop_sidebar_control(show_result=True, message=message)
+
+    def _capture_stop_details(self, *, complete=False):
+        self._stop_phase = self._stop_phase or self._phase
+        self._stopped_at = datetime.now(timezone.utc).isoformat()
+        self._stop_taxel_index = int(self.taxel_index)
+        self._stop_pass_number = int(getattr(self, "_pass_number", self._trial_number))
+        if not complete and self._stop_reason in {"", "contact_threshold", "profile_complete"}:
+            self._stop_reason = "manual_stop"
+            self._stop_message = "Stopped by the operator."
+
+    def _stop_details(self):
+        return {
+            "stop_reason": self._stop_reason,
+            "stop_message": self._stop_message,
+            "stop_phase": self._stop_phase,
+            "stopped_at": self._stopped_at,
+        }
 
     def _clear_force_pause_state(self) -> None:
         self._force_paused_phase = ""
@@ -1191,6 +2153,9 @@ class CalibrationTask(ExperimentTask):
 
     def _begin_force_pause(self, host, now: float) -> None:
         """Stop motion while preserving the active calibration trial."""
+        if self._phase == "sliding":
+            self._request_stop(host, "force_stale_during_sliding", "Sliding aborted: force stream lost. Restart only after checking the setup.")
+            return
         if self._phase == "paused_force_meter":
             return
         self._force_paused_phase = str(self._phase)
@@ -1201,6 +2166,7 @@ class CalibrationTask(ExperimentTask):
         self._force_resume_last_sample_at = None
         self._force_resume_sample_count = 0
         self._force_pause_count += 1
+        self._pause_events.append({"start_monotonic_s": float(now), "phase": self._phase, "end_monotonic_s": None})
         self._stop_robot(self._robot_api(host))
         self._phase = "paused_force_meter"
         live_force_callback = getattr(
@@ -1290,15 +2256,18 @@ class CalibrationTask(ExperimentTask):
             else max(0.0, float(now) - float(pause_started_at))
         )
         self._force_pause_total_sec += pause_duration
+        if self._pause_events:
+            self._pause_events[-1]["end_monotonic_s"] = float(now)
 
         if resume_phase == "force_baseline":
             # Re-measure a complete stationary baseline after reconnection.
             self._started_at = float(now)
             self._force_baseline_samples = []
             self._last_force_sample_at = None
+            self._baseline_rows = []
+            self._baseline_last_sequence = None
         else:
-            # A paused interval must not consume the trial or contact-hold
-            # timeout and should not create an artificial gap in elapsed time.
+            # Keep active timers, but elapsed_s uses an independent wall clock.
             self._started_at = self._shift_timestamp(
                 self._started_at,
                 pause_duration,
@@ -1311,9 +2280,33 @@ class CalibrationTask(ExperimentTask):
                 self._contact_hold_started_at,
                 pause_duration,
             )
+            self._return_started_at = self._shift_timestamp(self._return_started_at, pause_duration)
+            self._return_last_progress_at = self._shift_timestamp(self._return_last_progress_at, pause_duration)
+            self._recovery_started_at = self._shift_timestamp(self._recovery_started_at, pause_duration)
+            self._profile_stage_started_at = self._shift_timestamp(self._profile_stage_started_at, pause_duration)
+            self._step_started_at = self._shift_timestamp(self._step_started_at, pause_duration)
+            self._step_arrived_at = self._shift_timestamp(self._step_arrived_at, pause_duration)
 
         self._phase = resume_phase
         self._clear_force_pause_state()
+        if self._stepwise() and self._step_state == "moving" and self._step_target is not None:
+            # The pause stop cancelled the line-move step; command it again.
+            self._step_index -= 1
+            self._send_step_move(host, now, self._step_target, self._step_size_m, self._step_mode)
+        if resume_phase == "profile_move":
+            # The pause stop cancelled the TM line move; command it again.
+            self._profile_move_to(
+                host, now, self._profile_target_z_m, self._profile_after_move,
+                kind=self._profile_kind, tolerance_m=self._profile_move_tolerance_m,
+                hold_sec=self._profile_move_hold_sec,
+            )
+            return
+        if resume_phase == "returning" and self._return_purpose == "start":
+            # Pausing clears the controller's position trajectory. Rebuild the
+            # clearance route from current feedback, rather than waiting for a
+            # cancelled trajectory to arrive.
+            self._begin_return_to_initial(host, now, purpose="start")
+            return
         phase_detail = {
             "force_baseline": "Re-measuring force baseline",
             "approaching": "Force restored; resuming approach",
@@ -1362,6 +2355,8 @@ class CalibrationTask(ExperimentTask):
     ) -> bool:
         api = self._robot_api(host)
         purpose = str(purpose)
+        if not self._measurement_guard(host, now):
+            return False
         if api is None:
             self._request_stop(
                 host,
@@ -1380,6 +2375,9 @@ class CalibrationTask(ExperimentTask):
         self._return_best_remaining_m = None
         self._return_last_progress_at = float(now)
         self._current_return_timeout_sec = float(self.return_timeout_sec)
+        if self._fresh_force_reading(host, now) is None:
+            self._begin_force_pause(host, now)
+            return True
 
         if purpose == "start" and self._finite_values(
             (self.initial_position or {}).get("joints_rad"), 6
@@ -1444,7 +2442,19 @@ class CalibrationTask(ExperimentTask):
                     "is unavailable for the base +Z return.",
                 )
                 return False
-            return_speed_m_s = abs(float(self.approach_speed_m_s))
+            if self._stepwise():
+                self._return_start_z = None
+                self._current_return_timeout_sec = max(float(self.return_timeout_sec), 1800.0)
+                self._step_target = np.asarray(current_pose[0], dtype=float)
+                self._update_travel_status(host, current_pose[0])
+                self._update_progress(host, "Stepwise unloading, then a line move to the start height")
+                host._append_sidebar_control_message(
+                    f"Calibration trial {self._trial_number}/{self._batch_total}: unloading in "
+                    f"{self.step_loading_mm:.3f} mm steps measured at rest, then a line move to the "
+                    "start height."
+                )
+                return self._next_unloading_step(host, now)
+            return_speed_m_s = abs(float(self._trial_speed_m_s))
             if return_speed_m_s <= 0.0:
                 self._request_stop(
                     host,
@@ -1453,6 +2463,8 @@ class CalibrationTask(ExperimentTask):
                     "be greater than zero.",
                 )
                 return False
+            self._return_start_z = float(current_pose[0][2])
+            self._reset_rest_tracking()
             return_distance_m = max(
                 0.0,
                 float(target_position[2]) - float(current_pose[0][2]),
@@ -1475,7 +2487,7 @@ class CalibrationTask(ExperimentTask):
                     "+Z return command.",
                 )
                 return False
-            return_speed_mm_s = abs(float(self.approach_speed_m_s)) * 1000.0
+            return_speed_mm_s = abs(float(self._trial_speed_m_s)) * 1000.0
             self._update_progress(
                 host,
                 f"Returning in base +Z at {return_speed_mm_s:.3f} mm/s",
@@ -1514,6 +2526,12 @@ class CalibrationTask(ExperimentTask):
         return route
 
     def _send_mapped_start_waypoint(self, host, point) -> bool:
+        now = time.monotonic()
+        if not self._measurement_guard(host, now):
+            return False
+        if self._fresh_force_reading(host, now) is None:
+            self._begin_force_pause(host, now)
+            return True
         api = self._robot_api(host)
         quaternion = self._finite_values(
             (self.initial_position or {}).get("tool_quaternion_wxyz"), 4
@@ -1682,6 +2700,42 @@ class CalibrationTask(ExperimentTask):
             return
         self._begin_trial(host, now, tool_pose[0])
 
+    def _next_unloading_step(self, host, now: float) -> bool:
+        start = np.asarray(self._start_tool_position, dtype=float)
+        target = np.asarray(self._step_target, dtype=float).copy()
+        target[:2] = start[:2]
+        target[2] = min(float(start[2]), float(target[2]) + float(self.step_loading_mm) / 1000.0)
+        if target[2] >= float(start[2]) - 1e-9:
+            return self._send_step_move(host, now, start, 2 * self.STEP_RETURN_TOLERANCE_M, "retract", self.STEP_RETRACT_SPEED_M_S)
+        return self._send_step_move(host, now, target, float(self.step_loading_mm) / 1000.0, "unloading")
+
+    def _tick_stepwise_return(self, host, now: float, position, purpose: str) -> None:
+        reading = self._fresh_force_reading(host, now)
+        force_g = (
+            0.0 if reading is None or self._force_baseline_n is None
+            else abs(float(reading[0]) - float(self._force_baseline_n)) / self.NEWTONS_PER_GRAM
+        )
+        if self._step_mode == "retract":
+            if self._step_state == "moving":
+                self._tick_step(host, now, position, force_g)
+                return
+            if now - float(self._step_arrived_at) < float(self.return_settle_sec):
+                return
+            self._step_state = ""
+            self._step_mode = ""
+            self._finish_returned_trial(host, now, purpose)
+            return
+        force = self._tick_step(host, now, position, force_g, period_sec=self._loading_period_sec())
+        if force is None:
+            return
+        if force < self._step_contact_threshold_g:
+            self._send_step_move(
+                host, now, np.asarray(self._start_tool_position, dtype=float),
+                2 * self.STEP_RETURN_TOLERANCE_M, "retract", self.STEP_RETRACT_SPEED_M_S,
+            )
+            return
+        self._next_unloading_step(host, now)
+
     def _tick_vertical_return_to_initial(
         self,
         host,
@@ -1702,6 +2756,16 @@ class CalibrationTask(ExperimentTask):
         current_z = float(tool_pose[0][2])
         target_z = float(target_position[2])
         self._update_travel_status(host, tool_pose[0])
+        if self._stepwise():
+            self._tick_stepwise_return(host, now, tool_pose[0], purpose)
+            return
+        if self._return_start_z is not None and current_z < self._return_start_z - self.RETURN_REVERSAL_LIMIT_M:
+            self._request_stop(
+                host, "velocity_reversal",
+                "Stopped: the robot moved down during the +Z return (TM velocity-mode reversal). "
+                "It is stopped where it is; retract it manually before restarting.",
+            )
+            return
         remaining_m = target_z - current_z
         if remaining_m > float(self.return_height_tolerance_m):
             best_remaining = self._return_best_remaining_m
@@ -1727,7 +2791,7 @@ class CalibrationTask(ExperimentTask):
             self._return_arrived_at = None
             if not self._send_base_z_velocity(
                 api,
-                abs(float(self.approach_speed_m_s)),
+                abs(float(self._trial_speed_m_s)),
             ):
                 self._request_stop(
                     host,
@@ -1737,19 +2801,36 @@ class CalibrationTask(ExperimentTask):
                 )
             return
 
+        if not self._send_zero_velocity(host):
+            return
+        at_rest = self._at_rest(now, tool_pose[0])
         if self._return_arrived_at is None:
-            self._stop_robot(api)
             self._return_arrived_at = float(now)
             self._update_progress(
                 host,
                 "Initial height reached; settling before completing trial",
             )
             return
-        if now - float(self._return_arrived_at) < float(self.return_settle_sec):
+        settled_for = now - float(self._return_arrived_at)
+        if settled_for < float(self.return_settle_sec) or not at_rest:
+            if settled_for >= float(self.return_settle_sec) + self.VELOCITY_REST_TIMEOUT_SEC:
+                self._request_stop(host, "not_at_rest", "Stopped: the TCP did not come to rest at the start height.")
             return
+        self._stop_robot(api)  # Leave velocity mode only while still.
+        self._return_start_z = None
         self._finish_returned_trial(host, now, purpose)
 
     def _finish_returned_trial(self, host, now: float, purpose: str) -> None:
+        if self._phase != "recovery" and self.recovery_observation_sec > 0:
+            self._phase = "recovery"
+            self._recovery_started_at = float(now)
+            self._pending_return_purpose = str(purpose)
+            self._update_progress(host, "At initial height; observing baseline recovery")
+            return
+        self._complete_returned_trial(host, now, purpose)
+
+    def _complete_returned_trial(self, host, now: float, purpose: str) -> None:
+        self._trial_completed = True
         try:
             result = self._save_current_trial(host)
         except Exception as exc:
@@ -1780,9 +2861,115 @@ class CalibrationTask(ExperimentTask):
                 ),
             )
         else:
-            self._start_sensor_recalibration(host, now)
+            self._begin_post_save_wait(host, purpose)
+
+    def _clear_post_save_wait(self):
+        self._post_save_started_at = None
+        self._post_save_purpose = ""
+        self._post_save_ready_since = None
+        self._post_save_last_stamps = None
+        self._post_save_frame_counts = [0, 0, 0]
+        self._post_save_wait_detail = ""
+
+    def _begin_post_save_wait(self, host, purpose):
+        """Yield to Qt after saving; no route or calibration in the save callback.
+
+        Serial payloads are delivered on the GUI thread. Even a healthy reader
+        cannot refresh its completed frame while synchronous analysis/save runs.
+        The normal next-motion guard must run on a later tick, on new feedback.
+        """
+        self._stop_robot(self._robot_api(host))
+        self._clear_post_save_wait()
+        self._post_save_started_at = time.monotonic()
+        self._post_save_purpose = str(purpose)
+        self._phase = "waiting_post_save_feedback"
+        if purpose == "resume_home":
+            self._update_progress(host, "Resume loaded; waiting for fresh feedback before routing")
+            host._append_sidebar_control_message(
+                "Resume files prepared. Robot remains stopped while new sensor, force and robot "
+                f"feedback is confirmed ({self.post_save_feedback_timeout_sec:g} s maximum)."
+            )
+            return
+        self._update_progress(host, "Trial saved; stopped at safe height, waiting for fresh feedback")
+        host._append_sidebar_control_message(
+            "Trial saved. Robot remains stopped; waiting for new tactile, force and robot "
+            f"feedback before continuing ({self.post_save_feedback_timeout_sec:g} s maximum)."
+        )
+
+    def _tick_post_save_wait(self, host, now):
+        """A bounded stationary wait, NOT a stale-data exception during motion."""
+        if not self._test_active or self._phase != "waiting_post_save_feedback":
+            return False
+        started = self._post_save_started_at
+        if started is None:
+            self._request_stop(host, "post_save_state_lost", "Stopped: the post-save continuation was lost.")
+            return True
+        # A force alarm still stops immediately, even while awaiting other data.
+        reading = self._read_force_meter(host)
+        if reading is not None:
+            raw, _stamp = reading
+            delta = abs(raw - float(self._force_baseline_n or 0))
+            if max(abs(raw), delta) >= self.EMERGENCY_FORCE_G * self.NEWTONS_PER_GRAM:
+                self._request_stop(host, "force_safety_limit", "Emergency force stop at 900 g while waiting after saving. No automatic motion.")
+                return True
+        sensor_frame = self._read_sensor_frame(host)
+        sensor_stamp = None if sensor_frame is None else finite_number(sensor_frame[1].frame_monotonic_sec)
+        force = self._fresh_force_reading(host, now)
+        force_stamp = None if force is None else float(force[1])
+        api = self._robot_api(host)
+        robot_stamp = finite_number(getattr(api, "current_feedback_state_time", None))
+        if self._read_tool_pose(api) is None or robot_stamp is None or not -0.1 <= now - robot_stamp <= 1.0:
+            robot_stamp = None
+        stamps = (sensor_stamp, force_stamp, robot_stamp)
+        missing = [name for name, stamp in zip(("tactile sensor", "force transmitter", "robot position"), stamps)
+                   if stamp is None or stamp <= started]
+        if now - started >= self.post_save_feedback_timeout_sec:
+            detail = ", ".join(missing) if missing else "a stable sequence of new feedback samples"
+            self._request_stop(
+                host, "post_save_feedback_timeout",
+                f"Stopped at safe height after saving: did not receive {detail} within "
+                f"{self.post_save_feedback_timeout_sec:g} s. Completed trial data is preserved; no next move was sent.",
+            )
+            return True
+        if missing:
+            self._post_save_ready_since = None
+            self._post_save_last_stamps = None
+            self._post_save_frame_counts = [0, 0, 0]
+            detail = "Waiting after save: " + ", ".join(missing)
+            if detail != self._post_save_wait_detail:
+                self._post_save_wait_detail = detail
+                self._update_progress(host, detail)
+            return True
+        if self._post_save_ready_since is None:
+            self._post_save_ready_since = now
+        previous = self._post_save_last_stamps
+        for i, stamp in enumerate(stamps):
+            if previous is None or stamp > previous[i]:
+                self._post_save_frame_counts[i] += 1
+        self._post_save_last_stamps = stamps
+        if (now - self._post_save_ready_since < self.post_save_feedback_stable_sec
+                or min(self._post_save_frame_counts) < 3):
+            return True
+        # Preserve all ordinary freshness, force and wall-time checks before motion.
+        if not self._measurement_guard(host, now):
+            return True
+        purpose = self._post_save_purpose
+        self._clear_post_save_wait()
+        host._append_sidebar_control_message("Fresh feedback confirmed after saving; continuing the calibration sequence.")
+        self._continue_after_saved_trial(host, now, purpose)
+        return True
+
+    def _continue_after_saved_trial(self, host, now, purpose):
+        self._start_sensor_recalibration(host, now)
 
     def _start_sensor_recalibration(self, host, now: float) -> None:
+        if not self.recalibrate_between_trials:
+            pose = self._read_tool_pose(self._robot_api(host))
+            if pose is None:
+                self._request_stop(host, "feedback_unavailable", "Robot pose unavailable.")
+                return
+            self._begin_next_trial_or_force_recovery(host, now, pose[0])
+            return
         sensor = getattr(self._ui_ros(host), "sensor_functions", None)
         if sensor is None or not hasattr(sensor, "updateCal"):
             self._request_stop(
@@ -1854,6 +3041,8 @@ class CalibrationTask(ExperimentTask):
                 message += f" {detail}"
             self._request_stop(host, "sensor_calibration_failed", message)
             return
+        if self._read_sensor_frame(host) is None:
+            return  # Wait for the first complete post-calibration frame.
         tool_pose = self._read_tool_pose(self._robot_api(host))
         if tool_pose is None:
             self._request_stop(
@@ -1946,8 +3135,76 @@ class CalibrationTask(ExperimentTask):
     def _save_result(self) -> Optional[dict]:
         if not self._samples:
             return None
-        rows = list(self._samples)
-        analysis = analyze_calibration_rows(rows, self.signal_field)
+        recording_metadata = self._recording_metadata()
+        # The derived contact-distance column is not an input to this analysis.
+        # Reuse one result instead of computing the same expensive fits twice.
+        analysis = analyze_calibration_rows(self._samples, self.signal_field)
+        rows = contact_referenced_rows(
+            self._samples, self.signal_field, analysis=analysis, in_place=True
+        )
+        profile = None
+        if self.protocol == "proximity_profile":
+            profile = analyse_proximity_profile(
+                rows, rows_n=self.sensor_rows, columns_n=self.sensor_columns,
+                target=self.taxel_index, signal_field=self.signal_field,
+                force_threshold_g=self._profile_force_threshold_g,
+            )
+            profile.update(recording_metadata)
+        contact_travel_mm = (analysis.get("contact_onset") or {}).get("distance_mm")
+        if contact_travel_mm is not None and self._start_tool_position is not None:
+            self._contact_z_by_taxel[int(self.taxel_index)] = (
+                float(self._start_tool_position[2]) - float(contact_travel_mm) / 1000.0
+            )
+        quality = {
+            "resume_session": len(getattr(self, "_resume_history", [])),
+            "interrupted": bool(self._force_pause_count),
+            "trial_completed": self._trial_completed,
+            "eligible_for_comparison": self._trial_completed and self._stop_reason == "contact_threshold" and not self._force_pause_count,
+            "pause_events": copy.deepcopy(self._pause_events),
+            "recording_clock": "monotonic wall time; pauses retained",
+            "acquisition": "unique tactile frames polled at up to 20 Hz; latest timestamped force/robot readings",
+            "rated_force_g": self.RATED_FORCE_G,
+            "emergency_force_g": self.EMERGENCY_FORCE_G,
+            "protocol": self.protocol,
+            "near_target_speed_fraction": 0.25,
+            "slowdown_at_target_fraction": 0.8,
+            "motion": self._motion_metadata(),
+            "loading_setup_plan": copy.deepcopy(self._loading_plan),
+            "far_field_approach": {
+                "speed_mm_s": float(self.far_field_speed_mm_s),
+                "slow_zone_mm": float(self.slow_zone_mm),
+                "expected_contact_z_m": self._expected_contact_z_m,
+                "used": any(row.get("approach_zone") == "far_field" for row in self._samples),
+                "rule": "Fast only above (previous contact Z of this taxel in this run + slow zone) and before any 1 g force change.",
+            },
+            "speed_schedule_mm_s": list(self.speed_schedule_mm_s),
+            "force_schedule_g": list(self.force_schedule_g),
+            "setup": {
+                "specimen_id": self.specimen_id or self.active_sensor_key_name,
+                "session_id": self.session_id,
+                "mounting_id": self.mounting_id,
+                "probe_geometry": self.probe_geometry,
+                "probe_material": self.probe_material,
+                "probe_material_note": str(self.probe_material_note).strip(),
+                "probe_diameter_mm": self.probe_diameter_mm or None,
+                "contact_area_confirmed": bool(self.contact_area_confirmed),
+                "force_reference_verified": bool(self.force_reference_verified),
+                "pressure_interpretation": "Nominal force divided by declared flat-tip area, not measured pressure distribution.",
+            },
+            "sliding": {
+                "distance_mm": self.sliding_distance_mm,
+                "speed_mm_s": self.sliding_speed_mm_s,
+                "direction": self.sliding_direction,
+                "mode": "fixed Z, no shear measurement or constant-force control",
+            } if self.protocol == "sliding" else None,
+            "proximity_profile_settings": self._profile_settings() if profile is not None else None,
+            "notes": str(self.experiment_notes),
+            "recalibrate_between_trials": bool(self.recalibrate_between_trials),
+            "recovery_observation_s": float(self.recovery_observation_sec),
+            "sensor_baseline_frames": len(self._baseline_rows),
+            "sensor_identity": self.active_sensor_key_name,
+            "sensor_name": recording_metadata["sensor_name"],
+        }
         trial_number = max(1, int(self._trial_number))
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         stem = (
@@ -1957,9 +3214,13 @@ class CalibrationTask(ExperimentTask):
         )
         csv_path = None
         metadata_path = None
+        profile_files = {}
+        rows = self._rows_for_storage(rows)
         if self.output_directory is not None:
             result_directory = self._batch_directory or self.output_directory
             result_directory.mkdir(parents=True, exist_ok=True)
+            if profile is not None:
+                profile_files = save_profile_outputs(profile, result_directory, stem)
             csv_path = result_directory / f"{stem}.csv"
             columns = list(rows[0].keys())
             with csv_path.open("w", encoding="utf-8", newline="") as stream:
@@ -1968,7 +3229,9 @@ class CalibrationTask(ExperimentTask):
                 writer.writerows(rows)
             metadata_path = result_directory / f"{stem}.json"
             metadata = {
-                "version": 7,
+                "version": 8,
+                **recording_metadata,
+                "measurement_quality": quality,
                 "batch_id": self._batch_id,
                 "trial_number": trial_number,
                 "requested_trials": int(self._batch_total),
@@ -1977,8 +3240,9 @@ class CalibrationTask(ExperimentTask):
                 "taxel_index": int(self.taxel_index),
                 "signal_field": self.signal_field,
                 "recorded_taxel_indices": self._recorded_taxel_indices(),
-                "approach_speed_m_s": float(self.approach_speed_m_s),
-                "return_speed_m_s": float(abs(self.approach_speed_m_s)),
+                "approach_speed_m_s": float(self._trial_speed_m_s),
+                "return_speed_m_s": float(abs(self._trial_speed_m_s)),
+                **self._return_speed_metadata(),
                 "return_height_tolerance_m": float(
                     self.return_height_tolerance_m
                 ),
@@ -2000,6 +3264,13 @@ class CalibrationTask(ExperimentTask):
                 "force_pause_total_s": float(self._force_pause_total_sec),
                 "sample_count": len(rows),
                 "analysis": analysis,
+                "proximity_profile": None if profile is None else {
+                    key: profile.get(key) for key in (
+                        "surface", "single_frame_sigma", "reference_drift", "detection",
+                        "hysteresis", "profile", "warnings",
+                    )
+                },
+                "proximity_profile_files": profile_files,
                 "csv_path": str(csv_path),
             }
             with metadata_path.open("w", encoding="utf-8") as stream:
@@ -2007,6 +3278,8 @@ class CalibrationTask(ExperimentTask):
                 stream.write("\n")
 
         result = {
+            **recording_metadata,
+            "measurement_quality": quality,
             "rows": rows,
             "csv_path": str(csv_path) if csv_path is not None else "",
             "metadata_path": (
@@ -2019,8 +3292,9 @@ class CalibrationTask(ExperimentTask):
             "signal_field": self.signal_field,
             "sensor_shape": [self.sensor_rows, self.sensor_columns],
             "recorded_taxel_indices": self._recorded_taxel_indices(),
-            "approach_speed_m_s": float(self.approach_speed_m_s),
-            "return_speed_m_s": float(abs(self.approach_speed_m_s)),
+            "approach_speed_m_s": float(self._trial_speed_m_s),
+            "return_speed_m_s": float(abs(self._trial_speed_m_s)),
+            **self._return_speed_metadata(),
             "return_height_tolerance_m": float(
                 self.return_height_tolerance_m
             ),
@@ -2035,9 +3309,87 @@ class CalibrationTask(ExperimentTask):
             "force_pause_count": int(self._force_pause_count),
             "force_pause_total_s": float(self._force_pause_total_sec),
             "analysis": analysis,
+            "proximity_profile": profile,
+            "proximity_profile_files": profile_files,
         }
         result["summary"] = self._summarize_trial(result)
         return result
+
+    def _return_speed_metadata(self) -> dict:
+        """Qualify the legacy nominal rate without changing any motion command."""
+        return {
+            "return_speed_m_s_scope": (
+                "nominal_stepwise_unloading_rate" if self._stepwise() else
+                "not_applicable_to_proximity_profile_steps" if self.protocol == "proximity_profile" else
+                "velocity_return_command"
+            ),
+            "fast_return_command_speed_m_s": (
+                self.STEP_RETRACT_SPEED_M_S if self._stepwise() else None
+            ),
+            "return_speed_note": (
+                "Configured rates/commands, not measured TCP speeds. Stepwise unloading includes dwell; "
+                "fast return includes arrival settling. Acceleration and robot project speed can affect motion."
+            ),
+        }
+
+    def _motion_metadata(self) -> dict:
+        if not self._stepwise():
+            return {"mode": "proximity_profile_steps" if self.protocol == "proximity_profile" else "velocity"}
+        loading = [
+            row for row in self._samples
+            if row.get("step_mode") == "loading" and row.get("step_state") == "dwell"
+        ]
+        rate = None
+        if len(loading) >= 2:
+            span = float(loading[-1]["elapsed_s"]) - float(loading[0]["elapsed_s"])
+            travel = float(loading[0]["tool_z_m"]) - float(loading[-1]["tool_z_m"])
+            rate = travel * 1000.0 / span if span > 0 else None
+        return {
+            "mode": "stepwise",
+            "description": "TM line (position) moves; each step measured at rest",
+            "far_step_mm": float(self.step_far_mm),
+            "near_step_mm": float(self.step_near_mm),
+            "loading_step_mm": float(self.step_loading_mm),
+            "time_at_rest_per_step_s": float(self.step_dwell_sec),
+            "force_lag_ignored_s": self.STEP_FORCE_LAG_SEC,
+            "contact_threshold_g": float(self._step_contact_threshold_g),
+            "light_contact_threshold_g": float(self.light_contact_threshold_g),
+            "force_zeros": [dict(zero) for zero in self._force_zero_log],
+            "nominal_loading_rate_mm_s": abs(float(self._trial_speed_m_s)) * 1000.0,
+            "nominal_unloading_rate_mm_s": abs(float(self._trial_speed_m_s)) * 1000.0,
+            "fast_return_command_speed_mm_s": self.STEP_RETRACT_SPEED_M_S * 1000.0,
+            "measured_loading_rate_mm_s": rate,
+            "sliding_step_mm": float(self.sliding_step_mm) if self.protocol == "sliding" else None,
+        }
+
+    def _profile_settings(self) -> dict:
+        reference_gap, levels = self._profile_level_gaps()
+        return {
+            "reference_gap_mm": reference_gap,
+            "level_gaps_mm": levels,
+            "sweeps": int(self.profile_sweeps),
+            "order": self.profile_order,
+            "random_seed": self._profile_seed,
+            "frames_per_level": int(self.profile_frames_per_level),
+            "settle_s": float(self.profile_settle_sec),
+            "reference_every_levels": int(self.profile_reference_every),
+            "surface_probes": int(self.profile_surface_probes),
+            "surface_stop_g": float(self.profile_surface_stop_g),
+            "surface_contact_threshold_g": float(self._profile_force_threshold_g),
+            "light_contact_threshold_g": float(self.light_contact_threshold_g),
+            "force_zeros": [dict(zero) for zero in self._force_zero_log],
+            "motion": "TM line (position) steps checked at rest; no velocity mode",
+            "surface_search_step_far_mm": float(self.profile_search_step_far_mm),
+            "surface_search_step_near_mm": float(self.profile_search_step_near_mm),
+            "surface_slow_signal_drop": self._profile_slow_threshold,
+            "surface_probe_step_mm": float(self.profile_probe_step_mm),
+            "surface_probe_start_mm": self.PROFILE_PROBE_START_M * 1000.0,
+            "force_lag_s": self.PROFILE_FORCE_LAG_SEC,
+            "move_speed_mm_s": float(self.profile_move_speed_mm_s),
+            "project_speed_percent": self._profile_project_speed_percent,
+            "position_tolerance_mm": self.PROFILE_POSITION_TOLERANCE_M * 1000.0,
+            "remeasure_surface": bool(self.profile_remeasure_surface),
+        }
 
     @staticmethod
     def _finite_row_values(rows, field: str) -> list[float]:
@@ -2068,7 +3420,30 @@ class CalibrationTask(ExperimentTask):
         signal_distance_fit = analysis.get("signal_distance_fit") or {}
         force_distance_fit = analysis.get("force_distance_fit") or {}
         force_signal_fit = analysis.get("force_signal_fit") or {}
+        proximity_range = analysis.get("proximity_range") or {}
+        turning = analysis.get("turning_point") or {}
+        turning = turning if turning.get("detected") else {}
+        baseline_return = analysis.get("baseline_return") or {}
+        rise_fit = analysis.get("force_signal_rise_fit") or {}
+        profile = result.get("proximity_profile")
+        profile_fields = {}
+        if profile is not None:
+            detection = profile.get("detection") or {}
+            localized = profile.get("detection_localized") or {}
+            profile_fields = {
+                "profile_surface_z_mm": (
+                    None if (profile.get("surface") or {}).get("surface_z_m") is None
+                    else profile["surface"]["surface_z_m"] * 1000.0
+                ),
+                "profile_surface_sd_mm": (profile.get("surface") or {}).get("surface_sd_mm"),
+                "profile_single_frame_sigma": profile.get("single_frame_sigma"),
+                "profile_detection_3sigma_mm": (detection.get("3_sigma") or {}).get("distance_mm"),
+                "profile_detection_5sigma_mm": (detection.get("5_sigma") or {}).get("distance_mm"),
+                "profile_localized_3sigma_mm": (localized.get("3_sigma") or {}).get("distance_mm"),
+                "profile_localized_5sigma_mm": (localized.get("5_sigma") or {}).get("distance_mm"),
+            }
         return {
+            **profile_fields,
             "trial_number": int(result.get("trial_number", 0)),
             "stop_reason": str(result.get("stop_reason", "")),
             "force_pause_count": int(result.get("force_pause_count", 0)),
@@ -2097,6 +3472,18 @@ class CalibrationTask(ExperimentTask):
             "force_signal_slope": force_signal_fit.get("slope"),
             "force_signal_intercept": force_signal_fit.get("intercept"),
             "force_signal_r_squared": force_signal_fit.get("r_squared"),
+            "proximity_range_status": proximity_range.get("status"),
+            "proximity_range_mm": proximity_range.get("distance_above_contact_mm"),
+            "proximity_range_lower_bound_mm": proximity_range.get("lower_bound_mm"),
+            "turning_force_g": turning.get("force_g"),
+            "turning_force_low_g": turning.get("force_low_g"),
+            "turning_force_high_g": turning.get("force_high_g"),
+            "turning_after_contact_mm": turning.get("after_contact_mm"),
+            "turning_signal": turning.get("signal"),
+            "baseline_return_force_g": baseline_return.get("force_g"),
+            "force_signal_rise_slope": rise_fit.get("slope"),
+            "force_signal_rise_intercept": rise_fit.get("intercept"),
+            "force_signal_rise_r_squared": rise_fit.get("r_squared"),
             "csv_path": str(result.get("csv_path", "")),
             "metadata_path": str(result.get("metadata_path", "")),
         }
@@ -2106,6 +3493,7 @@ class CalibrationTask(ExperimentTask):
             return self._batch_results[-1] if self._batch_results else None
         result = self._save_result()
         self._trial_result_saved = True
+        self._record_trial_memory()
         if result is None:
             return None
         self._batch_results.append(result)
@@ -2115,7 +3503,59 @@ class CalibrationTask(ExperimentTask):
                 f"Calibration trial {self._trial_number}/{self._batch_total} "
                 f"saved: {csv_path}"
             )
+        if result.get("proximity_profile") is not None:
+            lines = proximity_report_lines(result["proximity_profile"])
+            host._append_sidebar_control_message("\n".join(
+                line for line in lines[2:] if line.startswith((
+                    "Surface", "Single", "Far-field", "Common-mode", "Localized", "Detection", "Target strongest",
+                    "Warning",
+                ))
+            ))
+            if result.get("proximity_profile_files", {}).get("png"):
+                host._append_sidebar_control_message(
+                    f"Proximity profile graph: {result['proximity_profile_files']['png']}"
+                )
+            return result
+        for message in self._calibration_target_messages(result.get("analysis") or {}):
+            host._append_sidebar_control_message(message)
         return result
+
+    @staticmethod
+    def _calibration_target_messages(analysis) -> list[str]:
+        """Plain-language result of the three calibration targets for one trial."""
+        messages = []
+        proximity = analysis.get("proximity_range") or {}
+        status = proximity.get("status")
+        if status == "measured":
+            messages.append(
+                f"Proximity first detected {proximity['distance_above_contact_mm']:.2f} mm before force contact."
+            )
+        elif status == "start_inside_range":
+            messages.append(
+                "Proximity was already present at the start pose, so the range is at least "
+                f"{proximity['lower_bound_mm']:.2f} mm. Raise the start pose (and recalibrate "
+                "there) to measure the true range."
+            )
+        elif status == "proximity_not_detected":
+            messages.append("No proximity response was detected before contact.")
+        turning = analysis.get("turning_point") or {}
+        if turning.get("detected"):
+            messages.append(
+                f"Drop-to-rise turning point at {turning['force_g']:.1f} g "
+                f"(flat band {turning['force_low_g']:.1f}–{turning['force_high_g']:.1f} g), "
+                f"{turning['after_contact_mm']:.2f} mm after force contact."
+            )
+        elif turning.get("reason") == "no_rise_within_loading":
+            messages.append(
+                "The signal had not started rising when the force target was reached; "
+                "increase the force target to find the turning point."
+            )
+        baseline_return = analysis.get("baseline_return") or {}
+        if baseline_return.get("reached"):
+            messages.append(
+                f"Signal returned to its no-touch baseline at {baseline_return['force_g']:.1f} g."
+            )
+        return messages
 
     def _save_batch_summary(self) -> tuple[str, str, str]:
         if not self._batch_results or self.output_directory is None:
@@ -2144,6 +3584,8 @@ class CalibrationTask(ExperimentTask):
         metadata_path = result_directory / f"{summary_stem}.json"
         metadata = {
             "version": 2,
+            **self._recording_metadata(),
+            **self._stop_details(),
             "batch_id": self._batch_id,
             "status": (
                 "complete"
@@ -2159,6 +3601,7 @@ class CalibrationTask(ExperimentTask):
             "recorded_taxel_indices": self._recorded_taxel_indices(),
             "approach_speed_m_s": float(self.approach_speed_m_s),
             "return_speed_m_s": float(abs(self.approach_speed_m_s)),
+            **self._return_speed_metadata(),
             "return_height_tolerance_m": float(
                 self.return_height_tolerance_m
             ),
@@ -2187,6 +3630,7 @@ class CalibrationTask(ExperimentTask):
             return None
         summary_path, metadata_path, graph_directory = self._save_batch_summary()
         common = {
+            **self._recording_metadata(),
             "batch_id": self._batch_id,
             "batch_status": (
                 "complete"
@@ -2225,9 +3669,64 @@ class CalibrationTask(ExperimentTask):
             ),
         }
 
+    def _loading_project_speed(self, host):
+        percent = None
+        getter = getattr(self._robot_api(host), "get_project_speed_percent", None)
+        if callable(getter):
+            try:
+                percent = getter()
+            except Exception:
+                pass
+        return percent
+
     def on_start(self, host) -> bool:
+        if not self._test_active:
+            self._clear_post_save_wait()
+            self._stop_message = self._stop_phase = self._stopped_at = ""
+            self._stop_taxel_index = self._stop_pass_number = None
+        revision_error = revision_motion_error(getattr(self, "position_map", None))
+        if revision_error:
+            return self._fail_start(host, revision_error)
+        percent = self._loading_project_speed(host)
+        if self.loading_auto_plan and self.protocol == "standard":
+            # This runs only on an explicit Run, never on ticks, retries or
+            # per-taxel transitions. Runtime limits remain fixed for the batch.
+            if self._test_active or self._phase == "connecting_force_meter":
+                host._append_sidebar_control_message("Stop the current calibration before replanning.")
+                return False
+            mismatch = position_map_sensor_error(host, self.position_map)
+            if mismatch:
+                return self._fail_start(host, mismatch)
+            self.use_connected_sensor(host)
+            proposed = suggested_loading_plan(self, project_speed_percent=percent)
+            error = loading_plan_error(proposed)
+            if error:
+                return self._fail_start(host, "Automatic loading plan blocked: " + error)
+            self.max_travel_m = proposed["suggested_travel_mm"] / 1000.
+            self.timeout_sec = proposed["suggested_timeout_sec"]
+            sync = getattr(host, "_refresh_calibration_planned_limits", None)
+            if callable(sync):
+                sync(self)
+            host._append_sidebar_control_message(
+                f"Automatic loading plan: travel {self.max_travel_m * 1000.:.1f} mm "
+                f"(mapped scan + {self.loading_extra_travel_mm:g} mm allowance), "
+                f"timeout {self.timeout_sec:.0f} s per taxel/trial. Force target unchanged. "
+                "This is not a clearance approval; verify a supervised low-force pilot."
+            )
         if not self._validate_start_prerequisites(host):
             return False
+        self._loading_plan = loading_plan(
+            self, extra_mm=self.loading_extra_travel_mm, project_speed_percent=percent,
+        )
+        if self._loading_plan is not None:
+            self._loading_plan["limits_mode"] = "automatic" if self.loading_auto_plan else "manual"
+        if self._loading_plan is not None and self.timeout_sec < self._loading_plan["suggested_timeout_sec"]:
+            host._append_sidebar_control_message(
+                f"Loading/unloading timeout warning: {self.timeout_sec:.0f} s is below the planning "
+                f"allowance of {self._loading_plan['suggested_timeout_sec']:.0f} s per trial at "
+                f"{self._loading_plan['project_speed_percent']:.0f}% project speed. "
+                "This estimate is not a measured duration; keep the finite limit and verify a single-taxel pilot."
+            )
         force_reading = self._read_force_meter(host)
         now = time.monotonic()
         if (
@@ -2246,6 +3745,12 @@ class CalibrationTask(ExperimentTask):
         if not self._test_active:
             return
         now = time.monotonic()
+        if self._tick_post_save_wait(host, now):
+            return
+        if not self._measurement_guard(
+            host, now, sensor_required=self._phase not in {"recalibrating"}
+        ):
+            return
         if self._phase == "paused_force_meter":
             self._tick_force_pause(host, now)
             return
@@ -2257,6 +3762,9 @@ class CalibrationTask(ExperimentTask):
             return
 
         force_reading = self._fresh_force_reading(host, now)
+        if force_reading is None and self._phase in {"returning", "recovery"}:
+            self._begin_force_pause(host, now)
+            return
         if self._phase == "returning":
             force_raw_n = force_reading[0] if force_reading is not None else None
             live_force_callback = getattr(
@@ -2297,6 +3805,7 @@ class CalibrationTask(ExperimentTask):
             self._begin_force_pause(host, now)
             return
         force_raw_n, force_sample_at = force_reading
+        self._force_raw_g_now = float(force_raw_n) / self.NEWTONS_PER_GRAM
         live_force_callback = getattr(
             host,
             "_refresh_calibration_live_force",
@@ -2317,11 +3826,30 @@ class CalibrationTask(ExperimentTask):
             )
 
         if self._phase == "force_baseline":
+            taxel = self._read_taxel(host)
+            pose = self._read_tool_pose(self._robot_api(host))
+            if taxel is None or pose is None:
+                self._request_stop(host, "feedback_unavailable", "Baseline stopped: missing tactile or robot feedback.")
+                return
+            sequence = (taxel["sensor_monotonic_s"], taxel["frame_sequence"])
+            if sequence != self._baseline_last_sequence:
+                self._baseline_last_sequence = sequence
+                self._baseline_rows.append((now, force_raw_n, dict(taxel), list(pose[0]), force_sample_at, self._pose_sample_source_at))
             if force_sample_at != self._last_force_sample_at:
                 self._force_baseline_samples.append(float(force_raw_n))
                 self._last_force_sample_at = force_sample_at
             baseline_elapsed = now - self._started_at
-            if baseline_elapsed < float(self.force_baseline_duration_sec):
+            if baseline_elapsed < max(float(self.force_baseline_duration_sec), self.sensor_baseline_duration_sec):
+                return
+            if len(self._baseline_rows) < self.sensor_baseline_frames:
+                # Large user-selected windows need longer than the default
+                # 30 s timeout (the UI collector is capped at 20 Hz).
+                baseline_timeout = max(
+                    float(self.sensor_baseline_timeout_sec),
+                    float(self.sensor_baseline_duration_sec) + 0.1 * self.sensor_baseline_frames,
+                )
+                if baseline_elapsed >= baseline_timeout:
+                    self._request_stop(host, "insufficient_sensor_baseline", "Stopped: insufficient unique stationary tactile frames.")
                 return
             if len(self._force_baseline_samples) < int(
                 self.force_baseline_min_samples
@@ -2339,15 +3867,57 @@ class CalibrationTask(ExperimentTask):
             self._force_baseline_n = float(
                 np.median(self._force_baseline_samples)
             )
+            baseline_values = [r[2]["diff_ave"] for r in self._baseline_rows]
+            if any(finite_number(v) is None for v in baseline_values):
+                self._request_stop(host, "invalid_sensor_baseline", "Stopped: non-finite tactile baseline.")
+                return
+            detector = downward_detector(baseline_values, self.proximity_window_frames, self.proximity_min_margin)
+            half = max(1, len(baseline_values) // 2)
+            drift = abs(float(np.median(baseline_values[-half:]) - np.median(baseline_values[:half])))
+            if drift > detector["margin"]:
+                self._request_stop(host, "unstable_sensor_baseline", "Stopped: stationary baseline is drifting. Let it settle and restart.")
+                return
+            for stamp, force, baseline_taxel, position, force_at, pose_at in self._baseline_rows:
+                self._force_sample_source_at = force_at
+                self._pose_sample_source_at = pose_at
+                self._append_sample(stamp, force, baseline_taxel, position)
+            self._force_sample_source_at = force_sample_at
+            self._pose_sample_source_at = finite_number(getattr(self._robot_api(host), "current_feedback_state_time", None))
             self._phase = "approaching"
             self._approach_started_at = now
+            if self.protocol == "proximity_profile":
+                self._begin_profile(host, now)
+                return
+            if self._stepwise():
+                self._update_progress(host, "Stepwise approach to the selected taxel")
+                host._append_sidebar_control_message(
+                    f"Force baseline: {self._force_baseline_n / self.NEWTONS_PER_GRAM:+.1f} g. Stepwise "
+                    f"approach to taxel {self.taxel_index}: {self.step_far_mm:.2f} mm steps until the "
+                    f"signal is strong, {self.step_near_mm:.3f} mm to contact, then "
+                    f"{self.step_loading_mm:.3f} mm loading steps, each measured at rest for "
+                    f"{self.step_dwell_sec:.2f} s."
+                    + (
+                        " Insulative probe: the far step continues until force contact, "
+                        "then loading steps begin."
+                        if self._insulative_full_taxel_approach() else ""
+                    )
+                )
+                self._begin_stepwise_approach(host, now)
+                return
             self._update_progress(host, "Approaching the selected taxel")
             baseline_g = self._force_baseline_n / self.NEWTONS_PER_GRAM
             host._append_sidebar_control_message(
                 f"Force baseline: {baseline_g:+.1f} g "
                 f"({self._force_baseline_n:+.4f} N). "
                 f"Approaching taxel {self.taxel_index} at "
-                f"{self.approach_speed_m_s * 1000.0:.3f} mm/s."
+                f"{self._trial_speed_m_s * 1000.0:.3f} mm/s."
+                + (
+                    f" Far field at {float(self.far_field_speed_mm_s):.2f} mm/s until "
+                    f"{self.slow_zone_mm:.1f} mm above the previous contact height."
+                    if self._expected_contact_z_m is not None
+                    and float(self.far_field_speed_mm_s) / 1000.0 > abs(float(self._trial_speed_m_s))
+                    else ""
+                )
             )
 
         taxel = self._read_taxel(host)
@@ -2372,12 +3942,47 @@ class CalibrationTask(ExperimentTask):
             )
             return
 
+        if self._phase == "recovery":
+            if now - float(self._recovery_started_at or now) >= self.recovery_observation_sec:
+                self._complete_returned_trial(host, now, self._pending_return_purpose)
+            return
+
+        if self._phase == "sliding":
+            self._tick_sliding(host, now, tool_position, force_delta_abs_g)
+            return
+
+        # Limits apply during holds as well as during descent.
+        if travel_down_m >= float(self.max_travel_m):
+            self._request_stop(host, "max_travel", "Stopped: maximum downward travel limit reached.")
+            return
+
+        if self._phase.startswith("profile_"):
+            self._tick_profile(host, now, tool_position, force_delta_abs_g)
+            return
+
         if self._phase == "contact_hold":
-            if (
-                self._contact_hold_started_at is None
-                or now - float(self._contact_hold_started_at)
-                < float(self.contact_hold_sec)
-            ):
+            if not self._stepwise() and not self._send_zero_velocity(host):
+                return
+            at_rest = self._at_rest(now, tool_position)
+            held_for = (
+                -1.0 if self._contact_hold_started_at is None
+                else now - float(self._contact_hold_started_at)
+            )
+            if held_for < float(self.contact_hold_sec):
+                return
+            if not at_rest:
+                if held_for >= float(self.contact_hold_sec) + self.VELOCITY_REST_TIMEOUT_SEC:
+                    self._request_stop(host, "not_at_rest", "Stopped: the TCP did not come to rest after the contact stop.")
+                return
+            self._stop_robot(self._robot_api(host))  # Leave velocity mode only while still.
+            if self.protocol == "sliding":
+                self._slide_origin = np.asarray(tool_position, dtype=float)
+                self._slide_returning = False
+                self._slide_resting = False
+                self._slide_target_m = 0.0
+                self._step_state = ""
+                self._phase = "sliding"
+                self._update_progress(host, "Fixed-Z out-and-back sliding; normal-force guard active")
                 return
             purpose = (
                 "complete"
@@ -2396,7 +4001,12 @@ class CalibrationTask(ExperimentTask):
             and force_delta_abs >= float(self.contact_threshold_n)
         ):
             self._stop_reason = "contact_threshold"
-            self._stop_robot(self._robot_api(host))
+            if self._stepwise():
+                self._stop_robot(self._robot_api(host))  # Cancels the current line-move step.
+                self._step_state = ""
+            elif not self._send_zero_velocity(host):
+                return
+            self._reset_rest_tracking()
             self._phase = "contact_hold"
             self._contact_hold_started_at = float(now)
             self._update_progress(
@@ -2406,8 +4016,9 @@ class CalibrationTask(ExperimentTask):
             )
             host._append_sidebar_control_message(
                 f"Contact threshold reached at {force_delta_abs_g:.1f} g "
-                f"({force_delta_abs:.4f} N). Robot stopped; holding for "
-                f"{self.contact_hold_sec:.1f} s before returning."
+                f"({force_delta_abs:.4f} N). "
+                + ("Step stopped" if self._stepwise() else "Velocity set to zero")
+                + f"; holding for {self.contact_hold_sec:.1f} s and returning once the TCP is still."
             )
             return
         if (
@@ -2430,20 +4041,505 @@ class CalibrationTask(ExperimentTask):
                 f"Calibration stopped at the {self.timeout_sec:.1f} s timeout.",
             )
             return
-        if not self._send_base_z_velocity(
-            self._robot_api(host), -abs(float(self.approach_speed_m_s))
-        ):
+        if self._stepwise():
+            self._tick_stepwise_approach(host, now, tool_position, force_delta_abs_g)
+            return
+        if float(tool_position[2]) > float(self._start_tool_position[2]) + self.DESCENT_REVERSAL_LIMIT_M:
+            self._request_stop(
+                host, "velocity_reversal",
+                "Stopped: the robot moved up while commanded down (TM velocity-mode reversal "
+                "after an abrupt stop). Restart the run.",
+            )
+            return
+        speed = abs(float(self._trial_speed_m_s))
+        if force_delta_abs >= 0.8 * self.contact_threshold_n:
+            speed *= 0.25
+        elif self._far_field_allowed(tool_position, force_delta_abs_g):
+            speed = float(self.far_field_speed_mm_s) / 1000.0
+        if self._approach_zone == "far_field" and speed <= abs(float(self._trial_speed_m_s)):
+            host._append_sidebar_control_message(
+                f"Entered the slow measurement zone ({speed * 1000.0:.3f} mm/s) "
+                f"{self.slow_zone_mm:.1f} mm above the previous contact height."
+            )
+        self._approach_zone = "far_field" if speed > abs(float(self._trial_speed_m_s)) else "measurement"
+        if not self._send_base_z_velocity(self._robot_api(host), -speed):
             self._request_stop(
                 host,
                 "command_failed",
                 "Calibration stopped: the robot rejected the base -Z velocity command.",
             )
 
+    # TM velocity mode moves in stick-slip jumps of up to ~0.6 mm at low speed
+    # and keeps moving after a stop, so the profile never uses it. Every move,
+    # including the surface search, is a TM line (position) move that is
+    # checked with the robot at rest.
+    PROFILE_LINE_MOTION = 4
+    PROFILE_POSITION_TOLERANCE_M = 0.0001
+    PROFILE_STATIONARY_TOLERANCE_M = 0.000003
+    PROFILE_STEP_SETTLE_SEC = 0.3
+    PROFILE_FORCE_LAG_SEC = 0.25
+    PROFILE_CHECK_FORCE_SAMPLES = 2
+    PROFILE_CHECK_TIMEOUT_SEC = 5.0
+    PROFILE_SEARCH_FORCE_LIMIT_G = 300.0
+    PROFILE_SLOW_SIGNAL_SIGMA = 10.0
+    PROFILE_SLOW_SIGNAL_MIN = 20.0
+    PROFILE_PROBE_START_M = 0.0003
+    PROFILE_SURFACE_SETTLE_SEC = 0.5
+    PROFILE_COLLECT_TIMEOUT_SEC = 60.0
+    # Duration model, slightly conservative against the TM rig: a line move
+    # takes ~1 s plus distance / (speed limit × project speed override).
+    PROFILE_ASSUMED_SPEED_PERCENT = 25.0
+    PROFILE_FALLBACK_SPEED_PERCENT = 10.0
+    PROFILE_MOVE_OVERHEAD_SEC = 1.0
+    PROFILE_WINDOW_OVERHEAD_SEC = 1.5
+    PROFILE_FRAME_RATE_HZ = 12.5
+    PROFILE_SEARCH_STEP_SEC = 1.1
+    PROFILE_NEAR_ZONE_MM = 15.0
+    _PROFILE_CORE_FIELDS = (
+        "frame_sequence", "sensor_monotonic_s", "cell_index", "display_row", "column",
+        "raw", "calibration", "diff", "diff_percent", "raw_ave", "diff_ave", "diff_percent_ave",
+    )
+
+    def _reset_profile_state(self) -> None:
+        self._profile_kind = ""
+        self._profile_window_kind = ""
+        self._profile_step = -1
+        self._profile_plan = []
+        self._profile_cursor = -1
+        self._profile_sweep = 0
+        self._profile_direction = ""
+        self._profile_target_gap_mm = None
+        self._profile_probe = -1
+        self._profile_probe_final = False
+        self._profile_surface_z_m = None
+        self._profile_force_threshold_g = 1.0
+        self._profile_target_z_m = None
+        self._profile_after_move = ""
+        self._profile_move_tolerance_m = self.PROFILE_POSITION_TOLERANCE_M
+        self._profile_move_hold_sec = None
+        self._profile_stage_started_at = None
+        self._profile_move_timeout_sec = 0.0
+        self._profile_last_z_m = None
+        self._profile_still_since = None
+        self._profile_collect_start = 0
+        self._profile_seed = None
+        self._profile_signal_centre = None
+        self._profile_slow_threshold = None
+        self._profile_search_mode = None
+        self._profile_step_target_z = None
+        self._profile_check_forces = []
+        self._profile_check_raw = []
+        self._profile_check_force_at = None
+        self._profile_check_rows = 0
+
+    def _profile_tags(self) -> dict:
+        kind = self._profile_kind
+        window = kind in {"level", "reference"}
+        probe = kind == "surface_probe"
+        return {
+            "profile_kind": kind,
+            "profile_step": self._profile_step if window else "",
+            "profile_sweep": self._profile_sweep if window else "",
+            "profile_direction": self._profile_direction if window else "",
+            "profile_target_gap_mm": (
+                self._profile_target_gap_mm if window and self._profile_target_gap_mm is not None else ""
+            ),
+            "profile_probe": self._profile_probe if probe else "",
+            "profile_probe_final": self._profile_probe_final if probe else "",
+            "profile_contact_threshold_g": self._profile_force_threshold_g if probe else "",
+            "profile_surface_z_m": "" if self._profile_surface_z_m is None else self._profile_surface_z_m,
+        }
+
+    def _profile_trimmed_taxel(self, taxel) -> dict:
+        """Keep every taxel only in stationary windows; elsewhere keep the target."""
+        if not self._phase.startswith("profile_") or self._profile_kind in {"level", "reference"}:
+            return taxel
+        target = int(self.taxel_index)
+        keep = set(self._PROFILE_CORE_FIELDS) | {
+            taxel_signal_column(field, target)
+            for field in (self.signal_field, "raw", "calibration", "diff", "diff_ave", "diff_percent_ave")
+        }
+        return {key: value for key, value in taxel.items() if key in keep}
+
+    def _enter_profile_stage(self, phase: str, now: float) -> None:
+        self._phase = phase
+        self._profile_stage_started_at = float(now)
+        self._profile_last_z_m = None
+        self._profile_still_since = None
+
+    def _profile_is_still(self, now: float, z_value: float, hold_sec: float) -> bool:
+        """True once the TCP has not moved for ``hold_sec``."""
+        previous = self._profile_last_z_m
+        self._profile_last_z_m = float(z_value)
+        if previous is None or abs(float(z_value) - previous) > self.PROFILE_STATIONARY_TOLERANCE_M:
+            self._profile_still_since = float(now)
+            return False
+        return now - float(self._profile_still_since) >= float(hold_sec)
+
+    def _profile_step_size_m(self) -> float:
+        return float({
+            "far": self.profile_search_step_far_mm,
+            "near": self.profile_search_step_near_mm,
+            "probe": self.profile_probe_step_mm,
+        }[self._profile_search_mode]) / 1000.0
+
+    def _begin_profile(self, host, now: float) -> None:
+        baseline = np.asarray(self._force_baseline_samples, dtype=float) / self.NEWTONS_PER_GRAM
+        noise_g = float(1.4826 * np.median(np.abs(baseline - np.median(baseline)))) if baseline.size > 1 else 0.0
+        self._profile_force_threshold_g = max(float(self.light_contact_threshold_g), 3.0 * noise_g)
+        self._far_rest_raw_g = []
+        if self._profile_force_threshold_g >= float(self.profile_surface_stop_g):
+            self._request_stop(
+                host, "profile_force_noise",
+                f"Proximity profile stopped: force noise needs a {self._profile_force_threshold_g:.1f} g "
+                "contact threshold, at or above the level contact guard. Raise the guard.",
+            )
+            return
+        signals = [
+            finite_number(row[2].get(self.signal_field)) for row in self._baseline_rows
+        ]
+        signals = np.asarray([value for value in signals if value is not None], dtype=float)
+        centre = float(np.median(signals)) if signals.size else 0.0
+        sigma = float(1.4826 * np.median(np.abs(signals - centre))) if signals.size > 1 else 0.0
+        self._profile_signal_centre = centre
+        self._profile_slow_threshold = max(self.PROFILE_SLOW_SIGNAL_MIN, self.PROFILE_SLOW_SIGNAL_SIGMA * sigma)
+        self._profile_seed = int(datetime.now().timestamp())
+        self._profile_search_mode = "far"
+        self._profile_step_target_z = float(self._start_tool_position[2])
+        self._update_progress(host, "Proximity profile: stepping down to find the surface")
+        host._append_sidebar_control_message(
+            f"Proximity profile: stepping down {self.profile_search_step_far_mm:.2f} mm at a time until "
+            f"the signal drops {self._profile_slow_threshold:.1f} counts, then "
+            f"{self.profile_search_step_near_mm:.3f} mm steps until {self._profile_force_threshold_g:.1f} g "
+            "light contact. Every step is a position move checked at rest. After the surface is found "
+            f"the profile takes about {self.estimate_profile_duration_sec() / 60.0:.0f} min."
+        )
+        self._profile_next_search_step(host, now)
+
+    def _profile_signal_drop(self) -> Optional[float]:
+        """Median signal drop of the last seven recorded frames versus the start baseline."""
+        values = [
+            finite_number(row.get(self.signal_field)) for row in self._samples[-7:]
+            if str(row.get("phase", "")).startswith("profile_")
+        ]
+        values = [value for value in values if value is not None]
+        if len(values) < 3 or self._profile_signal_centre is None:
+            return None
+        return float(self._profile_signal_centre - np.median(values))
+
+    def _build_profile_plan(self) -> list[dict]:
+        reference_gap, levels = self._profile_level_gaps()
+        every = max(1, int(self.profile_reference_every))
+        rng = np.random.default_rng(self._profile_seed)
+        plan = []
+
+        def reference(sweep):
+            if not plan or plan[-1]["kind"] != "reference":
+                plan.append({"kind": "reference", "gap_mm": reference_gap, "sweep": sweep, "direction": ""})
+
+        for sweep in range(1, max(1, int(self.profile_sweeps)) + 1):
+            if self.profile_order == "random":
+                ordered, direction = [float(g) for g in rng.permutation(levels)], "random"
+            elif self.profile_order == "alternate" and sweep % 2 == 0:
+                ordered, direction = list(reversed(levels)), "up"
+            else:
+                ordered, direction = list(levels), "down"
+            reference(sweep)
+            for count, gap in enumerate(ordered, 1):
+                plan.append({"kind": "level", "gap_mm": gap, "sweep": sweep, "direction": direction})
+                if count % every == 0 and count < len(ordered):
+                    reference(sweep)
+            reference(sweep)
+        return plan
+
+    def _profile_move_to(
+        self, host, now: float, target_z: float, after: str, *,
+        kind: str = "move", tolerance_m: Optional[float] = None, hold_sec: Optional[float] = None,
+    ) -> bool:
+        """Vertical TM line move at the start XY and orientation."""
+        api = self._robot_api(host)
+        start = self._finite_values(self._start_tool_position, 3)
+        quaternion = self._finite_values((self.initial_position or {}).get("tool_quaternion_wxyz"), 4)
+        pose = self._read_tool_pose(api)
+        if api is None or not hasattr(api, "send_positions_tool_position") or start is None or pose is None:
+            self._request_stop(host, "robot_unavailable", "Proximity profile stopped: TCP position control is unavailable.")
+            return False
+        if quaternion is None:
+            quaternion = self._finite_values(pose[1], 4)
+        target = [float(start[0]), float(start[1]), float(target_z)]
+        speed_m_s = float(self.profile_move_speed_mm_s) / 1000.0
+        percent = None
+        getter = getattr(api, "get_project_speed_percent", None)
+        if callable(getter):
+            try:
+                percent = finite_number(getter())
+            except Exception:
+                percent = None
+        effective = speed_m_s * max(1.0, percent if percent is not None else 10.0) / 100.0
+        distance = abs(float(target_z) - float(pose[0][2]))
+        self._profile_move_timeout_sec = 30.0 + 3.0 * distance / max(effective, 1e-6)
+        self._stop_robot(api)
+        try:
+            sent = bool(api.send_positions_tool_position(
+                target, list(quaternion), velocity=speed_m_s, acc_time=0.2,
+                blend_percentage=0, fine_goal=True, motion_type=self.PROFILE_LINE_MOTION,
+            ))
+        except Exception:
+            sent = False
+        if not sent:
+            self._request_stop(host, "command_failed", "Proximity profile stopped: the robot rejected a vertical line move.")
+            return False
+        self._profile_target_z_m = float(target_z)
+        self._profile_after_move = after
+        self._profile_move_tolerance_m = (
+            self.PROFILE_POSITION_TOLERANCE_M if tolerance_m is None else float(tolerance_m)
+        )
+        self._profile_move_hold_sec = hold_sec
+        self._profile_kind = kind
+        self._enter_profile_stage("profile_move", now)
+        return True
+
+    def _tick_profile_move(self, host, now: float, z_value: float) -> bool:
+        """True once the TCP is still within tolerance of the line-move target."""
+        hold = self.velocity_rest_sec if self._profile_move_hold_sec is None else self._profile_move_hold_sec
+        still = self._profile_is_still(now, z_value, hold)
+        error = abs(float(self._profile_target_z_m) - float(z_value))
+        close = error <= self._profile_move_tolerance_m or (
+            now - float(self._profile_stage_started_at) >= self.STEP_RELAXED_AFTER_SEC
+            and error <= self.STEP_REPEATABILITY_M
+        )
+        if close and still:
+            return True
+        if now - float(self._profile_stage_started_at) > self._profile_move_timeout_sec:
+            self._request_stop(
+                host, "profile_move_timeout",
+                f"Proximity profile stopped: the line move to Z {self._profile_target_z_m * 1000.0:.3f} mm "
+                f"did not finish within {self._profile_move_timeout_sec:.0f} s.",
+            )
+        return False
+
+    def _profile_next_search_step(self, host, now: float) -> None:
+        """One downward position step of the surface search or a probe."""
+        step = self._profile_step_size_m()
+        self._profile_step_target_z -= step
+        self._profile_move_to(
+            host, now, self._profile_step_target_z, "check",
+            kind="surface_probe" if self._profile_search_mode == "probe" else "move",
+            tolerance_m=max(0.000003, 0.5 * step), hold_sec=self.PROFILE_STEP_SETTLE_SEC,
+        )
+
+    def _start_profile_probe(self, host, now: float, final: bool, index: int, contact_z: float) -> None:
+        self._profile_probe_final = bool(final)
+        self._profile_probe = int(index)
+        self._profile_search_mode = "probe"
+        self._profile_step_target_z = float(contact_z) + self.PROFILE_PROBE_START_M
+        self._profile_move_to(host, now, self._profile_step_target_z, "probe_settle")
+
+    def _finish_profile_probe(self, host, now: float, z_value: float) -> None:
+        count = int(self.profile_surface_probes)
+        if self._profile_probe + 1 < count:
+            self._start_profile_probe(host, now, self._profile_probe_final, self._profile_probe + 1, z_value)
+            return
+        surface = surface_reference(self._samples, self._profile_force_threshold_g)
+        if self._profile_probe_final:
+            self._profile_search_mode = None
+            host._append_sidebar_control_message(
+                "Surface re-measured at the end"
+                + (f": shift {surface['final_shift_mm']:+.3f} mm." if surface["final_shift_mm"] is not None else ".")
+            )
+            self._profile_move_to(host, now, float(self._start_tool_position[2]), "finish")
+            return
+        if surface["surface_z_m"] is None:
+            self._request_stop(host, "profile_surface_unresolved", "Proximity profile stopped: no light-contact crossing was found.")
+            return
+        self._profile_search_mode = None
+        self._profile_surface_z_m = float(surface["surface_z_m"])
+        spread = surface["surface_sd_mm"]
+        host._append_sidebar_control_message(
+            f"Surface Z {self._profile_surface_z_m * 1000.0:.3f} mm from {count} probe(s)"
+            + (f", SD {spread:.3f} mm." if spread is not None else ".")
+        )
+        self._profile_plan = self._build_profile_plan()
+        self._profile_cursor = -1
+        self._advance_profile_step(host, now)
+
+    def _advance_profile_step(self, host, now: float) -> None:
+        self._profile_cursor += 1
+        if self._profile_cursor >= len(self._profile_plan):
+            if self.profile_remeasure_surface:
+                self._start_profile_probe(host, now, True, 0, self._profile_surface_z_m)
+            else:
+                self._profile_move_to(host, now, float(self._start_tool_position[2]), "finish")
+            return
+        step = self._profile_plan[self._profile_cursor]
+        self._profile_step = self._profile_cursor
+        self._profile_window_kind = step["kind"]
+        self._profile_sweep = step["sweep"]
+        self._profile_direction = step["direction"]
+        self._profile_target_gap_mm = float(step["gap_mm"])
+        self._profile_move_to(host, now, self._profile_surface_z_m + step["gap_mm"] / 1000.0, "settle")
+        self._update_progress(
+            host,
+            f"Proximity profile sweep {step['sweep']}/{self.profile_sweeps}: "
+            f"{step['kind']} at {step['gap_mm']:g} mm ({self._profile_cursor + 1}/{len(self._profile_plan)})",
+        )
+
+    def _tick_profile_check(self, host, now: float, z_value: float, force_g: float) -> None:
+        """Decide the next search step from fresh force samples taken at rest."""
+        stamp = self._force_sample_source_at
+        if (
+            stamp is not None and stamp != self._profile_check_force_at
+            and now - float(self._profile_stage_started_at) >= self.PROFILE_FORCE_LAG_SEC
+        ):
+            self._profile_check_force_at = stamp
+            self._profile_check_forces.append(float(force_g))
+            if self._force_raw_g_now is not None:
+                self._profile_check_raw.append(self._force_raw_g_now)
+        if len(self._profile_check_forces) < self.PROFILE_CHECK_FORCE_SAMPLES or len(self._samples) <= self._profile_check_rows:
+            if now - float(self._profile_stage_started_at) > self.PROFILE_CHECK_TIMEOUT_SEC:
+                self._request_stop(host, "profile_check_timeout", "Proximity profile stopped: no fresh force and sensor data at rest.")
+            return
+        force = float(np.median(self._profile_check_forces))
+        mode = self._profile_search_mode
+        if force >= self._profile_force_threshold_g:
+            if mode == "probe":
+                self._finish_profile_probe(host, now, z_value)
+                return
+            self._profile_surface_z_m = float(z_value)
+            host._append_sidebar_control_message(
+                f"Light contact {force:.1f} g at Z {z_value * 1000.0:.3f} mm; starting "
+                f"{int(self.profile_surface_probes)} light-contact probe(s) in "
+                f"{self.profile_probe_step_mm:.3f} mm steps."
+            )
+            self._start_profile_probe(host, now, False, 0, z_value)
+            return
+        if mode == "far":
+            self._track_far_force_zero(
+                float(np.median(self._profile_check_raw)) if self._profile_check_raw else None
+            )
+            drop = self._profile_signal_drop()
+            if drop is not None and drop >= self._profile_slow_threshold:
+                self._profile_search_mode = "near"
+                host._append_sidebar_control_message(
+                    f"Proximity signal dropped {drop:.1f} counts at Z {z_value * 1000.0:.2f} mm; "
+                    f"continuing in {self.profile_search_step_near_mm:.3f} mm steps to light contact."
+                )
+                self._begin_profile_force_zero(now, "near surface search")
+                return
+        self._profile_next_search_step(host, now)
+
+    def _begin_profile_force_zero(self, now: float, purpose: str) -> None:
+        self._start_force_zero(now, purpose)
+        self._enter_profile_stage("profile_zero", now)
+
+    def _finish_profile_force_zero(self, host, now: float) -> None:
+        zero = self._poll_force_zero(now)
+        if zero is None:
+            return
+        self._profile_force_threshold_g = zero["threshold_g"]
+        host._append_sidebar_control_message(self._force_zero_message(zero))
+        if self._profile_force_threshold_g >= float(self.profile_surface_stop_g):
+            self._request_stop(
+                host, "profile_force_noise",
+                f"Proximity profile stopped: the force at rest needs a {self._profile_force_threshold_g:.1f} g "
+                "light-contact threshold, at or above the level contact guard. Secure the force-meter cable.",
+            )
+            return
+        if self._profile_search_mode == "probe":
+            self._profile_kind = "surface_probe"
+        self._profile_next_search_step(host, now)
+
+    def _tick_profile(self, host, now: float, tool_position, force_g: float) -> None:
+        phase = self._phase
+        z_value = float(tool_position[2])
+        searching = self._profile_search_mode is not None
+        moving_up = phase == "profile_move" and float(self._profile_target_z_m) > z_value
+        if searching and not moving_up and force_g >= self.PROFILE_SEARCH_FORCE_LIMIT_G:
+            self._request_stop(
+                host, "profile_search_force",
+                f"Proximity profile stopped: {force_g:.0f} g during the surface search. "
+                "Inspect the setup; there is no automatic retraction.",
+            )
+            return
+        if not searching and not moving_up and force_g >= float(self.profile_surface_stop_g):
+            self._request_stop(
+                host, "profile_unexpected_contact",
+                f"Proximity profile stopped: {force_g:.1f} g contact away from the surface probes. "
+                "Inspect the setup; there is no automatic retraction.",
+            )
+            return
+        if phase == "profile_move":
+            if not self._tick_profile_move(host, now, z_value):
+                return
+            after = self._profile_after_move
+            if after == "finish":
+                self._profile_kind = ""
+                self._stop_reason = "profile_complete"
+                self._begin_return_to_initial(
+                    host, now,
+                    purpose="complete" if self._trial_number >= self._batch_total else "next_trial",
+                )
+            elif after == "check":
+                self._profile_check_forces = []
+                self._profile_check_raw = []
+                self._profile_check_force_at = self._force_sample_source_at
+                self._profile_check_rows = len(self._samples)
+                self._enter_profile_stage("profile_check", now)
+            elif after == "probe_settle":
+                # Rows before the new zero use the old one and must not count as probe samples.
+                self._profile_kind = "force_zero"
+                self._enter_profile_stage("profile_settle_probe", now)
+            else:
+                self._profile_kind = "settle"
+                self._enter_profile_stage("profile_settle", now)
+            return
+        if phase == "profile_check":
+            self._tick_profile_check(host, now, z_value, force_g)
+            return
+        if phase == "profile_zero":
+            self._finish_profile_force_zero(host, now)
+            return
+        if phase in {"profile_settle", "profile_settle_probe"}:
+            probe = phase == "profile_settle_probe"
+            settle = self.PROFILE_SURFACE_SETTLE_SEC if probe else float(self.profile_settle_sec)
+            if now - float(self._profile_stage_started_at) < settle:
+                return
+            if probe:
+                label = "final " if self._profile_probe_final else ""
+                self._begin_profile_force_zero(now, f"{label}light-contact probe {self._profile_probe + 1}")
+            else:
+                self._profile_kind = self._profile_window_kind
+                self._profile_collect_start = len(self._samples)
+                self._enter_profile_stage("profile_collect", now)
+            return
+        if phase == "profile_collect":
+            if len(self._samples) - self._profile_collect_start >= int(self.profile_frames_per_level):
+                self._advance_profile_step(host, now)
+            elif now - float(self._profile_stage_started_at) > max(
+                self.PROFILE_COLLECT_TIMEOUT_SEC, int(self.profile_frames_per_level) / 2.0
+            ):
+                self._request_stop(host, "profile_frames_too_slow", "Proximity profile stopped: too few fresh sensor frames.")
+
+    def _far_field_allowed(self, tool_position, force_delta_abs_g) -> bool:
+        """Fast approach only well above this taxel's measured contact height."""
+        if self._slow_zone_entered:
+            return False
+        allowed = (
+            float(self.far_field_speed_mm_s) / 1000.0 > abs(float(self._trial_speed_m_s))
+            and self._expected_contact_z_m is not None
+            and force_delta_abs_g < 1.0
+            and float(tool_position[2]) > self._expected_contact_z_m + float(self.slow_zone_mm) / 1000.0
+        )
+        # Once the slow zone is entered it is kept for the rest of the approach.
+        self._slow_zone_entered = not allowed
+        return allowed
+
     def on_stop(self, host, show_result: bool = True) -> None:
         was_active = self._test_active
         self._stop_robot(self._robot_api(host))
-        if was_active and not self._stop_reason:
-            self._stop_reason = "manual_stop"
+        if was_active:
+            self._capture_stop_details(complete=self._batch_completed)
+        self._clear_post_save_wait()
         self._test_active = False
         self._phase = "idle"
         self._force_connection_started_at = None
@@ -2478,7 +4574,13 @@ class CalibrationTask(ExperimentTask):
                 host._append_sidebar_control_message(
                     f"Calibration batch summary saved: {summary_path}"
                 )
-            if show_result and hasattr(host, "_show_calibration_result"):
+            profile_trials = [
+                trial for trial in (self.last_result.get("trial_results") or [self.last_result])
+                if trial.get("proximity_profile") is not None
+            ]
+            if show_result and profile_trials and hasattr(host, "_show_proximity_profile_result"):
+                host._show_proximity_profile_result(profile_trials[-1])
+            elif show_result and hasattr(host, "_show_calibration_result"):
                 host._show_calibration_result(self.last_result)
 
 
@@ -2488,8 +4590,8 @@ class FullTaxelCalibrationTask(CalibrationTask):
     The robot changes XY only at the map's saved clearance height.  One
     repetition visits every measured taxel once.  Further repetitions start
     again at the first taxel after that full scan finishes.  Recordings
-    deliberately retain only the active taxel's signal column so graphs from
-    neighbouring taxels cannot be mixed in.
+    retain only the pressed taxel plus synchronized force/robot/time data.
+    Offline comparisons group by physical target and acquisition conditions.
     """
 
     id = "full_taxel_calibration"
@@ -2499,7 +4601,8 @@ class FullTaxelCalibrationTask(CalibrationTask):
         "Load a Taxel Position Mapping result, visit every measured taxel at "
         "the saved clearance height, and run the normal force calibration "
         "for each taxel. Repeated runs scan the whole set before starting "
-        "again. Data and graphs are saved separately per taxel."
+        "again. Each trial saves only the tested taxel's signals plus force, "
+        "position and timing, with a separate graph per taxel."
     )
     start_button_label = "Run Full Taxel Calibration"
     initial_position_name = "Full Taxel Calibration"
@@ -2512,12 +4615,10 @@ class FullTaxelCalibrationTask(CalibrationTask):
         output_directory=_DEFAULT_STORAGE_PATH,
         storage_path=_DEFAULT_STORAGE_PATH,
     ) -> None:
-        if storage_path is _DEFAULT_STORAGE_PATH:
-            storage_path = resource_path(
-                "config", "full_taxel_calibration_initial_position.json"
-            )
+        # Keep the argument for callers of the old API, but neither read nor
+        # overwrite the legacy home file. The loaded map owns the home pose.
         super().__init__(
-            storage_path=storage_path, output_directory=output_directory
+            storage_path=None, output_directory=output_directory
         )
         self._home_position: Optional[dict] = None
         self.position_map: Optional[dict] = None
@@ -2548,13 +4649,142 @@ class FullTaxelCalibrationTask(CalibrationTask):
         self._routing_force_baseline_n: Optional[float] = None
         self._full_recalibration_started_at: Optional[float] = None
         self._pending_target_route: Optional[tuple[dict, str]] = None
+        self.resume_plan = None
+        self.resume_setup_confirmed = False
+        self._resume_previous_settings = None
+        self._resume_history = []
+        self._resume_completed = set()
+        self._resume_at_anchor = False
+        self._run_lock = None
+        self._run_settings = None
+
+    def load_resume(self, source_path) -> tuple[bool, str]:
+        """Stage a stopped run without changing files, connecting or moving."""
+        if self._test_active or self._phase == "connecting_force_meter":
+            return False, "Stop Full Taxel Calibration before loading a saved run."
+        try:
+            defaults = full_taxel_resume.settings_snapshot(
+                FullTaxelCalibrationTask(output_directory=None)
+            )
+            plan = full_taxel_resume.load_plan(source_path, self.prepare_position_map, defaults)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            return False, f"Cannot resume: {exc}"
+        if self._resume_previous_settings is None:
+            self._resume_previous_settings = (
+                full_taxel_resume.settings_snapshot(self), self.loading_auto_plan
+            )
+        for name, value in plan["settings"].items():
+            setattr(self, name, copy.deepcopy(value))
+        # Never silently recompute saved travel/time limits when resuming.
+        self.loading_auto_plan = False
+        self.sliding_path_confirmed = False
+        self.position_map = copy.deepcopy(plan["position_map"])
+        self.position_map_path = plan["map_source"]
+        self.sensor_rows, self.sensor_columns = plan["summary"]["sensor_shape"]
+        self._home_position = None
+        self._use_map_anchor_as_home()
+        self.resume_plan = plan
+        self.resume_setup_confirmed = False
+        self.start_button_label = "Resume Full Taxel Calibration"
+        self._targets = copy.deepcopy(self.position_map["positions"])
+        self._trials_by_taxel = copy.deepcopy(plan["trials"])
+        self._completed_taxels = [i for i, trials in plan["trials"].items() if len(trials) == self.repeat_count]
+        self._current_target = None
+        self._target_cursor = -1
+        self._full_completed = False
+        self._full_directory = None
+        self._full_target_results = []
+        self.last_result = None
+        p, i = plan["remaining"][0]
+        self._pass_number = self._trial_number = p
+        self._batch_total = int(self.repeat_count)
+        detail = (f"{len(plan['completed'])} completed trials preserved · "
+                  f"{len(plan['remaining'])} remaining · next: pass {p}, Taxel {i}. "
+                  "Interrupted trials restart from clearance. Keep the sensor, probe and mounting unchanged. "
+                  "Resume lifts an unloaded probe to the safe anchor before continuing. Keep that path clear.")
+        if plan["legacy"]:
+            detail += " Older run: recorded settings recovered; unrecorded timing/safety options use current defaults."
+        return True, detail
+
+    def clear_resume(self):
+        if self._test_active or self._phase == "connecting_force_meter":
+            return
+        if self._resume_previous_settings is not None:
+            settings, auto = self._resume_previous_settings
+            for name, value in settings.items():
+                setattr(self, name, copy.deepcopy(value))
+            self.loading_auto_plan = auto
+        self.resume_plan = self._resume_previous_settings = None
+        self.start_button_label = "Run Full Taxel Calibration"
+        self._targets, self._trials_by_taxel, self._completed_taxels = [], {}, []
+
+    def _write_run_manifest(self, status):
+        if self._full_directory is None or self._run_settings is None:
+            return
+        full_taxel_resume.atomic_json(self._full_directory / full_taxel_resume.MANIFEST, {
+            "version": 1, "run_id": self._full_run_id, "status": status,
+            "settings": self._run_settings, "position_map": self.position_map,
+            "settings_digest": full_taxel_resume.digest(self._run_settings),
+            "map_digest": full_taxel_resume.digest(self.position_map),
+            "resume_history": self._resume_history,
+        })
+
+    def _resume_selection_error(self, host):
+        if self.resume_plan is not None:
+            if not self.resume_setup_confirmed:
+                return "Confirm the unchanged sensor/probe setup and clear unloaded route before Resume."
+            if (full_taxel_resume.settings_snapshot(self) != self.resume_plan["settings"]
+                    or self.loading_auto_plan
+                    or self.position_map != self.resume_plan["position_map"]):
+                return "Saved resume settings/map changed. Reload the saved run first."
+            key, _label, rows, columns = connected_calibration_sensor(host)
+            expected = self.resume_plan["summary"]
+            if key != expected.get("sensor_identity") or [rows, columns] != expected["sensor_shape"]:
+                return "Connect the same identified sensor used in this saved run before resuming."
+            if self.output_directory is None:
+                return "Resume requires recording storage to be enabled."
+        return ""
+
+    def on_start(self, host) -> bool:
+        if self._test_active or self._phase == "connecting_force_meter":
+            host._append_sidebar_control_message("Stop the active calibration before starting again.")
+            return False
+        if error := self._resume_selection_error(host):
+            return self._fail_start(host, error)
+        if self.resume_plan is not None:
+            if self.protocol == "sliding":
+                # The resume confirmation explicitly covers the sliding path.
+                self.sliding_path_confirmed = True
+        self._force_baseline_n = None
+        self._routing_force_baseline_n = None
+        return super().on_start(host)
 
     def capture_initial_position(self, host) -> bool:
-        saved = super().capture_initial_position(host)
-        refresher = getattr(host, "_refresh_full_taxel_calibration_controls", None)
-        if callable(refresher):
-            refresher()
-        return saved
+        host._append_sidebar_control_message(
+            "Full Taxel Calibration uses the loaded map's safe anchor as its home. "
+            "Update or relocate the map to change this position."
+        )
+        return False
+
+    def _use_map_anchor_as_home(self) -> None:
+        """Select the validated map anchor without persisting or moving anything."""
+        if self.position_map is None or revision_motion_error(self.position_map):
+            self.initial_position = None
+            return
+        pose = copy.deepcopy(self.position_map["anchor_pose"])
+        pose["source"] = "taxel_position_map_anchor"
+        pose["source_path"] = self.position_map_path
+        self.initial_position = pose
+
+    def use_connected_sensor(self, host) -> str:
+        if self._test_active:
+            return str(self.active_sensor_key_name or "")
+        key = super().use_connected_sensor(host)
+        if position_map_sensor_error(host, self.position_map):
+            self.initial_position = None
+        else:
+            self._use_map_anchor_as_home()
+        return key
 
     @staticmethod
     def _map_vector(values, count: int, name: str) -> list[float]:
@@ -2569,6 +4799,8 @@ class FullTaxelCalibrationTask(CalibrationTask):
     @classmethod
     def prepare_position_map(cls, result: dict) -> dict:
         """Validate and normalize the motion data needed by this task."""
+        if isinstance(result, dict) and revision_motion_error(result):
+            raise ValueError(revision_motion_error(result))
         if not isinstance(result, dict) or result.get("task") != "taxel_position_mapping":
             raise ValueError("Select a taxel_position_map.json recording.")
         settings = result.get("settings")
@@ -2689,7 +4921,9 @@ class FullTaxelCalibrationTask(CalibrationTask):
             item["calibration_start_position_m"] = [
                 float(centre[0]),
                 float(centre[1]),
-                probe_z,
+                # A mapping probe plane can already contain proximity.
+                # Start characterisation at the operator-provided clear anchor.
+                float(safe[2]),
             ]
             item["tool_quaternion_wxyz"] = (orientation / orientation_norm).tolist()
             measured.append(item)
@@ -2731,6 +4965,10 @@ class FullTaxelCalibrationTask(CalibrationTask):
         return normalized
 
     def load_position_map(self, result: dict, source_path=None) -> tuple[bool, str]:
+        if self._test_active or self._phase == "connecting_force_meter":
+            return False, "Stop Full Taxel Calibration before replacing its map and home anchor."
+        if self.resume_plan is not None:
+            return False, "Clear the loaded resume before replacing its saved map."
         try:
             prepared = self.prepare_position_map(result)
         except (KeyError, TypeError, ValueError) as exc:
@@ -2739,22 +4977,41 @@ class FullTaxelCalibrationTask(CalibrationTask):
         self.position_map_path = str(
             source_path or prepared.get("json_path") or ""
         )
+        self._home_position = None
+        self._use_map_anchor_as_home()
         count = len(prepared["positions"])
         state = "complete" if bool(prepared.get("completed")) else "partial"
-        return True, f"Loaded {count} measured taxels from a {state} position map."
+        return True, (
+            f"Loaded {count} measured taxels from a {state} position map. "
+            f"Home follows its safe anchor (Taxel {prepared['anchor_pose']['taxel_index']})."
+        )
+
+    def _recording_metadata(self) -> dict:
+        return {**super()._recording_metadata(), "recording_scope": "target_taxel_only"}
 
     def _recorded_taxel_indices(self) -> list[int]:
         return [int(self.taxel_index)]
 
-    def _read_taxel(self, host):
-        values = super()._read_taxel(host)
-        if values is None:
-            return None
-        keep_column = taxel_signal_column(self.signal_field, self.taxel_index)
-        for name in list(values):
-            if name.startswith("taxel_") and name != keep_column:
-                del values[name]
-        return values
+    def _target_taxel_only(self, row):
+        prefix = f"taxel_{int(self.taxel_index):03d}_"
+        return {key: value for key, value in row.items()
+                if not key.startswith("taxel_") or key.startswith(prefix)}
+
+    def _profile_trimmed_taxel(self, taxel) -> dict:
+        # The proximity-profile calculation still needs reference/neighbor
+        # channels in memory. Only project its rows AFTER deriving that report.
+        # Normal calibration can discard other channels at acquisition time.
+        if self.protocol == "proximity_profile":
+            return super()._profile_trimmed_taxel(taxel)
+        return self._target_taxel_only(taxel)
+
+    def _rows_for_storage(self, rows):
+        for row in rows:
+            prefix = f"taxel_{int(self.taxel_index):03d}_"
+            for key in list(row):
+                if key.startswith("taxel_") and not key.startswith(prefix):
+                    del row[key]
+        return rows
 
     def _full_folder_name(self, timestamp: str) -> str:
         travel_mm = max(0.0, float(self.max_travel_m)) * 1000.0
@@ -2765,14 +5022,18 @@ class FullTaxelCalibrationTask(CalibrationTask):
         timeout = (
             f"{self._folder_number(timeout_s)}s" if timeout_s > 0.0 else "unlimited"
         )
-        return (
-            f"calibration_full_taxel_{self._folder_token(timestamp)}_"
+        settings = (
             f"taxels-{len(self._targets)}_"
             f"signal-{self._folder_token(self.signal_field)}_"
             f"speed-{self._folder_number(abs(self.approach_speed_m_s) * 1000.0)}mmps_"
-            f"threshold-{self._folder_number(self.contact_threshold_g)}g_"
+            f"threshold-{self._force_folder_token()}g_"
             f"travel-{travel}_timeout-{timeout}_"
-            f"full-passes-{max(1, int(self.repeat_count))}"
+            f"full-passes-{max(1, int(self.repeat_count))}_"
+            f"{self._probe_material_folder_token()}"
+        )
+        return calibration_folder_name(
+            "calibration_full_taxel", timestamp, settings,
+            sensor_name=self._recording_metadata()["sensor_name"], protocol=self.protocol,
         )
 
     def _update_progress(self, host, detail: str = "") -> None:
@@ -2799,6 +5060,14 @@ class FullTaxelCalibrationTask(CalibrationTask):
             )
 
     def _validate_start_prerequisites(self, host) -> bool:
+        if not self._validate_measurement_settings(host):
+            return False
+        revision_error = revision_motion_error(getattr(self, "position_map", None))
+        if revision_error:
+            return self._fail_start(host, revision_error)
+        mismatch = position_map_sensor_error(host, getattr(self, "position_map", None))
+        if mismatch:
+            return self._fail_start(host, mismatch)
         if self.position_map is None:
             return self._fail_start(
                 host, "Load a Taxel Position Mapping JSON before pressing Run."
@@ -2866,11 +5135,9 @@ class FullTaxelCalibrationTask(CalibrationTask):
             (self.initial_position or {}).get("tool_position_m"), 3
         )
         if home is None:
-            sensor_label = str(self.active_sensor_label or "this sensor")
             return self._fail_start(
                 host,
-                "Remember the Full Taxel initial position for "
-                f"{sensor_label} before pressing Run.",
+                "Load a position map with a valid safe anchor before pressing Run.",
             )
         home_position = np.asarray(home, dtype=float)
         if float(np.linalg.norm(home_position[:2] - anchor_position[:2])) > float(
@@ -2878,12 +5145,18 @@ class FullTaxelCalibrationTask(CalibrationTask):
         ):
             return self._fail_start(
                 host,
-                "The Full Taxel initial position is outside this map's workspace. "
-                "Remember it again above the mapped sensor.",
+                "The Full Taxel home is outside this map's workspace. Reload the position map.",
             )
+        if self.protocol == "standard" and (error := travel_error(self)):
+            return self._fail_start(host, error)
+        if self.resume_plan is not None:
+            if np.linalg.norm(np.asarray(pose[0][:2]) - anchor_position[:2]) > self.position_map["calibration_xy_limit_m"]:
+                return self._fail_start(host, "Resume blocked: move the robot into the recorded sensor workspace first.")
         return True
 
     def _start_calibration_cycle(self, host) -> bool:
+        if error := self._resume_selection_error(host):
+            return self._fail_start(host, error)
         if not self._validate_start_prerequisites(host):
             return False
         now = time.monotonic()
@@ -2892,7 +5165,15 @@ class FullTaxelCalibrationTask(CalibrationTask):
             return self._fail_start(
                 host, "Fresh force-transmitter data is required before robot motion."
             )
+        self._trial_wall_started_at = None
+        if not self._measurement_guard(host, now):
+            return False
+        plan = self.resume_plan
+        if plan is not None and abs(float(force[0])) / self.NEWTONS_PER_GRAM >= self.route_force_guard_g:
+            return self._fail_start(host, "Resume blocked: unload the probe and check the force zero before routing.")
         self._targets = copy.deepcopy(self.position_map["positions"])
+        self._contact_z_by_taxel = {}
+        self._trial_memory_bytes = 0
         self._target_cursor = -1
         self._pass_number = 1
         self._current_target = None
@@ -2905,18 +5186,54 @@ class FullTaxelCalibrationTask(CalibrationTask):
         self._trial_result_saved = False
         self.last_result = None
         self._stop_reason = ""
+        self._resume_completed = set()
+        self._resume_history = []
+        self._resume_at_anchor = plan is not None
         self._full_run_id = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         self._full_directory = (
             self.output_directory / self._full_folder_name(self._full_run_id)
             if self.output_directory is not None
             else None
         )
+        if plan is not None:
+            self._full_run_id = plan["summary"]["run_id"]
+            self._full_directory = plan["folder"]
         if self._full_directory is not None:
             try:
                 self._full_directory.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
+                self._run_lock = full_taxel_resume.acquire_run_lock(self._full_directory)
+                if plan is not None:
+                    checked = full_taxel_resume.load_plan(
+                        self._full_directory, self.prepare_position_map,
+                        full_taxel_resume.settings_snapshot(FullTaxelCalibrationTask(output_directory=None)),
+                    )
+                    if checked["signature"] != plan["signature"]:
+                        raise ValueError("Saved recordings changed since loading. Reload Resume first.")
+                    self._resume_history = copy.deepcopy(plan["history"])
+                    self._resume_history.append(full_taxel_resume.archive_attempts(plan))
+                    self._resume_completed = set(plan["completed"])
+                    self._trials_by_taxel = copy.deepcopy(plan["trials"])
+                    self._pass_number, next_index = plan["remaining"][0]
+                    self._target_cursor = next(i for i, t in enumerate(self._targets) if t["taxel_index"] == next_index) - 1
+                    # Compact existing results: do not re-export completed trial files.
+                    for index, trials in self._trials_by_taxel.items():
+                        if len(trials) == int(self.repeat_count):
+                            directory = self._full_directory / f"taxel_{index:02d}"
+                            result = dict(trials[0]) if len(trials) == 1 else {"taxel_index": index, "trial_results": trials}
+                            result.update(batch_status="complete", completed_trials=len(trials),
+                                          requested_trials=int(self.repeat_count), experiment_directory=str(directory),
+                                          batch_summary_path=str(directory / "batch_summary.csv"),
+                                          batch_metadata_path=str(directory / "batch_summary.json"))
+                            self._full_target_results.append(result)
+                            self._completed_taxels.append(index)
+                self._run_settings = full_taxel_resume.settings_snapshot(self)
+                self._write_run_manifest("running")
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                if self._run_lock is not None:
+                    self._run_lock.close()
+                    self._run_lock = None
                 return self._fail_start(
-                    host, f"Could not create the full-taxel recording folder: {exc}"
+                    host, f"Could not prepare the full-taxel recording folder: {exc}"
                 )
         self._home_position = copy.deepcopy(self.initial_position)
         self._test_active = True
@@ -2927,20 +5244,33 @@ class FullTaxelCalibrationTask(CalibrationTask):
         if callable(setter):
             setter(True)
         host._append_sidebar_control_message(
-            "Full Taxel Calibration started from its own initial position. "
+            "Full Taxel Calibration will start and finish at the loaded map's safe anchor. "
             "The robot will change XY only at the saved clearance height; "
             "keep the workspace clear and remain beside the emergency stop."
         )
+        if plan is not None:
+            # Reading many trial files and archiving summaries can block Qt's
+            # feedback delivery. Never route using the samples from before I/O.
+            self._begin_post_save_wait(host, "resume_home")
+            return True
         return self._route_to_saved_home(
             host,
             "full_home_arrived",
-            "moving to the Full Taxel initial position",
+            "moving to the map's safe anchor",
         )
 
     def _start_next_target(self, host) -> bool:
         self._target_cursor += 1
-        if self._target_cursor >= len(self._targets):
-            return self._route_to_anchor_and_finish(host)
+        while True:
+            if self._target_cursor >= len(self._targets):
+                if self._pass_number >= max(1, int(self.repeat_count)):
+                    return self._route_to_anchor_and_finish(host)
+                self._pass_number += 1
+                self._target_cursor = 0
+            index = int(self._targets[self._target_cursor]["taxel_index"])
+            if (self._pass_number, index) not in self._resume_completed:
+                break
+            self._target_cursor += 1
         target = self._targets[self._target_cursor]
         self._current_target = target
         self.taxel_index = int(target["taxel_index"])
@@ -3037,13 +5367,13 @@ class FullTaxelCalibrationTask(CalibrationTask):
         return np.asarray(values, dtype=float)
 
     def _route_to_saved_home(self, host, action: str, detail: str) -> bool:
-        """Travel at clearance height to this task's own initial position."""
+        """Travel at clearance height to the map anchor captured for this run."""
         home = self._saved_home_position()
         if home is None or self.position_map is None:
             self._request_stop(
                 host,
                 "internal_error",
-                "Full Taxel Calibration stopped: its initial position is missing.",
+                "Full Taxel Calibration stopped: its map anchor is missing.",
             )
             return False
         pose = self._read_tool_pose(self._robot_api(host))
@@ -3052,7 +5382,7 @@ class FullTaxelCalibrationTask(CalibrationTask):
                 host,
                 "robot_feedback_lost",
                 "Full Taxel Calibration stopped: TCP feedback was lost before "
-                "returning to its initial position.",
+                "returning to the map's safe anchor.",
             )
             return False
         current = np.asarray(pose[0], dtype=float)
@@ -3087,7 +5417,7 @@ class FullTaxelCalibrationTask(CalibrationTask):
         return self._route_to_saved_home(
             host,
             "full_final_anchor",
-            "Returning to the Full Taxel initial position",
+            "Returning to the map's safe anchor",
         )
 
     def _advance_full_route(self, host) -> bool:
@@ -3102,6 +5432,12 @@ class FullTaxelCalibrationTask(CalibrationTask):
         return self._command_full_move(host, position, action, detail)
 
     def _command_full_move(self, host, position, action: str, detail: str) -> bool:
+        now = time.monotonic()
+        if not self._measurement_guard(host, now):
+            return False
+        if self._fresh_force_reading(host, now) is None:
+            self._request_stop(host, "force_stale_before_motion", "Stopped before a new route: force feedback is stale.")
+            return False
         api = self._robot_api(host)
         quaternion = self._finite_values(
             (self.position_map or {}).get("anchor_pose", {}).get(
@@ -3198,7 +5534,11 @@ class FullTaxelCalibrationTask(CalibrationTask):
             self._advance_full_route(host)
             return
         if action == "full_home_arrived":
-            self._start_next_target(host)
+            if self._resume_at_anchor:
+                self._resume_at_anchor = False
+                self._start_full_recalibration(host, now)
+            else:
+                self._start_next_target(host)
             return
         if action == "full_target_ready":
             pose = self._read_tool_pose(self._robot_api(host))
@@ -3233,12 +5573,12 @@ class FullTaxelCalibrationTask(CalibrationTask):
                 show_result=True,
                 message=(
                     "Full Taxel Calibration complete. All mapped taxels were "
-                    "saved separately and the robot returned to the Full Taxel "
-                    "initial position."
+                    "saved separately and the robot returned to the map's safe anchor."
                 ),
             )
 
-    def _finish_returned_trial(self, host, now: float, purpose: str) -> None:
+    def _complete_returned_trial(self, host, now: float, purpose: str) -> None:
+        self._trial_completed = True
         try:
             result = self._save_current_trial(host)
         except Exception as exc:
@@ -3256,9 +5596,12 @@ class FullTaxelCalibrationTask(CalibrationTask):
             )
             return
         index = int(self.taxel_index)
+        self._export_trial_graph(host, result)
+        self._batch_results.sort(key=lambda item: int(item["trial_number"]))
         self._trials_by_taxel[index] = list(self._batch_results)
+        self._resume_completed.add((int(self._pass_number), index))
         passes = max(1, int(self.repeat_count))
-        if int(self._pass_number) >= passes:
+        if len(self._batch_results) == passes:
             self._batch_completed = True
             target_result = self._build_final_result()
             if target_result is None:
@@ -3268,6 +5611,7 @@ class FullTaxelCalibrationTask(CalibrationTask):
                     "Full Taxel Calibration stopped: the taxel result could not be built.",
                 )
                 return
+            release_trial_rows(target_result)
             self._full_target_results.append(target_result)
             self._completed_taxels.append(index)
             host._append_sidebar_control_message(
@@ -3284,9 +5628,58 @@ class FullTaxelCalibrationTask(CalibrationTask):
                 host,
                 f"Pass {self._pass_number}/{passes} sample saved; moving to the next taxel",
             )
+        release_trial_rows(result)
+        self._samples = []
+        self._begin_post_save_wait(host, purpose)
+
+    def _export_trial_graph(self, host, result: dict) -> None:
+        """Save the trial PNG while its samples are still in memory."""
+        exporter = getattr(host, "_export_calibration_trial_graph", None)
+        directory = str(result.get("experiment_directory") or "")
+        if not callable(exporter) or not directory or not result.get("rows"):
+            return
+        number = int(result.get("trial_number", 1) or 1)
+        path = Path(directory) / f"trial_{number:04d}.png"
+        try:
+            saved = exporter(result, path)
+        except Exception as exc:
+            host._append_sidebar_control_message(
+                f"Trial graph not saved yet ({exc}); it is retried when the run ends."
+            )
+            return
+        if saved:
+            result["graph_path"] = str(path)
+
+    def _continue_after_saved_trial(self, host, now, purpose):
+        if purpose == "resume_home":
+            pose = self._read_tool_pose(self._robot_api(host))
+            anchor = self.position_map["anchor_pose"]
+            key, _label, rows, columns = connected_calibration_sensor(host)
+            expected = self.resume_plan["summary"]
+            force = self._fresh_force_reading(host, now)
+            valid = pose is not None and force is not None
+            if valid:
+                orientation = np.asarray(pose[1], dtype=float)
+                norm = float(np.linalg.norm(orientation))
+                alignment = 0. if norm < 1e-9 else abs(float(np.dot(orientation / norm, anchor["tool_quaternion_wxyz"])))
+                valid = (
+                    np.linalg.norm(np.asarray(pose[0][:2]) - np.asarray(anchor["tool_position_m"][:2])) <= self.position_map["calibration_xy_limit_m"]
+                    and alignment >= float(np.cos(np.radians(2.5)))
+                    and abs(float(force[0])) / self.NEWTONS_PER_GRAM < self.route_force_guard_g
+                    and key == expected.get("sensor_identity")
+                    and [rows, columns] == expected["sensor_shape"]
+                )
+            if not valid:
+                self._request_stop(host, "resume_preflight_changed", "Resume stopped before motion: sensor, force, clearance or tool pose changed while loading. Check the setup and reload Resume.")
+                return
+            self._route_to_saved_home(host, "full_home_arrived", "moving to the original map's safe anchor")
+            return
         self._route_current_target_to_clearance(host)
 
     def _start_full_recalibration(self, host, now: float) -> None:
+        if not self.recalibrate_between_trials:
+            self._start_next_target(host)
+            return
         sensor = getattr(self._ui_ros(host), "sensor_functions", None)
         if sensor is None or not callable(getattr(sensor, "updateCal", None)):
             self._request_stop(
@@ -3350,6 +5743,8 @@ class FullTaxelCalibrationTask(CalibrationTask):
                 "Full Taxel Calibration stopped: sensor calibration failed.",
             )
             return
+        if self._read_sensor_frame(host) is None:
+            return
         self._full_recalibration_started_at = None
         self._start_next_target(host)
 
@@ -3407,6 +5802,12 @@ class FullTaxelCalibrationTask(CalibrationTask):
 
     def on_tick(self, host) -> None:
         now = time.monotonic()
+        if self._tick_post_save_wait(host, now):
+            return
+        if self._test_active and not self._measurement_guard(
+            host, now, sensor_required=self._phase != "full_recalibrating"
+        ):
+            return
         if self._phase == "full_moving":
             force = self._fresh_force_reading(host, now)
             if force is None:
@@ -3429,7 +5830,7 @@ class FullTaxelCalibrationTask(CalibrationTask):
         super().on_tick(host)
 
     def _save_full_summary(self) -> tuple[str, str]:
-        if self._full_directory is None or not self._full_target_results:
+        if self._full_directory is None:
             return "", ""
         rows = []
         for target_result in self._full_target_results:
@@ -3448,11 +5849,17 @@ class FullTaxelCalibrationTask(CalibrationTask):
         metadata_path = self._full_directory / "full_taxel_summary.json"
         metadata = {
             "version": 1,
+            "resume_history": copy.deepcopy(self._resume_history),
+            **self._recording_metadata(),
+            **self._stop_details(),
+            "last_taxel_index": self._stop_taxel_index if self._stop_taxel_index is not None else int(self.taxel_index),
+            "last_pass_number": self._stop_pass_number if self._stop_pass_number is not None else int(self._pass_number),
             "task": self.id,
             "run_id": self._full_run_id,
             "status": "complete" if self._full_completed else "aborted",
             "sensor_shape": [self.sensor_rows, self.sensor_columns],
             "position_map_path": self.position_map_path,
+            "home_position": copy.deepcopy(self._home_position),
             "requested_taxels": [int(item["taxel_index"]) for item in self._targets],
             "completed_taxels": list(self._completed_taxels),
             "repetitions_per_taxel": int(self.repeat_count),
@@ -3476,21 +5883,22 @@ class FullTaxelCalibrationTask(CalibrationTask):
                 for item in self._full_target_results
             ],
         }
-        with metadata_path.open("w", encoding="utf-8") as stream:
-            json.dump(metadata, stream, indent=2)
-            stream.write("\n")
+        full_taxel_resume.atomic_json(metadata_path, metadata)
         return str(summary_path) if rows else "", str(metadata_path)
 
     def _build_full_result(self) -> Optional[dict]:
-        if not self._full_target_results:
+        if not self._full_target_results and self._full_directory is None:
             return None
         summary_path, metadata_path = self._save_full_summary()
         return {
+            **self._recording_metadata(),
+            **self._stop_details(),
             "task": self.id,
             "run_id": self._full_run_id,
             "status": "complete" if self._full_completed else "aborted",
             "sensor_shape": [self.sensor_rows, self.sensor_columns],
             "position_map_path": self.position_map_path,
+            "home_position": copy.deepcopy(self._home_position),
             "requested_taxels": len(self._targets),
             "completed_taxels": len(self._completed_taxels),
             "completed_taxel_indices": list(self._completed_taxels),
@@ -3537,8 +5945,9 @@ class FullTaxelCalibrationTask(CalibrationTask):
     def on_stop(self, host, show_result: bool = True) -> None:
         was_active = bool(self._test_active)
         self._stop_robot(self._robot_api(host))
-        if was_active and not self._full_completed and not self._stop_reason:
-            self._stop_reason = "manual_stop"
+        if was_active:
+            self._capture_stop_details(complete=self._full_completed)
+        self._clear_post_save_wait()
         if was_active and self._samples and not self._trial_result_saved:
             try:
                 self._save_current_trial(host)
@@ -3551,12 +5960,21 @@ class FullTaxelCalibrationTask(CalibrationTask):
         if was_active:
             self._flush_partial_taxel_results(host)
         try:
-            self.last_result = self._build_full_result()
+            if was_active:
+                self.last_result = self._build_full_result()
+                self._write_run_manifest("stopped")
         except Exception as exc:
             self.last_result = None
             host._append_sidebar_control_message(
                 f"Could not save the full-taxel summary: {exc}"
             )
+        finally:
+            if self._run_lock is not None:
+                self._run_lock.close()
+                self._run_lock = None
+        if was_active:
+            self.resume_plan = self._resume_previous_settings = None
+            self.start_button_label = "Run Full Taxel Calibration"
         self._test_active = False
         self._phase = "idle"
         self._force_connection_started_at = None
@@ -3565,6 +5983,7 @@ class FullTaxelCalibrationTask(CalibrationTask):
         self._full_recalibration_started_at = None
         self._pending_target_route = None
         self._clear_force_pause_state()
+        self._use_map_anchor_as_home()
         self._reset_travel_status(host)
         setter = getattr(host, "_set_full_taxel_calibration_controls_running", None)
         if callable(setter):
@@ -3583,7 +6002,7 @@ class FullTaxelCalibrationTask(CalibrationTask):
 
 
 class TaxelPositionMappingTask(ExperimentTask):
-    """Automatically locate the robot TCP pose above every taxel in an 8x10 skin."""
+    """Locate robot TCP response centres for the connected sensor grid."""
 
     id = "taxel_position_mapping"
     label = "Taxel Position Mapping"
@@ -3591,8 +6010,7 @@ class TaxelPositionMappingTask(ExperimentTask):
     description = (
         "Starting from a remembered safe pose above the anchor taxel, use bounded "
         "proximity probes and non-contact XY scans to locate every taxel centre "
-        "and save its robot TCP pose. An 8x10 sensor uses Taxel 35; other grids "
-        "use the centre taxel."
+        "and save its robot TCP pose. The anchor follows the connected sensor grid."
     )
     start_button_label = "Map 8x10 Sensor"
     tick_interval_ms = 50
@@ -3602,6 +6020,25 @@ class TaxelPositionMappingTask(ExperimentTask):
     FIRST_NEIGHBOURS = (34, 36, 27, 43)
     MAX_PROBE_SPEED_M_S = 0.005
     MAX_PROBE_DESCENT_M = 0.100
+    MAPPING_ORDER = "verified_neighbour_frontier_v1"
+    CENTRE_SCAN_POLICY = "strong_noncontact_v1"
+    DEFAULT_CENTRE_SCAN_SIGNAL_MULTIPLIER = 2.0
+    SEARCH_SAFETY_POLICY = "clearance_recalibration_bounded_search_v1"
+    MAX_AUTO_RERUNS = 10
+    NONCONTACT_FORCE_STOP_G = 5.0
+    MAX_NONCONTACT_EXTRA_DESCENT_M = 0.020
+    MIN_FIXED_SCAN_CLEARANCE_M = 0.005
+    FIXED_SCAN_COARSE_LIFT_M = 0.003
+    FIXED_SCAN_BOUNDARY_MARGIN_M = 0.0005
+    QUALITY_POLICY = "stationary_strength_repeatable_centre_v1"
+    STRENGTH_CONFIRM_BATCHES = 3
+    STRENGTH_BORDERLINE_RATIO = 0.90
+    STRENGTH_CLEAR_RATIO = 1.10
+    CENTRE_REPEAT_MIN_DOMINANCE = 1.20
+    # Every later scan plane descends from the anchor's, so an anchor that is
+    # barely stronger than its neighbours dooms the whole map. Completed maps
+    # had >= 1.8; maps scanned too high had 1.0-1.3.
+    MIN_ANCHOR_DOMINANCE = 1.5
 
     def __init__(
         self,
@@ -3614,7 +6051,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                 "config", "taxel_position_mapping_anchor.json"
             )
         if output_directory is _DEFAULT_STORAGE_PATH:
-            output_directory = resource_path("taxel_position_maps")
+            output_directory = experiment_path("taxel_position_maps")
         self.storage_path = (
             Path(storage_path).expanduser() if storage_path is not None else None
         )
@@ -3647,6 +6084,13 @@ class TaxelPositionMappingTask(ExperimentTask):
         # Probe in short Z increments and measure while stationary at every
         # level.  This avoids mixing position change into the sensor window.
         self.probe_step_m = 0.0005
+        # "stepwise": each depth step is a TM line move; "velocity": legacy
+        # streaming, which stalls and jumps at low speed on this robot.
+        self.probe_motion = "stepwise"
+        self._probe_line_target_z = None
+        self._probe_line_at_limit = False
+        self._probe_line_sent_at = None
+        self._probe_line_last_z = None
         self.probe_sample_frames = 20
         self.max_probe_descent_m = 0.100
         self.probe_confirm_frames = 2
@@ -3655,14 +6099,15 @@ class TaxelPositionMappingTask(ExperimentTask):
         # deeper until the target's downward change is this multiple of the
         # learned onset threshold.  The stronger non-contact response gives
         # the subsequent XY centre scan a clearer spatial peak.
-        self.centre_scan_signal_multiplier = 2.0
-        self.centre_scan_max_extra_descent_m = 0.005
+        self.centre_scan_signal_multiplier = self.DEFAULT_CENTRE_SCAN_SIGNAL_MULTIPLIER
+        self.centre_scan_max_extra_descent_m = self.MAX_NONCONTACT_EXTRA_DESCENT_M
         # Final centre verification uses a longer sample and permits only a
         # small near-tie with the strongest neighbouring taxel.
         self.final_min_dominance = 0.95
         self.force_guard_g = 20.0
         self.coarse_radius_m = 0.008
         self.coarse_step_m = 0.001
+        self.adaptive_coarse_search = True
         self.local_radius_m = 0.0025
         self.local_step_m = 0.0005
         self.local_radius_pitch_fraction = 0.6
@@ -3683,13 +6128,36 @@ class TaxelPositionMappingTask(ExperimentTask):
         self.force_stale_sec = 1.0
         self.force_connection_timeout_sec = 10.0
         self.baseline_frame_count = 100
-        self.scan_frame_count = 3
+        # XY search uses a short robust median; onset/baseline/final checks
+        # retain their longer stationary windows. Unclear sparse searches
+        # automatically fall back to the full grid and at least 20 frames.
+        self.scan_frame_count = 9
+        self.reverse_scan_order = False
         self.verify_frame_count = 20
         self.max_attempts_per_taxel = 2
+        # Explicit operator opt-in, never armed merely by loading a JSON.
+        self.max_auto_reruns = 0
+        self.auto_rerun_delay_sec = 30.
+        self._auto_rerun_count = 0
+        self._auto_rerun_history = []
+        self._auto_rerun_pending = None
+        self._auto_rerun_deadline = None
         self.baseline_stability_fraction = 0.50
         self.baseline_stability_floor_counts = 5.0
         self.resume_xy_tolerance_m = 0.0015
         self.resume_z_tolerance_m = 0.0020
+        # Fixed scan plane: every taxel is measured at one operator-chosen Z
+        # instead of a per-taxel, noise-derived proximity plane. A raised
+        # patch of skin stops the descent early; a far stronger response
+        # than the anchor's is treated as possible contact.
+        self.fixed_scan_z_m: Optional[float] = None
+        self._scan_plane_source = "proximity_threshold"
+        self.fixed_scan_approach_window_m = 0.005
+        self.fixed_scan_stop_ratio = 1.2
+        self.fixed_scan_contact_ratio = 2.0
+        self._fixed_scan_reference_signal: Optional[float] = None
+        self._skipped_failed_taxels: set[int] = set()
+        self._failed_attempt_total = 0
 
         self.anchor_pose: Optional[dict] = None
         self._anchor_profiles: dict = {}
@@ -3701,6 +6169,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._completed = False
         self._phase = "idle"
         self._stop_reason = ""
+        self._stop_message = ""
         self._output_folder: Optional[Path] = None
         self._started_at_iso = ""
         self._positions: dict[int, dict] = {}
@@ -3713,6 +6182,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._reference_onset_z: Optional[float] = None
         self._probe_start_z: Optional[float] = None
         self._mapping_queue: list[int] = []
+        self._current_prediction: Optional[dict] = None
         self._neighbor_queue: list[int] = []
         self._neighbor_guesses: dict[int, list[float]] = {}
         self._predicted_positions: dict[int, np.ndarray] = {}
@@ -3738,11 +6208,16 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._probe_recent_frames: list[np.ndarray] = []
         self._probe_candidate_pose: Optional[np.ndarray] = None
         self._probe_stage = "descending"
+        self._probe_line_target_z = None
         self._probe_step_start_z: Optional[float] = None
         self._probe_level_pose: Optional[np.ndarray] = None
         self._probe_level_frames: list[np.ndarray] = []
         self._probe_settle_started_at: Optional[float] = None
         self._probe_level_at_max_depth = False
+        self._probe_boundary_corrections = 0
+        self._probe_strength_hold = None
+        self._strength_checks = []
+        self._target_strength_check = None
         self._far_baseline: Optional[np.ndarray] = None
         self._far_baseline_min: Optional[np.ndarray] = None
         self._far_baseline_max: Optional[np.ndarray] = None
@@ -3754,11 +6229,21 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._probe_scan_target_signal = 0.0
         self._probe_scan_target_reached = False
         self._probe_onset_confirmed = False
+        self._probe_candidate_seen = False
+        self._working_probe_boundary = None
+        self._probe_log = []
+        self._stop_snapshot = None
+        self._clearance_reference_frames = None
+        self._clearance_next_context = ""
+        self._clearance_checks = []
         self._force_baseline_n: Optional[float] = None
         self._local_center: Optional[np.ndarray] = None
         self._local_axes: list[dict] = []
         self._local_recenters = 0
         self._verify_estimate: Optional[dict] = None
+        self._centre_repeat = None
+        self._centre_checks = []
+        self._target_centre_check = None
         self._route_queue: list[tuple] = []
         self._move_target: Optional[np.ndarray] = None
         self._move_action = ""
@@ -3781,6 +6266,8 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._scan_index = 0
         self._scan_baseline: Optional[np.ndarray] = None
         self._scan_target: Optional[int] = None
+        self._coarse_scan_centre: Optional[np.ndarray] = None
+        self._coarse_sparse_pass = False
         self._current_target_xy: Optional[np.ndarray] = None
         self._pending_recovery: Optional[dict] = None
         self._last_sensor_sequence: Optional[int] = None
@@ -3795,10 +6282,13 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._resume_history: list[dict] = []
         self._resume_anchor_previous: Optional[dict] = None
         self._resume_alignment_error = ""
+        self._anchor_stop: Optional[tuple[str, str]] = None
         self._resume_mapped_before = 0
         self._relocation_request: Optional[dict] = None
         self._relocation_source_path: Optional[Path] = None
         self._relocation_active = False
+        self._relocation_continues_mapping = False
+        self._relocation_finished = False
         self._relocation_source_result: Optional[dict] = None
         self._relocation_source_positions: dict[int, dict] = {}
         self._relocation_verification_queue: list[int] = []
@@ -3840,6 +6330,8 @@ class TaxelPositionMappingTask(ExperimentTask):
         columns = int(columns)
         if (rows, columns) == (8, 10):
             return 35
+        if (rows, columns) == (20, 20):
+            return 189
         return (rows // 2) + (columns // 2) * rows
 
     def anchor_neighbour_indices(self) -> tuple[int, ...]:
@@ -3912,12 +6404,153 @@ class TaxelPositionMappingTask(ExperimentTask):
         )
         if position is None or quaternion is None:
             return None
-        return {
+        anchor = {
             "saved_at": str(payload.get("saved_at", "")),
             "taxel_index": int(payload.get("taxel_index", 35)),
             "tool_position_m": position,
             "tool_quaternion_wxyz": quaternion,
         }
+        choice = payload.get("scan_plane_choice")
+        if isinstance(choice, dict) and "z_m" in choice:
+            z = finite_number(choice["z_m"])
+            if choice["z_m"] is None or z is not None:
+                anchor["scan_plane_choice"] = copy.deepcopy(choice)
+                anchor["scan_plane_choice"]["z_m"] = z
+        return anchor
+
+    def _restore_scan_plane_choice(self) -> None:
+        """A choice belongs to one sensor's anchor, never to another setup."""
+        choice = (self.anchor_pose or {}).get("scan_plane_choice")
+        if choice is not None and (
+            choice.get("sensor_identity") != self.active_sensor_key_name
+            or (choice.get("sensor_rows"), choice.get("sensor_columns"))
+            != (self.sensor_rows, self.sensor_columns)
+        ):
+            choice = None
+        self.fixed_scan_z_m = choice["z_m"] if choice is not None else None
+        if choice is None:
+            self.fixed_scan_z_m = self._scan_height_recorded_for_this_anchor()
+            if self.fixed_scan_z_m is not None and self.anchor_pose is not None:
+                self._save_scan_plane_choice()
+                return
+        self._scan_plane_source = (
+            "remembered_for_sensor_anchor" if self.fixed_scan_z_m is not None else "proximity_threshold"
+        )
+
+    def _scan_height_recorded_for_this_anchor(self):
+        """The fixed scan height saved with this anchor, including inside its position map."""
+        anchor = self.anchor_pose
+        directory = self.output_directory
+        if anchor is None or directory is None or not Path(directory).is_dir():
+            return None
+        identity = str(self.active_sensor_key_name or "")
+        position = np.asarray(anchor.get("tool_position_m"), dtype=float)
+        quaternion = np.asarray(anchor.get("tool_quaternion_wxyz"), dtype=float)
+        if position.shape != (3,) or quaternion.shape != (4,) or not np.all(np.isfinite(position)):
+            return None
+        quaternion_norm = float(np.linalg.norm(quaternion))
+        if quaternion_norm < 1e-9:
+            return None
+        quaternion = quaternion / quaternion_norm
+        newest = None
+        for path in Path(directory).glob("*/taxel_position_map.json"):
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    result = json.load(stream)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if str(result.get("sensor_identity") or "") != identity:
+                continue
+            if revision_motion_error(result):
+                continue
+            settings = result.get("settings") if isinstance(result.get("settings"), dict) else {}
+            if (int(settings.get("sensor_rows") or -1), int(settings.get("sensor_columns") or -1)) != (
+                int(self.sensor_rows), int(self.sensor_columns)
+            ):
+                continue
+            saved = result.get("anchor_pose") if isinstance(result.get("anchor_pose"), dict) else {}
+            if int(saved.get("taxel_index", -1)) != int(anchor.get("taxel_index", -2)):
+                continue
+            saved_position = np.asarray(saved.get("tool_position_m"), dtype=float)
+            saved_quaternion = np.asarray(saved.get("tool_quaternion_wxyz"), dtype=float)
+            height = finite_number(settings.get("fixed_scan_z_mm"))
+            if (saved_position.shape != (3,) or saved_quaternion.shape != (4,)
+                    or height is None or not np.all(np.isfinite(saved_position))):
+                continue
+            saved_norm = float(np.linalg.norm(saved_quaternion))
+            if saved_norm < 1e-9:
+                continue
+            alignment = abs(float(np.dot(quaternion, saved_quaternion / saved_norm)))
+            if float(np.linalg.norm(saved_position - position)) > 0.010 or alignment < 0.99:
+                continue
+            anchor_z = float(position[2])
+            scan_z = height / 1000.0
+            if not self.MIN_FIXED_SCAN_CLEARANCE_M <= anchor_z - scan_z <= self.MAX_PROBE_DESCENT_M:
+                continue
+            stamp = path.stat().st_mtime
+            if newest is None or stamp >= newest[0]:
+                newest = (stamp, scan_z)
+        return None if newest is None else newest[1]
+
+    def _save_scan_plane_choice(self) -> bool:
+        self.anchor_pose["scan_plane_choice"] = {
+            "z_m": self.fixed_scan_z_m,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "sensor_identity": self.active_sensor_key_name,
+            "sensor_rows": int(self.sensor_rows),
+            "sensor_columns": int(self.sensor_columns),
+        }
+        self._anchor_profiles[self.active_sensor_key_name] = copy.deepcopy(self.anchor_pose)
+        self._scan_plane_source = "remembered_for_sensor_anchor"
+        return self.save_anchor_pose()
+
+    def _resume_scan_plane_choice(self, result):
+        """Keep an explicit choice (including Clear) only for the same setup."""
+        choice = (self.anchor_pose or {}).get("scan_plane_choice")
+        if choice is None:
+            return None
+        settings = result["settings"]
+        saved_key = str(result.get("sensor_identity") or "")
+        if choice.get("sensor_identity") != self.active_sensor_key_name or (
+            saved_key and saved_key != choice.get("sensor_identity")
+        ) or (
+            (choice.get("sensor_rows"), choice.get("sensor_columns"))
+            != (int(settings["sensor_rows"]), int(settings["sensor_columns"]))
+        ):
+            return None
+        saved_anchor = self._normalize_anchor_pose(result["anchor_pose"])
+        same_position = np.allclose(
+            self.anchor_pose["tool_position_m"], saved_anchor["tool_position_m"],
+            rtol=0., atol=1e-9,
+        )
+        current_q = np.asarray(self.anchor_pose["tool_quaternion_wxyz"], dtype=float)
+        saved_q = np.asarray(saved_anchor["tool_quaternion_wxyz"], dtype=float)
+        same_orientation = min(
+            np.linalg.norm(current_q - saved_q), np.linalg.norm(current_q + saved_q)
+        ) < 1e-9
+        if (not same_position or not same_orientation
+                or self.anchor_pose["taxel_index"] != saved_anchor["taxel_index"]):
+            raise ValueError(
+                "the selected scan plane belongs to a different remembered anchor. "
+                "Use Relocate for a moved setup; do not apply this height to the old map."
+            )
+        return copy.deepcopy(choice)
+
+    def _scan_plane_status(self) -> str:
+        if self.fixed_scan_z_m is None:
+            return (
+                "Scan mode: automatic proximity-threshold descent (no fixed scan plane). A "
+                "remembered scan height is more reliable: the automatic descent can stop too "
+                "high to centre taxels."
+            )
+        source = (
+            "your remembered height" if self._scan_plane_source == "remembered_for_sensor_anchor"
+            else "saved map setting"
+        )
+        return (
+            f"Scan mode: fixed scan plane Z {self.fixed_scan_z_m * 1000.0:.2f} mm "
+            f"({source}). Force, travel and centre-quality guards remain active."
+        )
 
     def _read_anchor_profiles(self) -> dict:
         if self.storage_path is None or not self.storage_path.exists():
@@ -3952,6 +6585,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             key, anchor = next(iter(self._anchor_profiles.items()))
             self.active_sensor_key_name = key
             self.anchor_pose = copy.deepcopy(anchor)
+            self._restore_scan_plane_choice()
         return True
 
     def save_anchor_pose(self) -> bool:
@@ -3981,9 +6615,28 @@ class TaxelPositionMappingTask(ExperimentTask):
         if self._active:
             return str(self.active_sensor_key_name or "")
         key, label, rows, columns = connected_calibration_sensor(host)
+        previous_key = self.active_sensor_key_name
         self.active_sensor_key_name = key
         self.active_sensor_label = label
         if rows > 0 and columns > 0:
+            previous_shape = (self.sensor_rows, self.sensor_columns)
+            next_shape = (int(rows), int(columns))
+            if next_shape == (20, 20) and previous_shape != next_shape:
+                # Defaults for the 400-node sensor around Taxel 189. Keep the
+                # fine 0.5 mm scan separate from this wider coarse discovery.
+                self._smaller_grid_search_settings = (
+                    self.max_xy_offset_m, self.coarse_radius_m, self.coarse_step_m,
+                    self.skip_outer_border,
+                )
+                self.max_xy_offset_m = 0.200
+                self.coarse_radius_m = 0.020
+                self.coarse_step_m = 0.002
+                self.skip_outer_border = True
+            elif previous_shape == (20, 20) and next_shape != previous_shape:
+                (
+                    self.max_xy_offset_m, self.coarse_radius_m, self.coarse_step_m,
+                    self.skip_outer_border,
+                ) = getattr(self, "_smaller_grid_search_settings", (0.100, 0.008, 0.001, False))
             self.sensor_rows = int(rows)
             self.sensor_columns = int(columns)
             self.anchor_taxel = self.default_anchor_taxel(
@@ -3993,7 +6646,86 @@ class TaxelPositionMappingTask(ExperimentTask):
                 f"Map {self.sensor_rows}x{self.sensor_columns} Sensor"
             )
         self.anchor_pose = copy.deepcopy(self._anchor_profiles.get(key))
+        if key != previous_key or "scan_plane_choice" in (self.anchor_pose or {}):
+            self._restore_scan_plane_choice()
         return key
+
+    def preview_remembered_setup(self, host, kind, result=None):
+        """Capture a proposal only. Cancel must not alter profiles or any files."""
+        if self._active or getattr(host, "_sidebar_active_task", None) is not None:
+            raise ValueError("Stop the current experiment before changing the mapping setup.")
+        if kind not in {"anchor", "scan_height"}:
+            raise ValueError("Unknown mapping setup control.")
+        key, label, rows, columns = connected_calibration_sensor(host)
+        if rows <= 0 or columns <= 0:
+            raise ValueError("Connect/select the sensor before remembering its mapping setup.")
+        if result is not None:
+            settings = result.get("settings") or {}
+            if (result.get("sensor_identity") != key or (rows, columns) != (
+                    settings.get("sensor_rows"), settings.get("sensor_columns"))):
+                raise ValueError("The loaded map does not match the connected sensor. Load its map first.")
+        api = self._robot_api(host)
+        pose = self._read_tool_pose(api)
+        stamp = finite_number(getattr(api, "current_feedback_state_time", None))
+        if pose is None or stamp is None or not -.1 <= time.monotonic() - stamp <= 1.:
+            raise ValueError("Fresh robot TCP feedback is required; nothing was saved.")
+        position, quaternion = pose
+        stamp = datetime.now(timezone.utc).isoformat()
+        requested = revision_setup(result)
+        anchor = copy.deepcopy(
+            (requested or {}).get("anchor_pose")
+            or self._anchor_profiles.get(key)
+            or (result or {}).get("anchor_pose")
+        )
+        index = self.default_anchor_taxel(rows, columns)
+        z = None
+        if anchor is not None:
+            choice = anchor.get("scan_plane_choice")
+            if choice is not None:
+                z = choice.get("z_m")
+            elif requested is not None:
+                z = requested.get("fixed_scan_z_m")
+            elif result is not None:
+                mm = (result.get("settings") or {}).get("fixed_scan_z_mm")
+                z = None if mm is None else float(mm) / 1000.
+            elif self.active_sensor_key_name == key:
+                z = self.fixed_scan_z_m
+        captured = dict(saved_at=stamp, taxel_index=index,
+                        tool_position_m=position.tolist(), tool_quaternion_wxyz=quaternion.tolist())
+        if kind == "anchor":
+            # A changed anchor does not inherit an old absolute scan plane.
+            if anchor is None or not same_pose(anchor, captured):
+                z = None
+            anchor = captured
+        else:
+            if anchor is None:
+                raise ValueError(f"Remember the safe anchor above Taxel {index} first.")
+            distance = np.linalg.norm(position[:2] - np.asarray(anchor["tool_position_m"])[:2])
+            if distance > self.max_xy_offset_m:
+                raise ValueError("Move the robot over the sensor before remembering the scan height.")
+            z = float(position[2])
+        setup = normalize_setup(dict(
+            saved_at=stamp, sensor_identity=key, sensor_label=label,
+            sensor_rows=rows, sensor_columns=columns, anchor_pose=anchor, fixed_scan_z_m=z,
+        ))
+        return setup, captured
+
+    def apply_remembered_setup(self, setup, *, persist=False):
+        """Install a validated choice. Revisions themselves are the durable copy."""
+        setup = normalize_setup(setup)
+        before = copy.deepcopy(self._anchor_profiles)
+        key = setup["sensor_identity"]
+        self._anchor_profiles[key] = copy.deepcopy(setup["anchor_pose"])
+        if persist and not self.save_anchor_pose():
+            self._anchor_profiles = before
+            raise OSError(self.last_persistence_error)
+        self.active_sensor_key_name = key
+        self.active_sensor_label = setup.get("sensor_label", key)
+        self.sensor_rows, self.sensor_columns = setup["sensor_rows"], setup["sensor_columns"]
+        self.anchor_taxel = setup["anchor_pose"]["taxel_index"]
+        self.anchor_pose = copy.deepcopy(setup["anchor_pose"])
+        self.fixed_scan_z_m = setup["fixed_scan_z_m"]
+        self._scan_plane_source = "remembered_for_sensor_anchor" if self.fixed_scan_z_m is not None else "proximity_threshold"
 
     def capture_anchor_pose(self, host) -> bool:
         if self._active:
@@ -4017,6 +6749,8 @@ class TaxelPositionMappingTask(ExperimentTask):
         }
         sensor_key = str(self.active_sensor_key_name or "layout:unknown")
         self._anchor_profiles[sensor_key] = copy.deepcopy(self.anchor_pose)
+        previous_scan_z = self.fixed_scan_z_m
+        self._restore_scan_plane_choice()
         saved = self.save_anchor_pose()
         host._append_sidebar_control_message(
             f"Remembered the safe TCP pose above Taxel {self.anchor_taxel}: "
@@ -4024,16 +6758,97 @@ class TaxelPositionMappingTask(ExperimentTask):
         )
         if not saved:
             host._append_sidebar_control_message(self.last_persistence_error)
+        if previous_scan_z is not None and self.fixed_scan_z_m is None:
+            host._append_sidebar_control_message(
+                f"New anchor remembered: the previous scan plane (Z {previous_scan_z * 1000.0:.2f} mm) "
+                "does not belong to this pose. Remember the scan height again for this anchor."
+            )
         refresher = getattr(host, "_refresh_taxel_mapping_controls", None)
         if callable(refresher):
             refresher()
         return saved
+
+    def capture_scan_height(self, host) -> bool:
+        """Remember the current TCP Z as the fixed scan plane for every taxel."""
+        if self._active:
+            host._append_sidebar_control_message(
+                "Stop Taxel Position Mapping before changing its scan height."
+            )
+            return False
+        self.use_connected_sensor(host)
+        if self.anchor_pose is None:
+            host._append_sidebar_control_message(
+                f"Remember the safe anchor above Taxel {self.anchor_taxel} first."
+            )
+            return False
+        pose = self._read_tool_pose(self._robot_api(host))
+        stamp = finite_number(getattr(self._robot_api(host), "current_feedback_state_time", None))
+        if pose is None or stamp is None or not -0.1 <= time.monotonic() - stamp <= 1.0:
+            host._append_sidebar_control_message(
+                "Fresh robot TCP feedback is required; the scan height was not saved."
+            )
+            return False
+        anchor = np.asarray(self.anchor_pose["tool_position_m"], dtype=float)
+        position = np.asarray(pose[0], dtype=float)
+        clearance = float(anchor[2] - position[2])
+        if clearance < self.MIN_FIXED_SCAN_CLEARANCE_M:
+            host._append_sidebar_control_message(
+                f"The scan height must be at least {self.MIN_FIXED_SCAN_CLEARANCE_M * 1000.0:.0f} mm "
+                f"below the anchor (currently {clearance * 1000.0:.1f} mm); not saved."
+            )
+            return False
+        if clearance > self.MAX_PROBE_DESCENT_M:
+            host._append_sidebar_control_message(
+                "The scan height is more than 100 mm below the anchor; not saved."
+            )
+            return False
+        if float(np.linalg.norm(position[:2] - anchor[:2])) > float(self.max_xy_offset_m):
+            host._append_sidebar_control_message(
+                "Move the robot over the sensor before remembering the scan height; not saved."
+            )
+            return False
+        self.fixed_scan_z_m = float(position[2])
+        saved = self._save_scan_plane_choice()
+        host._append_sidebar_control_message(
+            f"Fixed scan height remembered: Z {position[2] * 1000.0:.2f} mm, "
+            f"{clearance * 1000.0:.1f} mm below the anchor. Every taxel is scanned at this height "
+            "unless a raised patch of skin stops the descent earlier."
+        )
+        if not saved:
+            host._append_sidebar_control_message(
+                "Scan height is set for this session but could not be saved for restart: "
+                + self.last_persistence_error
+            )
+        refresher = getattr(host, "_refresh_taxel_mapping_controls", None)
+        if callable(refresher):
+            refresher()
+        return saved
+
+    def clear_scan_height(self, host) -> None:
+        if self._active:
+            return
+        self.use_connected_sensor(host)
+        self.fixed_scan_z_m = None
+        if self.anchor_pose is not None and not self._save_scan_plane_choice():
+            host._append_sidebar_control_message(self.last_persistence_error)
+        host._append_sidebar_control_message(
+            "Fixed scan height cleared; mapping uses the proximity-threshold descent."
+        )
+        refresher = getattr(host, "_refresh_taxel_mapping_controls", None)
+        if callable(refresher):
+            refresher()
+
+    @property
+    def fixed_scan_active(self) -> bool:
+        return self.fixed_scan_z_m is not None
 
     @classmethod
     def validate_resume_result(cls, result) -> tuple[bool, str]:
         """Return whether a partial mapping JSON has enough state to continue."""
         if not isinstance(result, dict) or result.get("task") != cls.id:
             return False, "Select a taxel_position_map.json recording."
+        if revision_motion_error(result):
+            return False, revision_motion_error(result)
         if bool(result.get("completed")):
             return False, "This map is already complete."
         settings = result.get("settings")
@@ -4134,11 +6949,115 @@ class TaxelPositionMappingTask(ExperimentTask):
         target_total = len(target_indices)
         mapped_target = sum(index in measured for index in target_indices)
         region = " interior" if skip_border else ""
+        relocation_error = cls._relocation_resume_error(result)
+        if relocation_error:
+            return False, relocation_error
+        relocating = bool(result.get("relocation_checkpoint"))
         return (
             True,
-            f"Resume available from {mapped_target}/{target_total} measured"
+            f"{'Relocation resume' if relocating else 'Resume'} available from "
+            f"{mapped_target}/{target_total} measured"
             f"{region} taxels.",
         )
+
+    @classmethod
+    def _relocation_resume_error(cls, result) -> str:
+        state = result.get("relocation_checkpoint")
+        if state is None:
+            # Legacy intermediate transforms did not save their source map.
+            # Never silently turn an interrupted relocation into a full scan.
+            legacy_fit = isinstance(result.get("relocation"), dict) and "rotation" in result["relocation"]
+            legacy_unfitted = result.get("relocation") is None and Path(
+                str(result.get("output_folder") or "")
+            ).name.startswith("taxel_position_map_relocated_")
+            if legacy_fit or legacy_unfitted:
+                return "This relocation checkpoint lacks its source map; recover it before resuming."
+            return ""
+        if not isinstance(state, dict) or state.get("version") != 1:
+            return "The relocation checkpoint is invalid."
+        source = state.get("source_map")
+        valid, message = cls.validate_relocation_result(source)
+        if not valid:
+            return "The relocation source map is invalid: " + message
+        for key in ("sensor_rows", "sensor_columns", "anchor_taxel"):
+            if source["settings"].get(key) != result["settings"].get(key):
+                return "The relocation source grid/anchor does not match the checkpoint."
+        if source.get("sensor_identity") != result.get("sensor_identity"):
+            return "The relocation source sensor does not match the checkpoint."
+        if type(state.get("finished")) is not bool:
+            return "The relocation checkpoint has no valid completion state."
+        references = state.get("reference_taxels")
+        measured = {record["taxel_index"] for record in result["positions"] if record.get("status") == "measured"}
+        source_indices = {record["taxel_index"] for record in source["positions"] if record.get("status") == "measured"}
+        if (not isinstance(references, list)
+                or any(type(index) is not int for index in references)
+                or len(set(references)) != len(references)
+                or not set(references) <= measured.intersection(source_indices)):
+            return "The relocation reference taxels are invalid."
+        if not state["finished"] and not measured <= source_indices:
+            return "The relocation measurements do not belong to its source map."
+        rows = int(result["settings"]["sensor_rows"])
+        columns = int(result["settings"]["sensor_columns"])
+        anchor = int(result["settings"]["anchor_taxel"])
+        row, column = cls.taxel_row_column(anchor, rows)
+        expected = {anchor}
+        for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            if 0 <= row + dr < rows and 0 <= column + dc < columns:
+                expected.add(cls.taxel_index(row + dr, column + dc, rows))
+        if references:
+            if set(references) != expected:
+                return "The relocation checkpoint must retain its original centre/neighbour references."
+        elif state["finished"] or not measured <= expected:
+            return "The relocation checkpoint is missing its original reference taxels."
+        return ""
+
+    def _relocation_checkpoint(self):
+        """Self-contained continuation state, including before a fit exists."""
+        if not self._relocation_active:
+            return None
+        # Do not embed histories/checkpoints recursively when relocating a map
+        # that was itself relocated. Only these fields seed the rigid fit.
+        source = self._relocation_source_result or {}
+        source_keys = (
+            "task", "completed", "settings", "sensor_identity", "positions",
+            "initial_row_vector_xy_m", "initial_column_vector_xy_m",
+            "row_vector_xy_m", "column_vector_xy_m",
+        )
+        return {
+            "version": 1,
+            "source_json_path": str(self._relocation_source_path or ""),
+            "source_map": {key: copy.deepcopy(source[key]) for key in source_keys if key in source},
+            "finished": bool(self._relocation_finished),
+            "reference_taxels": list(self._relocation_reference_indices),
+        }
+
+    def _restore_relocation_checkpoint(self, result) -> None:
+        """Reset stale state and restore relocation without issuing motion."""
+        state = result.get("relocation_checkpoint") or {}
+        self._relocation_active = bool(state)
+        self._relocation_finished = bool(state.get("finished", False))
+        self._relocation_source_result = copy.deepcopy(state.get("source_map"))
+        self._relocation_continues_mapping = bool(
+            state and not self._relocation_source_result.get("completed")
+        )
+        self._relocation_source_path = (
+            Path(state["source_json_path"]) if state.get("source_json_path") else None
+        )
+        self._relocation_source_positions = {
+            int(record["taxel_index"]): copy.deepcopy(record)
+            for record in (self._relocation_source_result or {}).get("positions", [])
+            if record.get("status") == "measured"
+        }
+        self._relocation_transform = copy.deepcopy(result.get("relocation")) if state else None
+        self._relocation_reference_indices = list(state.get("reference_taxels", []))
+        self._relocation_verification_queue = []
+        if self._relocation_reference_indices and not self._relocation_finished:
+            # Rebuild the original deterministic plan, not just the queue:
+            # an interrupted in-flight target was already popped from it.
+            self._relocation_verification_queue = [
+                index for index in self._choose_relocation_verification_indices(3)
+                if index not in self._positions
+            ]
 
     def request_resume(self, result, source_path=None) -> tuple[bool, str]:
         """Queue a validated partial result for the next ``on_start`` call."""
@@ -4157,11 +7076,18 @@ class TaxelPositionMappingTask(ExperimentTask):
 
     @classmethod
     def validate_relocation_result(cls, result) -> tuple[bool, str]:
-        """Return whether a completed map can seed a moved-sensor map."""
+        """Return whether a saved map can seed a moved-sensor map.
+
+        A partial map is re-registered the same way and then continues
+        mapping its remaining targets from the re-measured taxels.
+        """
         if not isinstance(result, dict) or result.get("task") != cls.id:
             return False, "Select a taxel_position_map.json recording."
-        if not bool(result.get("completed")):
-            return False, "Relocation requires a completed taxel position map."
+        if "setup_revision" in result:
+            try:
+                validate_setup_binding(result, revision_setup(result))
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                return False, f"Invalid map setup revision: {exc}"
         settings = result.get("settings")
         if not isinstance(settings, dict):
             return False, "The saved map has no sensor-grid settings."
@@ -4209,10 +7135,15 @@ class TaxelPositionMappingTask(ExperimentTask):
             )
         if len(measured) < len(references) + 1:
             return False, "The saved map has too few positions to relocate."
+        continuation = (
+            ""
+            if bool(result.get("completed"))
+            else " The partial map then continues mapping its remaining taxels."
+        )
         return True, (
             f"Relocation available for {len(measured)} saved taxels. Move the "
             f"robot to a safe pose approximately above Taxel {anchor_index}, "
-            "remember that pose, then start relocation."
+            "remember that pose, then start relocation." + continuation
         )
 
     def request_relocation(self, result, source_path=None) -> tuple[bool, str]:
@@ -4287,8 +7218,36 @@ class TaxelPositionMappingTask(ExperimentTask):
             return None
         return np.array(vector, dtype=float, copy=True)
 
+    def _resume_scan_plane_mismatch(self, result) -> str:
+        """Centres saved at another scan height can be neither verified nor extended."""
+        if not self.fixed_scan_active:
+            return ""
+        anchor = int(result["settings"].get("anchor_taxel", self.anchor_taxel))
+        positions = result.get("positions") or []
+        if isinstance(positions, dict):
+            positions = list(positions.values())
+        saved_z = None
+        for item in positions:
+            if int(item.get("taxel_index", -1)) == anchor and item.get("status") == "measured":
+                position = self._finite_values(item.get("tool_position_m"), 3)
+                saved_z = None if position is None else float(position[2])
+        if saved_z is None:
+            return ""
+        difference = saved_z - float(self.fixed_scan_z_m)
+        if abs(difference) <= float(self.resume_z_tolerance_m):
+            return ""
+        return (
+            f"the saved centres were scanned at Z {saved_z * 1000.0:.1f} mm, but the scan height is "
+            f"now Z {self.fixed_scan_z_m * 1000.0:.1f} mm ({difference * 1000.0:+.1f} mm). Centres from "
+            "another scan height cannot be verified or mixed: start a new map at this height, or "
+            "clear the scan height to resume at the saved one."
+        )
+
     def _apply_resume_settings(self, result) -> None:
         settings = result["settings"]
+        scan_choice = self._resume_scan_plane_choice(result)
+        # Recovery controls intentionally remain the operator's current choice.
+        # Loading an old experiment must not enable automatic robot restarts.
         direct = {
             "skip_outer_border": "skip_outer_border",
             "proximity_detection_mode": "proximity_detection_mode",
@@ -4305,6 +7264,9 @@ class TaxelPositionMappingTask(ExperimentTask):
             "local_radius_pitch_fraction": "local_radius_pitch_fraction",
             "max_local_recenters": "max_local_recenters",
             "verify_frame_count": "verify_frame_count",
+            "scan_frame_count": "scan_frame_count",
+            "adaptive_coarse_search": "adaptive_coarse_search",
+            "reverse_scan_order": "reverse_scan_order",
             "baseline_frame_count": "baseline_frame_count",
             "baseline_stability_fraction": "baseline_stability_fraction",
             "baseline_stability_floor_counts": "baseline_stability_floor_counts",
@@ -4345,6 +7307,21 @@ class TaxelPositionMappingTask(ExperimentTask):
         for key, attribute in millimetres.items():
             if key in settings:
                 setattr(self, attribute, float(settings[key]) / 1000.0)
+        fixed_z_mm = finite_number(settings.get("fixed_scan_z_mm"))
+        self.fixed_scan_z_m = (
+            scan_choice["z_m"] if scan_choice is not None
+            else (None if fixed_z_mm is None else fixed_z_mm / 1000.0)
+        )
+        self._scan_plane_source = (
+            "remembered_for_sensor_anchor" if scan_choice is not None else "saved_map"
+        )
+        window_mm = finite_number(settings.get("fixed_scan_approach_window_mm"))
+        if window_mm is not None and window_mm > 0.0:
+            self.fixed_scan_approach_window_m = window_mm / 1000.0
+        for key in ("fixed_scan_stop_ratio", "fixed_scan_contact_ratio"):
+            value = finite_number(settings.get(key))
+            if value is not None and value > 1.0:
+                setattr(self, key, value)
         if "probe_sample_frames" not in settings:
             # Older maps used overlapping frames while moving.  Resume them
             # with the safer step-and-sample defaults instead of interpreting
@@ -4352,12 +7329,34 @@ class TaxelPositionMappingTask(ExperimentTask):
             self.probe_step_m = 0.0005
             self.probe_sample_frames = 20
             self.probe_confirm_frames = 2
+        if (settings.get("centre_scan_policy") != self.CENTRE_SCAN_POLICY
+                and np.isfinite(self.centre_scan_signal_multiplier)):
+            # Migrate legacy weak-fallback maps to at least the 2× target,
+            # preserving larger explicit settings and all measured poses.
+            self.centre_scan_signal_multiplier = max(
+                self.DEFAULT_CENTRE_SCAN_SIGNAL_MULTIPLIER, self.centre_scan_signal_multiplier
+            )
+        if np.isfinite(self.centre_scan_max_extra_descent_m):
+            self.centre_scan_max_extra_descent_m = min(
+                self.MAX_NONCONTACT_EXTRA_DESCENT_M, self.centre_scan_max_extra_descent_m
+            )
         self.sensor_rows = int(settings["sensor_rows"])
         self.sensor_columns = int(settings["sensor_columns"])
+        if (self.sensor_rows, self.sensor_columns) == (20, 20):
+            # Apply the requested border exclusion when resuming an older
+            # 400-node plan too; keep its already recorded data intact.
+            self.skip_outer_border = True
         if "proximity_detection_mode" not in settings:
             # Maps saved before adaptive envelopes used the fixed-count rule.
             self.proximity_detection_mode = "fixed"
         self.anchor_pose = self._normalize_anchor_pose(result["anchor_pose"])
+        # Keep the effective choice consistent with the profile used by idle UI
+        # refreshes, without importing another map's obsolete operator choice.
+        self.anchor_pose.pop("scan_plane_choice", None)
+        if scan_choice is not None:
+            self.anchor_pose["scan_plane_choice"] = scan_choice
+        if self.active_sensor_key_name:
+            self._anchor_profiles[self.active_sensor_key_name] = copy.deepcopy(self.anchor_pose)
         self.anchor_taxel = int(self.anchor_pose["taxel_index"])
         self.start_button_label = (
             f"Map {self.sensor_rows}x{self.sensor_columns} Sensor"
@@ -4383,6 +7382,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             if isinstance(record, dict) and record.get("status") == "measured"
         }
         self._positions = records
+        self._restore_relocation_checkpoint(result)
         self._resume_mapped_before = len(records)
         self._failures = {}
         self._baseline_checks = copy.deepcopy(result.get("baseline_checks") or [])
@@ -4390,15 +7390,23 @@ class TaxelPositionMappingTask(ExperimentTask):
             result.get("sensor_calibration_history") or []
         )
         self._baseline_stats_by_taxel = {}
-        self._attempt_counts = {
-            index: max(1, int(record.get("attempt_count", 1)))
-            for index, record in records.items()
-        }
+        # Saved measurement attempts are historical evidence, not the budget
+        # for this explicit Resume (including its required anchor re-check).
+        # Keep record metadata unchanged; archive the prior live counters below.
+        self._attempt_counts = {}
         self._reference_attempt_count = max(
             1, int(result.get("reference_attempt_count", 1) or 1)
         )
         self._reference_onset_z = float(result["reference_onset_z_m"])
         self._probe_start_z = float(result["probe_start_z_m"])
+        if self.fixed_scan_active:
+            # The previous threshold-derived start may lie BELOW the newly
+            # chosen plane. Rebuild the guarded approach before any movement.
+            self._reference_onset_z = float(self.fixed_scan_z_m)
+            self._probe_start_z = min(
+                float(self.anchor_pose["tool_position_m"][2]),
+                float(self.fixed_scan_z_m) + self.fixed_scan_approach_window_m,
+            )
         self._initial_row_vector_xy = self._saved_vector(
             result, "initial_row_vector_xy_m"
         )
@@ -4408,6 +7416,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._row_vector_xy = self._saved_vector(result, "row_vector_xy_m")
         self._column_vector_xy = self._saved_vector(result, "column_vector_xy_m")
         self._mapping_queue = []
+        self._current_prediction = None
         self._neighbor_queue = []
         self._neighbor_guesses = {}
         self._predicted_positions = {}
@@ -4464,15 +7473,67 @@ class TaxelPositionMappingTask(ExperimentTask):
                 else None
             )
         self._sample_log = self._load_resume_samples(self._output_folder)
+        probe_path = None if self._output_folder is None else self._output_folder / "probe_levels.csv"
+        if probe_path is not None and probe_path.is_file():
+            with probe_path.open("r", encoding="utf-8", newline="") as stream:
+                self._probe_log = list(csv.DictReader(stream))
+        self._clearance_checks = copy.deepcopy(result.get("clearance_checks") or [])
+        self._strength_checks = copy.deepcopy(result.get("stationary_strength_checks") or [])
+        self._centre_checks = copy.deepcopy(result.get("centre_repeat_checks") or [])
+        self._probe_strength_hold = None
+        self._target_strength_check = None
+        self._centre_repeat = None
+        self._target_centre_check = None
+        self._auto_rerun_history = copy.deepcopy(result.get("auto_rerun_history") or [])
+        self._auto_rerun_count = max(
+            0, int(result.get("auto_rerun_count", 0)),
+            sum(row.get("status") == "started" for row in self._auto_rerun_history),
+        )
+        for row in self._auto_rerun_history:
+            if row.get("status") == "waiting":
+                row["status"] = "interrupted_wait"
+                row["ended_at"] = datetime.now(timezone.utc).isoformat()
         self._started_at_iso = str(
             result.get("started_at") or datetime.now(timezone.utc).isoformat()
         )
+        reference = finite_number(
+            (result.get("settings") or {}).get("fixed_scan_reference_signal_counts")
+        )
+        self._fixed_scan_reference_signal = reference if reference and reference > 0.0 else None
+        previous_fixed_mm = finite_number((result.get("settings") or {}).get("fixed_scan_z_mm"))
+        if (not self.fixed_scan_active or previous_fixed_mm is None
+                or not math.isclose(previous_fixed_mm / 1000., self.fixed_scan_z_m, abs_tol=1e-9, rel_tol=0.)):
+            # A strength measured at a different Z cannot guard this plane.
+            # The fixed-plane anchor check will collect a fresh reference.
+            self._fixed_scan_reference_signal = None
+        # An explicit Resume retries unresolved taxels with a fresh bounded
+        # attempt budget. Keep measured positions and the old failure evidence.
+        self._skipped_failed_taxels = set()
+        self._failed_attempt_total = int(result.get("failed_attempt_total") or 0)
         self._resume_history = copy.deepcopy(result.get("resume_history") or [])
         self._resume_history.append(
             {
                 "resumed_at": datetime.now(timezone.utc).isoformat(),
                 "mapped_count_before_resume": len(records),
                 "previous_stop_reason": str(result.get("stop_reason") or "unknown"),
+                "previous_stop_snapshot": copy.deepcopy(result.get("stop_snapshot")),
+                "previous_failures": copy.deepcopy(result.get("failures") or {}),
+                "previous_attempt_counts": copy.deepcopy(result.get("attempt_counts") or {
+                    str(index): record.get("attempt_count", 1)
+                    for index, record in records.items()
+                }),
+                "attempt_budget_reset": True,
+                "previous_fixed_scan_z_mm": previous_fixed_mm,
+                "fixed_scan_z_mm": None if self.fixed_scan_z_m is None else self.fixed_scan_z_m * 1000.,
+                "scan_plane_source": self._scan_plane_source,
+                "retry_unresolved_taxels": list(result.get("skipped_failed_taxels") or []),
+                "search_safety_policy": self.SEARCH_SAFETY_POLICY,
+                "previous_mapping_order": (result.get("settings") or {}).get("mapping_order", "fixed_serpentine"),
+                "mapping_order": self.MAPPING_ORDER,
+                "previous_centre_scan_policy": (result.get("settings") or {}).get("centre_scan_policy", "weak_signal_fallback"),
+                "previous_centre_scan_signal_multiplier": (result.get("settings") or {}).get("centre_scan_signal_multiplier"),
+                "centre_scan_policy": self.CENTRE_SCAN_POLICY,
+                "centre_scan_signal_multiplier": float(self.centre_scan_signal_multiplier),
             }
         )
 
@@ -4567,7 +7628,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         if (
             not np.isfinite(force_n)
             or not np.isfinite(sample_at)
-            or now - sample_at > float(self.force_stale_sec)
+            or not -0.1 <= now - sample_at <= float(self.force_stale_sec)
         ):
             return None
         return force_n, sample_at
@@ -4632,23 +7693,11 @@ class TaxelPositionMappingTask(ExperimentTask):
                 series = frames[:, index]
             else:
                 series = np.asarray([centre], dtype=float)
-            rolling = self._rolling_medians(
-                series, int(self.probe_window_frames)
+            detector = downward_detector(
+                series, self.probe_window_frames, self.adaptive_min_margin_counts
             )
-            centre = float(np.median(rolling))
-            rolling_mad = float(np.median(np.abs(rolling - centre)))
-            robust_sigma = 1.4826 * rolling_mad
-            rolling_low = float(np.percentile(rolling, 1.0))
-            normal_downward_excursion = max(0.0, centre - rolling_low)
-            # The rolling 1st percentile already captures ordinary downward
-            # excursions.  Add a robust noise guard so a small distribution
-            # wobble is not mistaken for proximity.
-            noise_allowance = max(1.0, 1.5 * robust_sigma)
-            margin = max(
-                float(self.adaptive_min_margin_counts),
-                normal_downward_excursion + noise_allowance,
-            )
-            lower = centre - margin
+            centre, robust_sigma, rolling_low = detector["centre"], detector["sigma"], detector["low"]
+            margin, lower = detector["margin"], detector["lower"]
         elif mode == "adaptive_range":
             margin = max(
                 float(self.adaptive_min_margin_counts),
@@ -4857,6 +7906,108 @@ class TaxelPositionMappingTask(ExperimentTask):
             },
         }
 
+    def _verified_mapping_positions(self) -> dict[int, np.ndarray]:
+        """Only measured, finite centres may seed a new motion target."""
+        verified = {}
+        for index, record in self._positions.items():
+            if record.get("status") != "measured" or record.get("relocation_verified") is False:
+                continue
+            try:
+                point = np.asarray(record["tool_position_m"], dtype=float)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if point.shape == (3,) and np.all(np.isfinite(point)):
+                verified[int(index)] = point
+        return verified
+
+    def _cardinal_neighbours(self, index: int) -> list[int]:
+        row, column = self._taxel_coords(index)
+        candidates = (
+            self._index_if_valid(row-1, column), self._index_if_valid(row+1, column),
+            self._index_if_valid(row, column-1), self._index_if_valid(row, column+1),
+        )
+        return [candidate for candidate in candidates if candidate is not None]
+
+    def plan_frontier_target(self, current_xy=None) -> Optional[dict]:
+        """One grid step from verified neighbours, re-planned after each save.
+
+        Never extrapolate across an unmapped gap. Choose the innermost available
+        cardinal frontier, prefer multiple supports, then reduce travel. Nearby
+        measured edges update the two step vectors; the five-centre fit is only
+        a fallback/geometry sanity reference, not a distant target origin.
+        """
+        verified = self._verified_mapping_positions()
+        remaining = self._remaining_target_indices()
+        if not remaining:
+            return None
+        frontier = {}
+        for known in sorted(verified):
+            for index in self._cardinal_neighbours(known):
+                if index in remaining:
+                    frontier.setdefault(index, []).append(known)
+        if not frontier:
+            raise ValueError("No unmapped taxel has a verified cardinal neighbour; refusing a jump across unknown cells.")
+        anchor_row, anchor_column = self._taxel_coords(self.anchor_taxel)
+        current = None if current_xy is None else np.asarray(current_xy, dtype=float)
+
+        def priority(index):
+            row, column = self._taxel_coords(index)
+            supported_xy = np.mean([verified[known][:2] for known in frontier[index]], axis=0)
+            travel = 0. if current is None else float(np.linalg.norm(supported_xy-current))
+            return (abs(row-anchor_row)+abs(column-anchor_column), -len(frontier[index]), travel, index)
+
+        index = min(frontier, key=priority)
+        row, column = self._taxel_coords(index)
+        fitted = self.fit_lattice_from_positions({
+            known: {"tool_position_m": point} for known, point in verified.items()
+        })
+        if fitted is None:
+            raise ValueError("Verified anchor/reference neighbours no longer define a valid grid.")
+        reference_vectors = fitted[:2]
+        vectors, used_edges = [], []
+        for axis, reference in enumerate(reference_vectors):
+            reference = np.asarray(reference, dtype=float)
+            reference_length = float(np.linalg.norm(reference))
+            edges = []
+            for known in sorted(verified):
+                known_row, known_column = self._taxel_coords(known)
+                next_index = self._index_if_valid(known_row+(axis == 0), known_column+(axis == 1))
+                if next_index not in verified:
+                    continue
+                delta = verified[next_index][:2]-verified[known][:2]
+                length = float(np.linalg.norm(delta))
+                # Reject reversed/collapsed/implausibly long measured edges.
+                # This does not enlarge the workspace or local scan radius.
+                if not .5*reference_length <= length <= 2.*reference_length or np.dot(delta, reference) <= 0:
+                    continue
+                mid_row = known_row+.5*(axis == 0)
+                mid_column = known_column+.5*(axis == 1)
+                distance_sq = (mid_row-row)**2+(mid_column-column)**2
+                if distance_sq <= 4.**2:
+                    edges.append((distance_sq, known, next_index, delta))
+            nearby = sorted(edges, key=lambda edge: edge[:3])[:8]
+            vectors.append(np.median([edge[3] for edge in nearby], axis=0) if nearby else reference)
+            used_edges.append([[edge[1], edge[2]] for edge in nearby])
+        row_vector, column_vector = vectors
+        row_length, column_length = np.linalg.norm(row_vector), np.linalg.norm(column_vector)
+        separation = abs(row_vector[0]*column_vector[1]-row_vector[1]*column_vector[0]) / max(row_length*column_length, 1e-12)
+        if min(row_length, column_length) < .0005 or separation < .25:
+            raise ValueError("Local verified grid steps are collapsed or nearly parallel; mapping needs inspection.")
+        predictions = []
+        supports = sorted(frontier[index])
+        for known in supports:
+            known_row, known_column = self._taxel_coords(known)
+            predictions.append(verified[known][:2]+(row-known_row)*row_vector+(column-known_column)*column_vector)
+        xy = np.median(predictions, axis=0)
+        return {
+            "policy": self.MAPPING_ORDER, "taxel_index": int(index),
+            "verified_neighbours": supports, "position_xy_m": xy.tolist(),
+            "row_vector_xy_m": row_vector.tolist(), "column_vector_xy_m": column_vector.tolist(),
+            "row_spacing_edges": used_edges[0], "column_spacing_edges": used_edges[1],
+            "support_spread_mm": float(np.max(np.linalg.norm(np.asarray(predictions)-xy, axis=1))*1000.),
+            "interpretation": "One-step local prediction, not an accepted centre or geometric accuracy estimate. Full probe/refinement/verification still required.",
+        }
+
     def _index_if_valid(self, row: int, column: int) -> Optional[int]:
         if 0 <= int(row) < self.sensor_rows and 0 <= int(column) < self.sensor_columns:
             return self._taxel_flat(row, column)
@@ -4968,7 +8119,54 @@ class TaxelPositionMappingTask(ExperimentTask):
         result["offset_m"] = peak[0]
         result["bracket_m"] = peak[0] - window_centre
         result["method"] = peak[1]
+        neighbours = [int(index) for index in (minus, plus) if index is not None]
+        edge = self._lead_rises_to_window_edge(
+            samples, baseline, offsets, window_centre, target_index,
+            neighbours, self._signal_threshold_for_taxel(target_index),
+        )
+        if edge is not None and abs(result["bracket_m"]) <= float(axis.get("radius", 0.0)):
+            # The peak sits inside the window only by noise: the target loses
+            # to its own axis neighbour everywhere except at one end.
+            result["offset_m"] = edge
+            result["bracket_m"] = 1.5 * (edge - window_centre)
+            result["method"] = "neighbour_lead_edge"
         return result
+
+    @staticmethod
+    def _lead_rises_to_window_edge(
+        samples, baseline, offsets, window_centre, target_index,
+        neighbours, threshold,
+    ):
+        """Offset of the window end the centre lies beyond, or ``None``.
+
+        True only when the target loses to its axis neighbours in the middle
+        of the window and first wins at one end.
+        """
+        if not neighbours or len(samples) < 5:
+            return None
+        baseline = np.asarray(baseline, dtype=float)
+        leads = []
+        for sample in samples:
+            delta = np.abs(np.asarray(sample["frame"], dtype=float) - baseline)
+            leads.append(
+                float(delta[int(target_index)])
+                - max(float(delta[index]) for index in neighbours)
+            )
+        order = np.argsort(offsets)
+        ordered_offsets = np.asarray(offsets, dtype=float)[order]
+        ordered = np.asarray(leads, dtype=float)[order]
+        smoothed = np.convolve(
+            np.pad(ordered, 1, mode="edge"), np.ones(3) / 3.0, mode="valid"
+        )
+        middle = int(np.argmin(np.abs(ordered_offsets - window_centre)))
+        if smoothed[middle] > 0.0:
+            return None
+        best = int(np.argmax(smoothed))
+        if best not in (0, smoothed.size - 1) or ordered[best] <= 0.0:
+            return None
+        if smoothed[best] - smoothed[middle] < max(1.0, 0.25 * float(threshold)):
+            return None
+        return float(ordered_offsets[best])
 
     def _progress(self, host, detail="") -> None:
         callback = getattr(host, "_refresh_taxel_mapping_progress", None)
@@ -4990,6 +8188,11 @@ class TaxelPositionMappingTask(ExperimentTask):
                     else int(pending_index)
                 )
                 attempt = int(pending.get("next_attempt", attempt))
+            if self.fixed_scan_active or self._failed_attempt_total or self._skipped_failed_taxels:
+                detail = (
+                    f"Failed attempts {self._failed_attempt_total} · "
+                    f"skipped {len(self._skipped_failed_taxels)} | {detail}"
+                )
             callback(
                 mapped=self.mapped_target_count(),
                 total=len(self.mapping_target_indices()),
@@ -4998,15 +8201,173 @@ class TaxelPositionMappingTask(ExperimentTask):
                 current_taxel=current_taxel,
                 attempt=attempt,
                 max_attempts=int(self.max_attempts_per_taxel),
+                auto_reruns=int(self._auto_rerun_count),
+                max_auto_reruns=int(self.max_auto_reruns),
             )
 
     def _request_stop(self, host, reason: str, message: str) -> None:
         if not self._active:
             return
         self._stop_reason = str(reason)
+        self._stop_message = str(message)
         CalibrationTask._stop_robot(self._robot_api(host))
+        try:
+            self._stop_snapshot = self._mapping_snapshot(host)
+        except Exception as exc:
+            self._stop_snapshot = {"diagnostic_error": str(exc)}
         host._append_sidebar_control_message(message)
         host._stop_sidebar_control(show_result=False, message=message)
+
+    def _mapping_snapshot(self, host):
+        """Feedback at a stopped/settled sample; never call it first contact."""
+        pose = self._read_tool_pose(self._robot_api(host))
+        force = self._fresh_force(host)
+        z = None if pose is None else float(pose[0][2])
+        baseline = self._force_baseline_n
+        onset = self._probe_onset_pose
+        start = self._probe_start_pose
+        now = time.monotonic()
+        pose_stamp = finite_number(getattr(self._robot_api(host), "current_feedback_state_time", None))
+        force_stamp = finite_number(getattr(getattr(host, "ui_ros", None), "_force_meter_last_sample_monotonic", None))
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "taxel_index": self._current_taxel, "attempt": self._attempt_counts.get(self._current_taxel, 0),
+            "phase": self._phase, "probe_stage": self._probe_stage,
+            "tcp_position_m": None if pose is None else pose[0].tolist(),
+            "tcp_x_m": None if pose is None else float(pose[0][0]),
+            "tcp_y_m": None if pose is None else float(pose[0][1]),
+            "tcp_z_m": z,
+            "tcp_feedback_age_sec": None if pose_stamp is None else now-pose_stamp,
+            "tcp_feedback_fresh": pose_stamp is not None and -.1 <= now-pose_stamp <= 1.,
+            "force_sample_age_sec": None if force_stamp is None else now-force_stamp,
+            "force_raw_g": None if force is None else float(force[0])/self.NEWTONS_PER_GRAM,
+            "force_reference_g": None if baseline is None else float(baseline)/self.NEWTONS_PER_GRAM,
+            "force_change_g": None if force is None or baseline is None else abs(float(force[0])-baseline)/self.NEWTONS_PER_GRAM,
+            "probe_start_z_m": None if start is None else float(start[2]),
+            "probe_descent_mm": None if z is None or start is None else max(0., float(start[2])-z)*1000.,
+            "onset_confirmed": bool(self._probe_onset_confirmed),
+            "onset_z_m": None if onset is None else float(onset[2]),
+            "extra_descent_mm": None if z is None or onset is None else max(0., float(onset[2])-z)*1000.,
+            "working_boundary": copy.deepcopy(self._working_probe_boundary),
+            "working_boundary_z_m": None if self._working_probe_boundary is None else self._working_probe_boundary["z_m"],
+            "working_boundary_source": None if self._working_probe_boundary is None else self._working_probe_boundary["source"],
+            "interpretation": "Measured stop/sample feedback, not an independently verified contact point or air gap.",
+        }
+
+    def _begin_clearance_cycle(self, host, context):
+        """Return to the operator-established clear anchor, never zero near-field."""
+        self._clearance_next_context = str(context)
+        anchor = self.anchor_pose["tool_position_m"]
+        self._route_to(
+            host, anchor[:2], anchor[2], "clearance_anchor_arrived",
+            f"returning to Taxel {self.anchor_taxel} clearance anchor before full calibration",
+        )
+
+    def _continue_after_clearance(self, host):
+        context = self._clearance_next_context
+        self._clearance_next_context = ""
+        if context == "resume_alignment_failed":
+            self._request_stop(host, "resume_alignment_failed", self._resume_alignment_error)
+        elif context == "resume_anchor":
+            self._continue_after_resume_anchor_check(host)
+        elif context == "anchor":
+            self._neighbor_queue = list(self.anchor_neighbour_indices())
+            self._start_next_neighbor(host)
+        elif context == "neighbor":
+            self._start_next_neighbor(host)
+        elif context == "relocation_verify":
+            self._start_next_relocation_verification(host)
+        else:
+            self._start_next_regular_taxel(host)
+
+    def _queue_auto_rerun(self, host, pending):
+        """Only an ordinary exhausted target can enter this guarded path."""
+        if (self._auto_rerun_count >= self.max_auto_reruns
+                or pending.get("kind") != "target"
+                or (self._relocation_active and not self._relocation_finished)
+                or pending.get("context") not in {"anchor", "neighbor", "regular"}
+                or self._reference_onset_z is None or self._probe_start_z is None):
+            return False
+        CalibrationTask._stop_robot(self._robot_api(host))
+        self._auto_rerun_pending = copy.deepcopy(pending)
+        self._pending_recovery = None
+        self._auto_rerun_deadline = time.monotonic() + self.auto_rerun_delay_sec
+        self._phase = "auto_rerun_wait"
+        self._auto_rerun_history.append({
+            "rerun_number": self._auto_rerun_count+1,
+            "status": "waiting", "queued_at": datetime.now(timezone.utc).isoformat(),
+            "taxel_index": pending["taxel_index"], "reason": pending["reason"],
+            "mapped_count": self.mapped_target_count(),
+            "attempts_before_rerun": self._attempt_counts.get(pending["taxel_index"], 0),
+            "delay_sec": float(self.auto_rerun_delay_sec),
+        })
+        message = (f"Taxel {pending['taxel_index']}: normal attempts exhausted ({pending['reason']}). "
+                   f"At the clearance anchor; auto rerun {self._auto_rerun_count+1}/{self.max_auto_reruns} "
+                   f"scheduled in {self.auto_rerun_delay_sec:.0f} s. Stop cancels it; safety guards remain active.")
+        host._append_sidebar_control_message(message)
+        self._progress(host, message)
+        try:
+            self._save_results(checkpoint=True)
+        except Exception as exc:
+            self._request_stop(host, "checkpoint_failed", f"Automatic rerun cancelled: checkpoint failed ({exc}).")
+        return True
+
+    def _at_auto_rerun_anchor(self, host):
+        pose = self._read_tool_pose(self._robot_api(host))
+        anchor = np.asarray(self.anchor_pose["tool_position_m"], dtype=float)
+        orientation = np.asarray(self.anchor_pose["tool_quaternion_wxyz"], dtype=float)
+        if pose is None:
+            return False
+        norm = float(np.linalg.norm(pose[1])*np.linalg.norm(orientation))
+        return bool(np.linalg.norm(pose[0]-anchor) <= 2.*self.position_tolerance_m
+                    and norm > 1e-9
+                    and abs(float(np.dot(pose[1], orientation)))/norm >= np.cos(np.radians(2.5)))
+
+    def _tick_auto_rerun_wait(self, host, now):
+        # on_tick has already checked force, robot and tactile freshness.
+        if not self._at_auto_rerun_anchor(host):
+            self._request_stop(host, "auto_rerun_clearance_lost",
+                               "Automatic rerun cancelled: TCP left the remembered clearance pose. Inspect before resuming.")
+            return
+        if self._auto_rerun_pending is None or self._auto_rerun_deadline is None:
+            self._request_stop(host, "internal_error", "Automatic rerun cancelled: recovery state was lost.")
+            return
+        remaining = max(0., self._auto_rerun_deadline-now)
+        self._progress(host, f"At clearance anchor: auto rerun {self._auto_rerun_count+1}/{self.max_auto_reruns} "
+                       f"in {np.ceil(remaining):.0f} s; Stop cancels")
+        if remaining > 0.:
+            return
+        self._auto_rerun_deadline = None
+        self._clearance_next_context = "auto_rerun"
+        self._begin_collection(host, "clearance_precheck", self.baseline_frame_count,
+                               "Cooldown finished: checking clearance and recalibrating before automatic rerun")
+
+    def _start_auto_rerun(self, host, frame, force_n, baseline_min, baseline_max, baseline_frames):
+        pending = self._auto_rerun_pending
+        if pending is None or self._auto_rerun_count >= self.max_auto_reruns or not self._at_auto_rerun_anchor(host):
+            self._request_stop(host, "auto_rerun_limit", "Automatic rerun cancelled: recovery limit/state changed.")
+            return
+        index = int(pending["taxel_index"])
+        self._auto_rerun_count += 1
+        self._auto_rerun_history[-1].update(
+            status="started", started_at=datetime.now(timezone.utc).isoformat(),
+            clearance_pose_m=list(self.anchor_pose["tool_position_m"]),
+        )
+        self._auto_rerun_pending = None
+        self._clearance_next_context = ""
+        # Only the failed target's two-attempt round is reset. No measured
+        # taxel, neighbour queue, geometry or previous failure history is lost.
+        self._attempt_counts[index] = 0
+        self._pending_recovery = dict(pending, retry=True, next_attempt=1)
+        try:
+            self._save_results(checkpoint=True)
+        except Exception as exc:
+            self._request_stop(host, "checkpoint_failed", f"Automatic rerun cancelled: checkpoint failed ({exc}).")
+            return
+        host._append_sidebar_control_message(
+            f"Auto rerun {self._auto_rerun_count}/{self.max_auto_reruns}: continuing Taxel {index}; measured taxels retained.")
+        self._handle_collection(host, "retry_anchor_stability", frame, force_n,
+                                baseline_min, baseline_max, baseline_frames)
 
     @staticmethod
     def _project_speed_percent(api) -> Optional[float]:
@@ -5060,10 +8421,12 @@ class TaxelPositionMappingTask(ExperimentTask):
         )
         return timeout_sec, expected_duration_sec, speed_percent
 
-    def _command_move(self, host, position, action: str, detail: str) -> bool:
+    def _command_move(self, host, position, action: str, detail: str, *, quaternion=None,
+                      vertical_only=False) -> bool:
         api = self._robot_api(host)
         quaternion = self._finite_values(
-            (self.anchor_pose or {}).get("tool_quaternion_wxyz"), 4
+            (self.anchor_pose or {}).get("tool_quaternion_wxyz")
+            if quaternion is None else quaternion, 4
         )
         position = self._finite_values(position, 3)
         if (
@@ -5079,6 +8442,35 @@ class TaxelPositionMappingTask(ExperimentTask):
         pose = self._read_tool_pose(api)
         start_position = None if pose is None else np.asarray(pose[0], dtype=float)
         target_position = np.asarray(position, dtype=float)
+        boundary = self._working_probe_boundary
+        if vertical_only:
+            if pose is None:
+                self._request_stop(host, "robot_feedback_lost",
+                                   "Mapping stopped: TCP feedback was lost before vertical correction.")
+                return False
+            if boundary is not None and start_position[2] < boundary["z_m"] - self.position_tolerance_m:
+                self._handle_probe_failure(host, "TCP moved too far below the known-height boundary before correction; refusing XY scanning")
+                return False
+            # Re-read XY/orientation at dispatch: tiny feedback changes since
+            # the sampling tick must not turn an upward correction into XY.
+            target_position[:2] = start_position[:2]
+            target_position[2] = max(target_position[2], start_position[2])
+            position = target_position.tolist()
+            quaternion = pose[1].tolist()
+        if boundary is not None and target_position[2] < boundary["z_m"]-1e-6:
+            self._handle_probe_failure(
+                host, f"requested scan Z {target_position[2]*1000.:.2f} mm is below "
+                f"the onset-independent boundary {boundary['z_m']*1000.:.2f} mm",
+            )
+            return False
+        if (boundary is not None and start_position is not None
+                and start_position[2] < boundary["z_m"]-1e-6
+                and np.linalg.norm(target_position[:2]-start_position[:2]) > 1e-6):
+            self._handle_probe_failure(
+                host, "TCP feedback is below the onset-independent boundary; "
+                "refusing XY motion before a vertical clearance return",
+            )
+            return False
         distance_m = (
             0.0
             if start_position is None
@@ -5209,6 +8601,11 @@ class TaxelPositionMappingTask(ExperimentTask):
         context: str,
     ) -> None:
         """Recalibrate at the motionless safe anchor before any baseline."""
+        pose = self._read_tool_pose(self._robot_api(host))
+        anchor = np.asarray(self.anchor_pose["tool_position_m"], dtype=float)
+        if pose is None or np.linalg.norm(pose[0]-anchor) > 2.*self.position_tolerance_m:
+            self._request_stop(host, "calibration_pose_not_clear", "Update Calibration refused: the robot has not reached the remembered clearance anchor.")
+            return
         ui_ros = getattr(host, "ui_ros", None)
         sensor = getattr(ui_ros, "sensor_functions", None) if ui_ros else None
         if sensor is None or not callable(getattr(sensor, "updateCal", None)):
@@ -5235,6 +8632,9 @@ class TaxelPositionMappingTask(ExperimentTask):
             "context": str(context),
             "started_at": datetime.now(timezone.utc).isoformat(),
             "status": "running",
+            "taxel_index": self._current_taxel,
+            "clearance_pose_m": list(self.anchor_pose["tool_position_m"]),
+            "clearance_interpretation": "Operator-established clear anchor; sensor stability is not independent clearance measurement.",
         }
         self._sensor_calibration_history.append(history)
         self._progress(
@@ -5337,7 +8737,10 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._sensor_calibration_next_action = ""
         self._last_sensor_sequence = int(frame[0])
         self._last_sensor_advance_at = float(now)
-        self._force_baseline_n = None
+        # Tactile recalibration must never disable/re-zero the force guard.
+        # The reference is refreshed only after a stable unloaded anchor batch.
+        self._far_baseline = None
+        self._far_baseline_frames = None
         if history is not None:
             history["status"] = "complete"
             history["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -5349,7 +8752,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         detail = (
             f"Taxel {self.anchor_taxel} first probe: collecting the calibrated safe-anchor baseline"
             if action == "reference_baseline"
-            else "Resume: collecting the calibrated safe-anchor baseline"
+            else "Collecting the freshly calibrated clearance-anchor baseline"
         )
         self._begin_collection(
             host,
@@ -5368,7 +8771,11 @@ class TaxelPositionMappingTask(ExperimentTask):
         if len(self._collection_frames) < self._collection_count:
             return
         frames = np.asarray(self._collection_frames, dtype=float)
-        averaged = np.mean(frames, axis=0)
+        averaged = (
+            np.median(frames, axis=0)
+            if self._collection_action == "scan_sample"
+            else np.mean(frames, axis=0)
+        )
         baseline_min = np.min(frames, axis=0)
         baseline_max = np.max(frames, axis=0)
         averaged_force = float(np.mean(self._collection_forces))
@@ -5379,6 +8786,8 @@ class TaxelPositionMappingTask(ExperimentTask):
             "target_baseline",
             "retry_anchor_stability",
             "resume_anchor_stability",
+            "clearance_precheck",
+            "clearance_calibrated",
         }:
             stability = self._baseline_stability_stats(action, frames)
             self._baseline_checks.append(stability)
@@ -5533,6 +8942,9 @@ class TaxelPositionMappingTask(ExperimentTask):
                 f"grid P90 {stability['grid_p90_range_counts']:.1f}, "
                 f"limit {stability['stability_limit_counts']:.1f} sensor units)"
             )
+        if action in {"clearance_precheck", "clearance_calibrated"}:
+            self._request_stop(host, "clearance_unstable", "Mapping stopped at the clearance anchor: " + detail)
+            return
         if action == "retry_anchor_stability":
             self._pending_recovery = None
             self._request_stop(
@@ -5580,11 +8992,59 @@ class TaxelPositionMappingTask(ExperimentTask):
                 "sensor height"
             )
         else:
-            self._probe_speed_used_m_s = float(self.probe_speed_m_s)
+            # This is already the near-surface region. Never revert to the
+            # fast search speed just because one candidate window was lost.
+            self._probe_speed_used_m_s = min(
+                float(self.probe_speed_m_s), float(self.probe_confirmation_speed_m_s),
+            )
             self._probe_max_descent_used_m = float(self.max_probe_descent_m)
             detail = f"Taxel {self._current_taxel}: probing slowly in base -Z"
+            # A near-start baseline may already contain proximity. Use the
+            # far-field batch to detect onset; the near batch only checked
+            # stability and must not zero away that existing response.
+            if self._far_baseline is not None:
+                baseline = self._far_baseline
+                baseline_min = self._far_baseline_min
+                baseline_max = self._far_baseline_max
+                baseline_frames = self._far_baseline_frames
         self._probe_hit_count = 0
+        self._probe_candidate_seen = False
         self._probe_last_sequence = None
+        self._working_probe_boundary = None
+        if self._probe_kind != "reference" and self.fixed_scan_active:
+            # The descent itself stops at the plane (maximum descent below).
+            # The guard sits a margin lower: the arm settles a fraction of a
+            # millimetre past a commanded stop, which must not refuse the scan.
+            self._working_probe_boundary = {
+                "z_m": float(self.fixed_scan_z_m) - self.FIXED_SCAN_BOUNDARY_MARGIN_M,
+                "source": "operator_fixed_scan_height",
+                "taxels": [],
+            }
+            self._probe_max_descent_used_m = min(
+                self._probe_max_descent_used_m,
+                max(0.0, float(pose[0][2]) - float(self.fixed_scan_z_m)),
+            )
+            detail += (
+                f"; fixed scan height Z {float(self.fixed_scan_z_m) * 1000.0:.2f} mm"
+            )
+        elif self._probe_kind != "reference":
+            from phd.ui.mapping_safety import working_probe_boundary
+            self._working_probe_boundary = working_probe_boundary(
+                self._positions, self._current_taxel, self.sensor_rows, self.sensor_columns,
+                self._reference_onset_z,
+                discovery_allowance=min(.005, self.centre_scan_max_extra_descent_m),
+            ) or {
+                "z_m": float(pose[0][2])-min(self.max_probe_descent_m, self.centre_scan_max_extra_descent_m),
+                "source": "onset_independent_total_working_allowance", "taxels": [],
+            }
+            self._probe_max_descent_used_m = min(
+                self._probe_max_descent_used_m,
+                max(0., float(pose[0][2])-self._working_probe_boundary["z_m"]),
+            )
+            detail += (
+                f"; onset-independent Z boundary {self._working_probe_boundary['z_m']*1000.:.2f} mm "
+                f"({self._working_probe_boundary['source']}); actual speed {self._probe_speed_used_m_s*1000.:.2f} mm/s"
+            )
         baseline_frames_array = np.asarray(baseline_frames, dtype=float)
         if (
             str(self.proximity_detection_mode) == "robust_shift"
@@ -5620,11 +9080,17 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._probe_recent_frames = []
         self._probe_candidate_pose = None
         self._probe_stage = "descending"
+        self._probe_line_target_z = None
         self._probe_step_start_z = float(pose[0][2])
         self._probe_level_pose = None
         self._probe_level_frames = []
         self._probe_settle_started_at = None
         self._probe_level_at_max_depth = False
+        self._probe_boundary_corrections = 0
+        self._probe_strength_hold = None
+        self._target_strength_check = None
+        self._centre_repeat = None
+        self._target_centre_check = None
         self._probe_onset_confirmed = False
         self._probe_onset_pose = None
         self._probe_scan_pose = None
@@ -5633,6 +9099,18 @@ class TaxelPositionMappingTask(ExperimentTask):
             float(self.centre_scan_signal_multiplier)
             * float(self._probe_detection_threshold)
         )
+        saved_target = self._resume_anchor_saved_scan_target()
+        if saved_target is not None:
+            # The resume check is only comparable when it scans at the signal
+            # strength the anchor was saved with; a new noise-derived target
+            # moves the scan plane and makes the XY/Z comparison meaningless.
+            self._probe_scan_target_signal = max(
+                saved_target, float(self._probe_detection_threshold)
+            )
+            detail += (
+                f"; resume check uses the saved {saved_target:.1f}-unit "
+                "centre-scan signal"
+            )
         self._probe_scan_target_reached = False
         if detection["mode"] == "robust_shift":
             detail += (
@@ -5655,10 +9133,220 @@ class TaxelPositionMappingTask(ExperimentTask):
             f"; step {float(self.probe_step_m) * 1000.0:.2f} mm and sample "
             f"{int(self.probe_sample_frames)} stationary frames per level"
         )
-        self._force_baseline_n = float(force_baseline_n)
+        # Never re-zero force at the lower probe-start height: contact/load
+        # picked up during the approach must remain visible to the guards.
+        if self._probe_kind == "reference" or self._force_baseline_n is None:
+            self._force_baseline_n = float(force_baseline_n)
         self._probe_start_pose = np.asarray(pose[0], dtype=float)
         self._phase = "probing"
         self._progress(host, detail)
+
+    def _start_fixed_scan_mapping(self, host, force_n) -> None:
+        """The operator chose the scan plane, so no reference probe is needed."""
+        anchor_z = float(self.anchor_pose["tool_position_m"][2])
+        scan_z = float(self.fixed_scan_z_m)
+        self._force_baseline_n = float(force_n)
+        self._reference_onset_z = scan_z
+        self._probe_start_z = min(
+            anchor_z, scan_z + float(self.fixed_scan_approach_window_m)
+        )
+        host._append_sidebar_control_message(
+            f"Fixed scan height Z {scan_z * 1000.0:.2f} mm "
+            f"({(anchor_z - scan_z) * 1000.0:.1f} mm below the anchor). Each taxel "
+            f"descends in {float(self.probe_step_m) * 1000.0:.1f} mm steps from "
+            f"{(self._probe_start_z - scan_z) * 1000.0:.1f} mm above it."
+        )
+        anchor_xy = np.asarray(self.anchor_pose["tool_position_m"], dtype=float)[:2]
+        self._start_target(host, self.anchor_taxel, anchor_xy, "anchor")
+
+    def _fixed_scan_strongest(self, frame, baseline) -> tuple[float, int]:
+        delta = np.abs(np.asarray(frame, dtype=float) - np.asarray(baseline, dtype=float))
+        index = int(np.argmax(delta))
+        return float(delta[index]), index
+
+    def _fixed_scan_contact_limit(self) -> Optional[float]:
+        reference = self._fixed_scan_reference_signal
+        if not self.fixed_scan_active or reference is None:
+            return None
+        return float(self.fixed_scan_contact_ratio) * float(reference)
+
+    def _fixed_scan_contact(self, host, frame, baseline, where: str) -> bool:
+        """Abort the attempt (lift, recalibrate, retry) on a contact-like response."""
+        limit = self._fixed_scan_contact_limit()
+        if limit is None:
+            return False
+        strongest, index = self._fixed_scan_strongest(frame, baseline)
+        if strongest < limit:
+            return False
+        CalibrationTask._stop_robot(self._robot_api(host))
+        self._handle_probe_failure(
+            host,
+            f"Taxel {index} reached {strongest:.0f} sensor units {where}, above the "
+            f"{self.fixed_scan_contact_ratio:.1f}× contact guard ({limit:.0f}); "
+            "possible contact, lifting to the anchor",
+        )
+        return True
+
+    def _tick_fixed_scan_level(
+        self, host, evaluation_frame, level_pose, target, at_depth_limit=False
+    ) -> bool:
+        """Decide one stationary level of a fixed-plane descent.
+
+        Returns True when the level was handled (scan started, failure
+        scheduled); False to keep descending.
+        """
+        if self._fixed_scan_contact(
+            host, evaluation_frame, self._probe_baseline, "while descending"
+        ):
+            return True
+        strongest, _index = self._fixed_scan_strongest(evaluation_frame, self._probe_baseline)
+        reference = self._fixed_scan_reference_signal
+        raised_skin = (
+            reference is not None
+            and strongest >= float(self.fixed_scan_stop_ratio) * float(reference)
+        )
+        at_plane = bool(at_depth_limit) or (
+            float(level_pose[2]) <= float(self.fixed_scan_z_m) + float(self.position_tolerance_m)
+        )
+        if not (raised_skin or at_plane):
+            return False
+        CalibrationTask._stop_robot(self._robot_api(host))
+        target_signal = max(
+            0.0,
+            abs(float(evaluation_frame[target]) - float(self._probe_baseline[target])),
+        )
+        if reference is None:
+            # The anchor taxel defines the expected strength at this plane.
+            threshold = self._signal_threshold_for_taxel(target)
+            if target_signal < 3.0 * threshold:
+                self._handle_probe_failure(
+                    host,
+                    f"the anchor signal at the fixed scan height is too weak "
+                    f"({target_signal:.1f} sensor units, need {3.0 * threshold:.1f})",
+                )
+                return True
+            self._fixed_scan_reference_signal = float(target_signal)
+            host._append_sidebar_control_message(
+                f"Reference strength at the fixed scan height: {target_signal:.1f} sensor units "
+                f"on Taxel {target}. Descents stop early above "
+                f"{self.fixed_scan_stop_ratio * target_signal:.0f}; any response above "
+                f"{self.fixed_scan_contact_ratio * target_signal:.0f} is treated as possible contact."
+            )
+        pose = np.array(level_pose, dtype=float, copy=True)
+        # An overshoot past the plane is not a deeper scan: every taxel is
+        # scanned at the remembered height (or higher over raised skin).
+        pose[2] = max(float(pose[2]), float(self.fixed_scan_z_m))
+        self._probe_onset_pose = np.array(pose, copy=True)
+        self._probe_scan_pose = np.array(pose, copy=True)
+        self._probe_scan_signal = float(target_signal)
+        self._probe_onset_confirmed = True
+        self._probe_scan_target_reached = True
+        if raised_skin and not at_plane:
+            host._append_sidebar_control_message(
+                f"Taxel {target}: raised skin, the descent stopped "
+                f"{(pose[2] - float(self.fixed_scan_z_m)) * 1000.0:.2f} mm above the scan height."
+            )
+        current = self._read_tool_pose(self._robot_api(host))
+        if (
+            current is not None
+            and float(current[0][2]) < float(pose[2]) - float(self.position_tolerance_m)
+        ):
+            self._fixed_scan_plane_pose = np.array(pose, copy=True)
+            lift = np.array(current[0], dtype=float, copy=True)
+            lift[2] = float(pose[2])
+            self._command_move(
+                host, lift, "fixed_scan_plane_arrived",
+                f"Taxel {target}: settling back up to the scan height",
+            )
+            return True
+        self._start_fixed_plane_scan(host, pose)
+        return True
+
+    def _start_fixed_plane_scan(self, host, pose) -> None:
+        pose = np.asarray(pose, dtype=float)
+        if self._current_context == "anchor":
+            # The wide neighbour search crosses skin that may stand higher
+            # than at the anchor; it only needs approximate neighbour centres.
+            coarse_pose = np.array(pose, copy=True)
+            coarse_pose[2] = min(
+                float(self.anchor_pose["tool_position_m"][2]),
+                float(pose[2]) + self.FIXED_SCAN_COARSE_LIFT_M,
+            )
+            self._start_coarse_scan(host, self._far_baseline, coarse_pose)
+        else:
+            self._start_local_scan(host, pose)
+
+    def _resume_anchor_saved_scan_target(self) -> Optional[float]:
+        if (
+            self._current_context != "resume_anchor"
+            or self._probe_kind == "reference"
+            or self._current_taxel is None
+            or int(self._current_taxel) != int(self.anchor_taxel)
+        ):
+            return None
+        value = finite_number(
+            (self._resume_anchor_previous or {}).get("centre_scan_target_units")
+        )
+        if value is None or value <= 0.0:
+            return None
+        return float(value)
+
+    def _confirm_stationary_strength(self, host, pose, signal, qualified, sample):
+        """Three disjoint batches at ONE pose, without moving or lowering the target.
+
+        Return None while collecting, otherwise the acceptance decision. A
+        transient peak cannot win: the combined median, two batch medians and
+        the final batch must reach the unchanged target with valid dominance.
+        """
+        hold = self._probe_strength_hold
+        if hold is None:
+            hold = {"pose": np.array(pose, copy=True), "frames": [], "batches": []}
+            self._probe_strength_hold = hold
+            host._append_sidebar_control_message(
+                f"Taxel {self._current_taxel}: confirming borderline scan strength "
+                f"at the SAME height ({signal:.1f}/{self._probe_scan_target_signal:.1f} "
+                f"sensor units): {self.STRENGTH_CONFIRM_BATCHES} stationary batches; no deeper move."
+            )
+        if np.linalg.norm(np.asarray(pose) - hold["pose"]) > 2.0 * self.position_tolerance_m:
+            self._request_stop(host, "probe_hold_moved",
+                               "Mapping stopped: TCP moved during stationary strength confirmation.")
+            return None
+        hold["frames"].extend(np.array(self._probe_level_frames, copy=True))
+        hold["batches"].append({"signal_units": float(signal), "qualified": bool(qualified)})
+        sample["strength_confirmation_batch"] = len(hold["batches"])
+        if len(hold["batches"]) < self.STRENGTH_CONFIRM_BATCHES:
+            self._probe_level_frames = []
+            self._progress(host, f"Taxel {self._current_taxel}: stationary strength check "
+                           f"{len(hold['batches'])}/{self.STRENGTH_CONFIRM_BATCHES} at "
+                           f"Z {float(pose[2])*1000.:.2f} mm; no further descent")
+            return None
+        target = int(self._current_taxel)
+        median = np.median(hold["frames"], axis=0)
+        signal = max(0., float(self._probe_baseline[target] - median[target]))
+        dominance = self._signal_metrics(median, self._probe_baseline, target)[2]
+        threshold = float(self._probe_scan_target_signal)
+        strong = [batch["qualified"] and batch["signal_units"] >= threshold for batch in hold["batches"]]
+        accepted = bool(
+            signal >= threshold and sum(strong) >= 2 and strong[-1]
+            and dominance >= self.probe_min_dominance
+            and self._below_detection_threshold(float(median[target]), self._probe_detection_by_taxel[target])
+        )
+        check = {
+            "taxel_index": target, "attempt": int(self._attempt_counts.get(target, 1)),
+            "tcp_position_m": hold["pose"].tolist(), "frame_count": len(hold["frames"]),
+            "batches": hold["batches"], "signal_units": signal,
+            "target_units": threshold, "dominance": float(dominance), "accepted": accepted,
+            "at_depth_limit": bool(self._probe_level_at_max_depth),
+        }
+        self._strength_checks.append(check)
+        self._target_strength_check = check
+        sample.update(strength_confirmation_accepted=accepted,
+                      strength_confirmation_median_units=signal)
+        self._probe_strength_hold = None
+        if accepted:
+            self._probe_scan_signal = signal
+            self._probe_scan_pose = np.array(pose, copy=True)
+        return accepted
 
     def _tick_probe(self, host, frame) -> None:
         if self._probe_baseline is None or self._probe_start_pose is None:
@@ -5673,6 +9361,13 @@ class TaxelPositionMappingTask(ExperimentTask):
         descent = max(0.0, float(self._probe_start_pose[2] - pose[0][2]))
         sequence, values = frame
         now = time.monotonic()
+
+        # Never evaluate a stationary batch below the unchanged working
+        # boundary. A tiny arrival undershoot may be corrected upwards once;
+        # all old strength evidence is discarded before trying the scan again.
+        if self._probe_stage in ("settling", "sampling"):
+            if self._correct_probe_boundary_undershoot(host, pose):
+                return
 
         if self._probe_stage == "settling":
             started_at = self._probe_settle_started_at
@@ -5718,12 +9413,36 @@ class TaxelPositionMappingTask(ExperimentTask):
                 )
                 and dominance >= float(self.probe_min_dominance)
             )
+            if qualified:
+                self._probe_candidate_seen = True
+            sample = self._mapping_snapshot(host)
+            sample["onset_confirmed_before_level"] = sample.pop("onset_confirmed")
+            sample.update(
+                signal_change_units=float(downward_signal),
+                onset_threshold_units=float(self._probe_detection_threshold),
+                stronger_target_units=float(self._probe_scan_target_signal),
+                qualified=qualified, dominance=float(dominance),
+                sensor_frame_sequence=int(sequence),
+            )
+            self._probe_log.append(sample)
             level_pose = np.asarray(
                 self._probe_level_pose
                 if self._probe_level_pose is not None
                 else pose[0],
                 dtype=float,
             )
+            if self.fixed_scan_active and self._probe_kind != "reference":
+                if self._tick_fixed_scan_level(
+                    host, evaluation_frame, level_pose, target,
+                    at_depth_limit=self._probe_level_at_max_depth,
+                ):
+                    return
+                self._probe_level_frames = []
+                self._probe_stage = "descending"
+                self._probe_line_target_z = None
+                self._probe_step_start_z = float(pose[0][2])
+                self._probe_level_pose = None
+                return
             if not self._probe_onset_confirmed:
                 if qualified:
                     if self._probe_hit_count == 0:
@@ -5764,10 +9483,25 @@ class TaxelPositionMappingTask(ExperimentTask):
                 self._probe_scan_signal = float(downward_signal)
 
             if self._probe_onset_confirmed and self._probe_kind != "reference":
-                strong_enough = bool(
-                    self._probe_scan_signal
-                    >= float(self._probe_scan_target_signal)
+                # Use the current stationary level, not a historical maximum
+                # acquired at a different height or before onset confirmation.
+                strong_enough = qualified and downward_signal >= self._probe_scan_target_signal
+                borderline = bool(
+                    qualified
+                    and downward_signal >= self.STRENGTH_BORDERLINE_RATIO * self._probe_scan_target_signal
+                    and (self._probe_level_at_max_depth or
+                         1.0 <= downward_signal / max(self._probe_scan_target_signal, 1e-9)
+                         < self.STRENGTH_CLEAR_RATIO)
                 )
+                if self._probe_strength_hold is not None or borderline:
+                    strong_enough = self._confirm_stationary_strength(
+                        host, pose[0], downward_signal, qualified, sample
+                    )
+                    if strong_enough is None:
+                        return
+                elif strong_enough:
+                    self._probe_scan_pose = np.array(level_pose, copy=True)
+                    self._probe_scan_signal = float(downward_signal)
                 if strong_enough:
                     self._probe_scan_target_reached = True
                     CalibrationTask._stop_robot(api)
@@ -5778,7 +9512,18 @@ class TaxelPositionMappingTask(ExperimentTask):
             if self._probe_level_at_max_depth:
                 if self._probe_onset_confirmed:
                     CalibrationTask._stop_robot(api)
-                    self._handle_probe_onset(host)
+                    self._handle_probe_failure(
+                        host,
+                        f"stronger non-contact scan signal was not reached reliably before the descent limit "
+                        f"(latest batch {downward_signal:.1f}/{self._probe_scan_target_signal:.1f} sensor units); "
+                        f"TCP Z {float(pose[0][2])*1000.:.2f} mm, total probe descent {descent*1000.:.2f} mm; "
+                        f"boundary {self._working_probe_boundary}; "
+                        + (f"stationary confirmation median {self._target_strength_check['signal_units']:.1f} "
+                           f"from {self._target_strength_check['frame_count']} frames; "
+                           if self._target_strength_check is not None else "")
+                        + "refusing a weak-signal XY scan or further descent",
+                        quality_failure=True,
+                    )
                     return
                 if qualified:
                     # Confirm again at the same level rather than exceeding
@@ -5788,11 +9533,15 @@ class TaxelPositionMappingTask(ExperimentTask):
                 self._handle_probe_failure(
                     host,
                     "no proximity onset within "
-                    f"{self._probe_max_descent_used_m * 1000.0:.2f} mm",
+                    f"{self._probe_max_descent_used_m * 1000.0:.2f} mm; "
+                    f"TCP Z {float(pose[0][2])*1000.:.2f} mm, "
+                    f"onset-independent boundary {self._working_probe_boundary}",
+                    quality_failure=True,
                 )
                 return
 
             self._probe_stage = "descending"
+            self._probe_line_target_z = None
             self._probe_step_start_z = float(pose[0][2])
             self._probe_level_pose = None
             return
@@ -5802,8 +9551,15 @@ class TaxelPositionMappingTask(ExperimentTask):
             if self._probe_step_start_z is None
             else float(self._probe_step_start_z)
         )
+        if self.probe_motion == "stepwise":
+            self._tick_probe_line_step(host, api, pose, now, sequence, step_start_z)
+            return
         step_descent = max(0.0, step_start_z - float(pose[0][2]))
-        reached_probe_limit = descent >= float(self._probe_max_descent_used_m)
+        boundary = self._working_probe_boundary
+        boundary_headroom = (float(self.position_tolerance_m) if self.fixed_scan_active
+                             else self._probe_boundary_headroom_m())
+        reached_boundary = boundary is not None and float(pose[0][2]) <= boundary["z_m"] + boundary_headroom
+        reached_probe_limit = descent >= float(self._probe_max_descent_used_m) or reached_boundary
         reached_scan_limit = bool(
             self._probe_onset_confirmed
             and self._probe_onset_pose is not None
@@ -5828,13 +9584,115 @@ class TaxelPositionMappingTask(ExperimentTask):
                 abs(float(self._probe_speed_used_m_s)),
                 abs(float(self.probe_confirmation_speed_m_s)),
             )
-            if self._probe_hit_count > 0 or self._probe_onset_confirmed
+            if self._probe_candidate_seen or self._probe_onset_confirmed
             else abs(float(self._probe_speed_used_m_s))
         )
         if not CalibrationTask._send_base_z_velocity(api, -speed_m_s):
             self._request_stop(
                 host, "command_failed", "Mapping stopped: robot rejected the base -Z probe command."
             )
+
+    def _probe_boundary_headroom_m(self) -> float:
+        # Command above, not on, the guard: arrival tolerance must not authorize
+        # a scan below it. The second tolerance leaves room for feedback jitter.
+        return max(2e-6, 2.0 * float(self.position_tolerance_m))
+
+    def _correct_probe_boundary_undershoot(self, host, pose, *, sample_pose=None) -> bool:
+        """Return True if XY must wait for correction/recovery; never lower a guard."""
+        boundary = self._working_probe_boundary
+        if boundary is None or self.fixed_scan_active or self._probe_kind == "reference":
+            return False
+        boundary_z = float(boundary["z_m"])
+        measured_z = float(pose[0][2])
+        if sample_pose is not None:
+            measured_z = min(measured_z, float(sample_pose[2]))
+        undershoot = boundary_z - measured_z
+        if undershoot <= 1e-6:
+            return False
+        if undershoot > float(self.position_tolerance_m) or self._probe_boundary_corrections:
+            self._handle_probe_failure(
+                host, "TCP/sample exceeded the onset-independent known-height boundary by "
+                f"{undershoot * 1000.:.4f} mm; excessive or repeated undershoot, "
+                "refusing XY scanning",
+            )
+            return True
+        lift = np.array(pose[0], dtype=float, copy=True)
+        lift[2] = max(float(lift[2]), boundary_z + self._probe_boundary_headroom_m())
+        self._probe_boundary_corrections += 1
+        self._probe_scan_target_reached = False
+        self._probe_scan_pose = None
+        self._probe_scan_signal = 0.0
+        self._probe_strength_hold = None
+        self._target_strength_check = None
+        self._probe_level_frames = []
+        if not self._probe_onset_confirmed:
+            self._probe_hit_count = 0
+            self._probe_candidate_pose = None
+        detail = (
+            f"Taxel {self._current_taxel}: {undershoot * 1000.:.4f} mm boundary "
+            "undershoot; correcting vertically upwards, then collecting fresh "
+            "signal batches before any XY scan (1/1 correction)"
+        )
+        host._append_sidebar_control_message(detail)
+        self._command_move(host, lift, "probe_boundary_corrected", detail,
+                           quaternion=pose[1], vertical_only=True)
+        return True
+
+    def _tick_probe_line_step(self, host, api, pose, now, sequence, step_start_z) -> None:
+        """One depth step as a TM line move, clamped to the same descent limits."""
+        z_value = float(pose[0][2])
+        if self._probe_line_target_z is None:
+            lowest = float(self._probe_start_pose[2]) - float(self._probe_max_descent_used_m)
+            boundary = self._working_probe_boundary
+            if boundary is not None:
+                lowest = max(lowest, float(boundary["z_m"]))
+            if self._probe_onset_confirmed and self._probe_onset_pose is not None:
+                lowest = max(lowest, float(self._probe_onset_pose[2]) - float(self.centre_scan_max_extra_descent_m))
+            if boundary is not None and not self.fixed_scan_active:
+                # Leave arrival headroom on the safe side of every active
+                # working-depth limit, including the final short depth step.
+                lowest = min(float(self._probe_start_pose[2]),
+                             lowest + self._probe_boundary_headroom_m())
+            target_z = max(lowest, float(step_start_z) - float(self.probe_step_m))
+            at_limit = target_z <= lowest + 1e-9
+            if z_value <= lowest + float(self.position_tolerance_m) or float(step_start_z) - target_z <= 1e-7:
+                self._settle_probe_level(now, pose, sequence, at_limit=True)
+                return
+            position = [float(pose[0][0]), float(pose[0][1]), target_z]
+            CalibrationTask._stop_robot(api)
+            try:
+                sent = bool(api.send_positions_tool_position(
+                    position, list(pose[1]),
+                    velocity=max(0.001, abs(float(self._probe_speed_used_m_s))), acc_time=0.2,
+                    blend_percentage=0, fine_goal=True, motion_type=self.LINE_MOTION,
+                ))
+            except Exception:
+                sent = False
+            if not sent:
+                self._request_stop(host, "command_failed", "Mapping stopped: robot rejected a depth line-move step.")
+                return
+            self._probe_line_target_z = target_z
+            self._probe_line_at_limit = bool(at_limit)
+            self._probe_line_sent_at = float(now)
+            self._probe_line_last_z = None
+            return
+        previous = self._probe_line_last_z
+        self._probe_line_last_z = z_value
+        still = previous is not None and abs(z_value - previous) <= float(self.stationary_tolerance_m)
+        tolerance = min(float(self.position_tolerance_m), 0.5 * float(self.probe_step_m))
+        if abs(z_value - float(self._probe_line_target_z)) <= tolerance and still:
+            self._settle_probe_level(now, pose, sequence, at_limit=self._probe_line_at_limit)
+            return
+        if now - float(self._probe_line_sent_at) > float(self.move_timeout_sec):
+            self._request_stop(host, "move_timeout", "Mapping stopped: a depth line-move step did not finish.")
+
+    def _settle_probe_level(self, now, pose, sequence, *, at_limit) -> None:
+        self._probe_line_target_z = None
+        self._probe_stage = "settling"
+        self._probe_settle_started_at = now
+        self._probe_level_pose = np.asarray(pose[0], dtype=float)
+        self._probe_level_at_max_depth = bool(at_limit)
+        self._probe_last_sequence = int(sequence)
 
     def _handle_probe_onset(self, host) -> None:
         onset = np.asarray(self._probe_onset_pose, dtype=float)
@@ -5852,25 +9710,36 @@ class TaxelPositionMappingTask(ExperimentTask):
             )
             self._start_target(host, self.anchor_taxel, onset[:2], "anchor")
             return
+        if not self._probe_scan_target_reached:
+            self._handle_probe_failure(host, "the requested stronger non-contact signal has not been verified")
+            return
         scan_pose = np.asarray(
             self._probe_scan_pose
             if self._probe_scan_pose is not None
             else onset,
             dtype=float,
         )
+        boundary = self._working_probe_boundary
+        current = self._read_tool_pose(self._robot_api(host))
+        if current is None:
+            self._request_stop(host, "robot_feedback_lost", "Mapping stopped: TCP feedback was lost before XY scanning.")
+            return
+        if self._correct_probe_boundary_undershoot(host, current, sample_pose=scan_pose):
+            return
+        if boundary is not None and float(scan_pose[2]) < boundary["z_m"]-1e-6:
+            self._handle_probe_failure(host, "the stronger-signal sample exceeded the onset-independent known-height boundary; refusing XY scanning")
+            return
         extra_descent_mm = max(0.0, float(onset[2] - scan_pose[2])) * 1000.0
-        target_state = (
-            "reached"
-            if self._probe_scan_target_reached
-            else "not reached before the safe descent limit; using the strongest level"
-        )
+        if extra_descent_mm > self.centre_scan_max_extra_descent_m*1000.+1e-6:
+            self._handle_probe_failure(host, "the sampled strong-signal plane exceeded the allowed extra descent; refusing XY scanning")
+            return
         host._append_sidebar_control_message(
             f"Taxel {self._current_taxel}: proximity onset remembered at "
             f"Z={onset[2]:.6f} m. Centre scan uses "
             f"{self._probe_scan_signal:.1f} sensor units at "
             f"{extra_descent_mm:.2f} mm deeper; the "
             f"{self.centre_scan_signal_multiplier:.2f}× target "
-            f"({self._probe_scan_target_signal:.1f} sensor units) was {target_state}."
+            f"({self._probe_scan_target_signal:.1f} sensor units) was reached."
         )
         if self._current_context == "anchor":
             self._start_coarse_scan(host, self._far_baseline, scan_pose)
@@ -5932,15 +9801,22 @@ class TaxelPositionMappingTask(ExperimentTask):
             return
         self._local_center = np.asarray(centre, dtype=float)
         self._local_axes = axes
-        points = []
-        meta = []
+        self._centre_repeat = None
+        self._target_centre_check = None
+        lines = []
         for axis in axes:
+            line = []
             for offset in self.axis_offsets(axis["radius"], self.local_step_m):
                 offset += float(axis["window_centre"])
                 point = np.array(self._local_center, copy=True)
                 point[:2] += offset * axis["unit"]
-                points.append(point)
-                meta.append({"axis": axis["name"], "nominal_offset_m": offset})
+                line.append((point, {"axis": axis["name"], "nominal_offset_m": offset}))
+            lines.append(line)
+        pose = self._read_tool_pose(self._robot_api(host))
+        route = self.shortest_line_scan_route(
+            lines, self._local_center if pose is None else pose[0]
+        )
+        points, meta = zip(*route)
         # Line scans use the far-field baseline. The start-height baseline
         # already holds proximity signal whose left/right imbalance would
         # shift the neighbour balance point.
@@ -5953,10 +9829,31 @@ class TaxelPositionMappingTask(ExperimentTask):
             meta=meta,
         )
 
-    def _start_scan(self, host, *, kind, points, baseline, target, meta=None) -> None:
+    @staticmethod
+    def shortest_line_scan_route(lines, start):
+        """Visit both full measurement lines using the shortest endpoint route.
+
+        Only traversal order changes: positions, offsets, axis labels and
+        stationary measurement density are identical.
+        """
+        start = np.asarray(start, dtype=float)
+        candidates = []
+        for first, second in (lines, lines[::-1]):
+            for first_line in (first, first[::-1]):
+                for second_line in (second, second[::-1]):
+                    route = list(first_line) + list(second_line)
+                    positions = np.asarray([start] + [item[0] for item in route])
+                    length = float(np.linalg.norm(np.diff(positions, axis=0), axis=1).sum())
+                    candidates.append((length, route))
+        return min(candidates, key=lambda item: item[0])[1]
+
+    def _start_scan(self, host, *, kind, points, baseline, target, meta=None, preserve_order=False) -> None:
         self._scan_kind = str(kind)
         self._scan_points = [np.asarray(point, dtype=float) for point in points]
         self._scan_point_meta = list(meta or [])
+        if self.reverse_scan_order and not preserve_order:
+            self._scan_points.reverse()
+            self._scan_point_meta.reverse()
         self._scan_results = []
         self._scan_index = 0
         self._scan_baseline = np.asarray(baseline, dtype=float)
@@ -5968,9 +9865,9 @@ class TaxelPositionMappingTask(ExperimentTask):
             self._finish_scan(host)
             return
         target_text = (
-            "neighbour discovery"
+            ("fast neighbour discovery" if self._coarse_sparse_pass else "dense neighbour discovery")
             if self._scan_kind == "coarse"
-            else f"Taxel {self._scan_target} refinement"
+            else f"Taxel {self._scan_target} " + ("repeat refinement" if self._centre_repeat else "refinement")
         )
         self._command_move(
             host,
@@ -5985,6 +9882,10 @@ class TaxelPositionMappingTask(ExperimentTask):
             self._request_stop(host, "robot_feedback_lost", "Mapping stopped: TCP feedback was lost during the XY scan.")
             return
         result = {"position": np.asarray(pose[0], dtype=float), "frame": np.asarray(frame, dtype=float)}
+        if self._fixed_scan_contact(
+            host, result["frame"], self._scan_baseline, f"during the {self._scan_kind} XY scan"
+        ):
+            return
         meta = (
             self._scan_point_meta[self._scan_index]
             if self._scan_index < len(self._scan_point_meta)
@@ -6010,6 +9911,12 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._sample_log.append(
             {
                 "scan": self._scan_kind,
+                "scan_pass": (
+                    ("sparse" if self._coarse_sparse_pass else "dense")
+                    if self._scan_kind == "coarse" else
+                    ("local_repeat" if self._centre_repeat is not None else "local")
+                ),
+                "sample_frames": int(self._collection_count),
                 "taxel_index": target_index,
                 "attempt_number": int(
                     self._attempt_counts.get(int(attempt_taxel), 0)
@@ -6052,7 +9959,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                 samples, self._scan_baseline, self._local_center, axis, index
             )
             if estimate is None:
-                self._handle_probe_failure(
+                self._handle_centre_scan_failure(
                     host, f"the {axis['name']} scan gave no usable centre"
                 )
                 return
@@ -6069,7 +9976,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         centre = np.array(self._local_center, copy=True)
         centre[:2] += self._shift_from_axis_offsets(offsets)
         if outside:
-            if self._local_recenters < int(self.max_local_recenters):
+            if self._centre_repeat is None and self._local_recenters < int(self.max_local_recenters):
                 self._local_recenters += 1
                 host._append_sidebar_control_message(
                     f"Taxel {index}: the centre lies outside the local scan "
@@ -6078,10 +9985,31 @@ class TaxelPositionMappingTask(ExperimentTask):
                 )
                 self._start_local_scan(host, centre)
                 return
-            self._handle_probe_failure(
+            self._handle_centre_scan_failure(
                 host, "the centre was not bracketed by the local scan"
             )
             return
+        if self._centre_repeat is not None:
+            first = self._centre_repeat
+            separation = float(np.linalg.norm(centre[:2] - np.asarray(first["centre_m"])[:2]))
+            tolerance = max(float(self.local_step_m), 2.0 * float(self.position_tolerance_m))
+            check = {
+                "taxel_index": index, "attempt": int(self._attempt_counts.get(index, 1)),
+                "reason": first["reason"], "first_centre_m": first["centre_m"],
+                "repeat_centre_m": centre.tolist(), "separation_mm": separation * 1000.,
+                "tolerance_mm": tolerance * 1000., "repeatable": bool(separation <= tolerance),
+                "final_verified": False,
+                "first_axes": first["axes"], "repeat_axes": copy.deepcopy(estimates),
+                "interpretation": "Same-height repeatability, not absolute geometric accuracy.",
+            }
+            self._centre_checks.append(check)
+            self._target_centre_check = check
+            if not check["repeatable"]:
+                self._handle_centre_scan_failure(
+                    host, f"centre not repeatable: opposite-order scans disagree by "
+                    f"{separation*1000.:.2f} mm (limit {tolerance*1000.:.2f} mm)"
+                )
+                return
         self._verify_estimate = {"centre": centre, "axes": estimates}
         self._scan_kind = ""
         self._command_move(
@@ -6119,25 +10047,90 @@ class TaxelPositionMappingTask(ExperimentTask):
                 "Mapping stopped: TCP feedback was lost during verification.",
             )
             return
+        if self._fixed_scan_contact(
+            host, frame, self._far_baseline, "at the refined centre"
+        ):
+            return
         target, second, dominance, dominant, _delta = self._signal_metrics(
             frame, self._far_baseline, index
         )
         signal_threshold = self._signal_threshold_for_taxel(index)
         if target < 0.5 * signal_threshold:
-            self._handle_probe_failure(
+            self._handle_centre_scan_failure(
                 host,
                 f"the signal at the refined centre was too weak "
                 f"({target:.1f} sensor units)",
             )
             return
         if dominance < float(self.final_min_dominance):
-            self._handle_probe_failure(
+            self._handle_centre_scan_failure(
                 host,
                 f"Taxel {dominant} was stronger than the target at the refined "
                 f"centre ({second:.1f} vs {target:.1f} sensor units)",
             )
             return
+        if self._centre_repeat is None:
+            axes = (self._verify_estimate or {}).get("axes", {})
+            reasons = []
+            if any(axis.get("method") == "peak_centroid" for axis in axes.values()):
+                reasons.append("broad/flat peak")
+            if dominance < self.CENTRE_REPEAT_MIN_DOMINANCE:
+                reasons.append("small lead over neighbouring taxels")
+            if target < signal_threshold:
+                reasons.append("weak final signal")
+            if self._target_strength_check and self._target_strength_check.get("accepted"):
+                reasons.append("borderline probe strength")
+            if reasons:
+                if not self._scan_points or not axes:
+                    self._request_stop(host, "internal_error",
+                                       "Mapping stopped: centre repeat scan geometry is missing.")
+                    return
+                self._centre_repeat = {
+                    "centre_m": np.asarray(self._verify_estimate["centre"]).tolist(),
+                    "axes": copy.deepcopy(axes), "reason": "; ".join(reasons),
+                }
+                host._append_sidebar_control_message(
+                    f"Taxel {index}: {self._centre_repeat['reason']}; repeating the SAME "
+                    "XY lines in reverse order at the same height before saving the centre."
+                )
+                # These points already include the operator's scan direction.
+                # Reverse exactly once; do not expand/recentre the footprint.
+                self._start_scan(host, kind="local", points=list(reversed(self._scan_points)),
+                                 baseline=self._far_baseline, target=index,
+                                 meta=list(reversed(self._scan_point_meta)), preserve_order=True)
+                return
+        if self._target_centre_check is not None:
+            self._target_centre_check["final_verified"] = True
+            host._append_sidebar_control_message(
+                f"Taxel {index}: centre repeat check passed, "
+                f"{self._target_centre_check['separation_mm']:.2f} mm separation "
+                f"(limit {self._target_centre_check['tolerance_mm']:.2f} mm); final signal verified."
+            )
+        if index == int(self.anchor_taxel) and float(dominance) < self.MIN_ANCHOR_DOMINANCE:
+            self._stop_for_weak_anchor_plane(host, pose[0], target, dominance)
+            return
         self._accept_position(host, pose[0], target, second, dominance)
+
+    def _stop_for_weak_anchor_plane(self, host, position, target, dominance) -> None:
+        """Retrying at the same plane cannot help; the operator must lower it."""
+        plane = (
+            f"the fixed scan height (Z {self.fixed_scan_z_m * 1000.0:.1f} mm)"
+            if self.fixed_scan_active else "the automatic proximity-threshold scan plane"
+        )
+        self._anchor_stop = (
+            "scan_plane_too_high",
+            f"Mapping stopped: at {plane}, TCP Z {float(position[2]) * 1000.0:.1f} mm, Taxel "
+            f"{self.anchor_taxel} reads {float(target):.1f} sensor units, only {float(dominance):.2f}x "
+            f"its strongest neighbour (need {self.MIN_ANCHOR_DOMINANCE:.1f}x). The scan plane is too high "
+            "to centre taxels reliably, so the anchor was not saved. Jog the probe down over the anchor "
+            "until it clearly stands out from its neighbours (completed maps read about 100-200 units), "
+            "use Remember Scan Height there, then start a new map.",
+        )
+        anchor = self.anchor_pose["tool_position_m"]
+        self._route_to(
+            host, anchor[:2], anchor[2], "anchor_stop_returned",
+            f"scan plane too high; returning to the safe Taxel {self.anchor_taxel} anchor",
+        )
 
     def _accept_position(self, host, position, target, second, dominance) -> None:
         index = int(self._current_taxel)
@@ -6188,6 +10181,17 @@ class TaxelPositionMappingTask(ExperimentTask):
             "centre_scan_target_reached": bool(
                 self._probe_scan_target_reached
             ),
+            "centre_scan_policy": self.CENTRE_SCAN_POLICY,
+            "quality_policy": self.QUALITY_POLICY,
+            "stationary_strength_check": copy.deepcopy(self._target_strength_check),
+            "centre_repeat_check": copy.deepcopy(self._target_centre_check),
+            "centre_repeat_separation_mm": (self._target_centre_check or {}).get("separation_mm"),
+            "centre_repeat_status": (
+                "repeatable" if self._target_centre_check is not None else "not_triggered"
+            ),
+            "centre_scan_signal_multiplier": float(self.centre_scan_signal_multiplier),
+            "centre_scan_max_extra_descent_mm": float(self.centre_scan_max_extra_descent_m)*1000.,
+            "noncontact_force_stop_g": self.NONCONTACT_FORCE_STOP_G,
             "tool_quaternion_wxyz": list(self.anchor_pose["tool_quaternion_wxyz"]),
             "signal_counts": float(target),
             "competing_signal_counts": float(second),
@@ -6196,6 +10200,8 @@ class TaxelPositionMappingTask(ExperimentTask):
                 min(1.0, target / self._signal_threshold_for_taxel(index))
                 * min(1.0, dominance)
             ),
+            "confidence_interpretation": "Heuristic signal/dominance score, not a probability or position uncertainty.",
+            "position_interpretation": "Verified response centre; absolute geometric accuracy requires independent validation.",
             "proximity_detection_mode": detection.get(
                 "mode", self.proximity_detection_mode
             ),
@@ -6229,6 +10235,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                 "rolling_low_percentile_counts"
             ),
             "method": "cross_scan_verified",
+            "position_prediction": copy.deepcopy(self._current_prediction),
             "row_axis_method": axes.get("row", {}).get("method"),
             "column_axis_method": axes.get("column", {}).get("method"),
             "row_offset_mm": axis_mm("row", "offset_m"),
@@ -6268,12 +10275,24 @@ class TaxelPositionMappingTask(ExperimentTask):
                 xy_error > float(self.resume_xy_tolerance_m)
                 or z_error > float(self.resume_z_tolerance_m)
             ):
+                measured = self._positions[index]
                 self._positions[index] = previous
+                heights = ""
+                if previous_position.shape == (3,):
+                    heights = (
+                        f"Measured at Z {new_position[2] * 1000.0:.1f} mm with "
+                        f"{float(measured.get('signal_counts') or 0.0):.1f} sensor units; "
+                        f"saved at Z {previous_position[2] * 1000.0:.1f} mm with "
+                        f"{float(previous.get('signal_counts') or 0.0):.1f}. "
+                    )
                 self._resume_alignment_error = (
                     f"Resume verification failed: Taxel {self.anchor_taxel} moved by "
                     f"{xy_error * 1000.0:.2f} mm in XY and "
-                    f"{z_error * 1000.0:.2f} mm in Z relative to the saved map. "
-                    "The sensor, robot base, or tool may have moved."
+                    f"{z_error * 1000.0:.2f} mm in Z relative to the saved map "
+                    f"(limits {float(self.resume_xy_tolerance_m) * 1000.0:.1f} mm XY, "
+                    f"{float(self.resume_z_tolerance_m) * 1000.0:.1f} mm Z). "
+                    + heights
+                    + "The sensor, robot base, or tool may have moved."
                 )
                 anchor = self.anchor_pose["tool_position_m"]
                 self._route_to(
@@ -6284,16 +10303,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                     f"resume check failed; returning to the safe Taxel {self.anchor_taxel} anchor",
                 )
                 return
-            self._continue_after_resume_anchor_check(host)
-        elif self._current_context == "anchor":
-            self._neighbor_queue = list(self.anchor_neighbour_indices())
-            self._start_next_neighbor(host)
-        elif self._current_context == "neighbor":
-            self._start_next_neighbor(host)
-        elif self._current_context == "relocation_verify":
-            self._start_next_relocation_verification(host)
-        else:
-            self._start_next_regular_taxel(host)
+        self._begin_clearance_cycle(host, self._current_context)
 
     def _finish_coarse_scan(self, host) -> None:
         guesses = {}
@@ -6311,6 +10321,8 @@ class TaxelPositionMappingTask(ExperimentTask):
                 continue
             guesses[index] = np.asarray(refined["position"], dtype=float)
         if missing:
+            if self._retry_dense_coarse_scan(host, "some reference taxels were too weak"):
+                return
             self._handle_probe_failure(
                 host,
                 "the coarse scan could not find Taxel "
@@ -6326,10 +10338,27 @@ class TaxelPositionMappingTask(ExperimentTask):
                 (neighbours[2], neighbours[3]),
             )
         if vectors is None:
+            if self._retry_dense_coarse_scan(host, "the row/column directions were unclear"):
+                return
             self._handle_probe_failure(
                 host, "the coarse scan did not reveal a 2D taxel lattice"
             )
             return
+        if self._coarse_sparse_pass:
+            # A strong response clipped by the search boundary is not a
+            # measured peak. Do not trust a sparse-grid centroid in that case.
+            centre_xy = self._coarse_scan_centre[:2]
+            for index in (self.anchor_taxel,) + neighbours:
+                best = max(
+                    self._scan_results,
+                    key=lambda sample: self._signal_metrics(
+                        sample["frame"], self._scan_baseline, index
+                    )[0],
+                )
+                offset = np.abs(np.asarray(best["position"])[:2] - centre_xy)
+                if np.any(offset >= float(self.coarse_radius_m) - 1e-6):
+                    self._retry_dense_coarse_scan(host, f"Taxel {index}'s peak reached the search boundary")
+                    return
         self._initial_row_vector_xy, self._initial_column_vector_xy, _score = vectors
         self._neighbor_guesses = {
             index: guesses[index][:2].tolist()
@@ -6350,6 +10379,31 @@ class TaxelPositionMappingTask(ExperimentTask):
         centre[:2] = guesses[self.anchor_taxel][:2]
         self._start_local_scan(host, centre)
 
+    def _retry_dense_coarse_scan(self, host, reason: str) -> bool:
+        if not self._coarse_sparse_pass or self._coarse_scan_centre is None:
+            return False
+        host._append_sidebar_control_message(
+            f"Fast neighbour search needs a denser check ({reason}); "
+            "scanning the original grid with at least 20 readings per point."
+        )
+        self._local_recenters = 0
+        self._verify_estimate = None
+        self._start_coarse_scan(
+            host, self._far_baseline, self._coarse_scan_centre, dense=True
+        )
+        return True
+
+    def _handle_centre_scan_failure(self, host, reason: str) -> None:
+        # A sparse initial estimate must not force a full retract/re-probe
+        # cycle when the original denser discovery grid can resolve it.
+        if (
+            self._current_context == "anchor"
+            and self.anchor_taxel not in self._positions
+            and self._retry_dense_coarse_scan(host, reason)
+        ):
+            return
+        self._handle_probe_failure(host, reason, quality_failure=True)
+
     def _route_to(self, host, xy, z, action: str, detail: str) -> bool:
         """Travel at the safe height, then move vertically to (xy, z).
 
@@ -6368,9 +10422,12 @@ class TaxelPositionMappingTask(ExperimentTask):
         travel_z = max(float(current[2]), float(self.anchor_pose["tool_position_m"][2]))
         target = np.array([float(xy[0]), float(xy[1]), float(z)])
         waypoints = []
-        if float(np.linalg.norm(current[:2] - target[:2])) > float(self.route_xy_tolerance_m):
-            if current[2] < travel_z - float(self.position_tolerance_m):
-                waypoints.append(np.array([current[0], current[1], travel_z]))
+        xy_distance = float(np.linalg.norm(current[:2] - target[:2]))
+        # Any XY change from below the travel height starts straight up,
+        # even a sub-tolerance one: diagonal moves near the skin are refused.
+        if xy_distance > 1e-6 and current[2] < travel_z - float(self.position_tolerance_m):
+            waypoints.append(np.array([current[0], current[1], travel_z]))
+        if xy_distance > float(self.route_xy_tolerance_m):
             waypoints.append(np.array([target[0], target[1], travel_z]))
         waypoints.append(target)
         route = []
@@ -6393,9 +10450,27 @@ class TaxelPositionMappingTask(ExperimentTask):
         return self._command_move(host, position, action, detail)
 
     def _schedule_failure_recovery(
-        self, host, *, kind: str, reason: str
+        self, host, *, kind: str, reason: str, quality_failure=False
     ) -> None:
-        """Retract vertically, return to Taxel 35, then retry once or stop."""
+        """Return to the clearance anchor, recalibrate, then retry or stop."""
+        if getattr(self, "_scheduling_recovery", False):
+            # The return route itself was refused; retrying would recurse.
+            self._request_stop(
+                host,
+                "recovery_route_refused",
+                "Mapping stopped: the return to the clearance anchor was refused "
+                f"({reason}). The robot was left where it is; move it up manually.",
+            )
+            return
+        self._scheduling_recovery = True
+        try:
+            self._schedule_failure_recovery_route(host, kind=kind, reason=reason, quality_failure=quality_failure)
+        finally:
+            self._scheduling_recovery = False
+
+    def _schedule_failure_recovery_route(
+        self, host, *, kind: str, reason: str, quality_failure=False
+    ) -> None:
         kind = "reference" if str(kind) == "reference" else "target"
         if kind == "reference":
             index = int(self.anchor_taxel)
@@ -6407,6 +10482,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             label = f"Taxel {index}"
         will_retry = attempt < int(self.max_attempts_per_taxel)
         self._failures[index] = str(reason)
+        self._failed_attempt_total += 1
         self._pending_recovery = {
             "kind": kind,
             "taxel_index": index,
@@ -6415,6 +10491,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             else np.asarray(self._current_target_xy, dtype=float).tolist(),
             "context": str(self._current_context),
             "reason": str(reason),
+            "quality_failure": bool(quality_failure),
             "retry": bool(will_retry),
             "next_attempt": attempt + 1 if will_retry else attempt,
         }
@@ -6427,7 +10504,8 @@ class TaxelPositionMappingTask(ExperimentTask):
         else:
             message = (
                 f"{label} failed after {attempt} attempts: {reason}. "
-                f"Retracting and returning to Taxel {self.anchor_taxel} before stopping."
+                f"Retracting and returning to Taxel {self.anchor_taxel} for clearance "
+                "checks before deciding whether other supported taxels can continue."
             )
         self._scan_kind = ""
         host._append_sidebar_control_message(message)
@@ -6441,13 +10519,34 @@ class TaxelPositionMappingTask(ExperimentTask):
             f"returning to the remembered safe pose above Taxel {self.anchor_taxel}",
         )
 
-    def _handle_probe_failure(self, host, reason: str) -> None:
+    def _handle_probe_failure(self, host, reason: str, *, quality_failure=False) -> None:
         kind = "reference" if self._current_context == "reference" else "target"
-        self._schedule_failure_recovery(host, kind=kind, reason=str(reason))
+        self._schedule_failure_recovery(host, kind=kind, reason=str(reason), quality_failure=quality_failure)
 
     def _dispatch_move_action(self, host, action: str) -> None:
         if action == "route_waypoint":
             self._advance_route(host)
+        elif action == "probe_boundary_corrected":
+            pose = self._read_tool_pose(self._robot_api(host))
+            boundary = self._working_probe_boundary
+            if pose is None or boundary is None or float(pose[0][2]) < float(boundary["z_m"]):
+                self._request_stop(host, "probe_boundary_correction_failed",
+                                   "Mapping stopped: vertical boundary correction was not confirmed; no XY scan.")
+                return
+            self._phase = "probing"
+            # Do not chase the same boundary again if the raised signal is weak.
+            # The normal stationary-sampling path must re-qualify it here.
+            self._settle_probe_level(time.monotonic(), pose,
+                                     self._probe_last_sequence or 0, at_limit=True)
+        elif action == "fixed_scan_plane_arrived":
+            pose = getattr(self, "_fixed_scan_plane_pose", None)
+            self._fixed_scan_plane_pose = None
+            if pose is None:
+                self._request_stop(
+                    host, "internal_error", "Mapping stopped: the fixed scan plane was lost."
+                )
+                return
+            self._start_fixed_plane_scan(host, pose)
         elif action == "anchor_safe_arrived":
             self._current_taxel = self.anchor_taxel
             self._current_context = "reference"
@@ -6493,7 +10592,21 @@ class TaxelPositionMappingTask(ExperimentTask):
                 "sensor stability at the probe start height",
             )
         elif action == "scan_point_arrived":
-            self._begin_collection(host, "scan_sample", self.scan_frame_count, f"{self._scan_kind.title()} XY scan sample")
+            count = int(self.scan_frame_count)
+            if self._scan_kind == "local" and self._centre_repeat is not None:
+                count = max(count, int(self.verify_frame_count), 20)
+            if self._scan_kind == "coarse" and not self._coarse_sparse_pass:
+                count = max(20, count)
+            label = (
+                ("Fast" if self._coarse_sparse_pass else "Dense") + " neighbour search"
+                if self._scan_kind == "coarse"
+                else f"Taxel {self._scan_target} " + ("repeat refinement" if self._centre_repeat else "refinement")
+            )
+            self._begin_collection(
+                host, "scan_sample", count,
+                f"{label}: point {self._scan_index + 1}/{len(self._scan_points)}, "
+                f"collecting {count} stationary readings",
+            )
         elif action == "verify_arrived":
             self._begin_collection(
                 host,
@@ -6501,6 +10614,11 @@ class TaxelPositionMappingTask(ExperimentTask):
                 self.verify_frame_count,
                 f"Taxel {self._current_taxel}: checking that the refined "
                 "centre belongs to the intended taxel",
+            )
+        elif action == "clearance_anchor_arrived":
+            self._begin_collection(
+                host, "clearance_precheck", self.baseline_frame_count,
+                "At the clearance anchor: checking signal recovery BEFORE Update Calibration",
             )
         elif action == "recovery_anchor_arrived":
             pending = self._pending_recovery
@@ -6510,54 +10628,44 @@ class TaxelPositionMappingTask(ExperimentTask):
                     "internal_error",
                     f"Mapping stopped at Taxel {self.anchor_taxel}: recovery state was lost.",
                 )
-            elif bool(pending.get("retry")):
-                self._current_taxel = self.anchor_taxel
-                self._current_context = "recovery_check"
-                self._begin_collection(
-                    host,
-                    "retry_anchor_stability",
-                    self.baseline_frame_count,
-                    f"At Taxel {self.anchor_taxel} safe anchor: checking sensor stability "
-                    "before the single retry",
-                )
             else:
-                kind = str(pending.get("kind", "target"))
-                index = pending.get("taxel_index")
-                reason = str(pending.get("reason", "target not found"))
-                self._pending_recovery = None
-                target_text = (
-                    f"The first Taxel {self.anchor_taxel} probe"
-                    if kind == "reference"
-                    else f"Taxel {index}"
-                )
-                self._request_stop(
-                    host,
-                    "mapping_target_failed",
-                    f"Mapping stopped at the Taxel {self.anchor_taxel} safe anchor: "
-                    f"{target_text} failed twice ({reason}).",
+                self._clearance_next_context = "failure"
+                self._begin_collection(
+                    host, "clearance_precheck", self.baseline_frame_count,
+                    "Failed attempt returned to the clearance anchor: checking recovery before calibration",
                 )
         elif action == "complete_anchor_arrived":
-            self._completed = True
-            self._stop_reason = "complete"
+            self._completed = not bool(self._skipped_failed_taxels)
+            self._stop_reason = "complete" if self._completed else "partial_complete"
             completion_name = (
                 "Taxel map relocation"
                 if self._relocation_active
                 else "Taxel Position Mapping"
             )
-            host._stop_sidebar_control(
-                show_result=True,
-                message=(
-                    f"{completion_name} complete and returned to Taxel {self.anchor_taxel}: "
+            self._stop_message = (
+                    f"{completion_name} {'complete' if self._completed else 'pass finished with unresolved taxels'} "
+                    f"and returned to Taxel {self.anchor_taxel}: "
                     f"{self.mapped_target_count()}/"
                     f"{len(self.mapping_target_indices())} target taxels located, "
                     f"{len(self._failures)} failed."
-                ),
+                    + (" Review the failed taxels, then Resume to retry them; saved centres are retained."
+                       if not self._completed else "")
             )
+            host._stop_sidebar_control(show_result=True, message=self._stop_message)
+        elif action == "anchor_stop_returned":
+            reason, message = self._anchor_stop or (
+                "scan_plane_too_high", f"Mapping stopped at the Taxel {self.anchor_taxel} anchor."
+            )
+            self._request_stop(host, reason, message)
         elif action == "resume_alignment_returned":
-            message = self._resume_alignment_error or (
+            self._resume_alignment_error = self._resume_alignment_error or (
                 f"Resume verification failed because Taxel {self.anchor_taxel} no longer matches the saved map."
             )
-            self._request_stop(host, "resume_alignment_failed", message)
+            self._clearance_next_context = "resume_alignment_failed"
+            self._begin_collection(
+                host, "clearance_precheck", self.baseline_frame_count,
+                "Resume alignment failed: checking recovery at the anchor before calibration and stopping",
+            )
 
     def _handle_collection(
         self,
@@ -6569,7 +10677,96 @@ class TaxelPositionMappingTask(ExperimentTask):
         baseline_max,
         baseline_frames,
     ) -> None:
-        if action == "reference_baseline":
+        if action in {"reference_baseline", "resume_anchor_stability"}:
+            self._clearance_reference_frames = np.array(baseline_frames, dtype=float, copy=True)
+        if action == "clearance_precheck":
+            from phd.ui.mapping_safety import clearance_recovery
+            check = clearance_recovery(
+                baseline_frames, self._clearance_reference_frames, self.adaptive_min_margin_counts,
+            )
+            check.update(timestamp=datetime.now(timezone.utc).isoformat(), taxel_index=self._current_taxel)
+            self._clearance_checks.append(check)
+            if not check["recovered"]:
+                details = check.get("unrecovered_details") or [
+                    {"taxel": index} for index in check.get("unrecovered_taxels", [])
+                ]
+                taxels = ", ".join(
+                    f"taxel {item['taxel']} ({item['shift_units']:+.1f}, limit {item['tolerance_units']:.1f})"
+                    if "shift_units" in item else f"taxel {item['taxel']}"
+                    for item in details[:8]
+                )
+                median_shift = check.get("median_shift_units")
+                whole = "" if median_shift is None else f"; whole-sensor median shift {median_shift:+.1f}"
+                self._request_stop(
+                    host, "clearance_not_recovered",
+                    f"Mapping stopped at the saved clearance anchor: the signal has not recovered on {taxels}{whole}. "
+                    "Proximity lowers the signal, so a rise is baseline drift and a fall may be a residual "
+                    "proximity response. No calibration was applied; inspect clearance and baseline drift "
+                    "instead of zeroing a possible proximity response.",
+                )
+                return
+            self._begin_sensor_calibration(
+                host, next_action="clearance_calibrated",
+                context=f"{self._clearance_next_context}_taxel_{self._current_taxel}",
+            )
+        elif action == "clearance_calibrated":
+            self._clearance_reference_frames = np.array(baseline_frames, dtype=float, copy=True)
+            self._force_baseline_n = float(force_n)
+            if self._clearance_next_context == "auto_rerun":
+                self._start_auto_rerun(host, frame, force_n, baseline_min, baseline_max, baseline_frames)
+            elif self._clearance_next_context == "failure":
+                self._clearance_next_context = ""
+                pending = self._pending_recovery or {}
+                if not pending.get("retry"):
+                    if self._queue_auto_rerun(host, pending):
+                        return
+                    index = pending.get("taxel_index")
+                    reason = pending.get("reason", "target not found")
+                    self._pending_recovery = None
+                    if (
+                        pending.get("kind") == "target"
+                        and pending.get("context") == "regular"
+                        and index is not None
+                        and (self.fixed_scan_active or (
+                            pending.get("quality_failure")
+                            and not (self._relocation_active and not self._relocation_finished)
+                            and self.fit_lattice_from_positions({
+                                known: {"tool_position_m": point}
+                                for known, point in self._verified_mapping_positions().items()
+                            }) is not None
+                        ))
+                    ):
+                        self._skip_exhausted_taxel(host, int(index), str(reason))
+                        return
+                    guidance = ""
+                    if index is not None and int(index) == int(self.anchor_taxel) and not self.fixed_scan_active:
+                        guidance = (
+                            " The automatic descent found no usable scan plane for the anchor. Set a "
+                            "fixed one: jog the probe down over the anchor until it clearly stands out "
+                            "from its neighbours (completed maps read about 100-200 units), press "
+                            "Remember Scan Height, then start again."
+                        )
+                    self._request_stop(
+                        host, "mapping_target_failed",
+                        f"Mapping stopped at the Taxel {self.anchor_taxel} clearance anchor after calibration: "
+                        f"Taxel {index} exhausted its {self.max_attempts_per_taxel} attempts ({reason}). "
+                        f"Auto reruns used: {self._auto_rerun_count}/{self.max_auto_reruns}; "
+                        "no further automatic recovery is enabled/eligible." + guidance,
+                    )
+                    return
+                self._handle_collection(host, "retry_anchor_stability", frame, force_n,
+                                        baseline_min, baseline_max, baseline_frames)
+            else:
+                try:
+                    self._save_results(checkpoint=True)
+                except Exception as exc:
+                    self._request_stop(host, "checkpoint_failed", f"Mapping stopped at the clearance anchor: checkpoint could not be saved ({exc}).")
+                    return
+                self._continue_after_clearance(host)
+        elif action == "reference_baseline":
+            if self.fixed_scan_active:
+                self._start_fixed_scan_mapping(host, force_n)
+                return
             self._start_probe(
                 host,
                 frame,
@@ -6599,6 +10796,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                 baseline_frames=baseline_frames,
             )
         elif action == "far_baseline":
+            self._force_baseline_n = float(force_n)
             self._far_baseline = np.asarray(frame, dtype=float)
             self._far_baseline_min = np.asarray(baseline_min, dtype=float)
             self._far_baseline_max = np.asarray(baseline_max, dtype=float)
@@ -6636,7 +10834,11 @@ class TaxelPositionMappingTask(ExperimentTask):
                 self._current_taxel = self.anchor_taxel
                 self._current_context = "reference"
                 self._reference_attempt_count += 1
-                self._start_probe(host, frame, force_n, kind="reference")
+                self._start_probe(
+                    host, frame, force_n, kind="reference",
+                    baseline_min=baseline_min, baseline_max=baseline_max,
+                    baseline_frames=baseline_frames,
+                )
                 return
             index = int(pending["taxel_index"])
             xy = pending.get("xy")
@@ -6647,17 +10849,39 @@ class TaxelPositionMappingTask(ExperimentTask):
                     f"Mapping stopped at Taxel {self.anchor_taxel}: retry XY target was lost.",
                 )
                 return
+            from phd.ui.mapping_safety import local_retry_xy
+            refined_xy = local_retry_xy(
+                self._positions, index, xy, self.sensor_rows, self.sensor_columns, self.local_radius_m,
+            )
+            shift = float(np.linalg.norm(refined_xy-np.asarray(xy))) * 1000.
+            if shift > .01:
+                host._append_sidebar_control_message(
+                    f"Taxel {index}: retry XY adjusted {shift:.2f} mm using measured local spacing, "
+                    "within the existing local search radius."
+                )
             self._start_target(
                 host,
                 index,
-                xy,
+                refined_xy,
                 str(pending.get("context") or "regular"),
             )
 
-    def _start_coarse_scan(self, host, baseline, centre) -> None:
+    def _start_coarse_scan(self, host, baseline, centre, *, dense=False) -> None:
         centre = np.asarray(centre, dtype=float)
+        self._coarse_scan_centre = centre.copy()
+        full_offsets = self.grid_offsets(self.coarse_radius_m, self.coarse_step_m)
+        sparse_step = 2.0 * float(self.coarse_step_m)
+        self._coarse_sparse_pass = bool(
+            self.adaptive_coarse_search and not dense
+            and len(full_offsets) > 169
+            # Keep the sparse quantisation error within a local scan window.
+            and sparse_step <= 2.0 * float(self.local_radius_m)
+        )
         points = []
-        offsets = self.grid_offsets(self.coarse_radius_m, self.coarse_step_m)
+        offsets = (
+            self.grid_offsets(self.coarse_radius_m, sparse_step)
+            if self._coarse_sparse_pass else full_offsets
+        )
         offsets = [(0.0, 0.0)] + [
             offset for offset in offsets if offset != (0.0, 0.0)
         ]
@@ -6666,6 +10890,12 @@ class TaxelPositionMappingTask(ExperimentTask):
             point[0] += dx
             point[1] += dy
             points.append(point)
+        host._append_sidebar_control_message(
+            f"Initial neighbour search: {len(points)} positions "
+            f"({'fast first pass; automatic dense fallback' if self._coarse_sparse_pass else 'full-resolution grid'}). "
+            "This one-time search learns the anchor and four neighbours; "
+            "later taxels use only local centre scans."
+        )
         self._start_scan(
             host,
             kind="coarse",
@@ -6693,6 +10923,9 @@ class TaxelPositionMappingTask(ExperimentTask):
             return
         self._current_taxel = int(index)
         self._current_context = str(context)
+        self._working_probe_boundary = None
+        if context != "regular":
+            self._current_prediction = None
         self._current_target_xy = np.array(target_xy, copy=True)
         self._local_recenters = 0
         self._attempt_counts[int(index)] = (
@@ -6855,6 +11088,15 @@ class TaxelPositionMappingTask(ExperimentTask):
                     ),
                 }
             )
+            # These are absolute heights. The rigid move changes Z, so a copied
+            # taxel must not keep the height from before the sensor was moved.
+            for field in ("probe_start_z_m", "proximity_onset_z_m", "centre_scan_z_m"):
+                try:
+                    height = float(record.get(field))
+                except (TypeError, ValueError):
+                    continue
+                if np.isfinite(height):
+                    record[field] = height + float(fitted["z_shift_m"])
             transformed[index] = record
         for index, record in verified.items():
             record = copy.deepcopy(record)
@@ -6903,12 +11145,24 @@ class TaxelPositionMappingTask(ExperimentTask):
             "transformed_taxel_count": len(transformed),
         }
         self._failures = {}
+        self._relocation_finished = True
         self._publish_live_map(host)
         host._append_sidebar_control_message(
             f"Relocation verified. Applied a {fitted['angle_deg']:+.2f}° rotation "
             f"and {np.linalg.norm(fitted['translation']) * 1000.0:.2f} mm XY "
-            f"translation to {len(transformed)} taxels."
+            f"translation to {len(transformed)} taxels "
+            f"(fit RMS {fitted['rms_residual_mm']:.2f} mm, max "
+            f"{fitted['max_residual_mm']:.2f} mm)."
         )
+        if self._relocation_continues_mapping:
+            remaining = set(self.mapping_target_indices()).difference(self._positions)
+            host._append_sidebar_control_message(
+                f"Continuing the partial map: {len(remaining)} target taxels remain. "
+                "Only re-measured taxels seed the next targets; transformed "
+                "positions are kept but never used to plan motion."
+            )
+            self._start_next_regular_taxel(host)
+            return
         self._current_taxel = self.anchor_taxel
         self._current_context = "complete_return"
         anchor = self.anchor_pose["tool_position_m"]
@@ -6925,7 +11179,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             index = self._neighbor_queue.pop(0)
             self._start_target(host, index, self._neighbor_guesses[index], "neighbor")
             return
-        if self._relocation_active:
+        if self._relocation_active and not self._relocation_finished:
             self._start_next_relocation_verification(host)
             return
         predicted = self.predict_lattice_positions()
@@ -6951,25 +11205,44 @@ class TaxelPositionMappingTask(ExperimentTask):
             )
             return
         self._predicted_positions = predicted_positions
-        order = []
-        for row in range(self.sensor_rows):
-            columns = range(self.sensor_columns) if row % 2 == 0 else range(self.sensor_columns - 1, -1, -1)
-            order.extend(self._taxel_flat(row, column) for column in columns)
-        self._mapping_queue = [
-            index
-            for index in order
-            if index in target_indices and index not in self._positions
-        ]
+        self._mapping_queue = sorted(target_indices.difference(self._positions))
         host._append_sidebar_control_message(
             "Taxel lattice fitted: row pitch "
             f"{np.linalg.norm(self._row_vector_xy) * 1000.0:.2f} mm, column pitch "
             f"{np.linalg.norm(self._column_vector_xy) * 1000.0:.2f} mm, "
-            f"2D separation score {orthogonality:.2f}."
+            f"2D separation score {orthogonality:.2f}. "
+            "Continuing outwards from verified neighbours; local position estimates are updated after each verified taxel."
         )
         self._start_next_regular_taxel(host)
 
+    def _remaining_target_indices(self) -> set[int]:
+        """Unmapped targets, excluding taxels skipped after exhausting retries."""
+        return (
+            set(self.mapping_target_indices())
+            .difference(self._positions)
+            .difference(self._skipped_failed_taxels)
+        )
+
+    def _skip_exhausted_taxel(self, host, index: int, reason: str) -> None:
+        self._skipped_failed_taxels.add(int(index))
+        host._append_sidebar_control_message(
+            f"Taxel {index} skipped after {self.max_attempts_per_taxel} attempts ({reason}). "
+            f"Continuing with the next taxel; {len(self._skipped_failed_taxels)} skipped so far."
+        )
+        try:
+            self._save_results(checkpoint=True)
+        except Exception as exc:
+            self._request_stop(
+                host, "checkpoint_failed",
+                f"Mapping stopped at the clearance anchor: checkpoint could not be saved ({exc}).",
+            )
+            return
+        self._start_next_regular_taxel(host)
+
     def _start_next_regular_taxel(self, host) -> None:
+        self._mapping_queue = sorted(self._remaining_target_indices())
         if not self._mapping_queue:
+            self._current_prediction = None
             self._current_taxel = self.anchor_taxel
             self._current_context = "complete_return"
             anchor = self.anchor_pose["tool_position_m"]
@@ -6981,7 +11254,25 @@ class TaxelPositionMappingTask(ExperimentTask):
                 f"mapping finished; returning to the safe Taxel {self.anchor_taxel} anchor",
             )
             return
-        index = self._mapping_queue.pop(0)
+        pose = self._read_tool_pose(self._robot_api(host))
+        try:
+            prediction = self.plan_frontier_target(None if pose is None else pose[0][:2])
+        except ValueError as exc:
+            self._request_stop(host, "invalid_frontier", f"Mapping stopped: {exc}")
+            return
+        index = prediction["taxel_index"]
+        self._current_prediction = prediction
+        self._row_vector_xy = np.asarray(prediction["row_vector_xy_m"])
+        self._column_vector_xy = np.asarray(prediction["column_vector_xy_m"])
+        predicted_pose = np.array(self._positions[prediction["verified_neighbours"][0]]["tool_position_m"], dtype=float)
+        predicted_pose[:2] = prediction["position_xy_m"]
+        self._predicted_positions[index] = predicted_pose
+        self._mapping_queue.remove(index)
+        host._append_sidebar_control_message(
+            f"Taxel {index}: one-step estimate from verified neighbour(s) "
+            + ", ".join(str(known) for known in prediction["verified_neighbours"])
+            + f"; support spread {prediction['support_spread_mm']:.2f} mm (not position accuracy)."
+        )
         self._start_target(
             host,
             index,
@@ -7004,6 +11295,22 @@ class TaxelPositionMappingTask(ExperimentTask):
             "sensor_rows": int(self.sensor_rows),
             "sensor_columns": int(self.sensor_columns),
             "anchor_taxel": int(self.anchor_taxel),
+            "mapping_order": self.MAPPING_ORDER,
+            "centre_scan_policy": self.CENTRE_SCAN_POLICY,
+            "mapping_quality_policy": self.QUALITY_POLICY,
+            "stationary_strength_confirmation_batches": self.STRENGTH_CONFIRM_BATCHES,
+            "stationary_strength_borderline_ratio": self.STRENGTH_BORDERLINE_RATIO,
+            "centre_repeat_min_dominance": self.CENTRE_REPEAT_MIN_DOMINANCE,
+            "centre_repeat_tolerance_mm": max(self.local_step_m, 2.*self.position_tolerance_m)*1000.,
+            "search_safety_policy": self.SEARCH_SAFETY_POLICY,
+            "probe_boundary_policy": "upward_headroom_fresh_sampling_v1",
+            "probe_boundary_headroom_mm": self._probe_boundary_headroom_m() * 1000.,
+            "max_boundary_corrections_per_probe": 1,
+            "resume_attempt_budget": "fresh_per_explicit_resume_history_preserved",
+            "recalibrate_after_each_taxel_and_recoverable_failure": True,
+            "clearance_source": "operator-established remembered anchor, checked for signal recovery",
+            "noncontact_force_stop_g": self.NONCONTACT_FORCE_STOP_G,
+            "noncontact_interpretation": "No contact is intended. Force and travel guards cannot certify air gap; supervise with independently checked clearance.",
             "skip_outer_border": bool(self.skip_outer_border),
             "proximity_detection_mode": str(self.proximity_detection_mode),
             "signal_threshold_counts": float(self.signal_threshold_counts),
@@ -7021,6 +11328,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             )
             * 1000.0,
             "probe_step_mm": float(self.probe_step_m) * 1000.0,
+            "probe_motion": self.probe_motion,
             "probe_sample_frames": int(self.probe_sample_frames),
             "max_probe_descent_mm": float(self.max_probe_descent_m) * 1000.0,
             "probe_confirm_frames": int(self.probe_confirm_frames),
@@ -7051,6 +11359,10 @@ class TaxelPositionMappingTask(ExperimentTask):
             ),
             "max_xy_offset_mm": float(self.max_xy_offset_m) * 1000.0,
             "verify_frame_count": int(self.verify_frame_count),
+            "scan_frame_count": int(self.scan_frame_count),
+            "scan_sample_reducer": "median",
+            "adaptive_coarse_search": bool(self.adaptive_coarse_search),
+            "reverse_scan_order": bool(self.reverse_scan_order),
             "baseline_frame_count": int(self.baseline_frame_count),
             "baseline_stability_fraction": float(
                 self.baseline_stability_fraction
@@ -7059,11 +11371,21 @@ class TaxelPositionMappingTask(ExperimentTask):
                 self.baseline_stability_floor_counts
             ),
             "max_attempts_per_taxel": int(self.max_attempts_per_taxel),
+            "max_auto_reruns": int(self.max_auto_reruns),
+            "auto_rerun_delay_sec": float(self.auto_rerun_delay_sec),
             "sensor_calibration_timeout_sec": float(
                 self.sensor_calibration_timeout_sec
             ),
             "resume_xy_tolerance_mm": float(self.resume_xy_tolerance_m) * 1000.0,
             "resume_z_tolerance_mm": float(self.resume_z_tolerance_m) * 1000.0,
+            "fixed_scan_z_mm": (
+                None if self.fixed_scan_z_m is None else float(self.fixed_scan_z_m) * 1000.0
+            ),
+            "scan_plane_source": self._scan_plane_source,
+            "fixed_scan_approach_window_mm": float(self.fixed_scan_approach_window_m) * 1000.0,
+            "fixed_scan_stop_ratio": float(self.fixed_scan_stop_ratio),
+            "fixed_scan_contact_ratio": float(self.fixed_scan_contact_ratio),
+            "fixed_scan_reference_signal_counts": self._fixed_scan_reference_signal,
         }
 
     def _prepare_output_folder(self) -> None:
@@ -7111,7 +11433,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._output_folder = self.output_directory / folder_name
         self._output_folder.mkdir(parents=True, exist_ok=False)
 
-    def _save_results(self) -> Optional[dict]:
+    def _save_results(self, *, checkpoint=False) -> Optional[dict]:
         lattice_fit = self.lattice_fit_quality()
         residuals = (lattice_fit or {}).get("residual_mm_by_taxel", {})
         positions = []
@@ -7124,12 +11446,23 @@ class TaxelPositionMappingTask(ExperimentTask):
             return None if value is None else np.asarray(value, dtype=float).tolist()
 
         result = {
-            "version": 2,
+            "version": 3,
             "task": self.id,
+            "sensor_shape": [self.sensor_rows, self.sensor_columns],
+            "sensor_identity": self.active_sensor_key_name,
+            "centre_interpretation": "Response centres, not certified geometric centres. Lattice residuals measure internal consistency, not absolute accuracy.",
             "started_at": self._started_at_iso,
             "saved_at": datetime.now(timezone.utc).isoformat(),
             "completed": bool(self._completed),
-            "stop_reason": str(self._stop_reason or "manual_stop"),
+            "stop_reason": str(self._stop_reason or ("checkpoint" if checkpoint else "manual_stop")),
+            "stop_message": str(self._stop_message),
+            "stop_snapshot": copy.deepcopy(self._stop_snapshot),
+            "search_safety_policy": self.SEARCH_SAFETY_POLICY,
+            "clearance_checks": copy.deepcopy(self._clearance_checks),
+            "stationary_strength_checks": copy.deepcopy(self._strength_checks),
+            "centre_repeat_checks": copy.deepcopy(self._centre_checks),
+            "auto_rerun_count": int(self._auto_rerun_count),
+            "auto_rerun_history": copy.deepcopy(self._auto_rerun_history),
             "settings": self._settings(),
             "anchor_pose": self.anchor_pose,
             "reference_onset_z_m": self._reference_onset_z,
@@ -7146,6 +11479,9 @@ class TaxelPositionMappingTask(ExperimentTask):
             "skipped_taxels": self.skipped_taxel_indices(),
             "failed_count": len(self._failures),
             "failures": {str(index): reason for index, reason in sorted(self._failures.items())},
+            "failed_attempt_total": int(self._failed_attempt_total),
+            "skipped_failed_taxels": sorted(int(index) for index in self._skipped_failed_taxels),
+            "unresolved_taxels": sorted(set(self.mapping_target_indices()).difference(self._positions)),
             "attempt_counts": {
                 str(index): count
                 for index, count in sorted(self._attempt_counts.items())
@@ -7158,15 +11494,18 @@ class TaxelPositionMappingTask(ExperimentTask):
             "relocation": copy.deepcopy(self._relocation_transform)
             if self._relocation_active
             else None,
+            "relocation_checkpoint": self._relocation_checkpoint(),
             "positions": positions,
         }
         if self._output_folder is None:
+            result = json.loads(json.dumps(result, default=_mapping_json_default, allow_nan=False))
             self.last_result = result
             return result
         json_path = self._output_folder / "taxel_position_map.json"
         csv_path = self._output_folder / "taxel_positions.csv"
         samples_path = self._output_folder / "scan_samples.csv"
         baseline_path = self._output_folder / "baseline_checks.csv"
+        probe_path = self._output_folder / "probe_levels.csv"
         result.update(
             {
                 "output_folder": str(self._output_folder),
@@ -7174,11 +11513,13 @@ class TaxelPositionMappingTask(ExperimentTask):
                 "positions_csv_path": str(csv_path),
                 "samples_csv_path": str(samples_path),
                 "baseline_checks_csv_path": str(baseline_path),
+                "probe_levels_csv_path": str(probe_path),
             }
         )
-        with json_path.open("w", encoding="utf-8") as stream:
-            json.dump(result, stream, indent=2)
-            stream.write("\n")
+        # Validate the complete snapshot BEFORE overwriting any CSV or temp
+        # JSON. Keep allow_nan=False: invalid coordinates must still fail.
+        serialized = json.dumps(result, default=_mapping_json_default, indent=2, allow_nan=False) + "\n"
+        result = json.loads(serialized)
         optional_position_fields = [
             "probe_start_z_m",
             "proximity_onset_z_m",
@@ -7187,6 +11528,13 @@ class TaxelPositionMappingTask(ExperimentTask):
             "centre_scan_signal_units",
             "centre_scan_target_units",
             "centre_scan_target_reached",
+            "centre_scan_policy",
+            "quality_policy",
+            "centre_repeat_status",
+            "centre_repeat_separation_mm",
+            "centre_scan_signal_multiplier",
+            "centre_scan_max_extra_descent_mm",
+            "noncontact_force_stop_g",
             "row_axis_method",
             "column_axis_method",
             "row_offset_mm",
@@ -7243,7 +11591,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                 )
                 writer.writerow(row)
         sample_fields = [
-            "scan", "taxel_index", "attempt_number", "axis",
+            "scan", "scan_pass", "sample_frames", "taxel_index", "attempt_number", "axis",
             "nominal_offset_mm", "point_number",
             "x_m", "y_m", "z_m",
             "target_signal_counts", "competing_signal_counts", "dominance_ratio", "dominant_taxel",
@@ -7284,6 +11632,26 @@ class TaxelPositionMappingTask(ExperimentTask):
             writer = csv.DictWriter(stream, fieldnames=baseline_fields)
             writer.writeheader()
             writer.writerows(self._baseline_checks)
+        probe_fields = [
+            "timestamp", "taxel_index", "attempt", "phase", "probe_stage",
+            "tcp_x_m", "tcp_y_m", "tcp_z_m", "force_raw_g", "force_reference_g",
+            "force_change_g", "probe_start_z_m", "probe_descent_mm",
+            "onset_confirmed_before_level", "onset_z_m", "extra_descent_mm",
+            "tcp_feedback_age_sec", "tcp_feedback_fresh", "force_sample_age_sec",
+            "working_boundary_z_m", "working_boundary_source", "signal_change_units",
+            "onset_threshold_units", "stronger_target_units", "qualified", "dominance",
+            "sensor_frame_sequence",
+            "strength_confirmation_batch", "strength_confirmation_accepted",
+            "strength_confirmation_median_units",
+        ]
+        with probe_path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=probe_fields, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(self._probe_log)
+        temporary_json = json_path.with_suffix(".json.tmp")
+        with temporary_json.open("w", encoding="utf-8") as stream:
+            stream.write(serialized)
+        os.replace(temporary_json, json_path)
         self.last_result = result
         return result
 
@@ -7292,7 +11660,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         ui_ros = getattr(host, "ui_ros", None)
         if ui_ros is None:
             host._append_sidebar_control_message(
-                "Taxel Position Mapping could not access the force-transmitter controls."
+                f"{self.label} could not access the force-transmitter controls."
             )
             return False
         reader_running = self._force_reader_running(ui_ros)
@@ -7320,7 +11688,7 @@ class TaxelPositionMappingTask(ExperimentTask):
                 )
                 detail = f" ({status})" if status else ""
                 host._append_sidebar_control_message(
-                    "Taxel Position Mapping could not automatically start the "
+                    f"{self.label} could not automatically start the "
                     f"force transmitter{detail}."
                 )
                 return False
@@ -7335,7 +11703,7 @@ class TaxelPositionMappingTask(ExperimentTask):
             "Connecting force transmitter; waiting for a fresh safety sample",
         )
         host._append_sidebar_control_message(
-            "Taxel Position Mapping is connecting the force transmitter "
+            f"{self.label} is connecting the force transmitter "
             "automatically. Robot motion will start only after fresh force "
             "data is received."
         )
@@ -7349,12 +11717,12 @@ class TaxelPositionMappingTask(ExperimentTask):
             self._force_connection_started_at = None
             host._append_sidebar_control_message(
                 "Force transmitter connected and live data received. "
-                "Starting Taxel Position Mapping."
+                f"Starting {self.label}."
             )
             if not self.on_start(host):
                 host._stop_sidebar_control(
                     show_result=False,
-                    message="Taxel Position Mapping did not start",
+                    message=f"{self.label} did not start",
                 )
             return
         ui_ros = getattr(host, "ui_ros", None)
@@ -7381,7 +11749,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._request_stop(
             host,
             "force_connection_failed",
-            "Taxel Position Mapping did not start: "
+            f"{self.label} did not start: "
             f"{detail}. Check the serial port, transmitter power, RS-485 "
             "wiring, protocol, and baud rate.",
         )
@@ -7389,19 +11757,47 @@ class TaxelPositionMappingTask(ExperimentTask):
     def on_start(self, host) -> bool:
         self._active = False
         self._mapping_run_started = False
+        self._coarse_scan_centre = None
+        self._coarse_sparse_pass = False
         self._force_connection_started_at = None
         self._completed = False
         self._stop_reason = ""
+        self._stop_message = ""
+        self._stop_snapshot = None
+        self._probe_log = []
+        self._working_probe_boundary = None
+        self._probe_candidate_seen = False
+        self._clearance_reference_frames = None
+        self._probe_strength_hold = None
+        self._strength_checks = []
+        self._target_strength_check = None
+        self._centre_repeat = None
+        self._centre_checks = []
+        self._target_centre_check = None
+        self._clearance_next_context = ""
+        self._clearance_checks = []
+        self._auto_rerun_count = 0
+        self._auto_rerun_history = []
+        self._auto_rerun_pending = None
+        self._auto_rerun_deadline = None
+        self._fixed_scan_reference_signal = None
+        self._skipped_failed_taxels = set()
+        self._failed_attempt_total = 0
         self.last_result = None
         resume_result = self._resume_request
         relocation_result = self._relocation_request
+        mismatch = position_map_sensor_error(host, resume_result or relocation_result)
+        if mismatch:
+            host._append_sidebar_control_message(mismatch)
+            return False
         if resume_result is not None and relocation_result is not None:
             host._append_sidebar_control_message(
                 "Taxel mapping cannot resume and relocate at the same time."
             )
             return False
-        if resume_result is None:
-            self.use_connected_sensor(host)
+        # Recheck the live identity even for Resume: the sensor may have changed
+        # since the last idle UI refresh. Choices are restored per sensor/anchor.
+        self.use_connected_sensor(host)
         resume_source = self._resume_source_path
         relocation_source = (
             self._relocation_source_path
@@ -7420,6 +11816,12 @@ class TaxelPositionMappingTask(ExperimentTask):
             except (KeyError, TypeError, ValueError) as exc:
                 host._append_sidebar_control_message(
                     f"Taxel mapping cannot resume: invalid saved settings ({exc})."
+                )
+                return False
+            plane_mismatch = self._resume_scan_plane_mismatch(resume_result)
+            if plane_mismatch:
+                host._append_sidebar_control_message(
+                    f"Taxel mapping cannot resume: {plane_mismatch}"
                 )
                 return False
         if relocation_result is not None:
@@ -7449,14 +11851,45 @@ class TaxelPositionMappingTask(ExperimentTask):
                     "not match the live sensor's centre taxel."
                 )
                 return False
+            proposed = revision_setup(relocation_result)
+            if proposed is not None:
+                try:
+                    self.apply_remembered_setup(proposed)
+                except (KeyError, TypeError, ValueError) as exc:
+                    host._append_sidebar_control_message(f"Invalid map setup revision: {exc}")
+                    return False
         if self.anchor_pose is None:
             host._append_sidebar_control_message(
                 f"Remember the current safe pose above Taxel {self.anchor_taxel} before starting mapping."
             )
             return False
+        rerun_limit = finite_number(self.max_auto_reruns)
+        rerun_delay = finite_number(self.auto_rerun_delay_sec)
+        if (rerun_limit is None or not rerun_limit.is_integer()
+                or not 0 <= rerun_limit <= self.MAX_AUTO_RERUNS
+                or rerun_delay is None or not 10. <= rerun_delay <= 600.):
+            host._append_sidebar_control_message(
+                "Invalid automatic recovery settings: choose 0–10 reruns and a 10–600 s cooldown.")
+            return False
         if int(self.anchor_pose.get("taxel_index", -1)) != int(self.anchor_taxel):
             host._append_sidebar_control_message(f"The saved mapping anchor is not Taxel {self.anchor_taxel}; remember it again.")
             return False
+        if self.fixed_scan_z_m is not None:
+            scan_z = finite_number(self.fixed_scan_z_m)
+            anchor_z = float(self.anchor_pose["tool_position_m"][2])
+            if scan_z is None or scan_z > anchor_z - self.MIN_FIXED_SCAN_CLEARANCE_M:
+                host._append_sidebar_control_message(
+                    "The fixed scan height must be at least "
+                    f"{self.MIN_FIXED_SCAN_CLEARANCE_M * 1000.0:.0f} mm below the "
+                    "remembered anchor; remember it again."
+                )
+                return False
+            if anchor_z - scan_z > self.MAX_PROBE_DESCENT_M:
+                host._append_sidebar_control_message(
+                    "The fixed scan height is more than 100 mm below the anchor; "
+                    "remember a valid scan height before starting."
+                )
+                return False
         if (
             float(self.max_probe_descent_m) <= 0.0
             or float(self.probe_speed_m_s) <= 0.0
@@ -7477,6 +11910,8 @@ class TaxelPositionMappingTask(ExperimentTask):
             or int(self.probe_sample_frames) < 3
             or int(self.probe_window_frames) < 3
             or int(self.baseline_frame_count) < 3
+            or int(self.scan_frame_count) < 3
+            or int(self.verify_frame_count) < 3
             or float(self.centre_scan_signal_multiplier) < 1.0
             or float(self.centre_scan_max_extra_descent_m) <= 0.0
         ):
@@ -7491,6 +11926,14 @@ class TaxelPositionMappingTask(ExperimentTask):
         }:
             host._append_sidebar_control_message(
                 "Mapping settings are invalid; select robust-shift, adaptive-range, or fixed-change proximity detection."
+            )
+            return False
+        if (not np.isfinite(self.centre_scan_signal_multiplier)
+                or not np.isfinite(self.centre_scan_max_extra_descent_m)
+                or self.centre_scan_max_extra_descent_m > self.MAX_NONCONTACT_EXTRA_DESCENT_M):
+            host._append_sidebar_control_message(
+                f"Non-contact mapping needs finite scan settings and at most {self.MAX_NONCONTACT_EXTRA_DESCENT_M * 1000.:g} mm extra descent after onset. "
+                "This is not a verified air gap; independently check clearance before use."
             )
             return False
         if (
@@ -7527,13 +11970,28 @@ class TaxelPositionMappingTask(ExperimentTask):
             anchor_position = np.asarray(
                 self.anchor_pose["tool_position_m"], dtype=float
             )
+            current_z_mm = float(current_pose[0][2]) * 1000.0
+            anchor_z_mm = float(anchor_position[2]) * 1000.0
             if (
-                float(np.linalg.norm(current_pose[0][:2] - anchor_position[:2]))
-                > float(self.max_xy_offset_m)
+                resume_result.get("stop_reason") in {"possible_contact", "force_guard", "force_safety_limit"}
+                and current_pose[0][2] < anchor_position[2]-self.position_tolerance_m
             ):
                 host._append_sidebar_control_message(
-                    "Taxel mapping cannot resume: move the robot into the "
-                    "recorded sensor workspace first."
+                    "Resume refused after a force/contact stop: the TCP is at "
+                    f"Z {current_z_mm:.1f} mm, {anchor_z_mm - current_z_mm:.1f} mm "
+                    f"below the saved anchor height Z {anchor_z_mm:.1f} mm. "
+                    "Inspect the probe, raise the robot straight up to at least "
+                    f"Z {anchor_z_mm:.1f} mm, then press Resume again. "
+                    "No automatic retraction or recalibration of a possibly loaded probe."
+                )
+                return False
+            xy_offset_m = float(np.linalg.norm(current_pose[0][:2] - anchor_position[:2]))
+            if xy_offset_m > float(self.max_xy_offset_m):
+                host._append_sidebar_control_message(
+                    "Taxel mapping cannot resume: the TCP is "
+                    f"{xy_offset_m * 1000.0:.1f} mm from the saved anchor in XY "
+                    f"(limit {float(self.max_xy_offset_m) * 1000.0:.0f} mm). "
+                    "Move the robot back over the recorded sensor first."
                 )
                 return False
             current_quaternion = np.asarray(current_pose[1], dtype=float)
@@ -7555,9 +12013,13 @@ class TaxelPositionMappingTask(ExperimentTask):
                 )
             )
             if alignment < float(np.cos(np.radians(2.5))):
+                tilt_deg = float(
+                    np.degrees(2.0 * np.arccos(min(1.0, max(-1.0, alignment))))
+                )
                 host._append_sidebar_control_message(
-                    "Taxel mapping cannot resume: restore the tool orientation "
-                    "used by the saved map first."
+                    "Taxel mapping cannot resume: the tool orientation is "
+                    f"{tilt_deg:.1f}° away from the saved map (limit 5.0°). "
+                    "Restore the saved orientation first."
                 )
                 return False
         frame = self._read_sensor_frame(host)
@@ -7570,6 +12032,14 @@ class TaxelPositionMappingTask(ExperimentTask):
         force = self._fresh_force(host, now)
         if force is None:
             return self._begin_force_meter_connection(host)
+        pose_stamp = finite_number(getattr(api, "current_feedback_state_time", None))
+        if pose_stamp is None or not -0.1 <= now - pose_stamp <= 1.0:
+            host._append_sidebar_control_message("Mapping did not start: robot feedback is stale or untimestamped.")
+            return False
+        if abs(float(force[0])) / self.NEWTONS_PER_GRAM >= CalibrationTask.EMERGENCY_FORCE_G:
+            host._append_sidebar_control_message("Mapping did not start: raw force exceeds the 900 g safety limit for the 1 kg cell.")
+            return False
+        host._append_sidebar_control_message(self._scan_plane_status())
         if resume_result is not None:
             try:
                 self._restore_resume_state(resume_result, resume_source)
@@ -7608,6 +12078,17 @@ class TaxelPositionMappingTask(ExperimentTask):
                 f"resume: returning to the saved safe Taxel {self.anchor_taxel} anchor",
             )
         self._relocation_active = relocation_result is not None
+        self._relocation_continues_mapping = bool(
+            relocation_result is not None
+            and not bool(relocation_result.get("completed"))
+        )
+        self._relocation_finished = False
+        if self._relocation_continues_mapping:
+            # The remaining targets must be the same set the partial map was
+            # started with, whatever the sidebar currently shows.
+            source_settings = relocation_result["settings"]
+            if "skip_outer_border" in source_settings:
+                self.skip_outer_border = bool(source_settings["skip_outer_border"])
         self._relocation_source_result = (
             copy.deepcopy(relocation_result)
             if relocation_result is not None
@@ -7635,6 +12116,7 @@ class TaxelPositionMappingTask(ExperimentTask):
         self._reference_onset_z = None
         self._probe_start_z = None
         self._mapping_queue = []
+        self._current_prediction = None
         self._neighbor_queue = []
         self._neighbor_guesses = {}
         self._predicted_positions = {}
@@ -7684,11 +12166,16 @@ class TaxelPositionMappingTask(ExperimentTask):
         if callable(setter):
             setter(True)
         if self._relocation_active:
+            continuation = (
+                " It then continues mapping the remaining taxels."
+                if self._relocation_continues_mapping
+                else ""
+            )
             host._append_sidebar_control_message(
                 "Taxel map relocation started. The task will locate the new "
                 "centre and neighbours, verify distributed taxels, and save a "
-                "new transformed map. Keep the workspace clear and remain "
-                "beside the emergency stop."
+                "new transformed map." + continuation + " Keep the workspace "
+                "clear and remain beside the emergency stop."
             )
         else:
             host._append_sidebar_control_message(
@@ -7716,6 +12203,13 @@ class TaxelPositionMappingTask(ExperimentTask):
         if force is None:
             self._request_stop(host, "force_stale", "Mapping stopped: the force-transmitter reading became stale.")
             return
+        pose_stamp = finite_number(getattr(self._robot_api(host), "current_feedback_state_time", None))
+        if pose_stamp is None or not -0.1 <= now - pose_stamp <= 1.0:
+            self._request_stop(host, "robot_feedback_stale", "Mapping stopped: robot feedback is stale.")
+            return
+        if abs(float(force[0])) / self.NEWTONS_PER_GRAM >= CalibrationTask.EMERGENCY_FORCE_G:
+            self._request_stop(host, "force_safety_limit", "Mapping stopped: raw force reached 900 g.")
+            return
         if self._force_baseline_n is not None:
             force_delta_g = abs(float(force[0]) - float(self._force_baseline_n)) / self.NEWTONS_PER_GRAM
             if force_delta_g >= float(self.force_guard_g):
@@ -7725,6 +12219,19 @@ class TaxelPositionMappingTask(ExperimentTask):
                     f"Mapping stopped: unexpected contact force changed by {force_delta_g:.1f} g.",
                 )
                 return
+            if force_delta_g >= self.NONCONTACT_FORCE_STOP_G:
+                self._request_stop(
+                    host,
+                    "possible_contact",
+                    f"Non-contact mapping stopped: force changed by {force_delta_g:.1f} g "
+                    f"(conservative {self.NONCONTACT_FORCE_STOP_G:.0f} g stop). "
+                    "Possible contact; no automatic retraction or XY scanning. Inspect clearance before resuming.",
+                )
+                return
+        if self._auto_rerun_pending is not None and not self._at_auto_rerun_anchor(host):
+            self._request_stop(host, "auto_rerun_clearance_lost",
+                               "Automatic rerun cancelled: TCP left the clearance pose during recovery. Inspect before resuming.")
+            return
         if self._phase == "sensor_calibrating":
             self._tick_sensor_calibration(host, now)
             return
@@ -7745,6 +12252,8 @@ class TaxelPositionMappingTask(ExperimentTask):
             self._tick_collection(host, frame, force[0])
         elif self._phase == "probing":
             self._tick_probe(host, frame)
+        elif self._phase == "auto_rerun_wait":
+            self._tick_auto_rerun_wait(host, now)
 
     def on_stop(self, host, show_result: bool = True) -> None:
         was_active = bool(self._active)
@@ -7752,6 +12261,18 @@ class TaxelPositionMappingTask(ExperimentTask):
         CalibrationTask._stop_robot(self._robot_api(host))
         if was_active and not self._stop_reason:
             self._stop_reason = "manual_stop"
+        self._auto_rerun_deadline = None
+        self._auto_rerun_pending = None
+        if self._auto_rerun_history and self._auto_rerun_history[-1].get("status") == "waiting":
+            self._auto_rerun_history[-1].update(
+                status="cancelled", ended_at=datetime.now(timezone.utc).isoformat(),
+                stop_reason=self._stop_reason,
+            )
+        if was_active and self._stop_snapshot is None:
+            try:
+                self._stop_snapshot = self._mapping_snapshot(host)
+            except Exception as exc:
+                self._stop_snapshot = {"diagnostic_error": str(exc)}
         if (
             self._sensor_calibration_history
             and self._sensor_calibration_history[-1].get("status") == "running"
@@ -7769,7 +12290,12 @@ class TaxelPositionMappingTask(ExperimentTask):
         setter = getattr(host, "_set_taxel_mapping_controls_running", None)
         if callable(setter):
             setter(False)
-        self._progress(host, "Complete" if self._completed else "Stopped")
+        self._progress(
+            host,
+            "Complete" if self._completed else (
+                f"Stopped: {self._stop_message or self._stop_reason.replace('_', ' ') or 'reason not reported'}"
+            ),
+        )
         if not was_active or not mapping_run_started:
             return
         try:
@@ -8343,6 +12869,7 @@ TASKS: List[ExperimentTask] = [
     CalibrationTask(),
     FullTaxelCalibrationTask(),
     CalibrationGraphAnalysisTask(),
+    SensorCharacterisationTask(),
 ]
 
 

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import csv
 import json
 import math
 from collections import defaultdict
@@ -12,6 +11,7 @@ from pathlib import Path
 import numpy as np
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -29,8 +29,8 @@ from phd.ui.calibration_analysis import (
     APPROACH_PHASES,
     RETURN_PHASE,
     analyze_calibration_rows,
-    available_taxel_indices,
     calibration_rows_for_taxel,
+    read_calibration_csv_rows,
 )
 from phd.ui.calibration_result_dialog import (
     CalibrationCurveWidget,
@@ -38,6 +38,13 @@ from phd.ui.calibration_result_dialog import (
     CalibrationTaxelMap,
     SIGNAL_LABELS,
 )
+from phd.ui.calibration_comparison import (
+    CalibrationComparisonDialog, comparison_group, shared_axis_ranges,
+)
+from phd.ui.calibration_recording_catalog import (
+    catalog_full_taxel_run, dataset_rows, recorded_taxels,
+)
+from phd.ui.calibration_sequence import sequence_segments, RETURN_STAGE_LABELS
 
 
 SIGNAL_FIELD_PREFERENCE = (
@@ -69,19 +76,6 @@ def _finite(value):
     except (TypeError, ValueError):
         return None
     return value if math.isfinite(value) else None
-
-
-def _coerce_csv_value(value):
-    if value is None:
-        return None
-    text = str(value).strip()
-    if not text:
-        return None
-    try:
-        number = float(text)
-    except ValueError:
-        return text
-    return number if math.isfinite(number) else None
 
 
 def _infer_signal_field(rows, preferred=None):
@@ -126,12 +120,7 @@ def _resolve_reference(reference, base_directory):
 
 def _read_csv_rows(path):
     path = Path(path).expanduser().resolve()
-    with path.open("r", encoding="utf-8-sig", newline="") as stream:
-        reader = csv.DictReader(stream)
-        rows = [
-            {key: _coerce_csv_value(value) for key, value in row.items()}
-            for row in reader
-        ]
+    rows = read_calibration_csv_rows(path)
     if not rows:
         raise ValueError(f"The CSV contains no data rows: {path}")
     return rows
@@ -322,11 +311,15 @@ def _raw_csv_for_graph(path):
     return None
 
 
-def load_calibration_recording(path):
+def load_calibration_recording(path, *, browse_full_run=False):
     """Load raw trial data selected through CSV, JSON, or an exported graph."""
     path = Path(path).expanduser().resolve()
     if not path.is_file():
         raise FileNotFoundError(f"Calibration file does not exist: {path}")
+    if browse_full_run:
+        catalog = catalog_full_taxel_run(path)
+        if catalog is not None:
+            return catalog
     suffix = path.suffix.lower()
     if suffix == ".json":
         datasets = _load_json(path)
@@ -422,6 +415,8 @@ def _averaged_xy(rows, x_field, y_field, phases):
 
 
 def _hysteresis_metrics(rows, y_field):
+    if any(str(row.get("step_state", "")) == "dwell" for row in rows):
+        rows = [row for row in rows if str(row.get("step_state", "")) == "dwell"]
     load_x, load_y = _averaged_xy(
         rows, "travel_down_mm", y_field, APPROACH_PHASES
     )
@@ -473,7 +468,9 @@ def analyze_calibration_dataset(dataset):
     signals = _series(rows, signal_field)
     forces = _series(rows, "force_delta_abs_g")
     approach_signals = _series(rows, signal_field, APPROACH_PHASES)
-    baseline_values = approach_signals[: min(10, len(approach_signals))]
+    baseline_values = _series(rows, signal_field, {"force_baseline"})
+    if not baseline_values:
+        baseline_values = approach_signals[: min(10, len(approach_signals))]
     baseline_median = (
         float(np.median(baseline_values)) if baseline_values else None
     )
@@ -516,6 +513,8 @@ def analyze_calibration_dataset(dataset):
         "signal_field": signal_field,
         "signal_label": SIGNAL_LABELS.get(signal_field, signal_field),
         "metadata": dict(dataset.get("metadata") or {}),
+        "sequence_segments": sequence_segments(rows),
+        "onset_warnings": core.get("warnings", []),
         "acquisition": {
             "sample_count": len(rows),
             "invalid_core_sample_count": invalid_core_samples,
@@ -542,6 +541,20 @@ def analyze_calibration_dataset(dataset):
             "contact_detection_threshold_g": core.get(
                 "contact_detection_threshold_g"
             ),
+            "proximity_range": core.get("proximity_range"),
+            "turning_point": (
+                core.get("turning_point")
+                if (core.get("turning_point") or {}).get("detected") else None
+            ),
+            "turning_point_status": core.get("turning_point"),
+            "baseline_return": (
+                core.get("baseline_return")
+                if (core.get("baseline_return") or {}).get("reached") else None
+            ),
+        },
+        "transition_models": {
+            "force_signal_drop": core.get("force_signal_drop_fit"),
+            "force_signal_rise": core.get("force_signal_rise_fit"),
         },
         "response": {
             "peak_force_g": max(forces) if forces else None,
@@ -624,6 +637,11 @@ def analyze_calibration_batch(analyses):
             "distance_mm",
         ),
         "proximity_window_mm": ("events", "proximity_window_mm"),
+        "proximity_range_mm": ("events", "proximity_range", "distance_above_contact_mm"),
+        "turning_force_g": ("events", "turning_point", "force_g"),
+        "turning_after_contact_mm": ("events", "turning_point", "after_contact_mm"),
+        "baseline_return_force_g": ("events", "baseline_return", "force_g"),
+        "force_signal_rise_slope": ("transition_models", "force_signal_rise", "slope"),
         "peak_force_g": ("response", "peak_force_g"),
         "maximum_travel_mm": ("response", "maximum_travel_mm"),
         "signal_distance_slope": ("models", "signal_distance", "slope"),
@@ -688,6 +706,87 @@ def _fit_report(title, fit, x_unit, y_unit):
     ]
 
 
+_PROXIMITY_STATUS_TEXT = {
+    "start_inside_range": (
+        "the response was already present at the start pose, so the range is a "
+        "lower bound. Raise the start pose and recalibrate there."
+    ),
+    "proximity_not_detected": "no proximity response was detected before contact.",
+    "contact_not_reached": "force contact was not reached, so the range cannot be referenced.",
+}
+_TURNING_REASON_TEXT = {
+    "contact_not_reached": "force contact was not reached.",
+    "no_signal_drop": "the signal never dropped below its baseline noise threshold.",
+    "no_rise_within_loading": (
+        "the signal had not started rising when loading stopped; use a higher force target."
+    ),
+    "no_loading_samples": "no loading samples were recorded.",
+}
+
+
+def _calibration_target_report(analysis, signal_unit):
+    events = analysis["events"]
+    models = analysis.get("transition_models") or {}
+    proximity = events.get("proximity_range") or {}
+    turning = events.get("turning_point")
+    turning_status = events.get("turning_point_status") or {}
+    baseline_return = events.get("baseline_return")
+    lines = ["4b. CALIBRATION TARGETS"]
+    if proximity.get("status") == "measured":
+        lines.append(
+            "- Proximity range: first response "
+            f"{_number(proximity.get('distance_above_contact_mm'), 3, ' mm')} of robot travel "
+            "before force contact."
+        )
+    else:
+        detail = _PROXIMITY_STATUS_TEXT.get(proximity.get("status"), "not available.")
+        bound = proximity.get("lower_bound_mm")
+        lines.append(
+            "- Proximity range: "
+            + (f"at least {_number(bound, 3, ' mm')}; " if bound is not None else "")
+            + detail
+        )
+    if turning:
+        cross = turning.get("unaveraged_cross_check") or {}
+        lines.extend([
+            f"- Drop-to-rise turning point: {_number(turning.get('force_g'), 2, ' g')} "
+            f"(flat band {_number(turning.get('force_low_g'), 2)}–"
+            f"{_number(turning.get('force_high_g'), 2, ' g')}), "
+            f"{_number(turning.get('after_contact_mm'), 3, ' mm')} after force contact, "
+            f"signal {_number(turning.get('signal'), 3, ' ' + signal_unit)}.",
+            f"  Unaveraged cross-check ({cross.get('signal_field', 'not recorded')}): "
+            f"{_number(cross.get('force_g'), 2, ' g')}, "
+            f"{_number(cross.get('after_contact_mm'), 3, ' mm')} after contact.",
+        ])
+        if turning.get("before_detected_contact"):
+            lines.append(
+                "  The minimum precedes the detected force contact: the turning force "
+                "is below the load-cell detection threshold."
+            )
+    else:
+        lines.append(
+            "- Drop-to-rise turning point: not found; "
+            + _TURNING_REASON_TEXT.get(turning_status.get("reason"), "not available.")
+        )
+    lines.append(
+        "- Signal back at no-touch baseline: "
+        + (
+            f"{_number(baseline_return.get('force_g'), 2, ' g')}; below this force the "
+            "signal alone cannot separate proximity/light contact from no touch."
+            if baseline_return else "not reached within this loading."
+        )
+    )
+    lines.extend(_fit_report(
+        "Force from sensor response, drop branch (contact to turning point)",
+        models.get("force_signal_drop"), signal_unit, "g",
+    ))
+    lines.extend(_fit_report(
+        "Force from sensor response, rise branch (turning point onwards)",
+        models.get("force_signal_rise"), signal_unit, "g",
+    ))
+    return lines
+
+
 def build_trial_report(analysis):
     acquisition = analysis["acquisition"]
     events = analysis["events"]
@@ -705,7 +804,31 @@ def build_trial_report(analysis):
     signal_unit = "%" if "%" in analysis["signal_label"] else "sensor units"
     signal_onset = events.get("signal_onset") or {}
     contact_onset = events.get("contact_onset") or {}
-    warnings = []
+    warnings = list(analysis.get("onset_warnings") or [])
+    quality = metadata.get("measurement_quality") or {}
+    motion = quality.get("motion") or {}
+    stages = analysis.get("sequence_segments") or []
+    stepwise = motion.get("mode") == "stepwise" or any(stage["kind"] in {"unloading", "fast_return"} for stage in stages)
+    profile = motion.get("mode") == "proximity_profile_steps" or metadata.get("protocol") == "proximity_profile"
+    return_label = "nominal slow-unloading rate" if stepwise else "configured return speed"
+    fast_return = _finite(metadata.get("fast_return_command_speed_m_s"))
+    return_notes = []
+    if profile:
+        return_notes.append("- Proximity profile uses its own position-step speeds; the legacy return-speed field is not a profile speed.")
+    elif stepwise:
+        return_notes.extend([
+            "- Fast return commanded speed: " + (
+                f"{fast_return * 1000.0:.4f} mm/s" if fast_return is not None else "not recorded in this file"
+            ) + ". This is separate from slow unloading; not a measured TCP speed.",
+            "- Slow unloading includes dwell between steps. Fast return includes arrival settling; recovery is stationary observation at the anchor.",
+        ])
+    for stage in stages:
+        if stage["kind"] in RETURN_STAGE_LABELS:
+            return_notes.append(f"- {stage['label']}: {stage['start_s']:.2f}–{stage['end_s']:.2f} s (recorded stage boundaries).")
+    if quality.get("interrupted"):
+        warnings.append("Communication pause occurred. Wall time is retained; exclude this interrupted trial from uninterrupted loading comparisons.")
+    if not quality:
+        warnings.append("Legacy recording: acquisition timestamps and safety-range provenance are incomplete.")
     if not signal_onset:
         warnings.append("Proximity onset was not detected.")
     if not contact_onset:
@@ -752,8 +875,9 @@ def build_trial_report(analysis):
             f"stop reason: {metadata.get('stop_reason', 'not available')}",
             "- Approach speed: "
             f"{_number(None if approach_speed is None else approach_speed * 1000.0, 4, ' mm/s')}; "
-            "return speed: "
-            f"{_number(None if return_speed is None else return_speed * 1000.0, 4, ' mm/s')}",
+            f"{return_label}: "
+            f"{_number(None if return_speed is None or profile else return_speed * 1000.0, 4, ' mm/s')}",
+            *return_notes,
             "- Requested maximum contact force: "
             f"{_number(metadata.get('contact_threshold_g'), 2, ' g')}; "
             f"contact hold: {_number(metadata.get('contact_hold_sec'), 3, ' s')}",
@@ -803,6 +927,8 @@ def build_trial_report(analysis):
             f"{_number(events.get('signal_change_threshold'), 3, ' ' + signal_unit)}; "
             f"contact detection threshold: "
             f"{_number(events.get('contact_detection_threshold_g'), 2, ' g')}.",
+            "",
+            *_calibration_target_report(analysis, signal_unit),
             "",
             "5. RANGE AND RESPONSE",
             f"- Maximum travel: {_number(response.get('maximum_travel_mm'), 4, ' mm')}",
@@ -910,6 +1036,11 @@ def build_batch_report(batch):
         "signal_onset_distance_mm": ("Proximity onset distance", "mm"),
         "contact_onset_distance_mm": ("Contact onset distance", "mm"),
         "proximity_window_mm": ("Non-contact proximity window", "mm"),
+        "proximity_range_mm": ("Proximity range (start outside range only)", "mm"),
+        "turning_force_g": ("Drop-to-rise turning force", "g"),
+        "turning_after_contact_mm": ("Turning point after force contact", "mm"),
+        "baseline_return_force_g": ("Force where signal returns to baseline", "g"),
+        "force_signal_rise_slope": ("Force-signal slope, rise branch", "g/signal unit"),
         "peak_force_g": ("Peak force", "g"),
         "maximum_travel_mm": ("Maximum travel", "mm"),
         "signal_distance_slope": ("Signal-distance slope", "signal unit/mm"),
@@ -955,7 +1086,8 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self.datasets = list(self.loaded_recording.get("datasets") or [])
         if not self.datasets:
             raise ValueError("No calibration trials were loaded.")
-        first_metadata = dict(self.datasets[0].get("metadata") or {})
+        initial_index = max(0, min(int(self.loaded_recording.get("initial_dataset_index", 0)), len(self.datasets) - 1))
+        first_metadata = dict(self.datasets[initial_index].get("metadata") or {})
         self.selected_taxel_index = int(
             first_metadata.get("taxel_index", 0) or 0
         )
@@ -964,6 +1096,11 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self.analyses = []
         self.batch_analysis = analyze_calibration_batch([])
         self._detail_dialog = None
+        self._detail_dialogs = []
+        self._comparison_dialog = None
+        self._shared_range_cache = {}
+        self._scale_error = ""
+        self._displayed_index = initial_index
         self.setWindowTitle("Calibration Graph Analysis")
         self.setModal(False)
         components.size_to_screen(self, 1300, 850)
@@ -989,12 +1126,29 @@ class CalibrationGraphAnalysisDialog(QDialog):
         selector_layout.addWidget(QLabel("Analysed trial"))
         self.trial_selector = QComboBox(self)
         for dataset in self.datasets:
-            self.trial_selector.addItem(str(dataset.get("name") or "Trial"))
+            self.trial_selector.addItem(
+                f"{dataset.get('name') or 'Trial'} · probed taxel {self._original_taxel(dataset)}"
+            )
+            self.trial_selector.setItemData(
+                self.trial_selector.count() - 1, str(dataset.get("source_path") or ""), Qt.ToolTipRole,
+            )
         self.trial_selector.setEnabled(len(self.datasets) > 1)
+        self.trial_selector.setCurrentIndex(initial_index)
         selector_layout.addWidget(self.trial_selector, 1)
+        self.shared_scales_check = QCheckBox("Shared scales across nodes")
+        self.shared_scales_check.setChecked(True)
+        self.shared_scales_check.setToolTip(
+            "Use the same time, travel, force and signed signal limits for all "
+            "loaded trials/nodes with the same sensor identity, grid and signal units. "
+            "Uncheck for independent auto-scaling. Reset restores shared limits after zooming."
+        )
+        selector_layout.addWidget(self.shared_scales_check)
+        reset_scales = QPushButton("Reset View")
+        reset_scales.clicked.connect(self._reset_chart_views)
+        selector_layout.addWidget(reset_scales)
         layout.addLayout(selector_layout)
 
-        sensor_rows, sensor_columns = _dataset_sensor_shape(self.datasets[0])
+        sensor_rows, sensor_columns = _dataset_sensor_shape(self.datasets[initial_index])
         taxel_panel = QWidget(self)
         taxel_layout = QVBoxLayout(taxel_panel)
         taxel_layout.setContentsMargins(0, 0, 8, 0)
@@ -1003,7 +1157,8 @@ class CalibrationGraphAnalysisDialog(QDialog):
             f"font-weight: 600; color: {theme.TEXT_PRIMARY};"
         )
         taxel_hint = QLabel(
-            "Click a node to recalculate this trial's graphs and report.\n"
+            "Click a recorded node to open its own trial, graphs and report.\n"
+            "Grey nodes have no saved data. No robot motion.\n"
             "Indices are top-down, column-major."
         )
         taxel_hint.setWordWrap(True)
@@ -1051,6 +1206,17 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self.batch_report_view.setLineWrapMode(QTextEdit.NoWrap)
         self.tabs.addTab(self.batch_report_view, "Batch Repeatability")
         self.batch_tab_index = self.tabs.indexOf(self.batch_report_view)
+        self.characterisation_view = QTextEdit(self)
+        self.characterisation_view.setReadOnly(True)
+        self.tabs.addTab(self.characterisation_view, "Quality & Characterisation")
+        self.contact_chart = CalibrationCurveWidget([], "diff_ave", mode="signal_distance")
+        self.contact_chart.contact_referenced = True
+        self.contact_chart.distance_label = "TCP travel relative to detected contact (mm)"
+        self.tabs.addTab(self.contact_chart, "Contact-referenced Signal")
+        self.contact_chart.detailRequested.connect(self._open_contact_chart_detail)
+        self.matched_force_chart = CalibrationCurveWidget([], "diff_ave", mode="repeatability")
+        self.matched_force_chart.repeatability_x_field = "force_delta_abs_g"
+        self.matched_force_tab_index = self.tabs.addTab(self.matched_force_chart, "Matched-force Variation")
         content_layout = QHBoxLayout()
         content_layout.addWidget(taxel_panel)
         content_layout.addWidget(self.tabs, 1)
@@ -1058,18 +1224,25 @@ class CalibrationGraphAnalysisDialog(QDialog):
 
         actions = QHBoxLayout()
         hint = QLabel(
-            "Graphs: move the mouse for x/y values, use the wheel to zoom, "
-            "drag to pan, or open a large detail view."
+            "Select a node, then add it to comparison. Detail windows stay open."
         )
+        hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         actions.addWidget(hint, 1)
         open_button = QPushButton("Open Selected Graph")
+        self.compare_button = QPushButton("Compare Nodes…")
+        self.compare_button.setToolTip(
+            "Pin this node/trial, then add more or import another sensor/experiment "
+            "for linked side-by-side or overlay plots."
+        )
+        self.compare_button.clicked.connect(self._open_comparison)
         export_button = QPushButton("Export Analysis Report")
         close_button = QPushButton("Close")
         open_button.clicked.connect(self._open_selected_chart)
         export_button.clicked.connect(self._export_report)
         close_button.clicked.connect(self.close)
         actions.addWidget(open_button)
+        actions.addWidget(self.compare_button)
         actions.addWidget(export_button)
         actions.addWidget(close_button)
         layout.addLayout(actions)
@@ -1079,8 +1252,9 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self.status_label.setStyleSheet(f"color: {theme.TEXT_MUTED};")
         layout.addWidget(self.status_label)
 
-        self.trial_selector.currentIndexChanged.connect(self._select_trial)
+        self.trial_selector.currentIndexChanged.connect(self._choose_trial)
         self.taxel_map.taxelSelected.connect(self._select_taxel)
+        self.shared_scales_check.toggled.connect(self._update_shared_scales)
         self._apply_taxel(self.selected_taxel_index)
 
     @staticmethod
@@ -1089,17 +1263,23 @@ class CalibrationGraphAnalysisDialog(QDialog):
         return int(metadata.get("taxel_index", 0) or 0)
 
     def _available_taxels(self, dataset):
-        return available_taxel_indices(
-            dataset.get("rows") or [],
-            dataset.get("signal_field") or "diff_ave",
-            legacy_index=self._original_taxel(dataset),
-        )
+        return recorded_taxels(dataset)
+
+    def _map_taxels(self, dataset):
+        group = comparison_group(dataset)
+        if self.loaded_recording.get("full_taxel_run"):
+            return sorted({self._original_taxel(item) for item in self.datasets
+                           if comparison_group(item) == group})
+        return sorted({taxel for item in self.datasets if comparison_group(item) == group
+                       for taxel in self._available_taxels(item)})
 
     def _project_dataset(self, dataset, taxel_index):
+        if taxel_index not in self._available_taxels(dataset):
+            return None
         signal_field = str(dataset.get("signal_field") or "diff_ave")
         original_taxel = self._original_taxel(dataset)
         rows = calibration_rows_for_taxel(
-            dataset.get("rows") or [],
+            dataset_rows(dataset),
             signal_field,
             taxel_index,
             legacy_index=original_taxel,
@@ -1122,9 +1302,18 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self.selected_taxel_index = int(taxel_index)
         self.projected_datasets = {}
         self.analyses_by_index = {}
-        repeatability_trials = []
+        self.characterisation_trials = {}
         analyses = []
+        group = comparison_group(self.datasets[self._current_index()])
+        from phd.ui.characterisation_analysis import trial_characterisation, batch_characterisation
         for index, dataset in enumerate(self.datasets):
+            if (comparison_group(dataset) != group
+                    or (self.loaded_recording.get("full_taxel_run")
+                        and self._original_taxel(dataset) != self.selected_taxel_index)
+                    or self.selected_taxel_index not in self._available_taxels(dataset)):
+                if dataset.get("deferred_csv"):
+                    dataset["rows"] = []  # Keep only the currently analysed node's trials in RAM.
+                continue
             projected = self._project_dataset(
                 dataset,
                 self.selected_taxel_index,
@@ -1135,43 +1324,75 @@ class CalibrationGraphAnalysisDialog(QDialog):
             self.projected_datasets[index] = projected
             self.analyses_by_index[index] = analysis
             analyses.append(analysis)
-            repeatability_trials.append(
-                {
-                    "trial_number": index + 1,
-                    "rows": projected["rows"],
-                }
-            )
+            self.characterisation_trials[index] = trial_characterisation(projected)
         self.analyses = analyses
-        self.batch_analysis = analyze_calibration_batch(analyses)
-        signal_field = str(self.datasets[0].get("signal_field") or "diff_ave")
-        self.charts["repeatability"].set_trials(
-            repeatability_trials,
-            signal_field,
-        )
-        repeatable = len(repeatability_trials) > 1
-        self.tabs.setTabEnabled(self.repeatability_tab_index, repeatable)
-        self.batch_report_view.setPlainText(
-            build_batch_report(self.batch_analysis)
-        )
-        self.tabs.setTabEnabled(self.batch_tab_index, repeatable)
+        self.characterisation_batch = batch_characterisation(list(self.projected_datasets.values()))
         self._select_trial(self._current_index())
+
+    def _refresh_condition_comparison(self, index):
+        from phd.ui.characterisation_analysis import _condition_key, contact_points
+        dataset = self.projected_datasets[index]
+        condition = _condition_key(dataset)
+        indices = [
+            i for i, candidate in self.projected_datasets.items()
+            if _condition_key(candidate) == condition
+            and self.characterisation_trials[i]["eligible_for_comparison"]
+        ]
+        trials = [{"trial_number": i + 1, "rows": self.projected_datasets[i]["rows"]} for i in indices]
+        self.charts["repeatability"].set_trials(trials, dataset["signal_field"])
+        self.matched_force_chart.set_trials([
+            {"trial_number": i + 1, "rows": [
+                {"phase": "approaching", "elapsed_s": number,
+                 "force_delta_abs_g": force, dataset["signal_field"]: signal}
+                for number, (signal, force) in enumerate(contact_points(self.projected_datasets[i]))
+            ]} for i in indices
+        ], dataset["signal_field"])
+        self.tabs.setTabEnabled(self.matched_force_tab_index, len(trials) > 1)
+        self.batch_analysis = analyze_calibration_batch([self.analyses_by_index[i] for i in indices])
+        self.batch_report_view.setPlainText(
+            "Only uninterrupted, complete, matching-condition trials are included.\n\n"
+            + build_batch_report(self.batch_analysis)
+        )
+        self.tabs.setTabEnabled(self.repeatability_tab_index, len(trials) > 1)
+        self.tabs.setTabEnabled(self.batch_tab_index, len(trials) > 1)
 
     def _select_taxel(self, taxel_index):
         taxel_index = int(taxel_index)
+        current_index = self._current_index()
+        current = self.datasets[current_index]
+        group = comparison_group(current)
         matching_indices = [
             index
             for index, dataset in enumerate(self.datasets)
-            if taxel_index in self._available_taxels(dataset)
+            if comparison_group(dataset) == group and taxel_index in self._available_taxels(dataset)
+            and (not self.loaded_recording.get("full_taxel_run") or self._original_taxel(dataset) == taxel_index)
         ]
         if not matching_indices:
             self.status_label.setText(
                 f"Taxel {taxel_index} has no recorded calibration data."
             )
             return
-        current_index = self._current_index()
-        if current_index not in matching_indices:
+        # A physical calibration of this node takes precedence over a neighbour's
+        # signal captured while pressing a different node in an old full-grid CSV.
+        physical = [i for i in matching_indices if self._original_taxel(self.datasets[i]) == taxel_index]
+        candidates = physical or matching_indices
+        trial_number = (current.get("metadata") or {}).get("trial_number")
+        next_index = current_index if current_index in candidates else next(
+            (i for i in candidates if (self.datasets[i].get("metadata") or {}).get("trial_number") == trial_number),
+            candidates[0],
+        )
+        try:
+            # Validate before changing selection; a removed/changed file must not
+            # relabel the previous node's graph as the newly clicked node.
+            for i in matching_indices:
+                dataset_rows(self.datasets[i])
+        except (OSError, ValueError) as exc:
+            self.taxel_map.set_taxels(self._map_taxels(current), self.selected_taxel_index)
+            self.status_label.setText(f"Could not load Taxel {taxel_index}: {exc}")
+            return
+        if current_index != next_index:
             self.trial_selector.blockSignals(True)
-            self.trial_selector.setCurrentIndex(matching_indices[0])
+            self.trial_selector.setCurrentIndex(next_index)
             self.trial_selector.blockSignals(False)
         self._apply_taxel(taxel_index)
 
@@ -1186,40 +1407,129 @@ class CalibrationGraphAnalysisDialog(QDialog):
             for taxel in self._available_taxels(dataset)
             if 0 <= int(taxel) < taxel_count
         ]
-        if self.selected_taxel_index not in available and available:
+        if available and (self.selected_taxel_index not in available or index not in self.projected_datasets):
             original_taxel = self._original_taxel(dataset)
-            fallback = (
-                original_taxel
-                if original_taxel in available
-                else int(available[0])
-            )
+            fallback = self.selected_taxel_index
+            if self.loaded_recording.get("full_taxel_run") or fallback not in available:
+                fallback = original_taxel if original_taxel in available else int(available[0])
             self._apply_taxel(fallback)
             return
-        self.taxel_map.set_taxels(available, self.selected_taxel_index)
+        map_taxels = [i for i in self._map_taxels(dataset) if 0 <= i < taxel_count]
+        self.taxel_map.set_taxels(map_taxels, self.selected_taxel_index)
         dataset = self.projected_datasets.get(index)
         analysis = self.analyses_by_index.get(index)
         if dataset is None or analysis is None:
             return
+        self._refresh_condition_comparison(index)
         self.report_view.setPlainText(build_trial_report(analysis))
+        from phd.ui.characterisation_analysis import characterisation_report
+        from phd.ui.calibration_analysis import contact_referenced_rows
+        self.characterisation_view.setPlainText(characterisation_report(
+            self.characterisation_trials[index], self.characterisation_batch
+        ))
+        referenced = contact_referenced_rows(dataset["rows"], dataset["signal_field"])
+        self.contact_chart.set_data(
+            [{**r, "travel_down_mm": r["contact_relative_travel_mm"]} for r in referenced],
+            dataset["signal_field"],
+        )
         for mode, chart in self.charts.items():
             if mode == "repeatability":
                 continue
             chart.set_data(dataset["rows"], dataset["signal_field"])
+        self._update_shared_scales()
         original_taxel = self._original_taxel(self.datasets[index])
         self.taxel_context_label.setText(
             f"Viewing taxel {self.selected_taxel_index}\n"
-            f"Physical target: taxel {original_taxel}"
+            f"Physical target: taxel {original_taxel}\n"
+            f"{len(map_taxels)} nodes with saved data"
         )
+        partial = (dataset.get("metadata", {}).get("measurement_quality") or {}).get("trial_completed") is False
+        warnings = self.loaded_recording.get("catalog_warnings") or []
         self.status_label.setText(
-            f"Taxel {self.selected_taxel_index} | Raw data: "
+            ("Partial / interrupted trial — " if partial else "")
+            + (self._scale_error + " " if self._scale_error else "")
+            + (f"{len(warnings)} unreadable trial(s) skipped; see tooltip. " if warnings else "")
+            + f"Taxel {self.selected_taxel_index} | Raw data: "
             f"{dataset['source_path']}"
         )
+        self.status_label.setToolTip("\n".join(warnings))
+        self._displayed_index = index
+
+    def _choose_trial(self, index):
+        previous, previous_taxel = self._displayed_index, self.selected_taxel_index
+        try:
+            dataset_rows(self.datasets[index])
+            self._select_trial(index)
+        except (OSError, ValueError) as exc:
+            self.trial_selector.blockSignals(True)
+            self.trial_selector.setCurrentIndex(previous)
+            self.trial_selector.blockSignals(False)
+            self._apply_taxel(previous_taxel)
+            self.status_label.setText(f"Could not load this trial: {exc}")
 
     def _current_index(self):
         return max(0, min(self.trial_selector.currentIndex(), len(self.datasets) - 1))
 
+    def _current_shared_ranges(self):
+        if not self.shared_scales_check.isChecked():
+            return {}
+        group = comparison_group(self.datasets[self._current_index()])
+        if group not in self._shared_range_cache:
+            try:
+                self._shared_range_cache[group] = shared_axis_ranges([
+                    dataset for dataset in self.datasets if comparison_group(dataset) == group
+                ])
+                self._scale_error = ""
+            except (OSError, ValueError) as exc:
+                self._scale_error = f"Shared scales unavailable; using auto-scale. {exc}"
+                return {}
+        return self._shared_range_cache[group]
+
+    def _update_shared_scales(self, *_args):
+        ranges = self._current_shared_ranges()
+        for chart in [*self.charts.values(), self.contact_chart, self.matched_force_chart]:
+            chart.set_shared_axis_ranges(ranges)
+
+    def _reset_chart_views(self):
+        for chart in [*self.charts.values(), self.contact_chart, self.matched_force_chart]:
+            chart.reset_view()
+
+    def _open_comparison(self):
+        if self._comparison_dialog is None:
+            try:
+                dialog = CalibrationComparisonDialog(self.datasets, self)
+            except ImportError as exc:
+                self.status_label.setText(f"Comparison needs Matplotlib: {exc}")
+                return
+            self._comparison_dialog = dialog
+            dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+            dialog.destroyed.connect(lambda _=None: setattr(self, "_comparison_dialog", None))
+        dialog = self._comparison_dialog
+        dialog.add_node(self._current_index(), self.selected_taxel_index)
+        dialog.select_dataset(self._current_index())
+        selected = dialog.node_selector.findData(self.selected_taxel_index)
+        if selected >= 0:
+            dialog.node_selector.setCurrentIndex(selected)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _open_selected_chart(self):
         widget = self.tabs.currentWidget()
+        if widget is self.contact_chart:
+            self._open_contact_chart_detail()
+            return
+        if widget is self.matched_force_chart:
+            dialog = CalibrationGraphDetailDialog(
+                f"Signal variation at matched force — Taxel {self.selected_taxel_index} · "
+                f"{self.datasets[self._current_index()].get('name', 'Trial')}",
+                [], self.matched_force_chart.signal_field,
+                "repeatability", parent=self, trial_results=self.matched_force_chart.trial_results,
+            )
+            dialog.chart.repeatability_x_field = "force_delta_abs_g"
+            dialog.chart.set_shared_axis_ranges(self.matched_force_chart.shared_axis_ranges)
+            self._show_extra_detail(dialog)
+            return
         for mode, chart in self.charts.items():
             if widget is chart:
                 self._open_chart_detail(mode)
@@ -1228,36 +1538,55 @@ class CalibrationGraphAnalysisDialog(QDialog):
             "Select one of the graph tabs to open it in detail."
         )
 
+    def _show_extra_detail(self, dialog):
+        self._detail_dialog = dialog
+        self._detail_dialogs.append(dialog)
+        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(lambda _=None: self._detail_closed(dialog))
+        dialog.status_label.setText(
+            "Shared physical scales; Reset View restores common limits."
+            if dialog.chart.shared_axis_ranges else "Independent auto-scales."
+        )
+        dialog.status_label.setToolTip(str(self.datasets[self._current_index()].get("source_path") or ""))
+        dialog.show()
+
+    def _open_contact_chart_detail(self):
+        dialog = CalibrationGraphDetailDialog(
+            f"Signal vs contact-relative TCP travel — Taxel {self.selected_taxel_index} · "
+            f"{self.datasets[self._current_index()].get('name', 'Trial')}", self.contact_chart.rows,
+            self.contact_chart.signal_field, "signal_distance", parent=self,
+        )
+        dialog.chart.distance_label = self.contact_chart.distance_label
+        dialog.chart.contact_referenced = True
+        dialog.chart.set_shared_axis_ranges(self.contact_chart.shared_axis_ranges)
+        self._show_extra_detail(dialog)
+
     def _open_chart_detail(self, mode):
         if mode not in self.charts:
             return
-        if self._detail_dialog is not None:
-            self._detail_dialog.close()
         chart = self.charts[mode]
         trial_results = None
         if mode == "repeatability":
             trial_results = chart.trial_results
         dialog = CalibrationGraphDetailDialog(
             f"{self.GRAPH_TITLES[mode]} — Taxel "
-            f"{self.selected_taxel_index}",
+            f"{self.selected_taxel_index} · {self.datasets[self._current_index()].get('name', 'Trial')}",
             chart.rows,
             chart.signal_field,
             mode,
             parent=self,
             trial_results=trial_results,
         )
-        dialog.setAttribute(Qt.WA_DeleteOnClose, True)
-        dialog.destroyed.connect(
-            lambda _object=None, dialog=dialog: self._detail_closed(dialog)
-        )
-        self._detail_dialog = dialog
-        dialog.show()
+        dialog.chart.set_shared_axis_ranges(chart.shared_axis_ranges)
+        self._show_extra_detail(dialog)
         dialog.raise_()
         dialog.activateWindow()
 
     def _detail_closed(self, dialog):
+        if dialog in self._detail_dialogs:
+            self._detail_dialogs.remove(dialog)
         if self._detail_dialog is dialog:
-            self._detail_dialog = None
+            self._detail_dialog = self._detail_dialogs[-1] if self._detail_dialogs else None
 
     def _export_report(self):
         selected = Path(self.loaded_recording.get("selected_path") or "calibration")
@@ -1278,6 +1607,7 @@ class CalibrationGraphAnalysisDialog(QDialog):
             if output_path.suffix.lower() != ".txt":
                 output_path = output_path.with_suffix(".txt")
             sections = [build_trial_report(item) for item in self.analyses]
+            sections.append(self.characterisation_view.toPlainText())
             if len(self.analyses) > 1:
                 sections.append(build_batch_report(self.batch_analysis))
             content = "\n\n".join(sections) + "\n"
@@ -1292,6 +1622,8 @@ class CalibrationGraphAnalysisDialog(QDialog):
                 "selected_taxel_index": self.selected_taxel_index,
                 "trials": self.analyses,
                 "batch": self.batch_analysis,
+                "characterisation": self.characterisation_batch,
+                "trial_characterisation": self.characterisation_trials,
             }
             with output_path.open("w", encoding="utf-8") as stream:
                 json.dump(payload, stream, indent=2, allow_nan=False)
@@ -1299,8 +1631,10 @@ class CalibrationGraphAnalysisDialog(QDialog):
         self.status_label.setText(f"Analysis report saved: {output_path}")
 
     def closeEvent(self, event):
-        detail = self._detail_dialog
         self._detail_dialog = None
-        if detail is not None:
+        for detail in list(self._detail_dialogs):
             detail.close()
+        self._detail_dialogs.clear()
+        if self._comparison_dialog is not None:
+            self._comparison_dialog.close()
         super().closeEvent(event)

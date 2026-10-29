@@ -31,3 +31,8 @@ phd/resource/sensor_screenshots/*
 # Local caches / generated previews
 phd/resource/dexterous_scan/*.png
 phd/resource/geneva/*.blend1
+
+# Archived material stays local; only its index is versioned.
+archive/*
+!archive/README.md
+!archive/COLCON_IGNORE

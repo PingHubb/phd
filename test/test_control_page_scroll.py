@@ -20,6 +20,8 @@ from PyQt5.QtWidgets import (
     QApplication, QListWidget, QPushButton, QVBoxLayout, QWidget,
 )
 from phd.ui.components import CollapsibleGroup
+from phd.ui.motion import DISCLOSURE_MS
+from PyQt5.QtTest import QTest
 from phd.ui.ui_ping import _WidthFittingScrollArea
 
 app = QApplication([])
@@ -50,12 +52,14 @@ assert ports.height() > 150
 assert area.minimumSizeHint().height() < 120
 
 advanced.toggle.setChecked(True)
+QTest.qWait(DISCLOSURE_MS + 40)
 for _ in range(4):
     app.processEvents()
 assert page.minimumHeight() == layout.sizeHint().height()
 assert page.minimumHeight() > 300
 
 advanced.toggle.setChecked(False)
+QTest.qWait(DISCLOSURE_MS + 40)
 for _ in range(4):
     app.processEvents()
 assert page.minimumHeight() == layout.sizeHint().height()

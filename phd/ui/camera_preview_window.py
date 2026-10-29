@@ -682,18 +682,26 @@ class CameraPreviewWindow(QWidget):
         self.setWindowTitle("RealSense Camera")
         self.setAttribute(Qt.WA_DeleteOnClose, True)
         components.size_to_screen(self, 980, 720)
+        self.setObjectName("cameraPreviewWindow")
         self.setStyleSheet(
-            "QWidget { background: %s; color: %s; }"
+            "QWidget#cameraPreviewWindow { background: %s; color: %s; }"
             % (theme.WINDOW_BG, theme.TEXT_PRIMARY)
         )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
+        header = components.WorkspaceHeader(
+            "Camera", "Live color, depth and infrared from the connected RealSense.",
+            eyebrow="PINGLAB / VISION",
+        )
+        header.set_compact(True)
+        layout.addWidget(header)
         layout.addLayout(self._build_toolbar())
         self.view = QLabel("Looking for the RealSense camera...")
         self.view.setAlignment(Qt.AlignCenter)
-        self.view.setMinimumSize(640, 360)
+        self.view.setMinimumSize(320, 180)
+        self.view.setWordWrap(True)
         self.view.setStyleSheet(
             "background: %s; color: %s;"
             % (theme.VIEWPORT_BG, theme.TEXT_ON_ACCENT)
@@ -709,6 +717,7 @@ class CameraPreviewWindow(QWidget):
         self.distance_label.hide()
         layout.addWidget(self.distance_label)
         self.status = QLabel("")
+        self.status.setObjectName("workspaceStatus")
         self.status.setWordWrap(True)
         layout.addWidget(self.status)
 
@@ -726,6 +735,7 @@ class CameraPreviewWindow(QWidget):
         bar = QHBoxLayout()
         bar.addWidget(QLabel("View"))
         self.view_combo = QComboBox()
+        self.view_combo.setAccessibleName("Camera view")
         for mode, label in VIEW_MODES:
             self.view_combo.addItem(label, mode)
         self.view_combo.currentIndexChanged.connect(self._change_view)
@@ -743,10 +753,12 @@ class CameraPreviewWindow(QWidget):
 
         controls = QVBoxLayout()
         controls.addLayout(bar)
+        self.adjustments = components.CollapsibleGroup("Image adjustments · exposure, white balance and emitter")
+        controls.addWidget(self.adjustments)
         self.auto_exposure = QCheckBox("Auto exposure")
         self.exposure_slider = self._slider()
         self.exposure_value = QLabel("")
-        controls.addLayout(
+        self.adjustments.add_layout(
             self._slider_row(
                 self.auto_exposure, self.exposure_slider, self.exposure_value
             )
@@ -754,7 +766,7 @@ class CameraPreviewWindow(QWidget):
         self.auto_white_balance = QCheckBox("Auto white balance")
         self.white_balance_slider = self._slider()
         self.white_balance_value = QLabel("")
-        controls.addLayout(
+        self.adjustments.add_layout(
             self._slider_row(
                 self.auto_white_balance,
                 self.white_balance_slider,
@@ -764,7 +776,7 @@ class CameraPreviewWindow(QWidget):
         self.emitter = QCheckBox("Emitter")
         self.laser_slider = self._slider()
         self.laser_value = QLabel("")
-        controls.addLayout(
+        self.adjustments.add_layout(
             self._slider_row(self.emitter, self.laser_slider, self.laser_value)
         )
 
@@ -795,6 +807,7 @@ class CameraPreviewWindow(QWidget):
     @staticmethod
     def _slider_row(check, slider, value_label) -> QHBoxLayout:
         row = QHBoxLayout()
+        slider.setAccessibleName(check.text().replace("Auto ", "") + " value")
         check.setMinimumWidth(170)
         row.addWidget(check)
         row.addWidget(slider, 1)

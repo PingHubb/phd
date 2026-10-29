@@ -1,0 +1,564 @@
+{
+  "version": 1,
+  "date": "2026-10-23",
+  "project_root": "/home/ping2/ros2_ws/src/phd",
+  "purpose": "Organise guides and standalone tools while preserving runtime, datasets, model/config names and existing entry points.",
+  "baseline": {
+    "tests_passed": 851,
+    "checks_excluded": [
+      "flake8",
+      "pep257",
+      "copyright"
+    ],
+    "runtime_python_files_unchanged": 80
+  },
+  "preserved": [
+    "All existing phd/ui and phd/dependence Python implementations",
+    "Running UI process and hardware state",
+    "Experiment contents and saved positions",
+    "Dataset sessions, checkpoints, manifests and paper contents",
+    "Configuration filenames/contents",
+    "Existing CLI names and legacy imports/direct-file entry points",
+    "Virtual environment, ROS build/install/log trees, Git and IDE state"
+  ],
+  "files": [
+    {
+      "old_path": "phd/README.md",
+      "new_path": "README.md",
+      "original_sha256": "9d854053531f41e0e14b3924f867d7ce9e161c94b00e07d4bbe588ed79549573",
+      "canonical_sha256": "e72a34e8fe81fd34ebbb79d07fd8b8281048964435fbe7f3c375e88666d4d60e",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/README.md",
+      "compatibility": "Markdown pointer"
+    },
+    {
+      "old_path": "phd/INTENTION_LEARNING.md",
+      "new_path": "docs/guides/INTENTION_LEARNING.md",
+      "original_sha256": "5945b9155562243429ba0dafd78f45a9f631934cb0aa9940b8c96f1583b035bb",
+      "canonical_sha256": "52f2c433e1fd27606a83724fd628b12d2d6c2d341540fddc64f638d263a9b98b",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/INTENTION_LEARNING.md",
+      "compatibility": "Markdown pointer"
+    },
+    {
+      "old_path": "phd/ROBOT_DOG_GESTURES.md",
+      "new_path": "docs/guides/ROBOT_DOG_GESTURES.md",
+      "original_sha256": "42d6458069a5fa755474bb45ed47b12b8bf15ff08b48a057a8537c7c3bf9c9ed",
+      "canonical_sha256": "fef977c153070f962715103e3574c44f13a36600e9d59b27542319cc57ab36f5",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/ROBOT_DOG_GESTURES.md",
+      "compatibility": "Markdown pointer"
+    },
+    {
+      "old_path": "phd/SENSOR_CHARACTERISATION.md",
+      "new_path": "docs/guides/SENSOR_CHARACTERISATION.md",
+      "original_sha256": "d633437b1c50be05874179fc9449e4dc08e31d69b433111e1268a5e62a426259",
+      "canonical_sha256": "b88ad41197e2f02e329a90df6ae35b9ccb34de417f9f2402f23bec3897c25698",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/SENSOR_CHARACTERISATION.md",
+      "compatibility": "Markdown pointer"
+    },
+    {
+      "old_path": "docs/SENSOR_DATA_LAYOUT_AND_COMPATIBILITY.md",
+      "new_path": "docs/guides/SENSOR_DATA_LAYOUT_AND_COMPATIBILITY.md",
+      "original_sha256": "76b3796bf6f7b96ed83f6b31fd01afc480f53e7f295290ebc01f12728395213a",
+      "canonical_sha256": "716b4d123e141816b2480e9361a3cf1d7c3aae42713208492d4b3ce6b478e19e",
+      "original_copy": "archive/2026-10-23-organization/originals/docs/SENSOR_DATA_LAYOUT_AND_COMPATIBILITY.md",
+      "compatibility": "Markdown pointer"
+    },
+    {
+      "old_path": "docs/TOUCH_TRACKING_WORKFLOW.md",
+      "new_path": "docs/guides/TOUCH_TRACKING_WORKFLOW.md",
+      "original_sha256": "74bab6fd85aa829567be749c292e9ddf87589bf7f616d4489d45976f8f122c23",
+      "canonical_sha256": "5d6d4662117823adb5127cf083d204f2e4e3e8564c651979116fcec5fa9f6bbe",
+      "original_copy": "archive/2026-10-23-organization/originals/docs/TOUCH_TRACKING_WORKFLOW.md",
+      "compatibility": "Markdown pointer"
+    },
+    {
+      "old_path": "phd/script/analyse_height_profile.py",
+      "new_path": "phd/script/analysis/analyse_height_profile.py",
+      "original_sha256": "375e5455f3aef8b95cddcd3322a8b5336949ca63f4b3ea407ba639057f3410cc",
+      "canonical_sha256": "ad41d1f74c38e96475ec20c3c7c41bc7d25640d74a23496f0b5e515a42323acf",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/analyse_height_profile.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/analyse_proximity_profile.py",
+      "new_path": "phd/script/analysis/analyse_proximity_profile.py",
+      "original_sha256": "348b5271691c2c41b126d9697891ff331546c3a8e03a172d282f45a442c8e272",
+      "canonical_sha256": "aece7d421256ffe7d816bc165777cbff857009af878d5e868dfe2b64b84ca1de",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/analyse_proximity_profile.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/benchmark_ai_direct_finger_motion_robustness.py",
+      "new_path": "phd/script/analysis/benchmark_ai_direct_finger_motion_robustness.py",
+      "original_sha256": "4c17711e7daefd9ec23281df3b494f175a1de54f7a198cb04a70344614ed442a",
+      "canonical_sha256": "14fadd9427e55cd6c2e3e20f2ce25adda0b10411f247dc33b06d29e785194a80",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/benchmark_ai_direct_finger_motion_robustness.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/benchmark_robot_dog_gestures.py",
+      "new_path": "phd/script/analysis/benchmark_robot_dog_gestures.py",
+      "original_sha256": "8f1216d648f623b51aa3754080f78b110bde24f2260e97d029a0b47cf50b52d8",
+      "canonical_sha256": "001ee31ca9fa6a93f86eaeba6a3179a8110734f191e64287ccb0e9fded8b2ede",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/benchmark_robot_dog_gestures.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/check_ai_direct_finger_motion_dataset.py",
+      "new_path": "phd/script/analysis/check_ai_direct_finger_motion_dataset.py",
+      "original_sha256": "4df2077b684b4208290f0e99c9775d7d3dc34cce1f46fe9a3d5d902faaa2d06c",
+      "canonical_sha256": "a10ba1877ceb5bf6313c1772646d3b536793f1b593a4cd61e20aa94dc7a404f8",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/check_ai_direct_finger_motion_dataset.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/iges_xyz_to_csv.py",
+      "new_path": "phd/script/conversion/iges_xyz_to_csv.py",
+      "original_sha256": "076acf769119a09b8b6a74624220245f7a2d6f338e70268e8c759f16f6caca6d",
+      "canonical_sha256": "26ac9fb965cc910f5e380aa2953b9abc65322bc8339beefef78e037ea196a8fa",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/iges_xyz_to_csv.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/igs_to_csv_freecad.py",
+      "new_path": "phd/script/conversion/igs_to_csv_freecad.py",
+      "original_sha256": "ccfe037791d0c9cb8ab566b5001272207be42a6cb47f7abddf7c5638a60b90c3",
+      "canonical_sha256": "8d6780fc912bcce0cdcae53d0fcf422f87ce1a11332c2a06909ef8c961855e04",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/igs_to_csv_freecad.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/predict_robot_dog_gesture.py",
+      "new_path": "phd/script/inference/predict_robot_dog_gesture.py",
+      "original_sha256": "07240f13e7467c542d2913d73e6a0056ccab5d18383de11f0ee91beae017928d",
+      "canonical_sha256": "792cda173a18008c8141f47c47afd988f318e809e071323dba35847431104d52",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/predict_robot_dog_gesture.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/rh56f1_hand_menu.py",
+      "new_path": "phd/script/hardware/rh56f1_hand_menu.py",
+      "original_sha256": "7c6db69c1f61c1958d782c8d6a18dcefba57bc33b2d23fed440f80fba02220e4",
+      "canonical_sha256": "6200198270afecf605ef7e46f4f7dc76ace84ea33036680354a57dd1aba66d74",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/rh56f1_hand_menu.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/setup_goodix_usb_permissions.py",
+      "new_path": "phd/script/hardware/setup_goodix_usb_permissions.py",
+      "original_sha256": "365686f9f36610fa6bf58ef487dad3d88c43db01b95792f24f240a9146241034",
+      "canonical_sha256": "6ba6e9146080734d4666f4aa752b27def82e16de822f4196c286683277cd21f7",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/setup_goodix_usb_permissions.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/train_ai_direct_finger_motion.py",
+      "new_path": "phd/script/training/train_ai_direct_finger_motion.py",
+      "original_sha256": "ee790eac10f5349b186f08413e71d6bb52f8330c8eeaec44f5cb0004ca25e48e",
+      "canonical_sha256": "c4abdd9e1ca75e9e0efc6c416a2083786d87ce742310264c107f12af90867bf2",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/train_ai_direct_finger_motion.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/train_intention.py",
+      "new_path": "phd/script/training/train_intention.py",
+      "original_sha256": "7ad5b05ef7215a2c11c5b679563909581d44668d306ca6f6404093d541bfcb66",
+      "canonical_sha256": "c05e4c02de3293f3060345507fa95373bb58a76f5eb650f2f78e4a0d7929c477",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/train_intention.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/train_robot_dog_gestures.py",
+      "new_path": "phd/script/training/train_robot_dog_gestures.py",
+      "original_sha256": "3380e486c8fa0e4e4d8c0963a3bd539ded90ed2edc39d2eb3403e21384dcb267",
+      "canonical_sha256": "bbde50796d4299f5a7de87f72293d4349fd7221d04047ee6da7d1b8bcb903c30",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/train_robot_dog_gestures.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/train_tactile_proximity.py",
+      "new_path": "phd/script/training/train_tactile_proximity.py",
+      "original_sha256": "99baf17c180f95597db555aa3df9b9086be2e20d63deb7d7ef1582bf84b40ceb",
+      "canonical_sha256": "89a17b4efde18a946225c52ec77dd6e75e9d0dcc6ccbf746569c0654cef59be6",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/train_tactile_proximity.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    },
+    {
+      "old_path": "phd/script/train_touch_tracking.py",
+      "new_path": "phd/script/training/train_touch_tracking.py",
+      "original_sha256": "3e049e55d33da4138d9f0025a5dd3347845bcc92d244147020279e4e59c301d8",
+      "canonical_sha256": "9ab39d4ac8cc23033adbf8a8731d1230099d9aa195397741563ea2741f5c28d8",
+      "original_copy": "archive/2026-10-23-organization/originals/phd/script/train_touch_tracking.py",
+      "compatibility": "Module alias / direct execution forwarding file"
+    }
+  ],
+  "modified_setup": {
+    "path": "setup.py",
+    "original_copy": "archive/2026-10-23-organization/originals/setup.py",
+    "original_sha256": "079777c482d0bf8392fd4e004d22c08ebb864a324f0bf79029d714307274993b",
+    "updated_sha256": "074287a6732905b3f0778d4d2c0a43817e44c33f4fe5de0019a66f74fbb469e0",
+    "note": "Existing CLI command names retained, canonical grouped targets; adds read-only tool catalogue command."
+  },
+  "resource_aliases": [
+    {
+      "old_path": "phd/resource/calibration_recordings",
+      "relative_target": "experiment/calibration_recordings",
+      "type": "symlink",
+      "existing_data_moved": false,
+      "removed": "2026-10-23: alias deleted; no code or saved JSON/CSV path used it"
+    },
+    {
+      "old_path": "phd/resource/taxel_position_maps",
+      "relative_target": "experiment/taxel_position_maps",
+      "type": "symlink",
+      "existing_data_moved": false,
+      "removed": "2026-10-23: alias deleted; no code or saved JSON/CSV path used it"
+    },
+    {
+      "old_path": "phd/resource/sigraph2026_scanning_recordings",
+      "relative_target": "experiment/sigraph2026_scanning_recordings",
+      "type": "symlink",
+      "existing_data_moved": false,
+      "removed": "2026-10-23: alias deleted; no code or saved JSON/CSV path used it"
+    }
+  ],
+  "runtime_checksums_at_organisation": [
+    {
+      "path": "phd/dependence/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "phd/dependence/camera_api.py",
+      "sha256": "c48a7402e0068e4a6e97870d179a7e77fb9827ad38c03ed814b82b395f0f0229"
+    },
+    {
+      "path": "phd/dependence/characterisation_study.py",
+      "sha256": "8cf26bd3a933f1b0831758d60e8e14cf0aed6293e8e1c68ed3825855783232de"
+    },
+    {
+      "path": "phd/dependence/embedded_toolbar_icons.py",
+      "sha256": "2a45b5fe9c7c006045577b3c8f4898c0d5c04390483eeac8c4ec5d17e0c665b1"
+    },
+    {
+      "path": "phd/dependence/force_meter_api.py",
+      "sha256": "49fa8d91a01408b7afa526438da62cf2297d9a32d06c158b7c66eb24ebd27e89"
+    },
+    {
+      "path": "phd/dependence/func_meshLab.py",
+      "sha256": "fb1955d9205a2a7576832ba6f1d1e91bac96cd4ab15834772ef3b05eb2b61b28"
+    },
+    {
+      "path": "phd/dependence/func_sensor.py",
+      "sha256": "362d2092c1819ae89c2a482b1288d03d78ae056f65c88b354ec469c5a8cd2534"
+    },
+    {
+      "path": "phd/dependence/gesture/__init__.py",
+      "sha256": "fa624126b346ba3e26080d7609f8e2406f45ecdc1f8c3aa6e22a0e27292c52af"
+    },
+    {
+      "path": "phd/dependence/gesture/gesture_logic.py",
+      "sha256": "50491faf277deab792f082a1af23a778872bc927e3c0d958f2a253f74e2d1d55"
+    },
+    {
+      "path": "phd/dependence/gesture/gesture_logic_console.py",
+      "sha256": "77feb0c2350060d414ef9a650e84b654cd436e2b8af7895d35be972f2fb8c8a1"
+    },
+    {
+      "path": "phd/dependence/gesture/gesture_logic_direct_finger_motion.py",
+      "sha256": "e5d3be03a0045912f53848411eefef5f7748aa8393a321aee9f34e6abcdabca5"
+    },
+    {
+      "path": "phd/dependence/gesture/gesture_logic_proximity_control.py",
+      "sha256": "c5b20453bbfefdf3331c4e9105bd8423e3cc722126b924ad3af718fda32aab5f"
+    },
+    {
+      "path": "phd/dependence/gesture/gesture_logic_recording.py",
+      "sha256": "e0a283724b3d1de2de0f4bde40f452bb4e2fdd53a5717d733568f8e1d70e3d3a"
+    },
+    {
+      "path": "phd/dependence/gesture/gesture_logic_three_level.py",
+      "sha256": "1f7e2eb8bf623cd40a8d7f9bf74302276006c99a7c4d34e999ae22513563b641"
+    },
+    {
+      "path": "phd/dependence/goodix_usb_sensor.py",
+      "sha256": "7b286dde376eb9f6eb0b58d1321d7411ca1d1883de43c7d169f8107b90360983"
+    },
+    {
+      "path": "phd/dependence/gripper_api.py",
+      "sha256": "96915d7b9e10833d271b3a876557ed236079db0d909a8789e81ebc32ac37c003"
+    },
+    {
+      "path": "phd/dependence/height_profile.py",
+      "sha256": "a9b7ad37c2c4dbc1151e17d3e37f6d2ba7952e535c1f864b9dbb2268b8af5e21"
+    },
+    {
+      "path": "phd/dependence/humanoid_sensor_registry.py",
+      "sha256": "8a01035938f983d8037893116d5d412ef243183a091d3aee34b30db5a90717c4"
+    },
+    {
+      "path": "phd/dependence/humanoid_signal_parts.py",
+      "sha256": "b7d8fa90335a588b7bc7adba622d23bea15361b0ae40a81ddbf4d11e16e6952b"
+    },
+    {
+      "path": "phd/dependence/humanoid_urdf.py",
+      "sha256": "a02a03d7f160a1fbc3e5da39c65987b4b267e306ca3937ce5e827cb7054457be"
+    },
+    {
+      "path": "phd/dependence/intention_data.py",
+      "sha256": "74b1d7e6163c1caff3e17c518539bd10be0671037e60beee56ac1278d7525b09"
+    },
+    {
+      "path": "phd/dependence/intention_model.py",
+      "sha256": "6d1fcbdb4c877cbc155e4d26deb52dd92375825b7ea052e28c98cd05639447a9"
+    },
+    {
+      "path": "phd/dependence/live_gesture_recognition.py",
+      "sha256": "69a5527b7871f506ec09616f8e08171225bbc12a27c720176b16e5db7e0fdd5d"
+    },
+    {
+      "path": "phd/dependence/paths.py",
+      "sha256": "ccf1c4a8fc0a2373da013151bfab1f2d7d4501faddf25b0685d52aeceed849c3"
+    },
+    {
+      "path": "phd/dependence/robot_api.py",
+      "sha256": "682294ecbef49f8c9b1b638fcef3ce1d2baad1b59e40fdf45a9ecac5d49c5688"
+    },
+    {
+      "path": "phd/dependence/robot_dog_gesture_model.py",
+      "sha256": "7454bc0eba7cf27f00487cc2173eee70f4d4c5927d1158411b8e5f614f29376b"
+    },
+    {
+      "path": "phd/dependence/sensor_api.py",
+      "sha256": "70a1d81547e4d4da177d555bcda03aeb9f70c43896648a7dac935aed7b5b9144"
+    },
+    {
+      "path": "phd/dependence/sensor_data.py",
+      "sha256": "b917b9667a0666227aad49eafa142468bb124fa652d986229ce239738a21e478"
+    },
+    {
+      "path": "phd/dependence/sensor_geometry.py",
+      "sha256": "218e3b3dbee490cfac42f5253dbfee6f04893e7f9bc5ecb84dadecb46459bc79"
+    },
+    {
+      "path": "phd/dependence/sensor_heatmap.py",
+      "sha256": "6a104ddf78dcc834400d8a23a668f01c7f2cdc2b07f0ee5d2aaa06cdae328f39"
+    },
+    {
+      "path": "phd/dependence/sensor_layout.py",
+      "sha256": "3d0801cdcb95f3ae0da15fcfa40576a9bf23a74681c4ca0a315191fb0f46ecf9"
+    },
+    {
+      "path": "phd/dependence/sensor_protocol.py",
+      "sha256": "778cf53ab77e27fa61df169fbca3187a50615a38d0712884239ec035ba5f32ed"
+    },
+    {
+      "path": "phd/dependence/sensor_serial.py",
+      "sha256": "568bc4179846801de5ae87732674e85c705c859a17d9dd2014f1167fb0823100"
+    },
+    {
+      "path": "phd/dependence/sensor_signal_window.py",
+      "sha256": "36e60e66ce89f3882240f3a1198ebe8799a6880ba6a1a3dc5300472d41db597b"
+    },
+    {
+      "path": "phd/dependence/tactile_models.py",
+      "sha256": "7429285845e2c36eb5e3222b132a445740e71dc533bc4fc5c941eb4d916ec91f"
+    },
+    {
+      "path": "phd/dependence/tactile_proximity.py",
+      "sha256": "8c82d1fcc423caeb7257cd60cd33d2bc8e7b8186b29bd171177691ee84deb179"
+    },
+    {
+      "path": "phd/dependence/touch_tracking_camera_free.py",
+      "sha256": "4b0dfca4b9c3d2c567d52e8c9a09091b52b0044085d124b3992e9993052711c4"
+    },
+    {
+      "path": "phd/dependence/touch_tracking_data.py",
+      "sha256": "4bdb16adb94ce0bdbd0cd308f08eb522a87e0dcdc57f4275e8f4b0ce72218a34"
+    },
+    {
+      "path": "phd/dependence/touch_tracking_model.py",
+      "sha256": "5beac1c487d1c2ed1072f2a7ade2480df1a45e3037fcbccbd3754bb606a3150b"
+    },
+    {
+      "path": "phd/ui/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "phd/ui/calibration_analysis.py",
+      "sha256": "48c9056bfab09057dff0b1b475aa4110cfd151f747f9fbf80c04f1416c2e839e"
+    },
+    {
+      "path": "phd/ui/calibration_comparison.py",
+      "sha256": "51c2f09d6a97908f1e0f98f59ed877efecaf86431d600ec3f3df38669614eb18"
+    },
+    {
+      "path": "phd/ui/calibration_graph_analysis.py",
+      "sha256": "90fbe9d72453cc72aed97f0a0f7b0a340d16bee98ef5fb3560bb4933514eedb2"
+    },
+    {
+      "path": "phd/ui/calibration_protocol_panel.py",
+      "sha256": "2e5e380e03f73b04089b7aaa2df86c48015b794de185c4a57a04b0ef8d3c76cc"
+    },
+    {
+      "path": "phd/ui/calibration_result_dialog.py",
+      "sha256": "3f271e5e610ddd0a7066ffc18f78dd6fd27d72d09d4220cc54c7552ca0587f68"
+    },
+    {
+      "path": "phd/ui/camera_preview_window.py",
+      "sha256": "a9419ecad62a59555b97dafb3b630a13e42bb72a539a16052b57927164eac648"
+    },
+    {
+      "path": "phd/ui/characterisation_analysis.py",
+      "sha256": "1cbbe473e0b7c78198d0116383be8c625c849796215daa511f23d15d784be64d"
+    },
+    {
+      "path": "phd/ui/combo_popup.py",
+      "sha256": "e0a7709294c79589780a1e8ab8986dc16f1535488af80d8c25c338a7bf60d2a2"
+    },
+    {
+      "path": "phd/ui/components.py",
+      "sha256": "084d1511ff62167f934752b4c1da0011bdc116148353f510a8c8b82699c4a5b6"
+    },
+    {
+      "path": "phd/ui/experiment_quality.py",
+      "sha256": "6fd93ca409d894ddf2e7b438a7c0ffb3a8e0e7051748bf28365b98042a1e526c"
+    },
+    {
+      "path": "phd/ui/experiment_run_view.py",
+      "sha256": "1283d1228acce28552a4908e1a0eaad28a2b5edf72f049b870facfcdd9962d45"
+    },
+    {
+      "path": "phd/ui/experiment_tasks.py",
+      "sha256": "8e5790b6be18c2e43d0b7d8dde00177162b915911a5c6dc8ec79cbf7395fd2e6"
+    },
+    {
+      "path": "phd/ui/force_meter_chart.py",
+      "sha256": "8a15cab9b672ff45e6df9de6205bffcd2357fc56519e8c44cfb1a2c4354865b4"
+    },
+    {
+      "path": "phd/ui/gesture_recognition_panel.py",
+      "sha256": "ee5b2dc06e822fd6bb7b7c5549cbaea5a8ba45558df958301e7b6fdde59b4680"
+    },
+    {
+      "path": "phd/ui/heatmap_signal_recording.py",
+      "sha256": "30637997862546ee1967037269f1dd4edb8d8a36ea9f7b865584a627d9d2c7c4"
+    },
+    {
+      "path": "phd/ui/humanoid_viewer.py",
+      "sha256": "6d44d4ae8de2b114cf5a3a924adf6176daa0565da61c134256438d3d81085417"
+    },
+    {
+      "path": "phd/ui/icons.py",
+      "sha256": "8b718f19ee35b37e302c4a1734d3c6024727c5a584a29183da5a4dc324ef03e6"
+    },
+    {
+      "path": "phd/ui/intention_window.py",
+      "sha256": "f3f166987814233942d3f3af69d180e02fed4f0818225e3693af048fdd400ed2"
+    },
+    {
+      "path": "phd/ui/mapping_reference_dialog.py",
+      "sha256": "0039d4b5c0a46a6cba6b1f57437eca567412e915fe7aeaf3905ac7ecb0faf5c4"
+    },
+    {
+      "path": "phd/ui/mapping_repeatability_dialog.py",
+      "sha256": "f2e0a6b2366b46775bb7bb23dfb330fb63dfc831964086bc21a03ee3c8c2360f"
+    },
+    {
+      "path": "phd/ui/mapping_safety.py",
+      "sha256": "b0e2acc767eba72fcc4aa3a00048a1b536955c3630a4a8b09bd930761ea85416"
+    },
+    {
+      "path": "phd/ui/motion.py",
+      "sha256": "3993b3e96e2e319e34f02b06ba076123201f99766b3314f0bb0a0ee8961ef321"
+    },
+    {
+      "path": "phd/ui/nav_tabs.py",
+      "sha256": "3e4aac45dc372c6600c909af8744604f240fb8a9bf45c50c3d6f1bf40c7a6512"
+    },
+    {
+      "path": "phd/ui/plotter_video_recorder.py",
+      "sha256": "ed59410805b5b3e2aeafbb0d66210e8ecff567ddd0fef4a321bf95d67bd0b29a"
+    },
+    {
+      "path": "phd/ui/proximity_profile.py",
+      "sha256": "f5d05852b575850287eff5dd930463c9bdcbbd8ec38b2b97653badc22d48c3c2"
+    },
+    {
+      "path": "phd/ui/proximity_profile_dialog.py",
+      "sha256": "49fa506e3cca25f53b309695c8c0df39445c7484f9c8dcb8410faff21c960af4"
+    },
+    {
+      "path": "phd/ui/sensor_characterisation_window.py",
+      "sha256": "c58c55ca1ea1fea01e4ea6890e651464dfd8797fbd4d2814e3ea39bb3c9cc073"
+    },
+    {
+      "path": "phd/ui/sensor_shape_editor.py",
+      "sha256": "e1767c4c925d41cb5502ce7f37ed40b8491cf76125024db5e505c73fdc753858"
+    },
+    {
+      "path": "phd/ui/sensor_zero_mask_window.py",
+      "sha256": "bcd724e7a50b3cf428f36ab08e455976fe8067fa71a132abd403328af5512cfd"
+    },
+    {
+      "path": "phd/ui/taxel_position_navigation.py",
+      "sha256": "c625692d2233f5c57447dbaecaf83027f3eda795d3dd96f710d7feab55a0b00f"
+    },
+    {
+      "path": "phd/ui/theme.py",
+      "sha256": "69f382e48fa7847a3873a482a2857391b776c8d68ccbd427e3292d872e0c2b8c"
+    },
+    {
+      "path": "phd/ui/touch_tracking_window.py",
+      "sha256": "59be81a2f85413b82730998c2be6abc2daf43faaa88781edea62a2d029225978"
+    },
+    {
+      "path": "phd/ui/ui_initial.py",
+      "sha256": "2f34feb79d3741b3402642592de7576109dada7228e8ff73d87e0acfd57179c2"
+    },
+    {
+      "path": "phd/ui/ui_ping.py",
+      "sha256": "746520702a787f78301a6cd7d6268e7ee82be1a00f11fca4d03a1f186ac1d764"
+    },
+    {
+      "path": "phd/ui/ui_ping_ai_controls.py",
+      "sha256": "4c744af563fe79be995d81910225f372cbde409bddc149fb97df2fdddb8370e4"
+    },
+    {
+      "path": "phd/ui/ui_ping_camera_control.py",
+      "sha256": "d9ff01c7c652f85f7b4d7315144eda5f00a5f660390cdfa980c2368b220aa598"
+    },
+    {
+      "path": "phd/ui/ui_ping_direct_finger_motion.py",
+      "sha256": "40143b09313ef0ddc28baa360deb1bdcb15cd93b85e5faa331167f7cec969472"
+    },
+    {
+      "path": "phd/ui/ui_ping_robot_dog.py",
+      "sha256": "9f1b25d0aff669c074865e725f88352757b9d860e7f5daecbe141ed5e71d90a8"
+    },
+    {
+      "path": "phd/ui/ui_ping_robot_sensor_controls.py",
+      "sha256": "f203d5b90501d33e9e20f27ba2ca960d46d6bd63625ff045581df696af098b29"
+    },
+    {
+      "path": "phd/ui/ui_ping_ui_interactions.py",
+      "sha256": "d0e76175cf1a7618c46397e46031912364623f62153ac92c945fa2fd22fd0873"
+    }
+  ],
+  "verification": {
+    "baseline": "851 functional tests passed before organisation.",
+    "post_move": "890 functional/compatibility tests passed; 188 existing matplotlib/pyparsing deprecation warnings.",
+    "style_checks": "flake8, pep257 and copyright template checks excluded from both runs; no claim of repository-wide style compliance.",
+    "new_compatibility_tests": 39,
+    "moved_tools_with_identical_function_and_class_AST": 15,
+    "original_backup_hashes_verified": 22,
+    "runtime_python_files_unchanged": 80,
+    "ros_build": "Passed in a separate temporary build/install tree; live workspace installation not replaced.",
+    "isolated_validation_directory": "/tmp/pinglab-organization-tihUgi",
+    "installed_smoke_checks": [
+      "ros2 run phd pinglab_tools paths",
+      "ros2 run phd train_touch_tracking --help",
+      "ros2 run phd analyse_height_profile --help"
+    ],
+    "live_ui": "Existing UI PID 883958 left running; no restart, device connection or robot motion performed.",
+    "existing_research_data": "No existing recordings, checkpoints, paper contents or configuration files moved/edited/deleted."
+  }
+}

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 from PyQt5.QtCore import Qt, QRectF, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPainterPath
+from PyQt5.QtGui import QColor, QImage, QPainter, QPen, QPainterPath, QTextDocument
 from PyQt5.QtWidgets import (
     QComboBox,
     QDialog,
@@ -31,7 +31,12 @@ from phd.ui.calibration_analysis import (
     analyze_calibration_rows,
     available_taxel_indices,
     calibration_rows_for_taxel,
+    surface_referenced_rows,
+    with_trial_rows,
 )
+from phd.ui.characterisation_analysis import comparable_trial_results, result_condition_groups
+from phd.ui.calibration_sequence import sequence_segments
+from phd.ui.calibration_inspection import TimelineInspection
 
 
 SIGNAL_LABELS = {
@@ -42,6 +47,12 @@ SIGNAL_LABELS = {
     "diff_percent": "Relative change (%)",
     "diff_percent_ave": "Averaged relative change (%)",
 }
+
+SURFACE_DISTANCE_LABEL = "Distance from surface (mm)"
+SURFACE_DISTANCE_NOTE = (
+    "Contact-referenced estimate: + above, 0 detected contact, − below. "
+    "Negative values are TCP displacement, not measured fabric compression."
+)
 
 
 def _sensor_grid_shape(*sources, default=(8, 10)):
@@ -102,7 +113,7 @@ class CalibrationTaxelMap(QWidget):
             f"QToolButton:checked {{ background: {theme.ACCENT}; "
             f"color: {theme.TEXT_ON_ACCENT}; border-color: {theme.ACCENT}; }}"
             f"QToolButton:disabled {{ background: {theme.NEUTRAL_SOFT}; "
-            f"color: {theme.TEXT_FAINT}; border-color: {theme.BORDER_SUBTLE}; }}"
+            f"color: {theme.TEXT_MUTED}; border-color: {theme.BORDER_SUBTLE}; }}"
             f'QToolButton[taxelState="mapped"] {{ background: {theme.SUCCESS_SOFT}; '
             f"color: {theme.SUCCESS}; border-color: {theme.SUCCESS_BORDER}; "
             "font-weight: 600; }"
@@ -118,6 +129,10 @@ class CalibrationTaxelMap(QWidget):
             f'QToolButton[taxelState="mapped"]:checked:disabled {{ background: {theme.ACCENT}; '
             f"color: {theme.TEXT_ON_ACCENT}; border: 2px solid "
             f"{theme.ACCENT_PRESSED}; font-weight: 700; }}"
+            f"QToolButton:enabled:pressed {{ background: {theme.ACCENT_PRESSED}; "
+            f"color: {theme.TEXT_ON_ACCENT}; border-color: {theme.ACCENT_PRESSED}; }}"
+            f"QToolButton:focus {{ border: 2px dashed {theme.ACCENT}; }}"
+            f"QToolButton:checked:focus {{ border: 2px dashed {theme.TEXT_ON_ACCENT}; }}"
         )
 
     def _refresh_taxel_states(self, selected=None):
@@ -218,6 +233,29 @@ class CalibrationCurveWidget(QWidget):
     SIGNAL_COLOR = "#ff8a65"
     DISTANCE_COLOR = "#66bb6a"
     RETURN_COLOR = "#ab47bc"
+    # Shared by the event text and markers; readable on the light plot surface.
+    EVENT_COLORS = {
+        "signal_onset": theme.WARNING,
+        "contact_onset": theme.DANGER,
+        "peak_force": "#1c6fa6",
+        "return": RETURN_COLOR,
+        "fast_return": "#157b86",
+        "recovery": "#387947",
+    }
+    EVENT_LEGEND = (
+        ("signal_onset", "Amber: proximity onset"),
+        ("contact_onset", "Red: contact onset"),
+        ("peak_force", "Blue: peak force"),
+        ("return", "Purple: return begins"),
+        ("fast_return", "Teal: fast return"),
+        ("recovery", "Green: recovery"),
+    )
+    RETURN_STAGE_COLORS = {
+        "unloading": RETURN_COLOR,
+        "return": RETURN_COLOR,
+        "fast_return": EVENT_COLORS["fast_return"],
+        "recovery": EVENT_COLORS["recovery"],
+    }
     FIT_COLOR = "#fdd835"
     CONTACT_FIT_COLOR = "#ef5350"
     MEAN_COLOR = "#fdd835"
@@ -241,6 +279,7 @@ class CalibrationCurveWidget(QWidget):
         self.analysis = {}
         self._view_x_range = None
         self._view_y_range = None
+        self.shared_axis_ranges = {}
         self._last_plot_rect = None
         self._last_x_range = None
         self._last_y_range = None
@@ -253,10 +292,10 @@ class CalibrationCurveWidget(QWidget):
         self.setMinimumHeight(430)
         self.setMouseTracking(True)
         self.setCursor(Qt.CrossCursor)
-        self.setToolTip(
-            "Move mouse: inspect values · Mouse wheel: zoom · Left-drag: "
-            "pan · Double-click: open a large detailed view"
-        )
+        if self.mode != "process":
+            self.setToolTip(
+                "Mouse wheel: zoom · Left-drag: pan · Double-click: open a large detailed view"
+            )
         self.set_data(rows, signal_field)
 
     def set_data(self, rows, signal_field) -> None:
@@ -266,6 +305,11 @@ class CalibrationCurveWidget(QWidget):
             self.rows,
             self.signal_field,
         )
+        self.rows = surface_referenced_rows(
+            self.rows, self.signal_field, analysis=self.analysis, in_place=True
+        )
+        self.sequence_segments = sequence_segments(self.rows)
+        self._timeline_inspection = TimelineInspection(self.rows, self.analysis, self.sequence_segments)
         self._hover_position = None
         self.reset_view()
         self.update()
@@ -303,11 +347,27 @@ class CalibrationCurveWidget(QWidget):
             and float(value_range[1]) - float(value_range[0]) > 1e-12
         )
 
-    def _display_range(self, base_range, axis):
+    def set_shared_axis_ranges(self, ranges):
+        """Common physical limits; manual zoom is temporary until Reset View."""
+        self.shared_axis_ranges = {
+            str(field): tuple(map(float, pair))
+            for field, pair in (ranges or {}).items()
+            if self._valid_range(pair)
+        }
+        self.reset_view()
+
+    def _shared_range(self, field, fallback, *, repeatability=False):
+        ranges = self.shared_axis_ranges
+        if repeatability:
+            field = f"repeatability:{field}"
+        return ranges.get(field, fallback)
+
+    def _display_range(self, base_range, axis, field=None):
         override = (
             self._view_x_range if axis == "x" else self._view_y_range
         )
-        return override if self._valid_range(override) else base_range
+        shared = self._shared_range(field, base_range)
+        return override if self._valid_range(override) else shared
 
     def reset_view(self):
         self._view_x_range = None
@@ -441,6 +501,13 @@ class CalibrationCurveWidget(QWidget):
             self.update()
         super().leaveEvent(event)
 
+    def _process_hover_selection(self, position):
+        rect, x_range = self._last_plot_rect, self._last_x_range
+        if rect is None or not rect.contains(position) or not self._valid_range(x_range):
+            return None
+        time = x_range[0] + (position.x() - rect.left()) / rect.width() * (x_range[1] - x_range[0])
+        return self._timeline_inspection.snap(time, x_range, rect.width())
+
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.detailRequested.emit()
@@ -494,13 +561,14 @@ class CalibrationCurveWidget(QWidget):
         trial_rows,
         y_field,
         sample_count=180,
+        x_field="travel_down_mm",
     ):
         """Interpolate trials over their common distance and return mean ± SD."""
         curves = []
         for rows in trial_rows or []:
             source = cls._finite_points(
                 rows,
-                "travel_down_mm",
+                x_field,
                 y_field,
                 phases=APPROACH_PHASES,
             )
@@ -653,8 +721,11 @@ class CalibrationCurveWidget(QWidget):
         stack_index=None,
     ):
         metrics = painter.fontMetrics()
-        width = metrics.horizontalAdvance(text) + 14
-        height = metrics.height() + 8
+        width = min(metrics.horizontalAdvance(text) + 14, max(30, rect.width() - 12))
+        text_bounds = metrics.boundingRect(
+            0, 0, max(1, int(width - 14)), 1000, Qt.TextWordWrap, text
+        )
+        height = text_bounds.height() + 8
         if stack_index is None:
             left = marker_x + 9.0
             if left + width > rect.right():
@@ -677,7 +748,7 @@ class CalibrationCurveWidget(QWidget):
         painter.setPen(QColor(theme.TEXT_PRIMARY))
         painter.drawText(
             label_rect.adjusted(7.0, 2.0, -7.0, -2.0),
-            Qt.AlignLeft | Qt.AlignVCenter,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap,
             text,
         )
 
@@ -695,6 +766,9 @@ class CalibrationCurveWidget(QWidget):
         fraction = (float(position.x()) - plot_rect.left()) / plot_rect.width()
         fraction = max(0.0, min(1.0, fraction))
         x_value = x_range[0] + fraction * (x_range[1] - x_range[0])
+        if self.mode == "process":
+            x_value, _marker = self._process_hover_selection(position)
+            fraction = (x_value - x_range[0]) / (x_range[1] - x_range[0])
         line_x = plot_rect.left() + fraction * plot_rect.width()
 
         painter.save()
@@ -725,7 +799,7 @@ class CalibrationCurveWidget(QWidget):
                 context["y_range"],
                 rect,
             )
-            if not rect.contains(marker_x, marker_y):
+            if not rect.adjusted(-1, -1, 1, 1).contains(marker_x, marker_y):
                 continue
             color = context["color"]
             painter.setPen(QPen(QColor("#101318"), 2))
@@ -734,7 +808,7 @@ class CalibrationCurveWidget(QWidget):
             x_text = self._hover_number(point[0])
             y_text = self._hover_number(point[1], signed=True)
             if context["time_axis"]:
-                text = f"{context['label']}: t={x_text} s, value={y_text}"
+                text = f"{context['label']}: t={x_value:.4f} s, value={y_text}"
             else:
                 text = f"{context['label']}: x={x_text}, y={y_text}"
             rect_key = (
@@ -997,25 +1071,6 @@ class CalibrationCurveWidget(QWidget):
             return None
         return value if math.isfinite(value) else None
 
-    def _event_time(self, name):
-        event = self.analysis.get(name) or {}
-        return self._finite_row_value(event, "elapsed_s")
-
-    def _return_time(self):
-        for row in self.rows:
-            if str(row.get("phase", "")) == RETURN_PHASE:
-                return self._finite_row_value(row, "elapsed_s")
-        return None
-
-    def _peak_force_time(self):
-        candidates = []
-        for row in self.rows:
-            force = self._finite_row_value(row, "force_delta_abs_g")
-            elapsed = self._finite_row_value(row, "elapsed_s")
-            if force is not None and elapsed is not None:
-                candidates.append((force, elapsed))
-        return max(candidates, default=(None, None))[1]
-
     @staticmethod
     def _format_event(name, payload):
         if not payload:
@@ -1026,8 +1081,33 @@ class CalibrationCurveWidget(QWidget):
             return f"{name}: detected"
         return f"{name}: {float(distance):.3f} mm at {float(elapsed):.2f} s"
 
+    @classmethod
+    def _process_legend_document(cls, font, width):
+        document = QTextDocument()
+        document.setDocumentMargin(0)
+        document.setDefaultFont(font)
+        document.setHtml(
+            " &nbsp; ".join(
+                f'<span style="color:{cls.EVENT_COLORS[event]}">{label}</span>'
+                for event, label in cls.EVENT_LEGEND
+            ) + f' &nbsp; <span style="color:{theme.TEXT_MUTED}">Faint: raw · bright: smoothed</span>'
+        )
+        document.setTextWidth(max(1, width))
+        return document
+
     def _paint_process(self, painter):
-        outer = QRectF(self.rect().adjusted(86, 68, -68, -48))
+        surface_note = (
+            "Surface estimate: + above · 0 detected contact · − below contact "
+            "(TCP travel, not compression)"
+        )
+        metrics = painter.fontMetrics()
+        header_width = max(1, self.width() - 24)
+        legend = self._process_legend_document(painter.font(), header_width)
+        legend_height = int(math.ceil(legend.size().height()))
+        note_height = metrics.boundingRect(0, 0, header_width, 1000, Qt.TextWordWrap, surface_note).height()
+        note_top = 30 + legend_height + 2
+        plot_top = note_top + note_height + 26
+        outer = QRectF(self.rect().adjusted(86, plot_top, -68, -48))
         if outer.width() <= 0 or outer.height() <= 0:
             return
         elapsed_values = [
@@ -1047,37 +1127,32 @@ class CalibrationCurveWidget(QWidget):
             padding=0.0,
             nonnegative=True,
         )
-        x_range = self._display_range(base_x_range, "x")
+        x_range = self._display_range(base_x_range, "x", "elapsed_s")
         self._last_plot_rect = outer
         self._last_x_range = x_range
         self._last_y_range = None
         signal_label = SIGNAL_LABELS.get(self.signal_field, self.signal_field)
         specs = (
             (
-                "Travel distance (mm)",
-                "travel_down_mm",
+                SURFACE_DISTANCE_LABEL,
+                "surface_distance_mm",
                 self.DISTANCE_COLOR,
-                True,
+                False,
             ),
             (signal_label, self.signal_field, self.SIGNAL_COLOR, False),
             ("Force change (g)", "force_delta_abs_g", self.FORCE_COLOR, True),
         )
         gap = 28.0
         panel_height = (outer.height() - gap * 2.0) / 3.0
-        signal_time = self._event_time("signal_onset")
-        contact_time = self._event_time("contact_onset")
-        peak_force_time = self._peak_force_time()
-        return_time = self._return_time()
 
         painter.setPen(QColor(theme.TEXT_PRIMARY))
         painter.drawText(12, 24, "Complete Calibration Sequence")
         painter.setPen(QColor(theme.TEXT_MUTED))
-        painter.drawText(
-            12,
-            45,
-            "Amber: proximity onset   Red: contact onset   "
-            "Blue: peak force   Purple: return begins   Faint: raw · bright: smoothed",
-        )
+        painter.save()
+        painter.translate(12, 30)
+        legend.drawContents(painter)
+        painter.restore()
+        painter.drawText(QRectF(12, note_top, header_width, note_height), Qt.TextWordWrap, surface_note)
 
         for index, (label, field, color, include_zero) in enumerate(specs):
             panel = QRectF(
@@ -1088,13 +1163,27 @@ class CalibrationCurveWidget(QWidget):
             )
             points = self._finite_points(self.rows, "elapsed_s", field)
             if not points:
+                self._draw_grid(painter, panel)
+                painter.setPen(QColor(color))
+                painter.drawText(8, int(panel.top() - 5), label)
+                painter.setPen(QColor(theme.TEXT_MUTED))
+                painter.drawText(
+                    panel, Qt.AlignCenter,
+                    "Surface distance unavailable: contact not detected"
+                    if field == "surface_distance_mm" else "No recorded samples",
+                )
                 continue
             y_range = self._range(
                 [point[1] for point in points],
                 include_zero=not include_zero,
                 nonnegative=include_zero,
             )
+            y_range = self._shared_range(field, y_range)
             self._draw_grid(painter, panel)
+            if field == "surface_distance_mm" and y_range[0] <= 0 <= y_range[1]:
+                zero_y = panel.bottom() - (0 - y_range[0]) / (y_range[1] - y_range[0]) * panel.height()
+                painter.setPen(QPen(QColor(theme.TEXT_MUTED), 1.0, Qt.DotLine))
+                painter.drawLine(int(panel.left()), int(zero_y), int(panel.right()), int(zero_y))
             raw_color = QColor(color)
             raw_color.setAlpha(85)
             self._draw_series(
@@ -1106,7 +1195,9 @@ class CalibrationCurveWidget(QWidget):
                 raw_color,
                 width=1.0,
             )
-            smooth_points = self._smooth_points(points)
+            # Keep the position reference exact at the detected-contact sample.
+            # Smoothing the TCP trace could move its displayed zero crossing.
+            smooth_points = points if field == "surface_distance_mm" else self._smooth_points(points)
             self._draw_series(
                 painter,
                 smooth_points,
@@ -1122,28 +1213,17 @@ class CalibrationCurveWidget(QWidget):
                 y_range,
                 smooth_points,
                 color,
-                f"Smoothed {label}",
+                label if field == "surface_distance_mm" else f"Smoothed {label}",
                 time_axis=True,
             )
-            self._draw_vertical_marker(
-                painter, signal_time, x_range, panel, self.FIT_COLOR, Qt.DotLine
-            )
-            self._draw_vertical_marker(
-                painter, contact_time, x_range, panel, "#ef5350", Qt.DashLine
-            )
-            self._draw_vertical_marker(
-                painter,
-                peak_force_time,
-                x_range,
-                panel,
-                self.FORCE_COLOR,
-                Qt.DotLine,
-            )
-            self._draw_vertical_marker(
-                painter, return_time, x_range, panel, self.RETURN_COLOR, Qt.DashLine
-            )
+            for marker in self._timeline_inspection.markers:
+                for event in marker["events"]:
+                    self._draw_vertical_marker(
+                        painter, marker["time"], x_range, panel,
+                        self.EVENT_COLORS[event["key"]], Qt.DotLine,
+                    )
             painter.setPen(QColor(color))
-            painter.drawText(8, int(panel.top() + 14), label)
+            painter.drawText(8, int(panel.top() - 5), label)
             self._draw_y_ticks(painter, panel, y_range, side="right")
 
         self._draw_x_ticks(painter, outer, x_range)
@@ -1164,8 +1244,11 @@ class CalibrationCurveWidget(QWidget):
             (signal_label, self.signal_field, False),
             ("Force change (g)", "force_delta_abs_g", True),
         )
+        x_field = getattr(self, "repeatability_x_field", "travel_down_mm")
+        if x_field == "force_delta_abs_g":
+            specifications = specifications[:1]
         statistics = [
-            self._repeatability_statistics(trial_rows, field)
+            self._repeatability_statistics(trial_rows, field, x_field=x_field)
             for _label, field, _nonnegative in specifications
         ]
         all_curves = [
@@ -1188,15 +1271,15 @@ class CalibrationCurveWidget(QWidget):
             include_zero=True,
             nonnegative=True,
         )
-        x_range = self._display_range(base_x_range, "x")
+        x_range = self._display_range(base_x_range, "x", x_field)
         self._last_plot_rect = outer
         self._last_x_range = x_range
         self._last_y_range = None
         gap = 42.0
-        panel_height = (outer.height() - gap) / 2.0
+        panel_height = (outer.height() - gap * (len(specifications) - 1)) / len(specifications)
 
         painter.setPen(QColor(theme.TEXT_PRIMARY))
-        painter.drawText(12, 24, "Repeated-Trial Consistency")
+        painter.drawText(12, 24, getattr(self, "comparison_caption", "Repeated-Trial Consistency"))
         painter.setPen(QColor(theme.TEXT_MUTED))
         painter.drawText(
             12,
@@ -1229,6 +1312,7 @@ class CalibrationCurveWidget(QWidget):
                 include_zero=True,
                 nonnegative=nonnegative,
             )
+            y_range = self._shared_range(_field, y_range, repeatability=True)
             self._draw_grid(painter, panel)
             for curve_index, curve in enumerate(payload["curves"]):
                 color = QColor(
@@ -1274,7 +1358,7 @@ class CalibrationCurveWidget(QWidget):
 
         bottom_panel = QRectF(
             outer.left(),
-            outer.top() + panel_height + gap,
+            outer.top() + (panel_height + gap) * (len(specifications) - 1),
             outer.width(),
             panel_height,
         )
@@ -1283,7 +1367,7 @@ class CalibrationCurveWidget(QWidget):
         painter.drawText(
             int(outer.center().x() - 55),
             self.height() - 14,
-            "Travel distance (mm)",
+            "Matched force (g)" if x_field == "force_delta_abs_g" else "Travel distance (mm)",
         )
 
     def _relationship_spec(self):
@@ -1292,9 +1376,13 @@ class CalibrationCurveWidget(QWidget):
             "signal_distance": (
                 "travel_down_mm",
                 self.signal_field,
-                "Travel distance (mm)",
+                getattr(self, "distance_label", "Travel distance (mm)"),
                 signal_label,
-                "Sensor Signal vs Travel Distance",
+                (
+                    "Signal vs Contact-relative TCP Travel"
+                    if getattr(self, "contact_referenced", False)
+                    else "Sensor Signal vs Travel Distance"
+                ),
                 "signal_distance_fit",
                 "signal_distance",
             ),
@@ -1350,20 +1438,20 @@ class CalibrationCurveWidget(QWidget):
             painter.drawText(plot_rect, Qt.AlignCenter, "Not enough samples")
             return
 
-        include_x_zero = x_field in {"travel_down_mm", "force_delta_abs_g"}
         include_y_zero = y_field in {"force_delta_abs_g", self.signal_field}
-        base_x_range = self._range(
-            [point[0] for point in points],
-            include_zero=not include_x_zero and x_field == self.signal_field,
-            nonnegative=include_x_zero,
-        )
+        base_x_range = self._relationship_x_range(points, x_field)
         base_y_range = self._range(
             [point[1] for point in points],
             include_zero=include_y_zero and y_field == self.signal_field,
             nonnegative=y_field == "force_delta_abs_g",
         )
-        x_range = self._display_range(base_x_range, "x")
-        y_range = self._display_range(base_y_range, "y")
+        shared_x_field = (
+            "contact_relative_travel_mm"
+            if getattr(self, "contact_referenced", False)
+            else x_field
+        )
+        x_range = self._display_range(base_x_range, "x", shared_x_field)
+        y_range = self._display_range(base_y_range, "y", y_field)
         self._last_plot_rect = plot_rect
         self._last_x_range = x_range
         self._last_y_range = y_range
@@ -1466,6 +1554,24 @@ class CalibrationCurveWidget(QWidget):
         )
         self._draw_x_ticks(painter, plot_rect, x_range)
         self._draw_y_ticks(painter, plot_rect, y_range, side="left")
+        if getattr(self, "contact_referenced", False) and x_range[0] <= 0 <= x_range[1]:
+            px, _ = self._map_point(0, y_range[0], x_range, y_range, plot_rect)
+            painter.setPen(QPen(QColor("#c84444"), 1.2, Qt.DashLine))
+            painter.drawLine(int(px), int(plot_rect.top()), int(px), int(plot_rect.bottom()))
+            painter.drawText(int(px) - 115, int(plot_rect.top()) + 18, "Detected contact")
+
+    def _relationship_x_range(self, points, x_field):
+        return self._range(
+            [point[0] for point in points],
+            include_zero=True,
+            nonnegative=(
+                x_field == "force_delta_abs_g"
+                or (
+                    x_field == "travel_down_mm"
+                    and not getattr(self, "contact_referenced", False)
+                )
+            ),
+        )
 
     def resizeEvent(self, event):
         self._base_image = None
@@ -1831,7 +1937,7 @@ class CalibrationResultDialog(QDialog):
         ):
             chart.set_data(rows, signal_field)
         projected_trials = []
-        for trial_index, trial in enumerate(self.trial_results, start=1):
+        for trial_index, trial in enumerate(comparable_trial_results(self.trial_results, result), start=1):
             trial_signal = str(trial.get("signal_field") or signal_field)
             trial_original = int(trial.get("taxel_index", 0) or 0)
             trial_rows = calibration_rows_for_taxel(
@@ -1853,6 +1959,10 @@ class CalibrationResultDialog(QDialog):
         self.tabs.setTabEnabled(
             self.repeatability_tab_index,
             len(projected_trials) > 1,
+        )
+        self.tabs.setTabToolTip(
+            self.repeatability_tab_index,
+            "Only complete, uninterrupted trials with matching settings are compared.",
         )
         self.taxel_context_label.setText(
             f"Viewing taxel {self.selected_taxel_index}\n"
@@ -1936,6 +2046,11 @@ class CalibrationResultDialog(QDialog):
             mode="repeatability",
         )
         chart.set_trials(trial_results, signal_field)
+        if trial_results:
+            reference = trial_results[0]
+            speed = float(reference.get("approach_speed_m_s", 0)) * 1000
+            force = float(reference.get("contact_threshold_g", 0))
+            chart.comparison_caption = f"Repeated-Trial Consistency · {speed:g} mm/s · target {force:g} g"
         chart.resize(int(width), int(height))
         chart.ensurePolished()
         image = QImage(int(width), int(height), QImage.Format_ARGB32)
@@ -2000,6 +2115,25 @@ class CalibrationResultDialog(QDialog):
         path.parent.mkdir(parents=True, exist_ok=True)
         return bool(canvas.save(str(path), "PNG"))
 
+    @classmethod
+    def _export_repeatability_graphs(cls, trial_results, output):
+        groups = [items for items in result_condition_groups(trial_results).values() if len(items) > 1]
+        paths, failures = [], 0
+        for number, items in enumerate(groups, start=1):
+            name = "repeatability.png" if len(groups) == 1 else f"repeatability_condition_{number:02d}.png"
+            path = output / name
+            try:
+                image = cls._render_repeatability(items, items[0].get("signal_field") or "diff_ave")
+                output.mkdir(parents=True, exist_ok=True)
+                saved = bool(image.save(str(path), "PNG"))
+            except Exception:
+                saved = False
+            if saved:
+                paths.append(str(path))
+            else:
+                failures += 1
+        return paths, failures
+
     def export_all_graphs(self):
         graph_directory = str(self.result.get("graph_directory") or "")
         if not graph_directory:
@@ -2019,37 +2153,20 @@ class CalibrationResultDialog(QDialog):
                 result["graph_path"] = str(graph_path)
             else:
                 failures += 1
-        repeatability_saved = False
-        if len(self.trial_results) > 1:
-            signal_field = str(
-                (self.trial_results[0] or {}).get("signal_field")
-                or "diff_ave"
-            )
-            repeatability_path = output_directory / "repeatability.png"
-            try:
-                image = self._render_repeatability(
-                    self.trial_results,
-                    signal_field,
-                )
-                repeatability_path.parent.mkdir(parents=True, exist_ok=True)
-                repeatability_saved = bool(
-                    image.save(str(repeatability_path), "PNG")
-                )
-            except Exception:
-                repeatability_saved = False
-            if repeatability_saved:
-                exported.append(str(repeatability_path))
-                self.result["repeatability_graph_path"] = str(
-                    repeatability_path
-                )
-            else:
-                failures += 1
+        repeatability_paths, repeatability_failures = self._export_repeatability_graphs(
+            self.trial_results, output_directory,
+        )
+        failures += repeatability_failures
+        exported.extend(repeatability_paths)
+        self.result["repeatability_graph_paths"] = repeatability_paths
+        if len(repeatability_paths) == 1:
+            self.result["repeatability_graph_path"] = repeatability_paths[0]
         self.exported_graph_paths = exported
         if exported:
-            trial_graph_count = len(exported) - int(repeatability_saved)
+            trial_graph_count = len(exported) - len(repeatability_paths)
             message = f"Saved {trial_graph_count} trial graph(s)"
-            if repeatability_saved:
-                message += " and the repeatability graph"
+            if repeatability_paths:
+                message += f" and {len(repeatability_paths)} matching-condition repeatability graph(s)"
             message += f": {output_directory}"
             if failures:
                 message += f" ({failures} failed)"
@@ -2167,7 +2284,7 @@ class FullTaxelCalibrationResultDialog(QDialog):
         if self._selected_taxel not in self.taxel_results:
             return
         dialog = CalibrationResultDialog(
-            self.taxel_results[self._selected_taxel],
+            with_trial_rows(self.taxel_results[self._selected_taxel]),
             parent=self,
         )
         dialog.setAttribute(Qt.WA_DeleteOnClose, True)
@@ -2207,9 +2324,12 @@ class FullTaxelCalibrationResultDialog(QDialog):
             for sequence, trial in enumerate(trials, start=1):
                 number = int(trial.get("trial_number", sequence) or sequence)
                 path = output / f"trial_{number:04d}.png"
+                if trial.get("graph_path") and Path(trial["graph_path"]).is_file():
+                    saved_count += 1
+                    continue
                 try:
                     saved = CalibrationResultDialog._export_trial_graph(
-                        trial, path
+                        with_trial_rows(trial, taxel_columns=False), path
                     )
                 except Exception:
                     saved = False
@@ -2218,21 +2338,15 @@ class FullTaxelCalibrationResultDialog(QDialog):
                     saved_count += 1
                 else:
                     self._export_failures += 1
-            if len(trials) > 1:
-                path = output / "repeatability.png"
-                try:
-                    image = CalibrationResultDialog._render_repeatability(
-                        trials,
-                        str(result.get("signal_field") or "diff_ave"),
-                    )
-                    output.mkdir(parents=True, exist_ok=True)
-                    saved = bool(image.save(str(path), "PNG"))
-                except Exception:
-                    saved = False
-                if saved:
-                    result["repeatability_graph_path"] = str(path)
-                else:
-                    self._export_failures += 1
+            paths, failures = ([], 0) if len(trials) < 2 else (
+                CalibrationResultDialog._export_repeatability_graphs(
+                    [with_trial_rows(trial, taxel_columns=False) for trial in trials], output,
+                )
+            )
+            self._export_failures += failures
+            result["repeatability_graph_paths"] = paths
+            if len(paths) == 1:
+                result["repeatability_graph_path"] = paths[0]
         if saved_count:
             self._exported_taxels += 1
         processed = self._export_total - len(self._export_queue)

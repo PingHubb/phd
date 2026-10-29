@@ -157,7 +157,7 @@ def test_no_literal_index_is_passed_to_set_tab_enabled():
 
 def test_sensor_subtabs_are_named_by_task():
     calls = list(_addtab_calls(_function(_module(UI_PING), "setup_tab1"), "sensor_sub_tabs"))
-    assert [label for _a, label in calls] == ["Setup", "Diagnostics"]
+    assert [label for _a, label in calls] == ["Setup", "Display", "Diagnostics"]
 
 
 def test_ai_subtabs_separate_running_from_data():
@@ -165,19 +165,14 @@ def test_ai_subtabs_separate_running_from_data():
     assert [label for _a, label in calls] == ["Run", "Data"]
 
 
-def test_dense_robot_and_ai_pages_use_basic_advanced_disclosure():
+def test_ai_setup_is_labelled_by_task_not_generic_basic_advanced():
     tree = _module(UI_PING)
-    assert _collapsible_titles(_function(tree, "setup_tab2")) == [
-        "Basic controls",
-        "Advanced commands",
-    ]
     ai_titles = _collapsible_titles(_function(tree, "setup_tab3"))
     assert all(title in ai_titles for title in [
-        "Basic controls",
-        "Advanced setup",
-        "Basic recording",
-        "Advanced labels",
+        "Policy setup · checkpoint & frame",
+        "Proximity setup · model & sensitivity",
     ])
+    assert not {"Teaching labels · manual motion tags", "Legacy gesture recording"} & set(ai_titles)
 
 
 def test_data_subtab_index_is_captured_for_the_record_shortcut():

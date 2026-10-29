@@ -6009,7 +6009,8 @@ class MySensor:
             if restart_reader:
                 self._start_sensor_reader_worker()
 
-    # Geneva demo support has been archived to `backup/func_sensor_geneva_archive.py`.
+    # Geneva demo source is preserved under the repository's
+    # archive/2026-10-19/phd/backup/func_sensor_geneva_archive.py.
 
 
 class _MultiPortSensorReplica(MySensor):

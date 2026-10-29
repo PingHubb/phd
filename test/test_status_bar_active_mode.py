@@ -43,6 +43,19 @@ def test_idle_when_no_helper_is_running():
     assert _label(direct_finger_motion_class=_Helper()) == "Idle"
 
 
+def test_sensor_only_gesture_mode_does_not_hide_a_running_robot_policy():
+    from types import SimpleNamespace
+
+    window = _Window()
+    panel = SimpleNamespace(active=True)
+    window.ui_ros = SimpleNamespace(gesture_recognition_panel=panel)
+    assert MyMainWindow._active_mode_label(window, _SensorFunctions()) == "Gesture recognition"
+    helpers = _SensorFunctions(direct_finger_motion_class=_Helper(running=True))
+    assert MyMainWindow._active_mode_label(window, helpers) == "Rule-based DFM"
+    panel.active = False
+    assert MyMainWindow._active_mode_label(window, _SensorFunctions()) == "Idle"
+
+
 def test_running_helper_is_named():
     assert (
         _label(direct_finger_motion_class=_Helper(running=True)) == "Rule-based DFM"

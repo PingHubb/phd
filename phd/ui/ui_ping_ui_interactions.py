@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -566,7 +567,18 @@ class UiInteractionsMixin:
         self.log_display.append(self.sensor_functions.read_runtime_hz_report())
 
     def _on_read_joint_angles(self):
-        self.log_display.append(f"Joint angles: {self.robot_api.get_current_positions()}")
+        positions = list(self.robot_api.get_current_positions() or [])
+        if len(positions) < 6:
+            self.log_display.append("Joint angles: unavailable")
+            return
+        radians = [float(value) for value in positions[:6]]
+        degrees = [math.degrees(value) for value in radians]
+        degree_text = ", ".join(f"J{index + 1} {value:+.2f}°" for index, value in enumerate(degrees))
+        radian_text = ", ".join(f"{value:+.4f}" for value in radians)
+        self.log_display.append(f"Joint angles: {degree_text}  ({radian_text} rad)")
+        editor = getattr(self, "position_entry_widget", None)
+        if editor is not None and hasattr(editor, "fill_from_current_joints"):
+            editor.fill_from_current_joints()
 
     def _on_read_tool_position(self):
         self.log_display.append(f"Tool position: {self.robot_api.get_current_tool_position()}")
@@ -686,17 +698,6 @@ class UiInteractionsMixin:
             "Sensor Plotter Screenshot",
             f"Transparent PNG saved to:\n{path}",
         )
-
-    def _set_record_trigger_mode(self, mode: str):
-        helper = self._get_sensor_helper("record_gesture_class")
-        if helper is not None:
-            helper.set_trigger_mode(mode)
-
-    def _on_record_trigger_mode_selected(self, _index=None):
-        """Apply the recording mode chosen in the Data page's dropdown."""
-        mode = self.record_trigger_mode_combo.currentData()
-        if mode:
-            self._set_record_trigger_mode(str(mode))
 
     def _on_toggle_proximity_control(self):
         try:
@@ -938,10 +939,6 @@ class UiInteractionsMixin:
 
     def _connect_ai_workspace(self):
         """Wire learned-policy controls after that page has been built."""
-        self.record_gesture_button.pressed.connect(self.start_record_gesture)
-        self.record_trigger_mode_combo.currentIndexChanged.connect(
-            self._on_record_trigger_mode_selected
-        )
         self.predict_threelevel_hierarchical_transformer_gesture_button.pressed.connect(
             self._on_toggle_threelevel_predict
         )
@@ -956,27 +953,9 @@ class UiInteractionsMixin:
             self.proximity_settings_dialog.close
         )
         self._load_proximity_settings_into_ui()
-        if hasattr(self, "ai_teaching_label_buttons"):
-            for teaching_label, button in self.ai_teaching_label_buttons.items():
-                if teaching_label == "auto":
-                    button.clicked.connect(
-                        lambda _checked=False, label=teaching_label: self._set_ai_teaching_label(label)
-                    )
-                else:
-                    button.pressed.connect(
-                        lambda label=teaching_label: self._set_ai_teaching_label(label)
-                    )
-                    button.released.connect(
-                        lambda label="auto": self._set_ai_teaching_label(label)
-                    )
-            self._update_ai_teaching_label_ui()
         self.ai_direct_finger_motion_button.pressed.connect(
-            lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=False)
+            self._on_toggle_ai_direct_finger_motion
         )
-        if hasattr(self, "ai_direct_finger_motion_robot_button"):
-            self.ai_direct_finger_motion_robot_button.pressed.connect(
-                lambda: self._on_toggle_ai_direct_finger_motion(send_robot_commands=True)
-            )
         self.ai_proximity_environment_record_button.clicked.connect(
             self._on_toggle_ai_proximity_environment_recording
         )
@@ -988,9 +967,6 @@ class UiInteractionsMixin:
         )
         self.ai_direct_execution_select_model_button.clicked.connect(
             self._on_select_ai_direct_execution_model
-        )
-        self.ai_direct_execution_use_default_button.clicked.connect(
-            self._on_use_default_ai_direct_execution_model
         )
         self.ai_proximity_select_model_button.clicked.connect(
             self._on_select_ai_proximity_model
@@ -1126,10 +1102,12 @@ class UiInteractionsMixin:
             for w in widgets:
                 if components.is_visible_to_parent(w):
                     w.toggle_visibility()
+            if target_widget is getattr(self, "position_entry_widget", None):
+                target_widget.fill_from_current_joints()
             target_widget.toggle_visibility()
 
-        any_open = any(components.is_visible_to_parent(widget) for widget in widgets)
-        self.read_group_robot.setVisible(not any_open)
+        # Readouts now have their own task page: opening an editor must not
+        # leave that page blank when the operator returns to Read state.
         self._sync_robot_send_button_highlights()
 
     def _sync_robot_send_button_highlights(self):
@@ -1217,6 +1195,10 @@ class UiInteractionsMixin:
 
     def _stop_sensor_driven_controls(self):
         """Stop modes that must not keep commanding hardware without sensor data."""
+        self._shutdown_optional_call(
+            "_stop_gesture_recognition",
+            "Sensor-only gesture recognition",
+        )
         self._shutdown_optional_call(
             "_stop_admittance_control",
             "pressure admittance control",

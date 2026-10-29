@@ -49,11 +49,17 @@ QTimer.singleShot = lambda *_args, **_kwargs: None
 try:
     main_window = MyMainWindow()
     assert main_window.h_splitter.count() == 1
+    assert main_window.taxel_mapping_scan_strength_spin.value() == 2.0
+    assert "default 2×" in main_window.taxel_mapping_scan_strength_spin.toolTip()
+    assert main_window.taxel_mapping_scan_extra_descent_spin.maximum() == 20.0
+    assert main_window.taxel_mapping_scan_extra_descent_spin.value() == 20.0
+    assert "5 g" in main_window.taxel_mapping_noncontact_note.text()
+    assert "cannot certify" in main_window.taxel_mapping_noncontact_note.text()
     assert main_window.sidebar.parent() is main_window.experiments_window
     main_window.sidebar_btn_start.setEnabled(False)
     assert main_window.select_sidebar_task('graph_analysis')
     main_window._on_sidebar_task_changed()
-    assert main_window.sidebar_btn_start.text() == 'Select Recording'
+    assert main_window.sidebar_btn_start.text() == 'Select Graph'
     assert main_window.sidebar_btn_start.isEnabled()
     opened = []
     main_window._open_calibration_graph_analysis = lambda: opened.append(True)
@@ -61,6 +67,15 @@ try:
     app.processEvents()
     assert opened == [True]
     assert main_window._sidebar_active_task is None
+    assert main_window.select_sidebar_task('sensor_characterisation')
+    workbench_opened = []
+    main_window._open_sensor_characterisation = lambda: workbench_opened.append(True)
+    preserved_task = object()
+    main_window._sidebar_active_task = preserved_task
+    main_window._start_sidebar_control()
+    assert workbench_opened == [True]
+    assert main_window._sidebar_active_task is preserved_task
+    main_window._sidebar_active_task = None
     main_window.open_experiments_window()
     app.processEvents()
     assert main_window.experiments_window.isVisible()
@@ -78,19 +93,22 @@ try:
     assert [
         tree.topLevelItem(0).child(index).data(0, Qt.UserRole)
         for index in range(tree.topLevelItem(0).childCount())
-    ] == ['taxel_position_mapping', 'calibration', 'graph_analysis']
+    ] == ['taxel_position_mapping', 'calibration', 'graph_analysis', 'sensor_characterisation']
     assert tree.topLevelItem(1).child(0).data(0, Qt.UserRole) == 'sigraph2026_scanning'
     assert main_window.select_sidebar_task('calibration')
     tabs = main_window.calibration_mode_tabs
     assert [tabs.tabText(index) for index in range(tabs.count())] == [
-        'Single taxel',
         'Full taxel',
+        'Single taxel',
     ]
-    assert main_window.sidebar_btn_start.text() == 'Run'
-    tabs.setCurrentIndex(1)
+    assert tabs.currentIndex() == 0
+    assert main_window.sidebar_btn_start.text() == 'Run Full Taxel Calibration'
+    tabs.setCurrentIndex(0)
     app.processEvents()
     assert main_window._current_sidebar_control_id() == 'full_taxel_calibration'
     assert main_window.sidebar_btn_start.text() == 'Run Full Taxel Calibration'
+    assert not hasattr(main_window, 'full_taxel_remember_position_button')
+    assert 'safe anchor' in main_window.full_taxel_initial_position_label.text()
     splitter = main_window.experiment_controls_splitter
     assert splitter.orientation() == Qt.Horizontal
     assert main_window.sidebar_task_list.parent() is splitter.widget(0)
@@ -125,6 +143,55 @@ config_dir.cleanup()
     assert result.returncode == 0, result.stderr
 
 
+def test_file_dialogs_open_over_experiment_controls_and_keep_it_in_front():
+    project_root = Path(__file__).resolve().parents[1]
+    script = """
+import os
+import tempfile
+
+config_dir = tempfile.TemporaryDirectory()
+os.environ['XDG_CONFIG_HOME'] = config_dir.name
+
+from PyQt5.QtCore import QTimer
+from PyQt5.QtWidgets import QApplication, QFileDialog
+from phd.ui.ui_initial import MyMainWindow
+
+app = QApplication([])
+original_single_shot = QTimer.singleShot
+original_file_picker = QFileDialog.getOpenFileName
+QTimer.singleShot = lambda *_args, **_kwargs: None
+parents = []
+QFileDialog.getOpenFileName = lambda parent, *_args, **_kwargs: (parents.append(parent), ('', ''))[1]
+window = MyMainWindow()
+try:
+    controls = window.experiments_window
+    controls.hide()
+    window._choose_experiment_file('t', '', '*')
+    assert parents[-1] is window
+    controls.show()
+    raised = []
+    controls.raise_ = lambda: raised.append('raise')
+    window._load_single_calibration_map()
+    assert parents[-1] is controls
+    assert raised == ['raise']
+finally:
+    window.close()
+    QTimer.singleShot = original_single_shot
+    QFileDialog.getOpenFileName = original_file_picker
+    config_dir.cleanup()
+"""
+    env = os.environ.copy()
+    env["QT_QPA_PLATFORM"] = "offscreen"
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(None, (str(project_root), env.get("PYTHONPATH", "")))
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script], cwd=project_root, env=env,
+        capture_output=True, text=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_mapped_taxel_grid_routes_clicks_through_monitored_experiment_lifecycle():
     project_root = Path(__file__).resolve().parents[1]
     script = """
@@ -144,13 +211,18 @@ from PyQt5.QtWidgets import QApplication, QFileDialog
 from phd.ui.ui_initial import MyMainWindow
 
 class Robot:
+    @property
+    def current_feedback_state_time(self):
+        return time.monotonic()
     def __init__(self):
         self.position = [0.1, 0.2, 0.29]
+        self.quaternion = [1.0, 0.0, 0.0, 0.0]
         self.sent = []
     def get_current_tool_position(self):
-        return self.position, [1.0, 0.0, 0.0, 0.0]
+        return self.position, self.quaternion
     def send_positions_tool_position(self, position, quaternion, **kwargs):
         self.position = list(position)
+        self.quaternion = list(quaternion)
         self.sent.append((list(position), kwargs))
         return True
     def exit_end_effector_velocity_mode(self, send_zero=True):
@@ -235,6 +307,52 @@ try:
     assert not window._sidebar_control_timer.isActive()
     assert grid.buttons[43].isEnabled()
     assert 'stopped' in window.taxel_mapping_move_status_label.text()
+
+    # The same grid click recovers an outside/rotated starting pose first.
+    api.sent.clear()
+    api.position = [0.35, 0.2, 0.29]
+    api.quaternion = [float(np.cos(.3)), 0., 0., float(np.sin(.3))]
+    window.ui_ros._force_meter_last_sample_monotonic = time.monotonic()
+    grid.buttons[43].click()
+    task = window._sidebar_active_task
+    assert task is not None
+    task.move_settle_sec = 0
+    for _ in range(40):
+        data.frame_sequence += 1
+        window.ui_ros._force_meter_last_sample_monotonic = time.monotonic()
+        window._run_sidebar_control_action()
+        if window._sidebar_active_task is None:
+            break
+    assert window._sidebar_active_task is None
+    positions = [entry[0] for entry in api.sent]
+    assert positions[0] == [0.35, 0.2, 0.3]
+    assert positions.index([0.1, 0.2, 0.3]) < positions.index([0.104, 0.2, 0.3])
+    assert 'Arrived above Taxel 43' in window.taxel_mapping_move_status_label.text()
+
+    sensor = window.ui_ros.sensor_functions
+    sensor.n_row = sensor.n_col = 20
+    data.diffDataAve = np.zeros((20, 20))
+    window._sync_taxel_maps_to_streaming_sensor()
+    assert 'Taxel 189' in window.taxel_mapping_anchor_button.text()
+    assert 'Taxel 189' in window.taxel_mapping_anchor_button.toolTip()
+    assert 'Taxel 35' not in window.taxel_mapping_anchor_button.toolTip()
+    assert 'Taxel 189' in window.sidebar_task_info.text()
+    assert '20x20' in window.sidebar_task_info.text()
+    assert 'Taxel 35' not in window.taxel_mapping_note.text()
+    for field in (window.taxel_mapping_reference_speed_spin,
+                  window.taxel_mapping_start_margin_spin,
+                  window.taxel_mapping_xy_limit_spin):
+        assert 'Taxel 35' not in field.toolTip()
+    assert len(grid.buttons) == 400
+    assert window.taxel_mapping_xy_limit_spin.value() == 200
+    assert window.taxel_mapping_coarse_radius_spin.value() == 20
+    assert window.taxel_mapping_coarse_step_spin.value() == 2
+    assert window.taxel_mapping_progress_label.text() == 'Ready | 0/324 located'
+    assert len(window._taxel_mapping_task().skipped_taxel_indices()) == 76
+    window._taxel_navigation_result = None
+    window._refresh_taxel_mapping_controls()
+    assert len(grid._skipped_taxels) == 76
+    assert 'outer border' in grid.buttons[0].toolTip()
 finally:
     window.ui_ros = None
     window.close()
@@ -273,6 +391,9 @@ from PyQt5.QtWidgets import QApplication, QFileDialog
 from phd.ui.ui_initial import MyMainWindow
 
 class Robot:
+    @property
+    def current_feedback_state_time(self):
+        return time.monotonic()
     def __init__(self):
         self.position = [0.1, 0.2, 0.3]
         self.sent = []
@@ -323,6 +444,14 @@ record = {
     ],
 }
 path.write_text(json.dumps(record))
+
+# Resuming a map persists its anchor. XDG_CONFIG_HOME only isolates Qt settings;
+# this task normally writes under the project's resource/config directory.
+from phd.ui.experiment_tasks import get_task
+mapping_task = get_task('taxel_position_mapping')
+mapping_task.storage_path = Path(config_dir.name) / 'mapping_anchor.json'
+mapping_task._anchor_profiles = {}
+mapping_task.anchor_pose = None
 
 app = QApplication([])
 original_single_shot = QTimer.singleShot
@@ -388,6 +517,10 @@ try:
     window.taxel_mapping_resume_button.click()
     task = window._sidebar_active_task
     assert task is not None and task.id == 'taxel_position_mapping'
+    assert task is mapping_task
+    assert task.storage_path.is_file()
+    saved_anchor = json.loads(task.storage_path.read_text())
+    assert saved_anchor == {'version': 2, 'profiles': {}}
     assert set(task._positions) == {27, 34, 35, 36}
     assert task._move_action == 'resume_anchor_arrived'
     assert task._output_folder == folder.resolve()
